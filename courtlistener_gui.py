@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from collections import OrderedDict
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
@@ -113,10 +114,11 @@ class CourtListenerGUI:
         self._search_thread: Optional[threading.Thread] = None
         self._scholar: Optional["GoogleScholarFetcher"] = None
 
-        # Preview / text-fetch state
-        self._preview_cache: dict[int, str] = {}   # result index → plain text
-        self._fetch_gen: int = 0                    # incremented on each search
-        self._fetch_sema = threading.Semaphore(4)   # cap concurrent API fetches
+        self._preview_cache: dict[int, str] = {}  # result index → snippet text
+
+        # Initialize token from env or saved config
+        initial_token = os.environ.get("COURTLISTENER_TOKEN") or _load_saved_token()
+        self._token_var = tk.StringVar(value=initial_token)
 
         self._build_ui()
 
@@ -128,28 +130,16 @@ class CourtListenerGUI:
         style = ttk.Style()
         style.configure("Treeview", rowheight=28)
 
-        # --- Token row ---
-        token_frame = ttk.LabelFrame(self.root, text="API Token", padding=6)
-        token_frame.pack(fill="x", padx=10, pady=(10, 4))
-
-        initial_token = os.environ.get("COURTLISTENER_TOKEN") or _load_saved_token()
-        self._token_var = tk.StringVar(value=initial_token)
-        ttk.Label(token_frame, text="Token:").pack(side="left")
-        self._token_entry = ttk.Entry(
-            token_frame, textvariable=self._token_var, show="*", width=55
-        )
-        self._token_entry.pack(side="left", padx=6)
-        self._show_token_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            token_frame,
-            text="Show",
-            variable=self._show_token_var,
-            command=self._toggle_token_vis,
-        ).pack(side="left")
+        # --- Menubar ---
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+        settings_menu.add_command(label="API Token…", command=self._show_settings_dialog)
 
         # --- Search frame ---
         search_frame = ttk.LabelFrame(self.root, text="Search", padding=6)
-        search_frame.pack(fill="x", padx=10, pady=4)
+        search_frame.pack(fill="x", padx=10, pady=(10, 4))
 
         # Row 1: query + button
         row1 = ttk.Frame(search_frame)
@@ -195,14 +185,14 @@ class CourtListenerGUI:
             row2, from_=5, to=20, textvariable=self._page_size_var, width=5
         ).pack(side="left", padx=4)
 
-        # --- Results area: left trees + right preview ---
+        # --- Results area: left tree + right preview ---
         results_frame = ttk.LabelFrame(self.root, text="Results", padding=6)
         results_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
         paned = ttk.PanedWindow(results_frame, orient="horizontal")
         paned.pack(fill="both", expand=True)
 
-        # -- Left pane: main results tree + orders tree --
+        # -- Left pane: results tree --
         left_frame = ttk.Frame(paned)
         paned.add(left_frame, weight=3)
 
@@ -214,50 +204,19 @@ class CourtListenerGUI:
             main_tree_frame, columns=cols, show="headings", selectmode="browse"
         )
         self._configure_tree_columns(self._tree)
+        # Secondary opinions (same cluster, not the main opinion) are shown
+        # indented directly below the main opinion with muted styling.
+        self._tree.tag_configure("secondary", foreground="#888888")
         vsb = ttk.Scrollbar(main_tree_frame, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self._tree.bind("<Double-1>", lambda _e: self._download_selected())
-        self._tree.bind("<<TreeviewSelect>>", lambda _e: self._on_row_select(self._tree))
-
-        # Orders / short-opinion section
-        orders_sep = ttk.Frame(left_frame)
-        orders_sep.pack(fill="x", pady=(4, 0))
-        ttk.Separator(orders_sep, orient="horizontal").pack(fill="x")
-        ttk.Label(
-            orders_sep,
-            text="Short opinions / Orders  (< 100 words)",
-            foreground="gray",
-            font=("TkDefaultFont", 9, "italic"),
-        ).pack(anchor="w", pady=(2, 0))
-
-        orders_tree_frame = ttk.Frame(left_frame)
-        orders_tree_frame.pack(fill="x")
-        self._orders_tree = ttk.Treeview(
-            orders_tree_frame, columns=cols, show="headings", selectmode="browse", height=4
-        )
-        self._configure_tree_columns(self._orders_tree)
-        vsb2 = ttk.Scrollbar(orders_tree_frame, orient="vertical", command=self._orders_tree.yview)
-        self._orders_tree.configure(yscrollcommand=vsb2.set)
-        self._orders_tree.pack(side="left", fill="x", expand=True)
-        vsb2.pack(side="right", fill="y")
-        self._orders_tree.bind("<Double-1>", lambda _e: self._download_selected())
-        self._orders_tree.bind(
-            "<<TreeviewSelect>>", lambda _e: self._on_row_select(self._orders_tree)
-        )
+        self._tree.bind("<<TreeviewSelect>>", lambda _e: self._on_row_select())
 
         # -- Right pane: preview panel --
         right_frame = ttk.LabelFrame(paned, text="Preview", padding=4)
         paned.add(right_frame, weight=1)
-
-        self._preview_word_count_var = tk.StringVar(value="")
-        ttk.Label(
-            right_frame,
-            textvariable=self._preview_word_count_var,
-            foreground="gray",
-            font=("TkDefaultFont", 8),
-        ).pack(anchor="w")
 
         preview_inner = ttk.Frame(right_frame)
         preview_inner.pack(fill="both", expand=True)
@@ -303,6 +262,45 @@ class CourtListenerGUI:
         )
 
     # ------------------------------------------------------------------
+    # Settings dialog
+    # ------------------------------------------------------------------
+
+    def _show_settings_dialog(self) -> None:
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Settings")
+        dlg.geometry("460x95")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.root)
+
+        frame = ttk.LabelFrame(dlg, text="CourtListener API Token", padding=10)
+        frame.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+
+        ttk.Label(frame, text="Token:").pack(side="left")
+        entry = ttk.Entry(frame, textvariable=self._token_var, show="*", width=42)
+        entry.pack(side="left", padx=6, fill="x", expand=True)
+
+        show_var = tk.BooleanVar(value=False)
+
+        def _toggle() -> None:
+            entry.config(show="" if show_var.get() else "*")
+
+        ttk.Checkbutton(frame, text="Show", variable=show_var, command=_toggle).pack(
+            side="left"
+        )
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill="x", padx=10, pady=(4, 10))
+        ttk.Button(
+            btn_frame,
+            text="Save & Close",
+            command=lambda: (_save_token(self._token_var.get().strip()), dlg.destroy()),
+        ).pack(side="right")
+        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(
+            side="right", padx=4
+        )
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -318,30 +316,40 @@ class CourtListenerGUI:
         tree.column("citation", width=140, minwidth=80)
         tree.column("status", width=110, minwidth=70)
 
+    def _format_row(self, item: dict, secondary: bool = False) -> tuple:
+        """Return the tuple of column values for inserting a row into the tree."""
+        case_name = item.get("caseName") or item.get("case_name") or "(unknown)"
+        if secondary:
+            case_name = "    " + case_name  # visual indent for secondary opinions
+        court = item.get("court") or item.get("court_id") or ""
+        date_filed = item.get("dateFiled") or item.get("date_filed") or ""
+        citations = item.get("citation", [])
+        if isinstance(citations, list):
+            us_reports = next((c for c in citations if " U.S. " in c), None)
+            citation_str = us_reports or (citations[0] if citations else "")
+        else:
+            citation_str = str(citations) if citations else ""
+        status = (
+            item.get("precedentialStatus") or item.get("precedential_status") or ""
+        )
+        return (case_name, court, date_filed, citation_str, status)
+
     def _iid_to_idx(self, iid: str) -> int:
         """Convert a tree row iid to an index into self._results."""
-        return int(iid[1:]) if iid.startswith("s") else int(iid)
+        return int(iid)
 
     def _get_selected_item(self) -> Optional[tuple[int, dict]]:
-        """Return (index, result-dict) for whichever tree has a selection."""
-        for tree in (self._tree, self._orders_tree):
-            sel = tree.selection()
-            if sel:
-                idx = self._iid_to_idx(sel[0])
-                return idx, self._results[idx]
+        """Return (index, result-dict) for the selected row."""
+        sel = self._tree.selection()
+        if sel:
+            idx = self._iid_to_idx(sel[0])
+            return idx, self._results[idx]
         return None
 
-    def _toggle_token_vis(self) -> None:
-        self._token_entry.config(show="" if self._show_token_var.get() else "*")
-
-    def _on_row_select(self, source_tree: ttk.Treeview) -> None:
-        sel = source_tree.selection()
+    def _on_row_select(self) -> None:
+        sel = self._tree.selection()
         if not sel:
             return
-        # Deselect the other tree so only one row is ever active
-        other = self._orders_tree if source_tree is self._tree else self._tree
-        if other.selection():
-            other.selection_remove(*other.selection())
         self._download_btn.config(state="normal")
         self._scholar_btn.config(state="normal")
         self._show_preview(self._iid_to_idx(sel[0]))
@@ -350,7 +358,9 @@ class CourtListenerGUI:
         token = self._token_var.get().strip()
         if not token:
             messagebox.showerror(
-                "Missing Token", "Please enter your CourtListener API token."
+                "Missing Token",
+                "Please enter your CourtListener API token.\n\n"
+                "Go to Settings → API Token…",
             )
             return None
         if self._client is None or self._client._session.headers.get(
@@ -391,13 +401,8 @@ class CourtListenerGUI:
         self._status_var.set("Searching…")
         for row in self._tree.get_children():
             self._tree.delete(row)
-        for row in self._orders_tree.get_children():
-            self._orders_tree.delete(row)
         self._results.clear()
-        # Invalidate any in-flight preview fetches from the previous search
-        self._fetch_gen += 1
         self._preview_cache.clear()
-        self._preview_word_count_var.set("")
         self._preview_text.config(state="normal")
         self._preview_text.delete("1.0", "end")
         self._preview_text.config(state="disabled")
@@ -410,6 +415,7 @@ class CourtListenerGUI:
                     court=court,
                     date_filed_min=date_from,
                     date_filed_max=date_to,
+                    highlight=True,
                     page_size=page_size,
                 )
                 self.root.after(0, self._on_results, data)
@@ -427,25 +433,53 @@ class CourtListenerGUI:
         count = data.get("count", len(results))
         self._results = results
 
+        # Pre-populate preview cache from the snippet text the API returns
+        # in the search response (stripped of any HTML highlight markers).
         for i, item in enumerate(results):
-            case_name = item.get("caseName") or item.get("case_name") or "(unknown)"
-            court = item.get("court") or item.get("court_id") or ""
-            date_filed = item.get("dateFiled") or item.get("date_filed") or ""
-            citations = item.get("citation", [])
-            if isinstance(citations, list):
-                us_reports = next((c for c in citations if " U.S. " in c), None)
-                citation_str = us_reports or (citations[0] if citations else "")
+            snippet = item.get("snippet") or ""
+            text = re.sub(r"<[^>]+>", "", snippet).strip()
+            if text:
+                self._preview_cache[i] = text
+
+        # Group results by cluster_id so that opinions from the same case
+        # stay together.  Within each cluster the "main" opinion is the one
+        # with the highest outbound cite count (most cases cited), breaking
+        # ties by opinion type (combined > lead > others).  Secondary opinions
+        # are listed directly below, indented and muted.
+        _TYPE_RANK: dict[str, int] = {"010combined": 0, "020lead": 1}
+
+        clusters: OrderedDict[str, list[int]] = OrderedDict()
+        for i, item in enumerate(results):
+            cid = str(item.get("cluster_id") or f"solo_{i}")
+            clusters.setdefault(cid, []).append(i)
+
+        for indices in clusters.values():
+            if len(indices) == 1:
+                main_idx = indices[0]
+                secondary: list[int] = []
             else:
-                citation_str = str(citations) if citations else ""
-            status = (
-                item.get("precedentialStatus") or item.get("precedential_status") or ""
-            )
+                def _priority(idx: int) -> tuple:
+                    it = results[idx]
+                    return (
+                        _TYPE_RANK.get(it.get("type", ""), 2),
+                        -(it.get("citeCount") or 0),
+                    )
+
+                sorted_indices = sorted(indices, key=_priority)
+                main_idx = sorted_indices[0]
+                secondary = sorted_indices[1:]
+
             self._tree.insert(
-                "",
-                "end",
-                iid=str(i),
-                values=(case_name, court, date_filed, citation_str, status),
+                "", "end", iid=str(main_idx), values=self._format_row(results[main_idx])
             )
+            for idx in secondary:
+                self._tree.insert(
+                    "",
+                    "end",
+                    iid=str(idx),
+                    values=self._format_row(results[idx], secondary=True),
+                    tags=("secondary",),
+                )
 
         if results:
             self._status_var.set(
@@ -455,87 +489,14 @@ class CourtListenerGUI:
         else:
             self._status_var.set("No results found.")
 
-        # Kick off background text fetches (word-count + preview)
-        client = self._client
-        gen = self._fetch_gen
-        if client:
-            for i, item in enumerate(results):
-                opinion_id = item.get("id")
-                if opinion_id:
-                    threading.Thread(
-                        target=self._fetch_preview,
-                        args=(i, int(opinion_id), client, gen),
-                        daemon=True,
-                    ).start()
-
-    def _fetch_preview(
-        self,
-        idx: int,
-        opinion_id: int,
-        client: CourtListenerClient,
-        gen: int,
-    ) -> None:
-        """Background thread: fetch opinion text, compute word count, schedule UI update."""
-        with self._fetch_sema:
-            if gen != self._fetch_gen:
-                return
-            try:
-                op = client.get_opinion(
-                    opinion_id, fields="html_with_citations,html,plain_text"
-                )
-                raw = (
-                    op.get("html_with_citations")
-                    or op.get("html")
-                    or op.get("plain_text")
-                    or ""
-                )
-                text = re.sub(r"<[^>]+>", "", raw).strip()
-            except Exception:
-                text = ""
-            if gen != self._fetch_gen:
-                return
-            word_count = len(text.split()) if text else 0
-            self.root.after(0, self._on_preview_ready, idx, text, word_count, gen)
-
-    def _on_preview_ready(
-        self, idx: int, text: str, word_count: int, gen: int
-    ) -> None:
-        """Main-thread callback: store preview text and move short opinions to orders tree."""
-        if gen != self._fetch_gen:
-            return
-        self._preview_cache[idx] = text
-
-        # Refresh preview panel if this is the currently selected row
-        sel = self._tree.selection() or self._orders_tree.selection()
-        if sel and self._iid_to_idx(sel[0]) == idx:
-            self._show_preview(idx)
-
-        # Move short opinions to the orders tree
-        if word_count < 100 and text:
-            iid = str(idx)
-            if self._tree.exists(iid):
-                vals = self._tree.item(iid, "values")
-                self._tree.delete(iid)
-                self._orders_tree.insert("", "end", iid=f"s{idx}", values=vals)
-
     def _show_preview(self, idx: int) -> None:
         """Populate the right-hand preview panel for result at *idx*."""
         self._preview_text.config(state="normal")
         self._preview_text.delete("1.0", "end")
-        if idx in self._preview_cache:
-            text = self._preview_cache[idx]
-            if text:
-                word_count = len(text.split())
-                self._preview_word_count_var.set(f"{word_count:,} words")
-                self._preview_text.insert("1.0", text[:2000])
-            else:
-                self._preview_word_count_var.set("")
-                self._preview_text.insert(
-                    "1.0", "(No text available — download PDF for full opinion)"
-                )
-        else:
-            self._preview_word_count_var.set("")
-            self._preview_text.insert("1.0", "Loading preview…")
+        text = self._preview_cache.get(idx, "")
+        self._preview_text.insert(
+            "1.0", text if text else "(No preview available — download PDF for full opinion)"
+        )
         self._preview_text.config(state="disabled")
 
     def _on_error(self, message: str) -> None:
@@ -638,12 +599,13 @@ class CourtListenerGUI:
         """
         Attempt to find a PDF URL for the selected search result.
 
-        Strategy:
+        Strategy (local_path is always preferred over download_url):
         0. If a US Reports citation is present, use the official LOC/GovInfo PDF.
-        1. Use local_path from the search result (stored on CourtListener's servers).
-        2. Use download_url from the search result (original source — may not be .pdf).
-        3. Fetch the cluster's sub_opinions and check each opinion for
-           local_path or download_url.
+        1. Use local_path from the search result (if already present).
+        2. Fetch the opinion directly by ID to get its local_path.
+        3. Use download_url from the search result (original source).
+        4. Use download_url from the fetched opinion record.
+        5. Walk the cluster's sub_opinions checking local_path then download_url.
         """
         storage_base = "https://storage.courtlistener.com/"
 
@@ -659,37 +621,44 @@ class CourtListenerGUI:
                 print(f"[resolve] using official US Reports PDF: {official_url}")
                 return official_url
 
-        # 1. local_path on the search result (most reliable — CourtListener's own copy)
+        # 1. local_path already present on the search result
         local = item.get("local_path") or item.get("localPath") or ""
         if local:
+            print(f"[resolve] using local_path from search result: {local}")
             return storage_base + local.lstrip("/")
 
-        # 2. download_url on the search result (original court source)
-        #    Note: court URLs often don't end in ".pdf" even when they are PDFs.
-        url = item.get("download_url") or ""
-        if url:
-            return url
-
-        # 3. Fetch the opinion directly by its ID (search results return opinion-level
-        #    rows where 'id' is the opinion ID and 'cluster_id' is the cluster).
+        # 2. Fetch the opinion directly to get its local_path (preferred over
+        #    download_url — CourtListener's stored copy is more reliable than
+        #    the original court URL).
         opinion_id = item.get("id")
+        fetched_op: Optional[dict] = None
         if opinion_id:
             try:
-                print(f"[resolve] fetching opinion {opinion_id} directly")
-                op = client.get_opinion(int(opinion_id))
-                print(f"[resolve] opinion keys: {list(op.keys())}")
-                print(f"[resolve] opinion local_path = {op.get('local_path')!r}")
-                print(f"[resolve] opinion download_url = {op.get('download_url')!r}")
-                local = op.get("local_path") or ""
+                print(f"[resolve] fetching opinion {opinion_id} for local_path")
+                fetched_op = client.get_opinion(int(opinion_id))
+                print(f"[resolve] opinion local_path = {fetched_op.get('local_path')!r}")
+                print(f"[resolve] opinion download_url = {fetched_op.get('download_url')!r}")
+                local = fetched_op.get("local_path") or ""
                 if local:
+                    print(f"[resolve] using local_path from opinion record")
                     return storage_base + local.lstrip("/")
-                dl = op.get("download_url") or ""
-                if dl:
-                    return dl
             except Exception as exc:
                 print(f"[resolve] direct opinion fetch failed: {exc}")
 
-        # 4. Fall back to cluster → sub_opinions walk
+        # 3. download_url from the search result (original court source)
+        url = item.get("download_url") or ""
+        if url:
+            print(f"[resolve] using download_url from search result: {url}")
+            return url
+
+        # 4. download_url from the fetched opinion record
+        if fetched_op:
+            dl = fetched_op.get("download_url") or ""
+            if dl:
+                print(f"[resolve] using download_url from opinion record: {dl}")
+                return dl
+
+        # 5. Fall back to cluster → sub_opinions walk
         cluster_id = item.get("cluster_id") or item.get("id")
         if cluster_id:
             try:
