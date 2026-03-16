@@ -219,6 +219,33 @@ class CourtListenerGUI:
         results_frame = ttk.LabelFrame(self.root, text="Results", padding=6)
         results_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
+        # --- Status bar + action buttons — packed first so they are always
+        #     visible regardless of window height.
+        bottom = ttk.Frame(results_frame)
+        bottom.pack(side="bottom", fill="x", pady=(4, 0))
+
+        self._download_btn = ttk.Button(
+            bottom,
+            text="Download PDF",
+            command=self._download_selected,
+            state="disabled",
+        )
+        self._download_btn.pack(side="right", padx=4)
+
+        scholar_tip = "" if _SCHOLAR_AVAILABLE else " (needs beautifulsoup4)"
+        self._scholar_btn = ttk.Button(
+            bottom,
+            text=f"Scholar Text{scholar_tip}",
+            command=self._fetch_scholar_text,
+            state="disabled",
+        )
+        self._scholar_btn.pack(side="right", padx=4)
+
+        self._status_var = tk.StringVar(value="Enter a query and click Search.")
+        ttk.Label(bottom, textvariable=self._status_var, anchor="w").pack(
+            side="left", fill="x", expand=True
+        )
+
         paned = ttk.PanedWindow(results_frame, orient="horizontal")
         paned.pack(fill="both", expand=True)
 
@@ -269,8 +296,8 @@ class CourtListenerGUI:
         )
         self._orders_tree.bind("<Button-3>", lambda e: self._on_right_click(e, self._orders_tree))
 
-        # -- Right pane: preview panel --
-        right_frame = ttk.LabelFrame(paned, text="Preview", padding=4)
+        # -- Right pane: preview panel (narrow — user can drag sash to resize) --
+        right_frame = ttk.LabelFrame(paned, text="Preview", padding=4, width=160)
         paned.add(right_frame, weight=1)
 
         preview_inner = ttk.Frame(right_frame)
@@ -290,31 +317,6 @@ class CourtListenerGUI:
         preview_vsb.pack(side="right", fill="y")
         self._preview_text.pack(side="left", fill="both", expand=True)
 
-        # --- Status bar + download button ---
-        bottom = ttk.Frame(self.root)
-        bottom.pack(fill="x", padx=10, pady=(2, 10))
-
-        self._download_btn = ttk.Button(
-            bottom,
-            text="Download PDF",
-            command=self._download_selected,
-            state="disabled",
-        )
-        self._download_btn.pack(side="right", padx=4)
-
-        scholar_tip = "" if _SCHOLAR_AVAILABLE else " (needs beautifulsoup4)"
-        self._scholar_btn = ttk.Button(
-            bottom,
-            text=f"Scholar Text{scholar_tip}",
-            command=self._fetch_scholar_text,
-            state="disabled",
-        )
-        self._scholar_btn.pack(side="right", padx=4)
-
-        self._status_var = tk.StringVar(value="Enter a query and click Search.")
-        ttk.Label(bottom, textvariable=self._status_var, anchor="w").pack(
-            side="left", fill="x", expand=True
-        )
 
     # ------------------------------------------------------------------
     # Settings dialog
