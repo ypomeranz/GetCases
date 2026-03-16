@@ -4,7 +4,7 @@
 # A lightweight GUI for searching CourtListener opinions and downloading PDFs.
 #
 # Required packages:
-#   install.packages(c("shiny", "httr2", "jsonlite", "DT"))
+install.packages(c("shiny", "httr2", "jsonlite", "DT"))
 #
 # Run:
 #   shiny::runApp("courtlistener_gui.R")

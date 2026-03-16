@@ -326,6 +326,7 @@ class CourtListenerGUI:
     def _format_row(self, item: dict) -> tuple:
         """Return the tuple of column values for inserting a row into the tree."""
         case_name = item.get("caseName") or item.get("case_name") or "(unknown)"
+        case_name = re.sub(r"<[^>]+>", "", case_name).strip()
         court = item.get("court") or item.get("court_id") or ""
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
         citations = item.get("citation", [])
