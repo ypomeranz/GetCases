@@ -473,7 +473,7 @@ class CourtListenerGUI:
             # Route to orders tree only for SCOTUS cases with ≤ 2 outbound
             # citations.  Published orders don't exist for lower courts, so
             # we leave everything else in the main tree.
-            court_val = str(item.get("court") or item.get("court_id") or "")
+            court_val = str(item.get("court_id") or "")
             cites_count = len(main_op.get("cites") or []) if main_op else None
             row = self._format_row(item)
             if "scotus" in court_val and cites_count is not None and cites_count <= 2:
