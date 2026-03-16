@@ -472,25 +472,27 @@ class CourtListenerGUI:
         results = data.get("results", [])
         count = data.get("count", len(results))
         self._results = results
-
+        print(results)
+        '''
         # Debug: print all keys in first result to help identify the snippet field
         if results:
             print(f"\n[search] result keys: {list(results[0].keys())}")
-
+        if results:
+            for i, item in (enumerate(results)):
+                print(item)
+        '''
         # Pre-populate preview cache from any snippet/text the search result carries.
         # CourtListener v4 may use 'snippet', 'text', or similar field names.
-        for i, item in enumerate(results):
-            raw_snippet = (
-                item.get("snippet")
-                or item.get("text")
-                or item.get("plain_text")
-                or ""
-            )
+        for result_idx, result in enumerate(results):
+            raw_snippet = None
+            opinions = result.get("opinions") or []
+            for op in opinions:
+                raw_snippet = op.get("snippet")
+                if raw_snippet:
+                    break
             if raw_snippet:
-                text = re.sub(r"<[^>]+>", "", raw_snippet).strip()
-                if text:
-                    self._preview_cache[i] = text
-
+                clean = re.sub(r"<[^>]+>", "", raw_snippet)
+                self._preview_cache[result_idx] = clean
         # Insert all results flat; background threads will migrate items with
         # ≤ 2 outbound citations to the orders tree once their data arrives.
         for i, item in enumerate(results):
@@ -503,7 +505,7 @@ class CourtListenerGUI:
             )
         else:
             self._status_var.set("No results found.")
-
+        '''
         # Kick off background text fetches (word-count + full-text preview)
         client = self._client
         gen = self._fetch_gen
@@ -516,7 +518,7 @@ class CourtListenerGUI:
                         args=(i, int(opinion_id), client, gen),
                         daemon=True,
                     ).start()
-
+        
     def _fetch_preview(
         self,
         idx: int,
@@ -560,6 +562,7 @@ class CourtListenerGUI:
         if text:
             self._preview_cache[idx] = text
 
+
         # Refresh preview panel if this is the currently selected row
         sel = self._tree.selection() or self._orders_tree.selection()
         if sel and self._iid_to_idx(sel[0]) == idx:
@@ -574,6 +577,7 @@ class CourtListenerGUI:
                 vals = self._tree.item(iid, "values")
                 self._tree.delete(iid)
                 self._orders_tree.insert("", "end", iid=iid, values=vals)
+'''
 
     def _show_preview(self, idx: int) -> None:
         """Populate the right-hand preview panel for result at *idx*."""
@@ -908,3 +912,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
