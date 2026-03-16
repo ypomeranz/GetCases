@@ -58,6 +58,10 @@ def _save_token(token: str) -> None:
 _LOC_CUTOFF = 542
 _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 
+# Regex to parse a standard legal citation: "volume reporter page"
+# Examples: "410 F.2d 1234", "12 F. Supp. 2d 567", "100 Cal. 400"
+_CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+?)\s+(\d+)")
+
 
 def _us_reports_loc_url(citation: str) -> Optional[str]:
     """
@@ -74,6 +78,50 @@ def _us_reports_loc_url(citation: str) -> Optional[str]:
         f"https://cdn.loc.gov/service/ll/usrep/"
         f"usrep{vol:03d}/usrep{vol:03d}{page:03d}/usrep{vol:03d}{page:03d}.pdf"
     )
+
+
+def _slugify_reporter(reporter: str) -> str:
+    """
+    Convert a reporter abbreviation to the slug used by static.case.law.
+
+    The Caselaw Access Project slugify rules:
+      1. Lowercase
+      2. Spaces → hyphens
+      3. Remove all characters that are not alphanumeric or hyphens
+      4. Collapse consecutive hyphens; strip leading/trailing hyphens
+
+    Examples:
+      "F.2d"        → "f2d"
+      "F.3d"        → "f3d"
+      "F. Supp."    → "f-supp"
+      "F. Supp. 2d" → "f-supp-2d"
+      "F. App'x"    → "f-appx"
+      "Cal."        → "cal"
+      "N.E.2d"      → "ne2d"
+    """
+    s = reporter.lower()
+    s = s.replace(" ", "-")
+    s = re.sub(r"[^a-z0-9-]", "", s)
+    s = re.sub(r"-+", "-", s)
+    return s.strip("-")
+
+
+def _static_case_law_url(citation: str) -> Optional[str]:
+    """
+    Return the PDF URL candidate on static.case.law for a citation string
+    such as '410 F.2d 1234', or None if the citation cannot be parsed.
+
+    URL pattern:
+      https://static.case.law/{reporter-slug}/{volume}/case-pdfs/{page:04d}-01.pdf
+    """
+    m = _CITE_PARSE_RE.match(citation.strip())
+    if not m:
+        return None
+    vol, reporter, page = m.group(1), m.group(2).strip(), m.group(3)
+    slug = _slugify_reporter(reporter)
+    if not slug:
+        return None
+    return f"https://static.case.law/{slug}/{vol}/case-pdfs/{int(page):04d}-01.pdf"
 
 
 try:
@@ -588,6 +636,8 @@ class CourtListenerGUI:
         Strategy (local_path always preferred over download_url):
         0. US Reports citation in LOC collection (vols 1-542) → LOC CDN PDF.
            Vols 543+ skip this step and fall through to local_path.
+        0.5. Non-SCOTUS cases: try static.case.law (Harvard CAP) first.
+             Only falls through if the URL returns a non-200 response.
         1. local_path from the search result (if already present).
         2. Fetch the opinion directly by ID to get its local_path.
         3. download_url from the search result (original court source).
@@ -595,6 +645,10 @@ class CourtListenerGUI:
         5. Walk the cluster's sub_opinions checking local_path then download_url.
         """
         storage_base = "https://storage.courtlistener.com/"
+
+        # Determine whether this is a SCOTUS case.
+        court_val = str(item.get("court_id") or "")
+        is_scotus = "scotus" in court_val
 
         # 0. Official US Reports PDF — LOC CDN only (vols 1-542).
         #    Opinions beyond vol 542 are not reliably served by GovInfo, so we
@@ -609,6 +663,26 @@ class CourtListenerGUI:
             if loc_url:
                 print(f"[resolve] using LOC US Reports PDF: {loc_url}")
                 return loc_url
+
+        # 0.5. For non-SCOTUS cases try the Harvard CAP static.case.law copy
+        #      first.  A HEAD request confirms availability before committing.
+        if not is_scotus:
+            cites = citations if isinstance(citations, list) else (
+                [str(citations)] if citations else []
+            )
+            for cite in cites:
+                scl_url = _static_case_law_url(cite)
+                if not scl_url:
+                    continue
+                print(f"[resolve] checking static.case.law: {scl_url}")
+                try:
+                    head = client._session.head(scl_url, timeout=10, allow_redirects=True)
+                    if head.status_code == 200:
+                        print(f"[resolve] using static.case.law PDF: {scl_url}")
+                        return scl_url
+                    print(f"[resolve] static.case.law returned {head.status_code}, falling through")
+                except Exception as exc:
+                    print(f"[resolve] static.case.law check failed: {exc}")
 
         # 1. local_path already present on the search result
         local = item.get("local_path") or item.get("localPath") or ""
