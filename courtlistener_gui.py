@@ -323,7 +323,7 @@ class CourtListenerGUI:
         tree.column("citation", width=140, minwidth=80)
         tree.column("status", width=110, minwidth=70)
 
-    def _format_row(self, item: dict, main_op: Optional[dict] = None) -> tuple:
+    def _format_row(self, item: dict) -> tuple:
         """Return the tuple of column values for inserting a row into the tree."""
         case_name = item.get("caseName") or item.get("case_name") or "(unknown)"
         court = item.get("court") or item.get("court_id") or ""
@@ -334,8 +334,7 @@ class CourtListenerGUI:
             citation_str = us_reports or (citations[0] if citations else "")
         else:
             citation_str = str(citations) if citations else ""
-        # Status lives on the opinion object, not the cluster-level result
-        status = (main_op.get("status") or "") if main_op else ""
+        status = item.get("status") or item.get("precedentialStatus") or ""
         return (case_name, court, date_filed, citation_str, status)
 
     def _iid_to_idx(self, iid: str) -> int:
@@ -476,7 +475,7 @@ class CourtListenerGUI:
             # we leave everything else in the main tree.
             court_id = item.get("court") or item.get("court_id") or ""
             cites_count = len(main_op.get("cites") or []) if main_op else None
-            row = self._format_row(item, main_op)
+            row = self._format_row(item)
             if court_id == "scotus" and cites_count is not None and cites_count <= 2:
                 self._orders_tree.insert("", "end", iid=str(i), values=row)
             else:
