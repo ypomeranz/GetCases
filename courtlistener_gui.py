@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from collections import OrderedDict
+
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
@@ -189,9 +189,6 @@ class CourtListenerGUI:
             main_tree_frame, columns=cols, show="headings", selectmode="browse"
         )
         self._configure_tree_columns(self._tree)
-        # Secondary opinions (same cluster, not the main opinion) are shown
-        # indented directly below the main opinion with muted styling.
-        self._tree.tag_configure("secondary", foreground="#888888")
         vsb = ttk.Scrollbar(main_tree_frame, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side="left", fill="both", expand=True)
@@ -206,7 +203,7 @@ class CourtListenerGUI:
         ttk.Separator(orders_sep, orient="horizontal").pack(fill="x")
         ttk.Label(
             orders_sep,
-            text="Short opinions / Orders  (< 100 words)",
+            text="Orders  (≤ 2 citations)",
             foreground="gray",
             font=("TkDefaultFont", 9, "italic"),
         ).pack(anchor="w", pady=(2, 0))
@@ -217,7 +214,6 @@ class CourtListenerGUI:
             orders_tree_frame, columns=cols, show="headings", selectmode="browse", height=4
         )
         self._configure_tree_columns(self._orders_tree)
-        self._orders_tree.tag_configure("secondary", foreground="#888888")
         vsb2 = ttk.Scrollbar(orders_tree_frame, orient="vertical", command=self._orders_tree.yview)
         self._orders_tree.configure(yscrollcommand=vsb2.set)
         self._orders_tree.pack(side="left", fill="x", expand=True)
@@ -338,11 +334,9 @@ class CourtListenerGUI:
         tree.column("citation", width=140, minwidth=80)
         tree.column("status", width=110, minwidth=70)
 
-    def _format_row(self, item: dict, secondary: bool = False) -> tuple:
+    def _format_row(self, item: dict) -> tuple:
         """Return the tuple of column values for inserting a row into the tree."""
         case_name = item.get("caseName") or item.get("case_name") or "(unknown)"
-        if secondary:
-            case_name = "    " + case_name  # visual indent for secondary opinions
         court = item.get("court") or item.get("court_id") or ""
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
         citations = item.get("citation", [])
@@ -483,9 +477,8 @@ class CourtListenerGUI:
         if results:
             print(f"\n[search] result keys: {list(results[0].keys())}")
 
-        # Pre-populate preview cache from the snippet/text the API returns.
-        # CourtListener v4 may use 'snippet', 'text', or similar field names;
-        # try each in order.
+        # Pre-populate preview cache from any snippet/text the search result carries.
+        # CourtListener v4 may use 'snippet', 'text', or similar field names.
         for i, item in enumerate(results):
             raw_snippet = (
                 item.get("snippet")
@@ -498,45 +491,10 @@ class CourtListenerGUI:
                 if text:
                     self._preview_cache[i] = text
 
-        # Group results by cluster_id so that opinions from the same case
-        # stay together.  Within each cluster the "main" opinion is the one
-        # with the highest citeCount, breaking ties by opinion type
-        # (combined > lead > others).  Secondary opinions are listed directly
-        # below, indented and muted, and may later be moved to the orders tree.
-        _TYPE_RANK: dict[str, int] = {"010combined": 0, "020lead": 1}
-
-        clusters: OrderedDict[str, list[int]] = OrderedDict()
+        # Insert all results flat; background threads will migrate items with
+        # ≤ 2 outbound citations to the orders tree once their data arrives.
         for i, item in enumerate(results):
-            cid = str(item.get("cluster_id") or f"solo_{i}")
-            clusters.setdefault(cid, []).append(i)
-
-        for indices in clusters.values():
-            if len(indices) == 1:
-                main_idx = indices[0]
-                secondary: list[int] = []
-            else:
-                def _priority(idx: int) -> tuple:
-                    it = results[idx]
-                    return (
-                        _TYPE_RANK.get(it.get("type", ""), 2),
-                        -(it.get("citeCount") or 0),
-                    )
-
-                sorted_indices = sorted(indices, key=_priority)
-                main_idx = sorted_indices[0]
-                secondary = sorted_indices[1:]
-
-            self._tree.insert(
-                "", "end", iid=str(main_idx), values=self._format_row(results[main_idx])
-            )
-            for idx in secondary:
-                self._tree.insert(
-                    "",
-                    "end",
-                    iid=str(idx),
-                    values=self._format_row(results[idx], secondary=True),
-                    tags=("secondary",),
-                )
+            self._tree.insert("", "end", iid=str(i), values=self._format_row(item))
 
         if results:
             self._status_var.set(
@@ -566,13 +524,13 @@ class CourtListenerGUI:
         client: CourtListenerClient,
         gen: int,
     ) -> None:
-        """Background thread: fetch full opinion text, compute word count, schedule UI update."""
+        """Background thread: fetch opinion text + cites count, schedule UI update."""
         with self._fetch_sema:
             if gen != self._fetch_gen:
                 return
             try:
                 op = client.get_opinion(
-                    opinion_id, fields="html_with_citations,html,plain_text"
+                    opinion_id, fields="html_with_citations,html,plain_text,cites"
                 )
                 raw = (
                     op.get("html_with_citations")
@@ -581,17 +539,21 @@ class CourtListenerGUI:
                     or ""
                 )
                 text = re.sub(r"<[^>]+>", "", raw).strip()
+                cites = op.get("cites")
+                # cites is a list of opinion URLs/IDs this opinion cites;
+                # None means the field wasn't returned (don't classify).
+                cites_count: Optional[int] = len(cites) if isinstance(cites, list) else None
             except Exception:
                 text = ""
+                cites_count = None
             if gen != self._fetch_gen:
                 return
-            word_count = len(text.split()) if text else 0
-            self.root.after(0, self._on_preview_ready, idx, text, word_count, gen)
+            self.root.after(0, self._on_preview_ready, idx, text, cites_count, gen)
 
     def _on_preview_ready(
-        self, idx: int, text: str, word_count: int, gen: int
+        self, idx: int, text: str, cites_count: Optional[int], gen: int
     ) -> None:
-        """Main-thread callback: store full text and move short opinions to orders tree."""
+        """Main-thread callback: store full text and move orders to the orders tree."""
         if gen != self._fetch_gen:
             return
         # Full fetched text replaces any snippet we had from the search result
@@ -603,17 +565,15 @@ class CourtListenerGUI:
         if sel and self._iid_to_idx(sel[0]) == idx:
             self._show_preview(idx)
 
-        # Move short opinions to the orders tree
-        if word_count < 100 and text:
+        # Opinions that cite ≤ 2 other opinions are treated as orders and
+        # moved to the orders tree.  If cites_count is None the field wasn't
+        # returned, so we leave the item in the main tree.
+        if cites_count is not None and cites_count <= 2:
             iid = str(idx)
             if self._tree.exists(iid):
                 vals = self._tree.item(iid, "values")
-                tags = self._tree.item(iid, "tags")
                 self._tree.delete(iid)
-                self._orders_tree.insert(
-                    "", "end", iid=iid, values=vals,
-                    tags=tags if tags else ()
-                )
+                self._orders_tree.insert("", "end", iid=iid, values=vals)
 
     def _show_preview(self, idx: int) -> None:
         """Populate the right-hand preview panel for result at *idx*."""
