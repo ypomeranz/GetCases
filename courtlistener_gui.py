@@ -145,6 +145,7 @@ class CourtListenerGUI:
         self._scholar: Optional["GoogleScholarFetcher"] = None
 
         self._preview_cache: dict[int, str] = {}  # result index → snippet text
+        self._sort_state: dict[int, tuple[str, bool]] = {}  # tree id → (col, reverse)
 
         # Initialize token from env or saved config
         initial_token = os.environ.get("COURTLISTENER_TOKEN") or _load_saved_token()
@@ -361,17 +362,42 @@ class CourtListenerGUI:
     # Helpers
     # ------------------------------------------------------------------
 
+    _COL_LABELS = {
+        "case_name": "Case Name",
+        "court": "Court",
+        "date_filed": "Date Filed",
+        "citation": "Citation",
+        "status": "Status",
+    }
+
     def _configure_tree_columns(self, tree: ttk.Treeview) -> None:
-        tree.heading("case_name", text="Case Name")
-        tree.heading("court", text="Court")
-        tree.heading("date_filed", text="Date Filed")
-        tree.heading("citation", text="Citation")
-        tree.heading("status", text="Status")
+        for col, label in self._COL_LABELS.items():
+            tree.heading(
+                col, text=label,
+                command=lambda c=col, t=tree: self._sort_tree(t, c),
+            )
         tree.column("case_name", width=310, minwidth=150)
         tree.column("court", width=70, minwidth=50, anchor="center")
         tree.column("date_filed", width=85, minwidth=70, anchor="center")
         tree.column("citation", width=140, minwidth=80)
         tree.column("status", width=110, minwidth=70)
+
+    def _sort_tree(self, tree: ttk.Treeview, col: str) -> None:
+        """Sort *tree* by *col*, toggling direction on repeated clicks."""
+        current_col, reverse = self._sort_state.get(id(tree), (None, False))
+        reverse = (not reverse) if col == current_col else False
+        self._sort_state[id(tree)] = (col, reverse)
+
+        rows = [(tree.set(iid, col), iid) for iid in tree.get_children("")]
+        rows.sort(key=lambda x: x[0].lower(), reverse=reverse)
+        for idx, (_, iid) in enumerate(rows):
+            tree.move(iid, "", idx)
+
+        # Update headings to show the active sort indicator.
+        for c, label in self._COL_LABELS.items():
+            if c == col:
+                label += "  ▼" if reverse else "  ▲"
+            tree.heading(c, text=label)
 
     def _format_row(self, item: dict) -> tuple:
         """Return the tuple of column values for inserting a row into the tree."""
