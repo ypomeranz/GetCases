@@ -96,10 +96,7 @@ class CourtListenerGUI:
         self._search_thread: Optional[threading.Thread] = None
         self._scholar: Optional["GoogleScholarFetcher"] = None
 
-        # Preview / text-fetch state
-        self._preview_cache: dict[int, str] = {}   # result index → plain text
-        self._fetch_gen: int = 0                    # incremented on each search
-        self._fetch_sema = threading.Semaphore(4)   # cap concurrent API fetches
+        self._preview_cache: dict[int, str] = {}  # result index → snippet text
 
         # Initialize token from env or saved config
         initial_token = os.environ.get("COURTLISTENER_TOKEN") or _load_saved_token()
@@ -227,14 +224,6 @@ class CourtListenerGUI:
         # -- Right pane: preview panel --
         right_frame = ttk.LabelFrame(paned, text="Preview", padding=4)
         paned.add(right_frame, weight=1)
-
-        self._preview_word_count_var = tk.StringVar(value="")
-        ttk.Label(
-            right_frame,
-            textvariable=self._preview_word_count_var,
-            foreground="gray",
-            font=("TkDefaultFont", 8),
-        ).pack(anchor="w")
 
         preview_inner = ttk.Frame(right_frame)
         preview_inner.pack(fill="both", expand=True)
@@ -439,10 +428,7 @@ class CourtListenerGUI:
         for row in self._orders_tree.get_children():
             self._orders_tree.delete(row)
         self._results.clear()
-        # Invalidate any in-flight preview fetches from the previous search
-        self._fetch_gen += 1
         self._preview_cache.clear()
-        self._preview_word_count_var.set("")
         self._preview_text.config(state="normal")
         self._preview_text.delete("1.0", "end")
         self._preview_text.config(state="disabled")
@@ -473,28 +459,26 @@ class CourtListenerGUI:
         count = data.get("count", len(results))
         self._results = results
 
-        # Debug: print all keys in first result to help identify the snippet field
-        if results:
-            print(f"\n[search] result keys: {list(results[0].keys())}")
-
-        # Pre-populate preview cache from any snippet/text the search result carries.
-        # CourtListener v4 may use 'snippet', 'text', or similar field names.
         for i, item in enumerate(results):
-            raw_snippet = (
-                item.get("snippet")
-                or item.get("text")
-                or item.get("plain_text")
-                or ""
-            )
-            if raw_snippet:
-                text = re.sub(r"<[^>]+>", "", raw_snippet).strip()
+            # Each search result has an 'opinions' list.  The opinion with the
+            # most outbound citations is the main opinion for this cluster.
+            opinions = item.get("opinions") or []
+            main_op = max(opinions, key=lambda o: len(o.get("cites") or []), default=None)
+
+            # Preview text comes from the main opinion's snippet field.
+            if main_op:
+                raw = main_op.get("snippet") or ""
+                text = re.sub(r"<[^>]+>", "", raw).strip()
                 if text:
                     self._preview_cache[i] = text
 
-        # Insert all results flat; background threads will migrate items with
-        # ≤ 2 outbound citations to the orders tree once their data arrives.
-        for i, item in enumerate(results):
-            self._tree.insert("", "end", iid=str(i), values=self._format_row(item))
+            # Route to orders tree if the main opinion cites ≤ 2 other opinions.
+            cites_count = len(main_op.get("cites") or []) if main_op else None
+            row = self._format_row(item)
+            if cites_count is not None and cites_count <= 2:
+                self._orders_tree.insert("", "end", iid=str(i), values=row)
+            else:
+                self._tree.insert("", "end", iid=str(i), values=row)
 
         if results:
             self._status_var.set(
@@ -504,95 +488,15 @@ class CourtListenerGUI:
         else:
             self._status_var.set("No results found.")
 
-        # Kick off background text fetches (word-count + full-text preview)
-        client = self._client
-        gen = self._fetch_gen
-        if client:
-            for i, item in enumerate(results):
-                opinion_id = item.get("id")
-                if opinion_id:
-                    threading.Thread(
-                        target=self._fetch_preview,
-                        args=(i, int(opinion_id), client, gen),
-                        daemon=True,
-                    ).start()
-
-    def _fetch_preview(
-        self,
-        idx: int,
-        opinion_id: int,
-        client: CourtListenerClient,
-        gen: int,
-    ) -> None:
-        """Background thread: fetch opinion text + cites count, schedule UI update."""
-        with self._fetch_sema:
-            if gen != self._fetch_gen:
-                return
-            try:
-                op = client.get_opinion(
-                    opinion_id, fields="html_with_citations,html,plain_text,cites"
-                )
-                raw = (
-                    op.get("html_with_citations")
-                    or op.get("html")
-                    or op.get("plain_text")
-                    or ""
-                )
-                text = re.sub(r"<[^>]+>", "", raw).strip()
-                cites = op.get("cites")
-                # cites is a list of opinion URLs/IDs this opinion cites;
-                # None means the field wasn't returned (don't classify).
-                cites_count: Optional[int] = len(cites) if isinstance(cites, list) else None
-            except Exception:
-                text = ""
-                cites_count = None
-            if gen != self._fetch_gen:
-                return
-            self.root.after(0, self._on_preview_ready, idx, text, cites_count, gen)
-
-    def _on_preview_ready(
-        self, idx: int, text: str, cites_count: Optional[int], gen: int
-    ) -> None:
-        """Main-thread callback: store full text and move orders to the orders tree."""
-        if gen != self._fetch_gen:
-            return
-        # Full fetched text replaces any snippet we had from the search result
-        if text:
-            self._preview_cache[idx] = text
-
-        # Refresh preview panel if this is the currently selected row
-        sel = self._tree.selection() or self._orders_tree.selection()
-        if sel and self._iid_to_idx(sel[0]) == idx:
-            self._show_preview(idx)
-
-        # Opinions that cite ≤ 2 other opinions are treated as orders and
-        # moved to the orders tree.  If cites_count is None the field wasn't
-        # returned, so we leave the item in the main tree.
-        if cites_count is not None and cites_count <= 2:
-            iid = str(idx)
-            if self._tree.exists(iid):
-                vals = self._tree.item(iid, "values")
-                self._tree.delete(iid)
-                self._orders_tree.insert("", "end", iid=iid, values=vals)
-
     def _show_preview(self, idx: int) -> None:
         """Populate the right-hand preview panel for result at *idx*."""
         self._preview_text.config(state="normal")
         self._preview_text.delete("1.0", "end")
-        if idx in self._preview_cache:
-            text = self._preview_cache[idx]
-            if text:
-                word_count = len(text.split())
-                self._preview_word_count_var.set(f"{word_count:,} words")
-                self._preview_text.insert("1.0", text[:2000])
-            else:
-                self._preview_word_count_var.set("")
-                self._preview_text.insert(
-                    "1.0", "(No text available — download PDF for full opinion)"
-                )
-        else:
-            self._preview_word_count_var.set("")
-            self._preview_text.insert("1.0", "Loading preview…")
+        text = self._preview_cache.get(idx, "")
+        self._preview_text.insert(
+            "1.0",
+            text if text else "(No preview available — download PDF for full opinion)",
+        )
         self._preview_text.config(state="disabled")
 
     def _on_error(self, message: str) -> None:
