@@ -411,6 +411,7 @@ class CourtListenerGUI:
             citation_str = us_reports or (citations[0] if citations else "")
         else:
             citation_str = str(citations) if citations else ""
+        citation_str = re.sub(r"<[^>]+>", "", citation_str).strip()
         status = item.get("status") or item.get("precedentialStatus") or ""
         return (case_name, court, date_filed, citation_str, status)
 
@@ -687,6 +688,7 @@ class CourtListenerGUI:
         else:
             us_cite = str(citations) if citations and " U.S. " in str(citations) else None
         if us_cite:
+            us_cite = re.sub(r"<[^>]+>", "", us_cite).strip()
             loc_url = _us_reports_loc_url(us_cite)
             if loc_url:
                 print(f"[resolve] using LOC US Reports PDF: {loc_url}")
