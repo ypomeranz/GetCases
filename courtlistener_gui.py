@@ -114,7 +114,8 @@ def _static_case_law_url(citation: str) -> Optional[str]:
     URL pattern:
       https://static.case.law/{reporter-slug}/{volume}/case-pdfs/{page:04d}-01.pdf
     """
-    m = _CITE_PARSE_RE.match(citation.strip())
+    citation = re.sub(r"<[^>]+>", "", citation).strip()
+    m = _CITE_PARSE_RE.match(citation)
     if not m:
         return None
     vol, reporter, page = m.group(1), m.group(2).strip(), m.group(3)
