@@ -696,23 +696,60 @@ class CourtListenerGUI:
 
         # 0.5. For non-SCOTUS cases try the Harvard CAP static.case.law copy
         #      first.  A HEAD request confirms availability before committing.
+        #      If the cites from the search result all fail, also try alternate
+        #      cites from the cluster record before giving up on static.case.law.
         if not is_scotus:
             cites = citations if isinstance(citations, list) else (
                 [str(citations)] if citations else []
             )
-            for cite in cites:
-                scl_url = _static_case_law_url(cite)
-                if not scl_url:
-                    continue
-                print(f"[resolve] checking static.case.law: {scl_url}")
+            tried_cites: set[str] = set()
+
+            def _try_static_case_law(cite_list: list[str]) -> Optional[str]:
+                for cite in cite_list:
+                    tried_cites.add(cite)
+                    scl_url = _static_case_law_url(cite)
+                    if not scl_url:
+                        continue
+                    print(f"[resolve] checking static.case.law: {scl_url}")
+                    try:
+                        head = client._session.head(scl_url, timeout=10, allow_redirects=True)
+                        if head.status_code == 200:
+                            print(f"[resolve] using static.case.law PDF: {scl_url}")
+                            return scl_url
+                        print(f"[resolve] static.case.law returned {head.status_code} for {cite!r}")
+                    except Exception as exc:
+                        print(f"[resolve] static.case.law check failed: {exc}")
+                return None
+
+            result = _try_static_case_law(cites)
+            if result:
+                return result
+
+            # The search result may only expose a subset of citations.
+            # Fetch the cluster record to get any alternate cites not already tried.
+            cluster_id_for_cites = item.get("cluster_id") or item.get("id")
+            if cluster_id_for_cites:
                 try:
-                    head = client._session.head(scl_url, timeout=10, allow_redirects=True)
-                    if head.status_code == 200:
-                        print(f"[resolve] using static.case.law PDF: {scl_url}")
-                        return scl_url
-                    print(f"[resolve] static.case.law returned {head.status_code}, falling through")
+                    print(f"[resolve] fetching cluster {cluster_id_for_cites} for alternate citations")
+                    cites_resp = client.get_cluster(int(cluster_id_for_cites), fields="citations")
+                    alt_cites: list[str] = []
+                    for c in (cites_resp.get("citations") or []):
+                        if isinstance(c, str):
+                            alt_cites.append(c)
+                        elif isinstance(c, dict):
+                            vol = c.get("volume") or ""
+                            rep = c.get("reporter") or ""
+                            page = c.get("page") or ""
+                            if vol and rep and page:
+                                alt_cites.append(f"{vol} {rep} {page}")
+                    new_cites = [c for c in alt_cites if c not in tried_cites]
+                    if new_cites:
+                        print(f"[resolve] trying {len(new_cites)} alternate cite(s) from cluster")
+                        result = _try_static_case_law(new_cites)
+                        if result:
+                            return result
                 except Exception as exc:
-                    print(f"[resolve] static.case.law check failed: {exc}")
+                    print(f"[resolve] cluster cite fetch failed: {exc}")
 
         # 1. local_path already present on the search result
         local = item.get("local_path") or item.get("localPath") or ""
