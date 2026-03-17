@@ -29,6 +29,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+import requests as _requests
+
 from courtlistener import COURTS, CourtListenerClient, CourtListenerError
 
 _CONFIG_PATH = Path.home() / ".config" / "courtlistener" / "config.json"
@@ -719,7 +721,7 @@ class CourtListenerGUI:
                         continue
                     print(f"[resolve] checking static.case.law: {scl_url}")
                     try:
-                        head = client._session.head(scl_url, timeout=10, allow_redirects=True)
+                        head = _requests.head(scl_url, timeout=10, allow_redirects=True)
                         if head.status_code == 200:
                             print(f"[resolve] using static.case.law PDF: {scl_url}")
                             return scl_url
