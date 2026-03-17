@@ -411,7 +411,6 @@ class CourtListenerGUI:
             citation_str = us_reports or (citations[0] if citations else "")
         else:
             citation_str = str(citations) if citations else ""
-        citation_str = re.sub(r"<[^>]+>", "", citation_str).strip()
         status = item.get("status") or item.get("precedentialStatus") or ""
         return (case_name, court, date_filed, citation_str, status)
 
@@ -534,6 +533,14 @@ class CourtListenerGUI:
         results = data.get("results", [])
         count = data.get("count", len(results))
         self._results = results
+        # Normalize citations from the API: strip any HTML tags (<mark>, etc.)
+        # immediately so every downstream consumer gets clean plain-text strings.
+        for item in results:
+            raw = item.get("citation")
+            if isinstance(raw, list):
+                item["citation"] = [re.sub(r"<[^>]+>", "", c).strip() for c in raw]
+            elif raw:
+                item["citation"] = re.sub(r"<[^>]+>", "", str(raw)).strip()
 
         for i, item in enumerate(results):
             # Each search result has an 'opinions' list.  The opinion with the
@@ -688,7 +695,6 @@ class CourtListenerGUI:
         else:
             us_cite = str(citations) if citations and " U.S. " in str(citations) else None
         if us_cite:
-            us_cite = re.sub(r"<[^>]+>", "", us_cite).strip()
             loc_url = _us_reports_loc_url(us_cite)
             if loc_url:
                 print(f"[resolve] using LOC US Reports PDF: {loc_url}")
@@ -706,7 +712,6 @@ class CourtListenerGUI:
 
             def _try_static_case_law(cite_list: list[str]) -> Optional[str]:
                 for cite in cite_list:
-                    cite = re.sub(r"<[^>]+>", "", cite).strip()
                     tried_cites.add(cite)
                     scl_url = _static_case_law_url(cite)
                     if not scl_url:
@@ -736,7 +741,7 @@ class CourtListenerGUI:
                     alt_cites: list[str] = []
                     for c in (cites_resp.get("citations") or []):
                         if isinstance(c, str):
-                            alt_cites.append(c)
+                            alt_cites.append(re.sub(r"<[^>]+>", "", c).strip())
                         elif isinstance(c, dict):
                             vol = c.get("volume") or ""
                             rep = c.get("reporter") or ""
