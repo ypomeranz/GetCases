@@ -716,6 +716,8 @@ class CourtListenerGUI:
             def _try_static_case_law(cite_list: list[str]) -> Optional[str]:
                 for cite in cite_list:
                     tried_cites.add(cite)
+                    if "lexis" in cite.lower():
+                        continue
                     scl_url = _static_case_law_url(cite)
                     if not scl_url:
                         continue
