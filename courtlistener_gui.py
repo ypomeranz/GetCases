@@ -54,14 +54,27 @@ def _save_token(token: str) -> None:
         pass  # Non-fatal – token simply won't persist
 
 
-# Browser-like User-Agent for requests to third-party hosts (LOC, GovInfo,
-# static.case.law).  These servers reject Python's default UA with a
-# connection reset or 403.
-_BROWSER_UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-_BROWSER_HEADERS = {"User-Agent": _BROWSER_UA}
+# Persistent session for third-party hosts (LOC, GovInfo, static.case.law).
+# Uses a full browser-like header set; government CDNs reset connections when
+# they see Python's default User-Agent or missing Accept/Sec-Fetch headers.
+_anon_session = _requests.Session()
+_anon_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "application/pdf,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+})
 
 # URL routing for official US Reports PDFs:
 #   vols 1-542  → LOC CDN per-opinion PDFs (volume and page both 3-digit zero-padded)
@@ -679,9 +692,7 @@ class CourtListenerGUI:
                 if "courtlistener.com" in pdf_url:
                     response = client._session.get(pdf_url, timeout=60, stream=True)
                 else:
-                    response = _requests.get(
-                        pdf_url, headers=_BROWSER_HEADERS, timeout=60, stream=True
-                    )
+                    response = _anon_session.get(pdf_url, timeout=60, stream=True)
                 ct = response.headers.get("content-type", "")
                 print(f"[download] HTTP {response.status_code}  content-type: {ct}")
                 response.raise_for_status()
@@ -759,7 +770,7 @@ class CourtListenerGUI:
                         continue
                     print(f"[resolve] checking static.case.law: {scl_url}")
                     try:
-                        head = _requests.head(scl_url, headers=_BROWSER_HEADERS, timeout=10, allow_redirects=True)
+                        head = _anon_session.head(scl_url, timeout=10, allow_redirects=True)
                         if head.status_code == 200:
                             print(f"[resolve] using static.case.law PDF: {scl_url}")
                             return scl_url
