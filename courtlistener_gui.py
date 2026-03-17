@@ -54,6 +54,15 @@ def _save_token(token: str) -> None:
         pass  # Non-fatal – token simply won't persist
 
 
+# Browser-like User-Agent for requests to third-party hosts (LOC, GovInfo,
+# static.case.law).  These servers reject Python's default UA with a
+# connection reset or 403.
+_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_BROWSER_HEADERS = {"User-Agent": _BROWSER_UA}
+
 # URL routing for official US Reports PDFs:
 #   vols 1-542  → LOC CDN per-opinion PDFs (volume and page both 3-digit zero-padded)
 #   vols 543+   → GovInfo link service (redirects to per-opinion PDF)
@@ -665,10 +674,14 @@ class CourtListenerGUI:
                 self.root.after(0, self._status_var.set, f"Downloading… {pdf_url}")
                 print(f"[download] fetching {pdf_url}")
                 # Only send the CourtListener API key to CourtListener itself.
+                # Use a browser-like UA for all other hosts; government CDNs
+                # (LOC, GovInfo) reject Python's default User-Agent.
                 if "courtlistener.com" in pdf_url:
                     response = client._session.get(pdf_url, timeout=60, stream=True)
                 else:
-                    response = _requests.get(pdf_url, timeout=60, stream=True)
+                    response = _requests.get(
+                        pdf_url, headers=_BROWSER_HEADERS, timeout=60, stream=True
+                    )
                 ct = response.headers.get("content-type", "")
                 print(f"[download] HTTP {response.status_code}  content-type: {ct}")
                 response.raise_for_status()
@@ -746,7 +759,7 @@ class CourtListenerGUI:
                         continue
                     print(f"[resolve] checking static.case.law: {scl_url}")
                     try:
-                        head = _requests.head(scl_url, timeout=10, allow_redirects=True)
+                        head = _requests.head(scl_url, headers=_BROWSER_HEADERS, timeout=10, allow_redirects=True)
                         if head.status_code == 200:
                             print(f"[resolve] using static.case.law PDF: {scl_url}")
                             return scl_url
