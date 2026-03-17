@@ -603,7 +603,7 @@ class CourtListenerGUI:
 
         idx, item = selected
 
-        case_name = item.get("caseName") or item.get("case_name") or "opinion"
+        case_name = re.sub(r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or "opinion").strip()
         safe_name = "".join(
             c if c.isalnum() or c in " -_" else "_" for c in case_name
         )[:80].strip()
