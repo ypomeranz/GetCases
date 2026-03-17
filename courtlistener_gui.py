@@ -56,7 +56,7 @@ def _save_token(token: str) -> None:
 
 # URL routing for official US Reports PDFs:
 #   vols 1-542  → LOC CDN per-opinion PDFs (volume and page both 3-digit zero-padded)
-#   vols 543+   → local_path / download_url chain (GovInfo is unreliable)
+#   vols 543+   → GovInfo link service (redirects to per-opinion PDF)
 _LOC_CUTOFF = 542
 _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 
@@ -75,11 +75,26 @@ def _us_reports_loc_url(citation: str) -> Optional[str]:
         return None
     vol, page = int(m.group(1)), int(m.group(2))
     if vol > _LOC_CUTOFF:
-        return None  # beyond LOC collection; caller should use local_path chain
+        return None
     return (
         f"https://cdn.loc.gov/service/ll/usrep/"
         f"usrep{vol:03d}/usrep{vol:03d}{page:03d}/usrep{vol:03d}{page:03d}.pdf"
     )
+
+
+def _us_reports_govinfo_url(citation: str) -> Optional[str]:
+    """
+    Return the GovInfo link-service URL for a US Reports citation, or None if
+    the volume is within the LOC collection (vols 1-542).
+    GovInfo covers vols 543+ where LOC CDN has no per-opinion PDFs.
+    """
+    m = _US_CITE_RE.search(citation)
+    if not m:
+        return None
+    vol, page = int(m.group(1)), int(m.group(2))
+    if vol <= _LOC_CUTOFF:
+        return None
+    return f"https://www.govinfo.gov/link/usreports/{vol}/{page}"
 
 
 def _slugify_reporter(reporter: str) -> str:
@@ -649,7 +664,11 @@ class CourtListenerGUI:
 
                 self.root.after(0, self._status_var.set, f"Downloading… {pdf_url}")
                 print(f"[download] fetching {pdf_url}")
-                response = client._session.get(pdf_url, timeout=60, stream=True)
+                # Only send the CourtListener API key to CourtListener itself.
+                if "courtlistener.com" in pdf_url:
+                    response = client._session.get(pdf_url, timeout=60, stream=True)
+                else:
+                    response = _requests.get(pdf_url, timeout=60, stream=True)
                 ct = response.headers.get("content-type", "")
                 print(f"[download] HTTP {response.status_code}  content-type: {ct}")
                 response.raise_for_status()
@@ -689,9 +708,9 @@ class CourtListenerGUI:
         court_val = str(item.get("court_id") or "")
         is_scotus = "scotus" in court_val
 
-        # 0. Official US Reports PDF — LOC CDN only (vols 1-542).
-        #    Opinions beyond vol 542 are not reliably served by GovInfo, so we
-        #    let them fall through to the local_path chain below.
+        # 0. Official US Reports PDF.
+        #    vols 1-542  → LOC CDN (exact per-opinion PDF)
+        #    vols 543+   → GovInfo link service (redirects to per-opinion PDF)
         citations = item.get("citation", [])
         if isinstance(citations, list):
             us_cite = next((c for c in citations if " U.S. " in c), None)
@@ -702,6 +721,10 @@ class CourtListenerGUI:
             if loc_url:
                 print(f"[resolve] using LOC US Reports PDF: {loc_url}")
                 return loc_url
+            govinfo_url = _us_reports_govinfo_url(us_cite)
+            if govinfo_url:
+                print(f"[resolve] using GovInfo US Reports PDF: {govinfo_url}")
+                return govinfo_url
 
         # 0.5. For non-SCOTUS cases try the Harvard CAP static.case.law copy
         #      first.  A HEAD request confirms availability before committing.
