@@ -174,6 +174,129 @@ def _static_case_law_url(citation: str) -> Optional[str]:
     return f"https://static.case.law/{slug}/{vol}/case-pdfs/{int(page):04d}-01.pdf"
 
 
+_OPINION_TYPE_LABELS: dict[str, str] = {
+    "010combined": "Opinion",
+    "015unamimous": "Unanimous Opinion",
+    "020lead": "Lead Opinion",
+    "025plurality": "Plurality Opinion",
+    "030concurrence": "Concurrence",
+    "035concurrenceinpart": "Concurrence in Part",
+    "040dissent": "Dissent",
+    "050addendum": "Addendum",
+    "060remittitur": "Remittitur",
+    "070rehearing": "Rehearing",
+    "080onthemerits": "On the Merits",
+    "090onmotiontoamend": "On Motion to Amend",
+}
+
+
+def _strip_html(html: str) -> str:
+    """Strip HTML tags, converting block-level tags to newlines first."""
+    text = re.sub(
+        r"<(br|/p|/div|/h[1-6]|/li|/tr|/blockquote)\b[^>]*>",
+        "\n", html, flags=re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _assemble_case_text(client, item: dict) -> str:
+    """
+    Build a plain-text representation of a case from CourtListener.
+
+    Layout:
+      Case name
+      Citations
+      (blank line)
+      Judges: …        ← only if the cluster has data
+      Attorneys: …     ← only if the cluster has data
+      Syllabus: …      ← only if the cluster has data
+      Headnotes: …     ← only if the cluster has data
+      (blank line)
+      --- Opinion type ---
+      <opinion text>
+      … repeated for each sub-opinion, sorted by ordering_key …
+    """
+    lines: list[str] = []
+
+    cluster_id = item.get("cluster_id") or item.get("id")
+    print(f"[text] fetching cluster {cluster_id}")
+    cluster = client.get_cluster(
+        int(cluster_id),
+        fields="case_name,citations,judges,attorneys,syllabus,headnotes,sub_opinions",
+    )
+
+    # --- Header ---
+    case_name = re.sub(
+        r"<[^>]+>", "",
+        cluster.get("case_name") or item.get("caseName") or item.get("case_name") or "",
+    ).strip()
+    lines.append(case_name)
+
+    citations = cluster.get("citations") or []
+    cite_parts: list[str] = []
+    for c in citations:
+        if isinstance(c, dict):
+            vol = c.get("volume", "")
+            reporter = c.get("reporter", "")
+            page = c.get("page", "")
+            if vol and reporter and page:
+                cite_parts.append(f"{vol} {reporter} {page}")
+        elif isinstance(c, str) and c.strip():
+            cite_parts.append(c.strip())
+    if cite_parts:
+        lines.append(", ".join(cite_parts))
+    lines.append("")
+
+    # --- Metadata sections ---
+    for field, label in [
+        ("judges", "Judges"),
+        ("attorneys", "Attorneys"),
+        ("syllabus", "Syllabus"),
+        ("headnotes", "Headnotes"),
+    ]:
+        val = (cluster.get(field) or "").strip()
+        if val:
+            val = _strip_html(val)
+        if val:
+            lines.append(f"{label}: {val}")
+            lines.append("")
+
+    # --- Sub-opinions ---
+    sub_urls = cluster.get("sub_opinions") or []
+    opinions: list[dict] = []
+    for url in sub_urls:
+        try:
+            op = client._get_url(
+                url,
+                {"fields": "ordering_key,type,html_with_citations,html,plain_text"},
+            )
+            opinions.append(op)
+        except Exception as exc:
+            print(f"[text] failed to fetch sub-opinion {url}: {exc}")
+
+    # Sort by ordering_key ascending; None sorts last
+    opinions.sort(key=lambda o: (o.get("ordering_key") is None, o.get("ordering_key") or 0))
+
+    for op in opinions:
+        type_code = op.get("type") or ""
+        label = _OPINION_TYPE_LABELS.get(type_code, type_code or "Opinion")
+        lines.append(f"--- {label} ---")
+        lines.append("")
+        text = (
+            op.get("html_with_citations")
+            or op.get("html")
+            or op.get("plain_text")
+            or ""
+        )
+        if text:
+            lines.append(_strip_html(text))
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 try:
     from google_scholar import GoogleScholarFetcher
 
@@ -687,27 +810,25 @@ class CourtListenerGUI:
                 print(f"[download] resolved url = {pdf_url!r}")
 
                 if not pdf_url:
-                    # Last-ditch: pull the opinion text from CourtListener and
-                    # save it as a .txt file with the same base name as the
-                    # intended PDF.
-                    opinion_id = item.get("id")
-                    if opinion_id:
+                    # Last-ditch: assemble full case text from CourtListener
+                    # (cluster metadata + all sub-opinions) and save as .txt.
+                    cluster_id = item.get("cluster_id") or item.get("id")
+                    if cluster_id:
                         try:
                             self.root.after(
                                 0, self._status_var.set,
                                 "No PDF found — fetching opinion text from CourtListener…"
                             )
-                            print(f"[download] no PDF found; fetching text for opinion {opinion_id}")
-                            text = client.get_opinion_text(int(opinion_id))
-                            if text:
-                                text = re.sub(r"<[^>]+>", "", text)
+                            print(f"[download] no PDF found; assembling text for cluster {cluster_id}")
+                            text = _assemble_case_text(client, item)
+                            if text.strip():
                                 txt_path = os.path.splitext(save_path)[0] + ".txt"
                                 with open(txt_path, "w", encoding="utf-8") as f:
                                     f.write(text)
                                 self.root.after(0, self._on_text_download_done, txt_path)
                                 return
                         except Exception as exc:
-                            print(f"[download] text fetch failed: {exc}")
+                            print(f"[download] text assembly failed: {exc}")
                     self.root.after(
                         0,
                         self._on_error,
