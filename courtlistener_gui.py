@@ -86,7 +86,7 @@ _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 
 # Regex to parse a standard legal citation: "volume reporter page"
 # Examples: "410 F.2d 1234", "12 F. Supp. 2d 567", "100 Cal. 400"
-_CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+?)\s+(\d+)")
+_CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+)\s+(\d+)")
 
 
 def _us_reports_loc_url(citation: str) -> Optional[str]:
