@@ -106,11 +106,13 @@ def _us_reports_loc_url(citation: str) -> Optional[str]:
     )
 
 
-def _us_reports_govinfo_url(citation: str) -> Optional[str]:
+def _us_reports_govinfo_url(citation: str) -> Optional[tuple[str, str]]:
     """
-    Return the GovInfo link-service URL for a US Reports citation, or None if
+    Return (link_url, direct_pdf_url) for a US Reports citation, or None if
     the volume is outside the GovInfo range (vols 543-582).
-    GovInfo covers vols 543-582; vols 1-542 are on LOC CDN.
+
+    link_url:       https://www.govinfo.gov/link/usreports/{vol}/{page}
+    direct_pdf_url: https://www.govinfo.gov/content/pkg/USREPORTS-{vol}/pdf/USREPORTS-{vol}-{page}.pdf
     """
     m = _US_CITE_RE.search(citation)
     if not m:
@@ -118,7 +120,9 @@ def _us_reports_govinfo_url(citation: str) -> Optional[str]:
     vol, page = int(m.group(1)), int(m.group(2))
     if vol <= _LOC_CUTOFF or vol > _GOVINFO_MAX:
         return None
-    return f"https://www.govinfo.gov/link/usreports/{vol}/{page}"
+    link_url = f"https://www.govinfo.gov/link/usreports/{vol}/{page}"
+    direct_url = f"https://www.govinfo.gov/content/pkg/USREPORTS-{vol}/pdf/USREPORTS-{vol}-{page}.pdf"
+    return link_url, direct_url
 
 
 def _slugify_reporter(reporter: str) -> str:
@@ -748,10 +752,19 @@ class CourtListenerGUI:
             if loc_url:
                 print(f"[resolve] using LOC US Reports PDF: {loc_url}")
                 return loc_url
-            govinfo_url = _us_reports_govinfo_url(us_cite)
-            if govinfo_url:
-                print(f"[resolve] using GovInfo US Reports PDF: {govinfo_url}")
-                return govinfo_url
+            govinfo_urls = _us_reports_govinfo_url(us_cite)
+            if govinfo_urls:
+                link_url, direct_url = govinfo_urls
+                try:
+                    head = _anon_session.head(link_url, timeout=10, allow_redirects=True)
+                    if head.status_code == 200:
+                        print(f"[resolve] using GovInfo link URL: {link_url}")
+                        return link_url
+                    print(f"[resolve] GovInfo link returned {head.status_code}, trying direct PDF URL")
+                except Exception as e:
+                    print(f"[resolve] GovInfo link check failed ({e}), trying direct PDF URL")
+                print(f"[resolve] using GovInfo direct PDF URL: {direct_url}")
+                return direct_url
 
         # 0.5. For non-SCOTUS cases try the Harvard CAP static.case.law copy
         #      first.  A HEAD request confirms availability before committing.
