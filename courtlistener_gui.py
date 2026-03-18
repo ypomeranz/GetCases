@@ -78,7 +78,8 @@ _anon_session.headers.update({
 
 # URL routing for official US Reports PDFs:
 #   vols 1-542  → LOC CDN per-opinion PDFs (volume and page both 3-digit zero-padded)
-#   vols 543-582 → GovInfo link service (redirects to per-opinion PDF)
+#              If LOC fails, fall back to GovInfo (available from vol 2 onward).
+#   vols 543-582 → GovInfo link service only (redirects to per-opinion PDF)
 #   vols 583+   → not available on GovInfo; skip
 _LOC_CUTOFF = 542
 _GOVINFO_MAX = 582
@@ -109,7 +110,10 @@ def _us_reports_loc_url(citation: str) -> Optional[str]:
 def _us_reports_govinfo_url(citation: str) -> Optional[tuple[str, str]]:
     """
     Return (link_url, direct_pdf_url) for a US Reports citation, or None if
-    the volume is outside the GovInfo range (vols 543-582).
+    the volume is outside the GovInfo range (vols 2-582).
+
+    GovInfo holds US Reports starting from vol 2, so this also serves as a
+    fallback for vols 1-542 when the LOC CDN is unavailable.
 
     link_url:       https://www.govinfo.gov/link/usreports/{vol}/{page}
     direct_pdf_url: https://www.govinfo.gov/content/pkg/USREPORTS-{vol}/pdf/USREPORTS-{vol}-{page}.pdf
@@ -118,7 +122,7 @@ def _us_reports_govinfo_url(citation: str) -> Optional[tuple[str, str]]:
     if not m:
         return None
     vol, page = int(m.group(1)), int(m.group(2))
-    if vol <= _LOC_CUTOFF or vol > _GOVINFO_MAX:
+    if vol > _GOVINFO_MAX:
         return None
     link_url = f"https://www.govinfo.gov/link/usreports/{vol}/{page}"
     direct_url = f"https://www.govinfo.gov/content/pkg/USREPORTS-{vol}/pdf/USREPORTS-{vol}-{page}.pdf"
@@ -750,8 +754,9 @@ class CourtListenerGUI:
             return False
 
         # 0. Official US Reports PDF.
-        #    vols 1-542  → LOC CDN (exact per-opinion PDF)
-        #    vols 543+   → GovInfo link service (redirects to per-opinion PDF)
+        #    vols 1-542  → LOC CDN (exact per-opinion PDF); if LOC fails,
+        #                  GovInfo is tried next (available from vol 2 onward).
+        #    vols 543+   → GovInfo link service only (redirects to per-opinion PDF)
         citations = item.get("citation", [])
         if isinstance(citations, list):
             us_cite = next((c for c in citations if " U.S. " in c), None)
