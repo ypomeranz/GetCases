@@ -739,6 +739,16 @@ class CourtListenerGUI:
         court_val = str(item.get("court_id") or "")
         is_scotus = "scotus" in court_val
 
+        def _head_ok(url: str, label: str) -> bool:
+            try:
+                resp = _anon_session.head(url, timeout=10, allow_redirects=True)
+                if resp.status_code == 200:
+                    return True
+                print(f"[resolve] {label} returned {resp.status_code}: {url}")
+            except Exception as exc:
+                print(f"[resolve] {label} check failed ({exc}): {url}")
+            return False
+
         # 0. Official US Reports PDF.
         #    vols 1-542  → LOC CDN (exact per-opinion PDF)
         #    vols 543+   → GovInfo link service (redirects to per-opinion PDF)
@@ -750,21 +760,18 @@ class CourtListenerGUI:
         if us_cite:
             loc_url = _us_reports_loc_url(us_cite)
             if loc_url:
-                print(f"[resolve] using LOC US Reports PDF: {loc_url}")
-                return loc_url
+                if _head_ok(loc_url, "LOC US Reports"):
+                    print(f"[resolve] using LOC US Reports PDF: {loc_url}")
+                    return loc_url
             govinfo_urls = _us_reports_govinfo_url(us_cite)
             if govinfo_urls:
                 link_url, direct_url = govinfo_urls
-                try:
-                    head = _anon_session.head(link_url, timeout=10, allow_redirects=True)
-                    if head.status_code == 200:
-                        print(f"[resolve] using GovInfo link URL: {link_url}")
-                        return link_url
-                    print(f"[resolve] GovInfo link returned {head.status_code}, trying direct PDF URL")
-                except Exception as e:
-                    print(f"[resolve] GovInfo link check failed ({e}), trying direct PDF URL")
-                print(f"[resolve] using GovInfo direct PDF URL: {direct_url}")
-                return direct_url
+                if _head_ok(link_url, "GovInfo link"):
+                    print(f"[resolve] using GovInfo link URL: {link_url}")
+                    return link_url
+                if _head_ok(direct_url, "GovInfo direct PDF"):
+                    print(f"[resolve] using GovInfo direct PDF URL: {direct_url}")
+                    return direct_url
 
         # 0.5. For non-SCOTUS cases try the Harvard CAP static.case.law copy
         #      first.  A HEAD request confirms availability before committing.
@@ -828,8 +835,10 @@ class CourtListenerGUI:
         # 1. local_path already present on the search result
         local = item.get("local_path") or item.get("localPath") or ""
         if local:
-            print(f"[resolve] using local_path from search result: {local}")
-            return storage_base + local.lstrip("/")
+            url = storage_base + local.lstrip("/")
+            if _head_ok(url, "local_path (search result)"):
+                print(f"[resolve] using local_path from search result: {local}")
+                return url
 
         # 2. Fetch the opinion directly to get its local_path (preferred over
         #    download_url — CourtListener's stored copy is more reliable than
@@ -844,23 +853,27 @@ class CourtListenerGUI:
                 print(f"[resolve] opinion download_url = {fetched_op.get('download_url')!r}")
                 local = fetched_op.get("local_path") or ""
                 if local:
-                    print(f"[resolve] using local_path from opinion record")
-                    return storage_base + local.lstrip("/")
+                    url = storage_base + local.lstrip("/")
+                    if _head_ok(url, "local_path (opinion record)"):
+                        print(f"[resolve] using local_path from opinion record")
+                        return url
             except Exception as exc:
                 print(f"[resolve] direct opinion fetch failed: {exc}")
 
         # 3. download_url from the search result (original court source)
         url = item.get("download_url") or ""
         if url:
-            print(f"[resolve] using download_url from search result: {url}")
-            return url
+            if _head_ok(url, "download_url (search result)"):
+                print(f"[resolve] using download_url from search result: {url}")
+                return url
 
         # 4. download_url from the fetched opinion record
         if fetched_op:
             dl = fetched_op.get("download_url") or ""
             if dl:
-                print(f"[resolve] using download_url from opinion record: {dl}")
-                return dl
+                if _head_ok(dl, "download_url (opinion record)"):
+                    print(f"[resolve] using download_url from opinion record: {dl}")
+                    return dl
 
         # 5. Fall back to cluster → sub_opinions walk
         cluster_id = item.get("cluster_id") or item.get("id")
@@ -875,10 +888,13 @@ class CourtListenerGUI:
                     print(f"[resolve]   local_path={op.get('local_path')!r}  download_url={op.get('download_url')!r}")
                     local = op.get("local_path") or ""
                     if local:
-                        return storage_base + local.lstrip("/")
+                        url = storage_base + local.lstrip("/")
+                        if _head_ok(url, "local_path (sub-opinion)"):
+                            return url
                     dl = op.get("download_url") or ""
                     if dl:
-                        return dl
+                        if _head_ok(dl, "download_url (sub-opinion)"):
+                            return dl
             except Exception as exc:
                 print(f"[resolve] cluster walk failed: {exc}")
 
