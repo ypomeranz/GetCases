@@ -687,11 +687,31 @@ class CourtListenerGUI:
                 print(f"[download] resolved url = {pdf_url!r}")
 
                 if not pdf_url:
+                    # Last-ditch: pull the opinion text from CourtListener and
+                    # save it as a .txt file with the same base name as the
+                    # intended PDF.
+                    opinion_id = item.get("id")
+                    if opinion_id:
+                        try:
+                            self.root.after(
+                                0, self._status_var.set,
+                                "No PDF found — fetching opinion text from CourtListener…"
+                            )
+                            print(f"[download] no PDF found; fetching text for opinion {opinion_id}")
+                            text = client.get_opinion_text(int(opinion_id))
+                            if text:
+                                text = re.sub(r"<[^>]+>", "", text)
+                                txt_path = os.path.splitext(save_path)[0] + ".txt"
+                                with open(txt_path, "w", encoding="utf-8") as f:
+                                    f.write(text)
+                                self.root.after(0, self._on_text_download_done, txt_path)
+                                return
+                        except Exception as exc:
+                            print(f"[download] text fetch failed: {exc}")
                     self.root.after(
                         0,
                         self._on_error,
-                        "No downloadable PDF found for this opinion.\n\n"
-                        "The source document may only be available as HTML.",
+                        "No downloadable PDF or text found for this opinion.",
                     )
                     return
 
@@ -1029,6 +1049,14 @@ class CourtListenerGUI:
         self._status_var.set(f"Saved: {path}")
         if messagebox.askyesno(
             "Download Complete", f"PDF saved to:\n{path}\n\nOpen it now?"
+        ):
+            self._open_file(path)
+
+    def _on_text_download_done(self, path: str) -> None:
+        self._status_var.set(f"Saved: {path}")
+        if messagebox.askyesno(
+            "Text Saved",
+            f"No PDF was available.\nOpinion text saved to:\n{path}\n\nOpen it now?",
         ):
             self._open_file(path)
 
