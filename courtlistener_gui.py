@@ -449,10 +449,11 @@ class CourtListenerGUI:
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
         citations = item.get("citation", [])
         if isinstance(citations, list):
-            us_reports = next((c for c in citations if " U.S. " in c), None)
-            citation_str = us_reports or (citations[0] if citations else "")
+            printed = [c for c in citations if "lexis" not in c.lower()]
+            us_reports = next((c for c in printed if " U.S. " in c), None)
+            citation_str = us_reports or (printed[0] if printed else "")
         else:
-            citation_str = str(citations) if citations else ""
+            citation_str = str(citations) if citations and "lexis" not in str(citations).lower() else ""
         status = item.get("status") or item.get("precedentialStatus") or ""
         return (case_name, court, date_filed, citation_str, status)
 
