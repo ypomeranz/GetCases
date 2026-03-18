@@ -78,8 +78,10 @@ _anon_session.headers.update({
 
 # URL routing for official US Reports PDFs:
 #   vols 1-542  → LOC CDN per-opinion PDFs (volume and page both 3-digit zero-padded)
-#   vols 543+   → GovInfo link service (redirects to per-opinion PDF)
+#   vols 543-582 → GovInfo link service (redirects to per-opinion PDF)
+#   vols 583+   → not available on GovInfo; skip
 _LOC_CUTOFF = 542
+_GOVINFO_MAX = 582
 _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 
 # Regex to parse a standard legal citation: "volume reporter page"
@@ -107,14 +109,14 @@ def _us_reports_loc_url(citation: str) -> Optional[str]:
 def _us_reports_govinfo_url(citation: str) -> Optional[str]:
     """
     Return the GovInfo link-service URL for a US Reports citation, or None if
-    the volume is within the LOC collection (vols 1-542).
-    GovInfo covers vols 543+ where LOC CDN has no per-opinion PDFs.
+    the volume is outside the GovInfo range (vols 543-582).
+    GovInfo covers vols 543-582; vols 1-542 are on LOC CDN.
     """
     m = _US_CITE_RE.search(citation)
     if not m:
         return None
     vol, page = int(m.group(1)), int(m.group(2))
-    if vol <= _LOC_CUTOFF:
+    if vol <= _LOC_CUTOFF or vol > _GOVINFO_MAX:
         return None
     return f"https://www.govinfo.gov/link/usreports/{vol}/{page}"
 
