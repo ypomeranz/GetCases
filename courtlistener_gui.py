@@ -29,6 +29,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+import requests as _requests
+
 from courtlistener import COURTS, CourtListenerClient, CourtListenerError
 
 _CONFIG_PATH = Path.home() / ".config" / "courtlistener" / "config.json"
@@ -52,15 +54,40 @@ def _save_token(token: str) -> None:
         pass  # Non-fatal – token simply won't persist
 
 
+# Persistent session for third-party hosts (LOC, GovInfo, static.case.law).
+# Uses a full browser-like header set; government CDNs reset connections when
+# they see Python's default User-Agent or missing Accept/Sec-Fetch headers.
+_anon_session = _requests.Session()
+_anon_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "application/pdf,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+})
+
 # URL routing for official US Reports PDFs:
 #   vols 1-542  → LOC CDN per-opinion PDFs (volume and page both 3-digit zero-padded)
-#   vols 543+   → local_path / download_url chain (GovInfo is unreliable)
+#              If LOC fails, fall back to GovInfo (available from vol 2 onward).
+#   vols 543-582 → GovInfo link service only (redirects to per-opinion PDF)
+#   vols 583+   → not available on GovInfo; skip
 _LOC_CUTOFF = 542
+_GOVINFO_MAX = 582
 _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 
 # Regex to parse a standard legal citation: "volume reporter page"
 # Examples: "410 F.2d 1234", "12 F. Supp. 2d 567", "100 Cal. 400"
-_CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+?)\s+(\d+)")
+_CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+)\s+(\d+)")
 
 
 def _us_reports_loc_url(citation: str) -> Optional[str]:
@@ -73,11 +100,33 @@ def _us_reports_loc_url(citation: str) -> Optional[str]:
         return None
     vol, page = int(m.group(1)), int(m.group(2))
     if vol > _LOC_CUTOFF:
-        return None  # beyond LOC collection; caller should use local_path chain
+        return None
     return (
         f"https://cdn.loc.gov/service/ll/usrep/"
         f"usrep{vol:03d}/usrep{vol:03d}{page:03d}/usrep{vol:03d}{page:03d}.pdf"
     )
+
+
+def _us_reports_govinfo_url(citation: str) -> Optional[tuple[str, str]]:
+    """
+    Return (link_url, direct_pdf_url) for a US Reports citation, or None if
+    the volume is outside the GovInfo range (vols 2-582).
+
+    GovInfo holds US Reports starting from vol 2, so this also serves as a
+    fallback for vols 1-542 when the LOC CDN is unavailable.
+
+    link_url:       https://www.govinfo.gov/link/usreports/{vol}/{page}
+    direct_pdf_url: https://www.govinfo.gov/content/pkg/USREPORTS-{vol}/pdf/USREPORTS-{vol}-{page}.pdf
+    """
+    m = _US_CITE_RE.search(citation)
+    if not m:
+        return None
+    vol, page = int(m.group(1)), int(m.group(2))
+    if vol > _GOVINFO_MAX:
+        return None
+    link_url = f"https://www.govinfo.gov/link/usreports/{vol}/{page}"
+    direct_url = f"https://www.govinfo.gov/content/pkg/USREPORTS-{vol}/pdf/USREPORTS-{vol}-{page}.pdf"
+    return link_url, direct_url
 
 
 def _slugify_reporter(reporter: str) -> str:
@@ -114,7 +163,8 @@ def _static_case_law_url(citation: str) -> Optional[str]:
     URL pattern:
       https://static.case.law/{reporter-slug}/{volume}/case-pdfs/{page:04d}-01.pdf
     """
-    m = _CITE_PARSE_RE.match(citation.strip())
+    citation = re.sub(r"<[^>]+>", "", citation).strip()
+    m = _CITE_PARSE_RE.match(citation)
     if not m:
         return None
     vol, reporter, page = m.group(1), m.group(2).strip(), m.group(3)
@@ -122,6 +172,129 @@ def _static_case_law_url(citation: str) -> Optional[str]:
     if not slug:
         return None
     return f"https://static.case.law/{slug}/{vol}/case-pdfs/{int(page):04d}-01.pdf"
+
+
+_OPINION_TYPE_LABELS: dict[str, str] = {
+    "010combined": "Opinion",
+    "015unamimous": "Unanimous Opinion",
+    "020lead": "Lead Opinion",
+    "025plurality": "Plurality Opinion",
+    "030concurrence": "Concurrence",
+    "035concurrenceinpart": "Concurrence in Part",
+    "040dissent": "Dissent",
+    "050addendum": "Addendum",
+    "060remittitur": "Remittitur",
+    "070rehearing": "Rehearing",
+    "080onthemerits": "On the Merits",
+    "090onmotiontoamend": "On Motion to Amend",
+}
+
+
+def _strip_html(html: str) -> str:
+    """Strip HTML tags, converting block-level tags to newlines first."""
+    text = re.sub(
+        r"<(br|/p|/div|/h[1-6]|/li|/tr|/blockquote)\b[^>]*>",
+        "\n", html, flags=re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _assemble_case_text(client, item: dict) -> str:
+    """
+    Build a plain-text representation of a case from CourtListener.
+
+    Layout:
+      Case name
+      Citations
+      (blank line)
+      Judges: …        ← only if the cluster has data
+      Attorneys: …     ← only if the cluster has data
+      Syllabus: …      ← only if the cluster has data
+      Headnotes: …     ← only if the cluster has data
+      (blank line)
+      --- Opinion type ---
+      <opinion text>
+      … repeated for each sub-opinion, sorted by ordering_key …
+    """
+    lines: list[str] = []
+
+    cluster_id = item.get("cluster_id") or item.get("id")
+    print(f"[text] fetching cluster {cluster_id}")
+    cluster = client.get_cluster(
+        int(cluster_id),
+        fields="case_name,citations,judges,attorneys,syllabus,headnotes,sub_opinions",
+    )
+
+    # --- Header ---
+    case_name = re.sub(
+        r"<[^>]+>", "",
+        cluster.get("case_name") or item.get("caseName") or item.get("case_name") or "",
+    ).strip()
+    lines.append(case_name)
+
+    citations = cluster.get("citations") or []
+    cite_parts: list[str] = []
+    for c in citations:
+        if isinstance(c, dict):
+            vol = c.get("volume", "")
+            reporter = c.get("reporter", "")
+            page = c.get("page", "")
+            if vol and reporter and page:
+                cite_parts.append(f"{vol} {reporter} {page}")
+        elif isinstance(c, str) and c.strip():
+            cite_parts.append(c.strip())
+    if cite_parts:
+        lines.append(", ".join(cite_parts))
+    lines.append("")
+
+    # --- Metadata sections ---
+    for field, label in [
+        ("judges", "Judges"),
+        ("attorneys", "Attorneys"),
+        ("syllabus", "Syllabus"),
+        ("headnotes", "Headnotes"),
+    ]:
+        val = (cluster.get(field) or "").strip()
+        if val:
+            val = _strip_html(val)
+        if val:
+            lines.append(f"{label}: {val}")
+            lines.append("")
+
+    # --- Sub-opinions ---
+    sub_urls = cluster.get("sub_opinions") or []
+    opinions: list[dict] = []
+    for url in sub_urls:
+        try:
+            op = client._get_url(
+                url,
+                {"fields": "ordering_key,type,html_with_citations,html,plain_text"},
+            )
+            opinions.append(op)
+        except Exception as exc:
+            print(f"[text] failed to fetch sub-opinion {url}: {exc}")
+
+    # Sort by ordering_key ascending; None sorts last
+    opinions.sort(key=lambda o: (o.get("ordering_key") is None, o.get("ordering_key") or 0))
+
+    for op in opinions:
+        type_code = op.get("type") or ""
+        label = _OPINION_TYPE_LABELS.get(type_code, type_code or "Opinion")
+        lines.append(f"--- {label} ---")
+        lines.append("")
+        text = (
+            op.get("html_with_citations")
+            or op.get("html")
+            or op.get("plain_text")
+            or ""
+        )
+        if text:
+            lines.append(_strip_html(text))
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 try:
@@ -407,11 +580,11 @@ class CourtListenerGUI:
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
         citations = item.get("citation", [])
         if isinstance(citations, list):
-            us_reports = next((c for c in citations if " U.S. " in c), None)
-            citation_str = us_reports or (citations[0] if citations else "")
+            printed = [c for c in citations if "lexis" not in c.lower()]
+            us_reports = next((c for c in printed if " U.S. " in c), None)
+            citation_str = us_reports or (printed[0] if printed else "")
         else:
-            citation_str = str(citations) if citations else ""
-        citation_str = re.sub(r"<[^>]+>", "", citation_str).strip()
+            citation_str = str(citations) if citations and "lexis" not in str(citations).lower() else ""
         status = item.get("status") or item.get("precedentialStatus") or ""
         return (case_name, court, date_filed, citation_str, status)
 
@@ -534,6 +707,14 @@ class CourtListenerGUI:
         results = data.get("results", [])
         count = data.get("count", len(results))
         self._results = results
+        # Normalize citations from the API: strip any HTML tags (<mark>, etc.)
+        # immediately so every downstream consumer gets clean plain-text strings.
+        for item in results:
+            raw = item.get("citation")
+            if isinstance(raw, list):
+                item["citation"] = [re.sub(r"<[^>]+>", "", c).strip() for c in raw]
+            elif raw:
+                item["citation"] = re.sub(r"<[^>]+>", "", str(raw)).strip()
 
         for i, item in enumerate(results):
             # Each search result has an 'opinions' list.  The opinion with the
@@ -595,7 +776,7 @@ class CourtListenerGUI:
 
         idx, item = selected
 
-        case_name = item.get("caseName") or item.get("case_name") or "opinion"
+        case_name = re.sub(r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or "opinion").strip()
         safe_name = "".join(
             c if c.isalnum() or c in " -_" else "_" for c in case_name
         )[:80].strip()
@@ -629,17 +810,41 @@ class CourtListenerGUI:
                 print(f"[download] resolved url = {pdf_url!r}")
 
                 if not pdf_url:
+                    # Last-ditch: assemble full case text from CourtListener
+                    # (cluster metadata + all sub-opinions) and save as .txt.
+                    cluster_id = item.get("cluster_id") or item.get("id")
+                    if cluster_id:
+                        try:
+                            self.root.after(
+                                0, self._status_var.set,
+                                "No PDF found — fetching opinion text from CourtListener…"
+                            )
+                            print(f"[download] no PDF found; assembling text for cluster {cluster_id}")
+                            text = _assemble_case_text(client, item)
+                            if text.strip():
+                                txt_path = os.path.splitext(save_path)[0] + ".txt"
+                                with open(txt_path, "w", encoding="utf-8") as f:
+                                    f.write(text)
+                                self.root.after(0, self._on_text_download_done, txt_path)
+                                return
+                        except Exception as exc:
+                            print(f"[download] text assembly failed: {exc}")
                     self.root.after(
                         0,
                         self._on_error,
-                        "No downloadable PDF found for this opinion.\n\n"
-                        "The source document may only be available as HTML.",
+                        "No downloadable PDF or text found for this opinion.",
                     )
                     return
 
                 self.root.after(0, self._status_var.set, f"Downloading… {pdf_url}")
                 print(f"[download] fetching {pdf_url}")
-                response = client._session.get(pdf_url, timeout=60, stream=True)
+                # Only send the CourtListener API key to CourtListener itself.
+                # Use a browser-like UA for all other hosts; government CDNs
+                # (LOC, GovInfo) reject Python's default User-Agent.
+                if "courtlistener.com" in pdf_url:
+                    response = client._session.get(pdf_url, timeout=60, stream=True)
+                else:
+                    response = _anon_session.get(pdf_url, timeout=60, stream=True)
                 ct = response.headers.get("content-type", "")
                 print(f"[download] HTTP {response.status_code}  content-type: {ct}")
                 response.raise_for_status()
@@ -679,46 +884,107 @@ class CourtListenerGUI:
         court_val = str(item.get("court_id") or "")
         is_scotus = "scotus" in court_val
 
-        # 0. Official US Reports PDF — LOC CDN only (vols 1-542).
-        #    Opinions beyond vol 542 are not reliably served by GovInfo, so we
-        #    let them fall through to the local_path chain below.
+        def _head_ok(url: str, label: str) -> bool:
+            try:
+                resp = _anon_session.head(url, timeout=10, allow_redirects=True)
+                if resp.status_code == 200:
+                    return True
+                print(f"[resolve] {label} returned {resp.status_code}: {url}")
+            except Exception as exc:
+                print(f"[resolve] {label} check failed ({exc}): {url}")
+            return False
+
+        # 0. Official US Reports PDF.
+        #    vols 1-542  → LOC CDN (exact per-opinion PDF); if LOC fails,
+        #                  GovInfo is tried next (available from vol 2 onward).
+        #    vols 543+   → GovInfo link service only (redirects to per-opinion PDF)
         citations = item.get("citation", [])
         if isinstance(citations, list):
             us_cite = next((c for c in citations if " U.S. " in c), None)
         else:
             us_cite = str(citations) if citations and " U.S. " in str(citations) else None
         if us_cite:
-            us_cite = re.sub(r"<[^>]+>", "", us_cite).strip()
             loc_url = _us_reports_loc_url(us_cite)
             if loc_url:
-                print(f"[resolve] using LOC US Reports PDF: {loc_url}")
-                return loc_url
+                if _head_ok(loc_url, "LOC US Reports"):
+                    print(f"[resolve] using LOC US Reports PDF: {loc_url}")
+                    return loc_url
+            govinfo_urls = _us_reports_govinfo_url(us_cite)
+            if govinfo_urls:
+                link_url, direct_url = govinfo_urls
+                if _head_ok(link_url, "GovInfo link"):
+                    print(f"[resolve] using GovInfo link URL: {link_url}")
+                    return link_url
+                if _head_ok(direct_url, "GovInfo direct PDF"):
+                    print(f"[resolve] using GovInfo direct PDF URL: {direct_url}")
+                    return direct_url
 
         # 0.5. For non-SCOTUS cases try the Harvard CAP static.case.law copy
         #      first.  A HEAD request confirms availability before committing.
+        #      If the cites from the search result all fail, also try alternate
+        #      cites from the cluster record before giving up on static.case.law.
         if not is_scotus:
             cites = citations if isinstance(citations, list) else (
                 [str(citations)] if citations else []
             )
-            for cite in cites:
-                scl_url = _static_case_law_url(cite)
-                if not scl_url:
-                    continue
-                print(f"[resolve] checking static.case.law: {scl_url}")
+            tried_cites: set[str] = set()
+
+            def _try_static_case_law(cite_list: list[str]) -> Optional[str]:
+                for cite in cite_list:
+                    tried_cites.add(cite)
+                    if "lexis" in cite.lower():
+                        continue
+                    scl_url = _static_case_law_url(cite)
+                    if not scl_url:
+                        continue
+                    print(f"[resolve] checking static.case.law: {scl_url}")
+                    try:
+                        head = _anon_session.head(scl_url, timeout=10, allow_redirects=True)
+                        if head.status_code == 200:
+                            print(f"[resolve] using static.case.law PDF: {scl_url}")
+                            return scl_url
+                        print(f"[resolve] static.case.law returned {head.status_code} for {cite!r}")
+                    except Exception as exc:
+                        print(f"[resolve] static.case.law check failed: {exc}")
+                return None
+
+            result = _try_static_case_law(cites)
+            if result:
+                return result
+
+            # The search result may only expose a subset of citations.
+            # Fetch the cluster record to get any alternate cites not already tried.
+            cluster_id_for_cites = item.get("cluster_id") or item.get("id")
+            if cluster_id_for_cites:
                 try:
-                    head = client._session.head(scl_url, timeout=10, allow_redirects=True)
-                    if head.status_code == 200:
-                        print(f"[resolve] using static.case.law PDF: {scl_url}")
-                        return scl_url
-                    print(f"[resolve] static.case.law returned {head.status_code}, falling through")
+                    print(f"[resolve] fetching cluster {cluster_id_for_cites} for alternate citations")
+                    cites_resp = client.get_cluster(int(cluster_id_for_cites), fields="citations")
+                    alt_cites: list[str] = []
+                    for c in (cites_resp.get("citations") or []):
+                        if isinstance(c, str):
+                            alt_cites.append(re.sub(r"<[^>]+>", "", c).strip())
+                        elif isinstance(c, dict):
+                            vol = c.get("volume") or ""
+                            rep = c.get("reporter") or ""
+                            page = c.get("page") or ""
+                            if vol and rep and page:
+                                alt_cites.append(f"{vol} {rep} {page}")
+                    new_cites = [c for c in alt_cites if c not in tried_cites]
+                    if new_cites:
+                        print(f"[resolve] trying {len(new_cites)} alternate cite(s) from cluster")
+                        result = _try_static_case_law(new_cites)
+                        if result:
+                            return result
                 except Exception as exc:
-                    print(f"[resolve] static.case.law check failed: {exc}")
+                    print(f"[resolve] cluster cite fetch failed: {exc}")
 
         # 1. local_path already present on the search result
         local = item.get("local_path") or item.get("localPath") or ""
         if local:
-            print(f"[resolve] using local_path from search result: {local}")
-            return storage_base + local.lstrip("/")
+            url = storage_base + local.lstrip("/")
+            if _head_ok(url, "local_path (search result)"):
+                print(f"[resolve] using local_path from search result: {local}")
+                return url
 
         # 2. Fetch the opinion directly to get its local_path (preferred over
         #    download_url — CourtListener's stored copy is more reliable than
@@ -733,23 +999,27 @@ class CourtListenerGUI:
                 print(f"[resolve] opinion download_url = {fetched_op.get('download_url')!r}")
                 local = fetched_op.get("local_path") or ""
                 if local:
-                    print(f"[resolve] using local_path from opinion record")
-                    return storage_base + local.lstrip("/")
+                    url = storage_base + local.lstrip("/")
+                    if _head_ok(url, "local_path (opinion record)"):
+                        print(f"[resolve] using local_path from opinion record")
+                        return url
             except Exception as exc:
                 print(f"[resolve] direct opinion fetch failed: {exc}")
 
         # 3. download_url from the search result (original court source)
         url = item.get("download_url") or ""
         if url:
-            print(f"[resolve] using download_url from search result: {url}")
-            return url
+            if _head_ok(url, "download_url (search result)"):
+                print(f"[resolve] using download_url from search result: {url}")
+                return url
 
         # 4. download_url from the fetched opinion record
         if fetched_op:
             dl = fetched_op.get("download_url") or ""
             if dl:
-                print(f"[resolve] using download_url from opinion record: {dl}")
-                return dl
+                if _head_ok(dl, "download_url (opinion record)"):
+                    print(f"[resolve] using download_url from opinion record: {dl}")
+                    return dl
 
         # 5. Fall back to cluster → sub_opinions walk
         cluster_id = item.get("cluster_id") or item.get("id")
@@ -764,10 +1034,13 @@ class CourtListenerGUI:
                     print(f"[resolve]   local_path={op.get('local_path')!r}  download_url={op.get('download_url')!r}")
                     local = op.get("local_path") or ""
                     if local:
-                        return storage_base + local.lstrip("/")
+                        url = storage_base + local.lstrip("/")
+                        if _head_ok(url, "local_path (sub-opinion)"):
+                            return url
                     dl = op.get("download_url") or ""
                     if dl:
-                        return dl
+                        if _head_ok(dl, "download_url (sub-opinion)"):
+                            return dl
             except Exception as exc:
                 print(f"[resolve] cluster walk failed: {exc}")
 
@@ -897,6 +1170,14 @@ class CourtListenerGUI:
         self._status_var.set(f"Saved: {path}")
         if messagebox.askyesno(
             "Download Complete", f"PDF saved to:\n{path}\n\nOpen it now?"
+        ):
+            self._open_file(path)
+
+    def _on_text_download_done(self, path: str) -> None:
+        self._status_var.set(f"Saved: {path}")
+        if messagebox.askyesno(
+            "Text Saved",
+            f"No PDF was available.\nOpinion text saved to:\n{path}\n\nOpen it now?",
         ):
             self._open_file(path)
 
