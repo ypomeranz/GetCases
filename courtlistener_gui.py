@@ -26,6 +26,7 @@ import threading
 import tkinter as tk
 import urllib.parse
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -90,6 +91,29 @@ _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 # Regex to parse a standard legal citation: "volume reporter page"
 # Examples: "410 F.2d 1234", "12 F. Supp. 2d 567", "100 Cal. 400"
 _CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+)\s+(\d+)")
+
+_CLUSTER_ID_RE = re.compile(r"/clusters/(\d+)/?")
+
+
+def _extract_cluster_id(url: str) -> Optional[int]:
+    """Parse a cluster ID out of a CourtListener clusters URL."""
+    m = _CLUSTER_ID_RE.search(str(url))
+    return int(m.group(1)) if m else None
+
+
+def _cluster_citations_to_strings(citations) -> list[str]:
+    """Convert cluster-endpoint citations (dicts or strings) to plain strings."""
+    result: list[str] = []
+    for c in (citations or []):
+        if isinstance(c, dict):
+            vol = c.get("volume", "")
+            rep = c.get("reporter", "")
+            page = c.get("page", "")
+            if vol and rep and page:
+                result.append(f"{vol} {rep} {page}")
+        elif isinstance(c, str) and c.strip():
+            result.append(c.strip())
+    return result
 
 # Bluebook (21st ed.) abbreviations keyed by CourtListener court ID.
 # SCOTUS is absent intentionally — the court name is omitted for SCOTUS cites.
@@ -825,10 +849,7 @@ class CourtListenerGUI:
         idx = self._iid_to_idx(iid)
         if 0 <= idx < len(self._results):
             item = self._results[idx]
-            client = self._get_client()
-            if client is None:
-                return
-            _CitingOpinionsWindow(self.root, client, item)
+            _CitingOpinionsWindow(self.root, self, item)
 
     def _get_client(self) -> Optional[CourtListenerClient]:
         token = self._token_var.get().strip()
@@ -1315,51 +1336,7 @@ class CourtListenerGUI:
         self._show_scholar_window(url, text)
 
     def _show_scholar_window(self, url: str, text: str) -> None:
-        win = tk.Toplevel(self.root)
-        win.title("Google Scholar Opinion Text")
-        win.geometry("800x600")
-
-        # URL bar
-        url_frame = ttk.Frame(win)
-        url_frame.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(url_frame, text="Source:").pack(side="left")
-        url_var = tk.StringVar(value=url)
-        ttk.Entry(url_frame, textvariable=url_var, state="readonly").pack(
-            side="left", fill="x", expand=True, padx=4
-        )
-
-        # Text area
-        text_frame = ttk.Frame(win)
-        text_frame.pack(fill="both", expand=True, padx=8, pady=4)
-        txt = tk.Text(text_frame, wrap="word", font=("TkDefaultFont", 10))
-        vsb = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        txt.pack(side="left", fill="both", expand=True)
-        txt.insert("1.0", text)
-        txt.config(state="disabled")
-
-        # Save button
-        def save_text() -> None:
-            path = filedialog.asksaveasfilename(
-                defaultextension=".txt",
-                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-                title="Save Opinion Text",
-                parent=win,
-            )
-            if path:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(text)
-                messagebox.showinfo("Saved", f"Text saved to:\n{path}", parent=win)
-
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Button(btn_frame, text="Save as .txt…", command=save_text).pack(side="right")
-        ttk.Label(
-            btn_frame,
-            text=f"{len(text):,} characters  |  cached locally",
-            foreground="gray",
-        ).pack(side="left")
+        _show_text_window(self.root, url, text)
 
     def _restore_buttons(self) -> None:
         self._download_btn.config(state="normal")
@@ -1400,29 +1377,71 @@ def _extract_opinion_id(url: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _show_text_window(parent: tk.Misc, url: str, text: str) -> None:
+    """Open a read-only text window showing *text* fetched from *url*."""
+    win = tk.Toplevel(parent)
+    win.title("Google Scholar Opinion Text")
+    win.geometry("800x600")
+
+    url_frame = ttk.Frame(win)
+    url_frame.pack(fill="x", padx=8, pady=(8, 0))
+    ttk.Label(url_frame, text="Source:").pack(side="left")
+    url_var = tk.StringVar(value=url)
+    ttk.Entry(url_frame, textvariable=url_var, state="readonly").pack(
+        side="left", fill="x", expand=True, padx=4
+    )
+
+    text_frame = ttk.Frame(win)
+    text_frame.pack(fill="both", expand=True, padx=8, pady=4)
+    txt = tk.Text(text_frame, wrap="word", font=("TkDefaultFont", 10))
+    vsb = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
+    txt.configure(yscrollcommand=vsb.set)
+    vsb.pack(side="right", fill="y")
+    txt.pack(side="left", fill="both", expand=True)
+    txt.insert("1.0", text)
+    txt.config(state="disabled")
+
+    def save_text() -> None:
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            title="Save Opinion Text",
+            parent=win,
+        )
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            messagebox.showinfo("Saved", f"Text saved to:\n{path}", parent=win)
+
+    btn_frame = ttk.Frame(win)
+    btn_frame.pack(fill="x", padx=8, pady=(0, 8))
+    ttk.Button(btn_frame, text="Save as .txt…", command=save_text).pack(side="right")
+    ttk.Label(
+        btn_frame,
+        text=f"{len(text):,} characters  |  cached locally",
+        foreground="gray",
+    ).pack(side="left")
+
+
 class _CitingOpinionsWindow:
     """
-    Popup window that lists all opinions citing a given case, sorted by
-    depth of treatment (most citations within the citing document first).
+    Popup window listing all opinions that cite the selected case,
+    sorted by depth of treatment (number of times cited within the
+    citing document, descending).
 
-    Data strategy
-    -------------
-    Phase 1 – fast display:
-        Use the search API (``cites:(cluster_id)``) to get full case data
-        (name, court, date, citation) for page 1.  Results appear
-        immediately.
+    Data strategy (single stage)
+    -----------------------------
+    1. Resolve the cited opinion's numeric ID from its cluster
+       (``/api/rest/v4/opinions/?cluster=<id>``).
+    2. Fetch citing opinions sorted by depth from the citations endpoint
+       (``/api/rest/v4/citations/?cited_opinion=<id>&ordering=-depth``).
+    3. In parallel (thread pool), resolve each citing opinion URL →
+       opinion record → cluster ID.
+    4. In parallel, fetch each cluster's case name, date, and citation.
+    5. Display the merged results immediately with depth populated.
 
-    Phase 2 – depth enrichment (background):
-        1. Resolve the cited case's opinion ID from its cluster.
-        2. Call ``/api/rest/v4/citations/?cited_opinion=<id>&ordering=-depth``
-           to get citing opinion IDs sorted by depth.
-        3. Match against the opinion IDs embedded in search results
-           (``result["opinions"][*]["id"]``).
-        4. Re-sort the displayed page by depth descending and populate the
-           Depth column.
-
-    If Phase 2 cannot be completed (API shape differs, etc.) the window
-    still functions normally with depth shown as "–".
+    Falls back to a plain ``cites:(cluster_id)`` search (depth shown as
+    "–") when step 1 fails (opinion not in citations database).
     """
 
     _COLS = ("case_name", "court", "date_filed", "citation", "depth")
@@ -1437,23 +1456,22 @@ class _CitingOpinionsWindow:
     def __init__(
         self,
         parent: tk.Tk | tk.Toplevel,
-        client: CourtListenerClient,
+        app: "CourtListenerGUI",
         cited_item: dict,
     ) -> None:
-        self._parent = parent
-        self._client = client
+        self._app = app
         self._cited_item = cited_item
         self._cluster_id = cited_item.get("cluster_id") or cited_item.get("id")
+        # Cached after first load so pagination doesn't re-fetch it
+        self._cited_op_id: Optional[int] = None
 
-        # Pagination state
-        self._cursor_history: list[Optional[str]] = [None]   # history[0] = page 1
-        self._history_idx: int = 0                            # current position
+        # Pagination: history[i] is the citations-endpoint next-URL that
+        # leads TO page i+1 (None = page 1, string URL = page 2+).
+        self._cursor_history: list[Optional[str]] = [None]
+        self._history_idx: int = 0
         self._next_cursor: Optional[str] = None
         self._total_count: int = 0
-
-        # Current page results + depth map (opinion_id → depth)
         self._page_results: list[dict] = []
-        self._depth_map: dict[int, int] = {}
 
         case_name = re.sub(
             r"<[^>]+>",
@@ -1561,34 +1579,153 @@ class _CitingOpinionsWindow:
         self._dl_btn.config(state="disabled")
         self._scholar_btn.config(state="disabled")
 
+    # ------------------------------------------------------------------
+    # Data loading – single stage (citations endpoint → parallel cluster
+    # fetches), falls back to plain search when depth data unavailable
+    # ------------------------------------------------------------------
+
     def _load_page(self) -> None:
         self._set_buttons_loading()
         self._status_var.set("Loading…")
-        cursor = self._current_cursor()
+        cursor_url = self._cursor_history[self._history_idx]   # None on pg 1
         cluster_id = self._cluster_id
+        # Re-use the cited opinion ID resolved on page 1
+        known_op_id = self._cited_op_id
+        client = self._app._get_client()
+        if client is None:
+            return
 
         def run() -> None:
             try:
-                if cursor:
-                    data = self._client._get_url(cursor)
-                else:
-                    data = self._client.search(
-                        f"cites:({cluster_id})",
-                        type="o",
-                        page_size=20,
+                # ── Step 1: resolve cited opinion ID (once only) ──────
+                op_id = known_op_id
+                if op_id is None:
+                    self._win.after(0, self._status_var.set, "Resolving opinion ID…")
+                    ops = client.list_opinions(
+                        cluster=int(cluster_id), fields="id", page_size=3
                     )
-                self._win.after(0, self._on_search_results, data)
+                    ids = [o["id"] for o in ops.get("results", []) if o.get("id")]
+                    op_id = ids[0] if ids else None
+                    self._cited_op_id = op_id   # cache for subsequent pages
+
+                # ── Step 2: citations page sorted by depth ─────────────
+                if op_id is None:
+                    # No opinion ID found; fall back to plain search
+                    self._win.after(0, self._status_var.set, "Fetching (search fallback)…")
+                    if cursor_url:
+                        data = client._get_url(cursor_url)
+                    else:
+                        data = client.search(
+                            f"cites:({cluster_id})", type="o", page_size=20
+                        )
+                    self._win.after(0, self._on_fallback_results, data)
+                    return
+
+                self._win.after(0, self._status_var.set, "Fetching citations…")
+                if cursor_url:
+                    cite_data = client._get_url(cursor_url)
+                else:
+                    cite_data = client.list_citing_opinions(
+                        cited_opinion_id=op_id, page_size=20
+                    )
+
+                entries = cite_data.get("results", [])
+                total = cite_data.get("count", len(entries))
+                next_url = cite_data.get("next")
+
+                if not entries:
+                    self._win.after(0, self._on_page_ready, [], total, next_url)
+                    return
+
+                # ── Step 3: opinion URL → cluster ID (parallel) ────────
+                self._win.after(0, self._status_var.set,
+                                f"Fetching {len(entries)} case records…")
+
+                def fetch_cluster_id(entry: dict):
+                    op_url = str(entry.get("citing_opinion", ""))
+                    citing_op_id = _extract_opinion_id(op_url)
+                    if citing_op_id is None:
+                        return entry, None
+                    try:
+                        opinion = client.get_opinion(citing_op_id, fields="cluster")
+                        cid = _extract_cluster_id(str(opinion.get("cluster", "")))
+                        return entry, cid
+                    except Exception:
+                        return entry, None
+
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    entry_cid = list(pool.map(fetch_cluster_id, entries))
+
+                # ── Step 4: cluster data (parallel) ───────────────────
+                def fetch_cluster(ec):
+                    entry, cid = ec
+                    if cid is None:
+                        return entry, cid, None
+                    try:
+                        cluster = client.get_cluster(
+                            int(cid), fields="case_name,citations,date_filed"
+                        )
+                        return entry, cid, cluster
+                    except Exception:
+                        return entry, cid, None
+
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    triples = list(pool.map(fetch_cluster, entry_cid))
+
+                # ── Assemble result dicts ──────────────────────────────
+                results: list[dict] = []
+                for entry, cid, cluster in triples:
+                    if cluster is None:
+                        continue
+                    cite_strs = _cluster_citations_to_strings(
+                        cluster.get("citations", [])
+                    )
+                    results.append({
+                        "caseName":   cluster.get("case_name", ""),
+                        "case_name":  cluster.get("case_name", ""),
+                        "citation":   cite_strs,
+                        "dateFiled":  cluster.get("date_filed", ""),
+                        "date_filed": cluster.get("date_filed", ""),
+                        "cluster_id": cid,
+                        "court": "",      # would require docket fetch
+                        "court_id": "",
+                        "_depth": entry.get("depth", 0),
+                    })
+
+                self._win.after(0, self._on_page_ready, results, total, next_url)
+
             except Exception as exc:
+                import traceback; traceback.print_exc()
                 self._win.after(0, self._status_var.set, f"Error: {exc}")
+                self._win.after(0, self._restore_buttons)
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _on_search_results(self, data: dict) -> None:
+    def _on_page_ready(
+        self,
+        results: list[dict],
+        total: int,
+        next_url: Optional[str],
+    ) -> None:
+        """Populate treeview from citations-endpoint results (depth filled)."""
+        self._page_results = results
+        self._total_count = total
+        self._next_cursor = next_url
+
+        self._tree.delete(*self._tree.get_children())
+        for i, item in enumerate(results):
+            depth = item.get("_depth", 0)
+            row = self._format_row(item, depth=str(depth))
+            self._tree.insert("", "end", iid=str(i), values=row)
+
+        self._update_status_and_nav()
+
+    def _on_fallback_results(self, data: dict) -> None:
+        """Populate treeview from plain search API results (no depth)."""
         results = data.get("results", [])
         self._total_count = data.get("count", len(results))
-        self._next_cursor = data.get("next")  # full URL for next page
+        self._next_cursor = data.get("next")
 
-        # Normalise citations (strip HTML tags)
         for item in results:
             raw = item.get("citation")
             if isinstance(raw, list):
@@ -1597,36 +1734,34 @@ class _CitingOpinionsWindow:
                 item["citation"] = re.sub(r"<[^>]+>", "", str(raw)).strip()
 
         self._page_results = results
-
-        # Populate tree with placeholder depth
         self._tree.delete(*self._tree.get_children())
         for i, item in enumerate(results):
-            row = self._format_row(item, depth="")
+            row = self._format_row(item, depth="–")
             self._tree.insert("", "end", iid=str(i), values=row)
 
+        self._update_status_and_nav()
+
+    def _update_status_and_nav(self) -> None:
         page = self._page_num()
         self._page_var.set(f"Page {page}")
-        shown = len(results)
+        shown = len(self._page_results)
         total = self._total_count
         self._status_var.set(
             f"Page {page} · {shown} of {total:,} citing opinions"
             if total else f"Page {page} · {shown} results"
         )
-
-        # Update nav buttons
         self._prev_btn.config(state="normal" if self._history_idx > 0 else "disabled")
         self._next_btn.config(state="normal" if self._next_cursor else "disabled")
+        has = bool(self._page_results)
+        self._dl_btn.config(state="normal" if has else "disabled")
+        self._scholar_btn.config(state="normal" if has else "disabled")
 
-        if results:
-            self._dl_btn.config(state="normal")
-            self._scholar_btn.config(state="normal")
-
-        # Kick off depth enrichment in background
-        if results:
-            threading.Thread(target=self._enrich_depth, daemon=True).start()
-
-    def _format_row(self, item: dict, depth: str | int = "") -> tuple:
-        case_name = re.sub(r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or "(unknown)").strip()
+    def _format_row(self, item: dict, depth: str = "") -> tuple:
+        case_name = re.sub(
+            r"<[^>]+>",
+            "",
+            item.get("caseName") or item.get("case_name") or "(unknown)",
+        ).strip()
         court = item.get("court") or item.get("court_id") or ""
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
         citations = item.get("citation", [])
@@ -1636,90 +1771,7 @@ class _CitingOpinionsWindow:
             cite_str = us or (printed[0] if printed else "")
         else:
             cite_str = str(citations) if citations and "lexis" not in str(citations).lower() else ""
-        return (case_name, court, date_filed, cite_str, str(depth))
-
-    # ------------------------------------------------------------------
-    # Phase 2 – depth enrichment
-    # ------------------------------------------------------------------
-
-    def _enrich_depth(self) -> None:
-        """
-        Background task: fetch citation depth for the cited opinion and
-        update the Depth column in the treeview, then re-sort by depth.
-        """
-        try:
-            # Step 1: get the opinion ID(s) for the cited cluster
-            cluster_id = self._cluster_id
-            ops_resp = self._client.list_opinions(
-                cluster=int(cluster_id),
-                fields="id",
-                page_size=5,
-            )
-            op_ids = [o["id"] for o in ops_resp.get("results", []) if o.get("id")]
-            if not op_ids:
-                return
-
-            # Step 2: fetch citations for the primary opinion, sorted by depth
-            cite_resp = self._client.list_citing_opinions(
-                cited_opinion_id=op_ids[0],
-                page_size=20,
-                fields="citing_opinion,depth",
-            )
-            # Build map: citing_opinion_id → depth
-            depth_map: dict[int, int] = {}
-            for obj in cite_resp.get("results", []):
-                op_url = obj.get("citing_opinion") or ""
-                oid = _extract_opinion_id(op_url)
-                dep = obj.get("depth")
-                if oid is not None and dep is not None:
-                    depth_map[oid] = int(dep)
-
-            if not depth_map:
-                return
-
-            # Step 3: match search results via their sub-opinion IDs
-            # Each search result has result["opinions"][*]["id"]
-            result_depths: dict[int, int] = {}  # result_index → depth
-            for i, item in enumerate(self._page_results):
-                sub_ops = item.get("opinions") or []
-                for sop in sub_ops:
-                    sop_id = sop.get("id")
-                    if sop_id and sop_id in depth_map:
-                        result_depths[i] = depth_map[sop_id]
-                        break
-
-            if not result_depths:
-                return
-
-            self._depth_map = depth_map
-            self._win.after(0, self._apply_depth, result_depths)
-
-        except Exception as exc:
-            print(f"[citing] depth enrichment failed: {exc}")
-
-    def _apply_depth(self, result_depths: dict[int, int]) -> None:
-        """Update the Depth column and re-sort the treeview by depth."""
-        # Collect (iid, depth) pairs; unmatched items get depth -1 for sort
-        rows: list[tuple[str, int]] = []
-        for iid in self._tree.get_children():
-            idx = int(iid)
-            depth = result_depths.get(idx, -1)
-            rows.append((iid, depth))
-
-        # Sort descending by depth (unmatched at bottom)
-        rows.sort(key=lambda x: x[1], reverse=True)
-
-        for pos, (iid, depth) in enumerate(rows):
-            idx = int(iid)
-            item = self._page_results[idx]
-            display_depth = str(depth) if depth >= 0 else "–"
-            new_values = self._format_row(item, depth=display_depth)
-            self._tree.item(iid, values=new_values)
-            self._tree.move(iid, "", pos)
-
-        # Update status to note depth info is live
-        cur = self._status_var.get()
-        self._status_var.set(cur.rstrip(".") + "  (sorted by depth)")
+        return (case_name, court, date_filed, cite_str, depth)
 
     # ------------------------------------------------------------------
     # Download
@@ -1740,6 +1792,10 @@ class _CitingOpinionsWindow:
             messagebox.showinfo("No Selection", "Please select a case first.", parent=self._win)
             return
 
+        client = self._app._get_client()
+        if client is None:
+            return
+
         safe_name = _build_default_filename(item)
         save_path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
@@ -1756,27 +1812,26 @@ class _CitingOpinionsWindow:
 
         def run() -> None:
             try:
-                # We need a temporary GUI proxy to reuse _resolve_pdf_url;
-                # instead we inline the minimal resolution here.
-                pdf_url = _resolve_pdf_for_item(self._client, item)
+                pdf_url = self._app._resolve_pdf_url(client, item)
                 if not pdf_url:
                     cluster_id = item.get("cluster_id") or item.get("id")
                     if cluster_id:
                         self._win.after(0, self._status_var.set, "No PDF – fetching text…")
-                        text = _assemble_case_text(self._client, item)
+                        text = _assemble_case_text(client, item)
                         if text.strip():
                             txt_path = os.path.splitext(save_path)[0] + ".txt"
                             with open(txt_path, "w", encoding="utf-8") as f:
                                 f.write(text)
                             self._win.after(0, self._on_dl_done, txt_path, True)
                             return
-                    self._win.after(0, self._status_var.set, "No downloadable PDF or text found.")
+                    self._win.after(0, self._status_var.set,
+                                    "No downloadable PDF or text found.")
                     self._win.after(0, self._restore_buttons)
                     return
 
                 self._win.after(0, self._status_var.set, f"Downloading… {pdf_url}")
                 if "courtlistener.com" in pdf_url:
-                    resp = self._client._session.get(pdf_url, timeout=60, stream=True)
+                    resp = client._session.get(pdf_url, timeout=60, stream=True)
                 else:
                     resp = _anon_session.get(pdf_url, timeout=60, stream=True)
                 resp.raise_for_status()
@@ -1810,39 +1865,60 @@ class _CitingOpinionsWindow:
         self._next_btn.config(state="normal" if self._next_cursor else "disabled")
 
     # ------------------------------------------------------------------
-    # Google Scholar
+    # Google Scholar  (reuses the main app's fetcher + text window)
     # ------------------------------------------------------------------
 
     def _open_scholar(self) -> None:
         item = self._get_selected()
         if not item:
-            messagebox.showinfo("No Selection", "Please select a case first.", parent=self._win)
+            messagebox.showinfo("No Selection", "Please select a case first.",
+                                parent=self._win)
             return
+
+        fetcher = self._app._get_scholar()
+        if fetcher is None:
+            return
+
         citations = item.get("citation", [])
-        cite = (citations[0] if isinstance(citations, list) and citations else str(citations or "")).strip()
-        case_name = re.sub(r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or "").strip()
-        query = cite or case_name
-        if not query:
+        citation_str = (
+            citations[0] if isinstance(citations, list) and citations
+            else str(citations or "")
+        ).strip()
+        case_name = re.sub(
+            r"<[^>]+>",
+            "",
+            item.get("caseName") or item.get("case_name") or "",
+        ).strip()
+        date_filed = item.get("dateFiled") or item.get("date_filed") or ""
+        year = date_filed[:4] if date_filed else None
+
+        self._scholar_btn.config(state="disabled")
+        self._status_var.set("Searching Google Scholar…")
+
+        def run() -> None:
+            result = None
+            if citation_str:
+                result = fetcher.fetch_by_citation(citation_str)
+            if result is None and case_name:
+                result = fetcher.fetch_by_name(case_name, year)
+            self._win.after(0, self._on_scholar_done, result)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_scholar_done(self, result: Optional[tuple[str, str]]) -> None:
+        self._restore_buttons()
+        if result is None:
+            self._status_var.set("Google Scholar: not found.")
+            messagebox.showwarning(
+                "Scholar Not Found",
+                "Could not find this opinion on Google Scholar.\n\n"
+                "Google may have blocked the request, or the case may not be indexed.",
+                parent=self._win,
+            )
             return
-        url = "https://scholar.google.com/scholar?q=" + urllib.parse.quote(query)
-        webbrowser.open(url)
-
-
-def _resolve_pdf_for_item(client: CourtListenerClient, item: dict) -> Optional[str]:
-    """
-    Minimal PDF URL resolver for use outside the main GUI class.
-    Tries local_path → download_url from the item dict only (no sub-opinion
-    walk or LOC/GovInfo logic).  The full resolver lives in
-    ``CourtListenerGUI._resolve_pdf_url``; callers that need the full
-    resolution should use that instead.
-    """
-    local = item.get("local_path") or item.get("localPath") or ""
-    if local:
-        return "https://storage.courtlistener.com/" + local.lstrip("/")
-    url = item.get("download_url") or ""
-    if url:
-        return url
-    return None
+        url, text = result
+        self._status_var.set(f"Scholar text loaded from {url}")
+        _show_text_window(self._win, url, text)
 
 
 def main() -> None:
