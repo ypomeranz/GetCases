@@ -115,6 +115,52 @@ def _cluster_citations_to_strings(citations) -> list[str]:
             result.append(c.strip())
     return result
 
+
+# Priority-ordered patterns for picking the best citation for display,
+# filenames, and Google Scholar searches.
+# Order: U.S. Reports > S.Ct. > Federal Reporter (newest first) >
+#        Federal Supplement > state/other reporters > anything non-Lexis.
+_CITE_PRIORITY = [
+    re.compile(r" U\.S\. "),
+    re.compile(r" S\. Ct\. "),
+    re.compile(r" F\.4th "),
+    re.compile(r" F\.3d "),
+    re.compile(r" F\.2d "),
+    re.compile(r" F\. \d"),          # "F. " immediately before a digit (not F. Supp.)
+    re.compile(r" F\. Supp\. 3d "),
+    re.compile(r" F\. Supp\. 2d "),
+    re.compile(r" F\. Supp\. "),
+    re.compile(r" B\.R\. "),
+]
+
+_NOISE_CITE_RE = re.compile(r"lexis|westlaw|\bwl\b", re.IGNORECASE)
+
+
+def _pick_citation(citations) -> str:
+    """
+    Return the most useful citation from *citations* for display,
+    filenames, and Google Scholar searches.
+
+    Strips HTML tags, discards Lexis/Westlaw cites, then walks
+    ``_CITE_PRIORITY`` to find the best reporter.  Falls back to the
+    first non-noise cite, or the raw first entry if everything is noise.
+    """
+    if not citations:
+        return ""
+    if isinstance(citations, str):
+        citations = [citations]
+
+    clean = [re.sub(r"<[^>]+>", "", c).strip() for c in citations]
+    non_noise = [c for c in clean if c and not _NOISE_CITE_RE.search(c)]
+
+    pool = non_noise if non_noise else clean
+    for pat in _CITE_PRIORITY:
+        hit = next((c for c in pool if pat.search(c)), None)
+        if hit:
+            return hit
+
+    return pool[0] if pool else ""
+
 # Bluebook (21st ed.) abbreviations keyed by CourtListener court ID.
 # SCOTUS is absent intentionally — the court name is omitted for SCOTUS cites.
 _COURT_BLUEBOOK: dict[str, str] = {
@@ -269,16 +315,8 @@ def _build_default_filename(item: dict) -> str:
         item.get("caseName") or item.get("case_name") or "opinion"
     ).strip()
 
-    # Best citation: prefer U.S. Reports for SCOTUS, else first non-Lexis cite
-    citations = item.get("citation", [])
-    if isinstance(citations, list):
-        clean = [re.sub(r"<[^>]+>", "", c).strip() for c in citations
-                 if "lexis" not in c.lower()]
-        us_cite = next((c for c in clean if " U.S. " in c), None)
-        citation_str = us_cite or (clean[0] if clean else "")
-    else:
-        raw = str(citations).strip()
-        citation_str = "" if "lexis" in raw.lower() else re.sub(r"<[^>]+>", "", raw).strip()
+    # Best citation (U.S. Reports > S.Ct. > Federal Reporters > others)
+    citation_str = _pick_citation(item.get("citation", []))
 
     # Year from date filed
     date_filed = item.get("dateFiled") or item.get("date_filed") or ""
@@ -805,13 +843,7 @@ class CourtListenerGUI:
         case_name = re.sub(r"<[^>]+>", "", case_name).strip()
         court = item.get("court") or item.get("court_id") or ""
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
-        citations = item.get("citation", [])
-        if isinstance(citations, list):
-            printed = [c for c in citations if "lexis" not in c.lower()]
-            us_reports = next((c for c in printed if " U.S. " in c), None)
-            citation_str = us_reports or (printed[0] if printed else "")
-        else:
-            citation_str = str(citations) if citations and "lexis" not in str(citations).lower() else ""
+        citation_str = _pick_citation(item.get("citation", []))
         status = item.get("status") or item.get("precedentialStatus") or ""
         return (case_name, court, date_filed, citation_str, status)
 
@@ -1295,8 +1327,7 @@ class CourtListenerGUI:
 
         _, item = selected
 
-        citations = item.get("citation", [])
-        citation_str = citations[0] if isinstance(citations, list) and citations else ""
+        citation_str = _pick_citation(item.get("citation", []))
         case_name = item.get("caseName") or item.get("case_name") or ""
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
         year = date_filed[:4] if date_filed else None
@@ -1764,13 +1795,7 @@ class _CitingOpinionsWindow:
         ).strip()
         court = item.get("court") or item.get("court_id") or ""
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
-        citations = item.get("citation", [])
-        if isinstance(citations, list):
-            printed = [c for c in citations if "lexis" not in c.lower()]
-            us = next((c for c in printed if " U.S. " in c), None)
-            cite_str = us or (printed[0] if printed else "")
-        else:
-            cite_str = str(citations) if citations and "lexis" not in str(citations).lower() else ""
+        cite_str = _pick_citation(item.get("citation", []))
         return (case_name, court, date_filed, cite_str, depth)
 
     # ------------------------------------------------------------------
@@ -1879,11 +1904,7 @@ class _CitingOpinionsWindow:
         if fetcher is None:
             return
 
-        citations = item.get("citation", [])
-        citation_str = (
-            citations[0] if isinstance(citations, list) and citations
-            else str(citations or "")
-        ).strip()
+        citation_str = _pick_citation(item.get("citation", []))
         case_name = re.sub(
             r"<[^>]+>",
             "",
