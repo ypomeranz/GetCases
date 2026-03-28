@@ -24,6 +24,8 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import urllib.parse
+import webbrowser
 
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -815,7 +817,7 @@ class CourtListenerGUI:
         self._show_preview(self._iid_to_idx(sel[0]))
 
     def _on_right_click(self, event: tk.Event, tree: ttk.Treeview) -> None:
-        """Right-click: print the raw API dict for the clicked row to the terminal."""
+        """Right-click: open the 'Citing Opinions' window for the clicked row."""
         iid = tree.identify_row(event.y)
         if not iid:
             return
@@ -823,10 +825,10 @@ class CourtListenerGUI:
         idx = self._iid_to_idx(iid)
         if 0 <= idx < len(self._results):
             item = self._results[idx]
-            name = item.get("caseName") or item.get("case_name") or iid
-            print(f"\n[debug] Raw API data for: {name!r}  (result index {idx})")
-            print(json.dumps(item, indent=2, default=str))
-            self._status_var.set(f"Raw API data for '{name}' printed to terminal.")
+            client = self._get_client()
+            if client is None:
+                return
+            _CitingOpinionsWindow(self.root, client, item)
 
     def _get_client(self) -> Optional[CourtListenerClient]:
         token = self._token_var.get().strip()
@@ -1387,6 +1389,460 @@ class CourtListenerGUI:
             subprocess.Popen(["open", path])
         else:
             subprocess.Popen(["xdg-open", path])
+
+
+_OP_ID_RE = re.compile(r"/opinions/(\d+)/?")
+
+
+def _extract_opinion_id(url: str) -> Optional[int]:
+    """Parse an opinion ID out of a CourtListener opinions URL."""
+    m = _OP_ID_RE.search(str(url))
+    return int(m.group(1)) if m else None
+
+
+class _CitingOpinionsWindow:
+    """
+    Popup window that lists all opinions citing a given case, sorted by
+    depth of treatment (most citations within the citing document first).
+
+    Data strategy
+    -------------
+    Phase 1 – fast display:
+        Use the search API (``cites:(cluster_id)``) to get full case data
+        (name, court, date, citation) for page 1.  Results appear
+        immediately.
+
+    Phase 2 – depth enrichment (background):
+        1. Resolve the cited case's opinion ID from its cluster.
+        2. Call ``/api/rest/v4/citations/?cited_opinion=<id>&ordering=-depth``
+           to get citing opinion IDs sorted by depth.
+        3. Match against the opinion IDs embedded in search results
+           (``result["opinions"][*]["id"]``).
+        4. Re-sort the displayed page by depth descending and populate the
+           Depth column.
+
+    If Phase 2 cannot be completed (API shape differs, etc.) the window
+    still functions normally with depth shown as "–".
+    """
+
+    _COLS = ("case_name", "court", "date_filed", "citation", "depth")
+    _COL_LABELS = {
+        "case_name": "Case Name",
+        "court":     "Court",
+        "date_filed": "Date Filed",
+        "citation":  "Citation",
+        "depth":     "Depth",
+    }
+
+    def __init__(
+        self,
+        parent: tk.Tk | tk.Toplevel,
+        client: CourtListenerClient,
+        cited_item: dict,
+    ) -> None:
+        self._parent = parent
+        self._client = client
+        self._cited_item = cited_item
+        self._cluster_id = cited_item.get("cluster_id") or cited_item.get("id")
+
+        # Pagination state
+        self._cursor_history: list[Optional[str]] = [None]   # history[0] = page 1
+        self._history_idx: int = 0                            # current position
+        self._next_cursor: Optional[str] = None
+        self._total_count: int = 0
+
+        # Current page results + depth map (opinion_id → depth)
+        self._page_results: list[dict] = []
+        self._depth_map: dict[int, int] = {}
+
+        case_name = re.sub(
+            r"<[^>]+>",
+            "",
+            cited_item.get("caseName") or cited_item.get("case_name") or "?",
+        ).strip()
+
+        self._win = tk.Toplevel(parent)
+        self._win.title(f"Citing: {case_name}")
+        self._win.geometry("950x480")
+        self._win.minsize(700, 300)
+
+        self._build_ui(case_name)
+        self._load_page()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self, case_name: str) -> None:
+        # ── status bar (top) ──────────────────────────────────────────
+        top = ttk.Frame(self._win)
+        top.pack(fill="x", padx=6, pady=(6, 0))
+        ttk.Label(top, text=f"Opinions citing:  {case_name}", font=("TkDefaultFont", 9, "italic")).pack(side="left")
+        self._status_var = tk.StringVar(value="Loading…")
+        ttk.Label(top, textvariable=self._status_var, foreground="gray").pack(side="right")
+
+        # ── treeview ─────────────────────────────────────────────────
+        tree_frame = ttk.Frame(self._win)
+        tree_frame.pack(fill="both", expand=True, padx=6, pady=4)
+
+        self._tree = ttk.Treeview(
+            tree_frame,
+            columns=self._COLS,
+            show="headings",
+            selectmode="browse",
+        )
+        for col, label in self._COL_LABELS.items():
+            self._tree.heading(col, text=label)
+        self._tree.column("case_name",  width=320, minwidth=160)
+        self._tree.column("court",      width=80,  minwidth=50,  anchor="center")
+        self._tree.column("date_filed", width=85,  minwidth=70,  anchor="center")
+        self._tree.column("citation",   width=150, minwidth=90)
+        self._tree.column("depth",      width=55,  minwidth=40,  anchor="center")
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._tree.pack(side="left", fill="both", expand=True)
+
+        self._tree.bind("<Double-1>", lambda _e: self._download_selected())
+
+        # ── bottom button bar ────────────────────────────────────────
+        bot = ttk.Frame(self._win)
+        bot.pack(fill="x", padx=6, pady=(0, 6))
+
+        self._prev_btn = ttk.Button(bot, text="◀  Prev", command=self._go_prev, state="disabled")
+        self._prev_btn.pack(side="left", padx=(0, 4))
+
+        self._page_var = tk.StringVar(value="Page 1")
+        ttk.Label(bot, textvariable=self._page_var, width=10, anchor="center").pack(side="left")
+
+        self._next_btn = ttk.Button(bot, text="Next  ▶", command=self._go_next, state="disabled")
+        self._next_btn.pack(side="left", padx=(4, 20))
+
+        self._dl_btn = ttk.Button(bot, text="Download PDF", command=self._download_selected, state="disabled")
+        self._dl_btn.pack(side="right", padx=(4, 0))
+
+        self._scholar_btn = ttk.Button(bot, text="Google Scholar", command=self._open_scholar, state="disabled")
+        self._scholar_btn.pack(side="right", padx=4)
+
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
+
+    def _page_num(self) -> int:
+        return self._history_idx + 1
+
+    def _go_next(self) -> None:
+        next_cur = self._next_cursor
+        if not next_cur:
+            return
+        # If we're at the end of history, append new cursor
+        if self._history_idx + 1 >= len(self._cursor_history):
+            self._cursor_history.append(next_cur)
+        self._history_idx += 1
+        self._load_page()
+
+    def _go_prev(self) -> None:
+        if self._history_idx <= 0:
+            return
+        self._history_idx -= 1
+        self._load_page()
+
+    def _current_cursor(self) -> Optional[str]:
+        return self._cursor_history[self._history_idx]
+
+    # ------------------------------------------------------------------
+    # Data loading  (Phase 1 – search results)
+    # ------------------------------------------------------------------
+
+    def _set_buttons_loading(self) -> None:
+        self._prev_btn.config(state="disabled")
+        self._next_btn.config(state="disabled")
+        self._dl_btn.config(state="disabled")
+        self._scholar_btn.config(state="disabled")
+
+    def _load_page(self) -> None:
+        self._set_buttons_loading()
+        self._status_var.set("Loading…")
+        cursor = self._current_cursor()
+        cluster_id = self._cluster_id
+
+        def run() -> None:
+            try:
+                if cursor:
+                    data = self._client._get_url(cursor)
+                else:
+                    data = self._client.search(
+                        f"cites:({cluster_id})",
+                        type="o",
+                        page_size=20,
+                    )
+                self._win.after(0, self._on_search_results, data)
+            except Exception as exc:
+                self._win.after(0, self._status_var.set, f"Error: {exc}")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_search_results(self, data: dict) -> None:
+        results = data.get("results", [])
+        self._total_count = data.get("count", len(results))
+        self._next_cursor = data.get("next")  # full URL for next page
+
+        # Normalise citations (strip HTML tags)
+        for item in results:
+            raw = item.get("citation")
+            if isinstance(raw, list):
+                item["citation"] = [re.sub(r"<[^>]+>", "", c).strip() for c in raw]
+            elif raw:
+                item["citation"] = re.sub(r"<[^>]+>", "", str(raw)).strip()
+
+        self._page_results = results
+
+        # Populate tree with placeholder depth
+        self._tree.delete(*self._tree.get_children())
+        for i, item in enumerate(results):
+            row = self._format_row(item, depth="")
+            self._tree.insert("", "end", iid=str(i), values=row)
+
+        page = self._page_num()
+        self._page_var.set(f"Page {page}")
+        shown = len(results)
+        total = self._total_count
+        self._status_var.set(
+            f"Page {page} · {shown} of {total:,} citing opinions"
+            if total else f"Page {page} · {shown} results"
+        )
+
+        # Update nav buttons
+        self._prev_btn.config(state="normal" if self._history_idx > 0 else "disabled")
+        self._next_btn.config(state="normal" if self._next_cursor else "disabled")
+
+        if results:
+            self._dl_btn.config(state="normal")
+            self._scholar_btn.config(state="normal")
+
+        # Kick off depth enrichment in background
+        if results:
+            threading.Thread(target=self._enrich_depth, daemon=True).start()
+
+    def _format_row(self, item: dict, depth: str | int = "") -> tuple:
+        case_name = re.sub(r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or "(unknown)").strip()
+        court = item.get("court") or item.get("court_id") or ""
+        date_filed = item.get("dateFiled") or item.get("date_filed") or ""
+        citations = item.get("citation", [])
+        if isinstance(citations, list):
+            printed = [c for c in citations if "lexis" not in c.lower()]
+            us = next((c for c in printed if " U.S. " in c), None)
+            cite_str = us or (printed[0] if printed else "")
+        else:
+            cite_str = str(citations) if citations and "lexis" not in str(citations).lower() else ""
+        return (case_name, court, date_filed, cite_str, str(depth))
+
+    # ------------------------------------------------------------------
+    # Phase 2 – depth enrichment
+    # ------------------------------------------------------------------
+
+    def _enrich_depth(self) -> None:
+        """
+        Background task: fetch citation depth for the cited opinion and
+        update the Depth column in the treeview, then re-sort by depth.
+        """
+        try:
+            # Step 1: get the opinion ID(s) for the cited cluster
+            cluster_id = self._cluster_id
+            ops_resp = self._client.list_opinions(
+                cluster=int(cluster_id),
+                fields="id",
+                page_size=5,
+            )
+            op_ids = [o["id"] for o in ops_resp.get("results", []) if o.get("id")]
+            if not op_ids:
+                return
+
+            # Step 2: fetch citations for the primary opinion, sorted by depth
+            cite_resp = self._client.list_citing_opinions(
+                cited_opinion_id=op_ids[0],
+                page_size=20,
+                fields="citing_opinion,depth",
+            )
+            # Build map: citing_opinion_id → depth
+            depth_map: dict[int, int] = {}
+            for obj in cite_resp.get("results", []):
+                op_url = obj.get("citing_opinion") or ""
+                oid = _extract_opinion_id(op_url)
+                dep = obj.get("depth")
+                if oid is not None and dep is not None:
+                    depth_map[oid] = int(dep)
+
+            if not depth_map:
+                return
+
+            # Step 3: match search results via their sub-opinion IDs
+            # Each search result has result["opinions"][*]["id"]
+            result_depths: dict[int, int] = {}  # result_index → depth
+            for i, item in enumerate(self._page_results):
+                sub_ops = item.get("opinions") or []
+                for sop in sub_ops:
+                    sop_id = sop.get("id")
+                    if sop_id and sop_id in depth_map:
+                        result_depths[i] = depth_map[sop_id]
+                        break
+
+            if not result_depths:
+                return
+
+            self._depth_map = depth_map
+            self._win.after(0, self._apply_depth, result_depths)
+
+        except Exception as exc:
+            print(f"[citing] depth enrichment failed: {exc}")
+
+    def _apply_depth(self, result_depths: dict[int, int]) -> None:
+        """Update the Depth column and re-sort the treeview by depth."""
+        # Collect (iid, depth) pairs; unmatched items get depth -1 for sort
+        rows: list[tuple[str, int]] = []
+        for iid in self._tree.get_children():
+            idx = int(iid)
+            depth = result_depths.get(idx, -1)
+            rows.append((iid, depth))
+
+        # Sort descending by depth (unmatched at bottom)
+        rows.sort(key=lambda x: x[1], reverse=True)
+
+        for pos, (iid, depth) in enumerate(rows):
+            idx = int(iid)
+            item = self._page_results[idx]
+            display_depth = str(depth) if depth >= 0 else "–"
+            new_values = self._format_row(item, depth=display_depth)
+            self._tree.item(iid, values=new_values)
+            self._tree.move(iid, "", pos)
+
+        # Update status to note depth info is live
+        cur = self._status_var.get()
+        self._status_var.set(cur.rstrip(".") + "  (sorted by depth)")
+
+    # ------------------------------------------------------------------
+    # Download
+    # ------------------------------------------------------------------
+
+    def _get_selected(self) -> Optional[dict]:
+        sel = self._tree.selection()
+        if not sel:
+            return None
+        idx = int(sel[0])
+        if 0 <= idx < len(self._page_results):
+            return self._page_results[idx]
+        return None
+
+    def _download_selected(self) -> None:
+        item = self._get_selected()
+        if not item:
+            messagebox.showinfo("No Selection", "Please select a case first.", parent=self._win)
+            return
+
+        safe_name = _build_default_filename(item)
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            initialfile=f"{safe_name}.pdf",
+            title="Save Opinion PDF",
+            parent=self._win,
+        )
+        if not save_path:
+            return
+
+        self._set_buttons_loading()
+        self._status_var.set("Resolving PDF URL…")
+
+        def run() -> None:
+            try:
+                # We need a temporary GUI proxy to reuse _resolve_pdf_url;
+                # instead we inline the minimal resolution here.
+                pdf_url = _resolve_pdf_for_item(self._client, item)
+                if not pdf_url:
+                    cluster_id = item.get("cluster_id") or item.get("id")
+                    if cluster_id:
+                        self._win.after(0, self._status_var.set, "No PDF – fetching text…")
+                        text = _assemble_case_text(self._client, item)
+                        if text.strip():
+                            txt_path = os.path.splitext(save_path)[0] + ".txt"
+                            with open(txt_path, "w", encoding="utf-8") as f:
+                                f.write(text)
+                            self._win.after(0, self._on_dl_done, txt_path, True)
+                            return
+                    self._win.after(0, self._status_var.set, "No downloadable PDF or text found.")
+                    self._win.after(0, self._restore_buttons)
+                    return
+
+                self._win.after(0, self._status_var.set, f"Downloading… {pdf_url}")
+                if "courtlistener.com" in pdf_url:
+                    resp = self._client._session.get(pdf_url, timeout=60, stream=True)
+                else:
+                    resp = _anon_session.get(pdf_url, timeout=60, stream=True)
+                resp.raise_for_status()
+                with open(save_path, "wb") as f:
+                    for chunk in resp.iter_content(8192):
+                        f.write(chunk)
+                self._win.after(0, self._on_dl_done, save_path, False)
+            except Exception as exc:
+                self._win.after(0, self._status_var.set, f"Download failed: {exc}")
+                self._win.after(0, self._restore_buttons)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_dl_done(self, path: str, is_text: bool) -> None:
+        self._restore_buttons()
+        self._status_var.set(f"Saved: {path}")
+        label = "Text Saved" if is_text else "Download Complete"
+        msg = (
+            f"Opinion text saved to:\n{path}\n\nOpen it now?"
+            if is_text else
+            f"PDF saved to:\n{path}\n\nOpen it now?"
+        )
+        if messagebox.askyesno(label, msg, parent=self._win):
+            CourtListenerGUI._open_file(path)
+
+    def _restore_buttons(self) -> None:
+        has = bool(self._page_results)
+        self._dl_btn.config(state="normal" if has else "disabled")
+        self._scholar_btn.config(state="normal" if has else "disabled")
+        self._prev_btn.config(state="normal" if self._history_idx > 0 else "disabled")
+        self._next_btn.config(state="normal" if self._next_cursor else "disabled")
+
+    # ------------------------------------------------------------------
+    # Google Scholar
+    # ------------------------------------------------------------------
+
+    def _open_scholar(self) -> None:
+        item = self._get_selected()
+        if not item:
+            messagebox.showinfo("No Selection", "Please select a case first.", parent=self._win)
+            return
+        citations = item.get("citation", [])
+        cite = (citations[0] if isinstance(citations, list) and citations else str(citations or "")).strip()
+        case_name = re.sub(r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or "").strip()
+        query = cite or case_name
+        if not query:
+            return
+        url = "https://scholar.google.com/scholar?q=" + urllib.parse.quote(query)
+        webbrowser.open(url)
+
+
+def _resolve_pdf_for_item(client: CourtListenerClient, item: dict) -> Optional[str]:
+    """
+    Minimal PDF URL resolver for use outside the main GUI class.
+    Tries local_path → download_url from the item dict only (no sub-opinion
+    walk or LOC/GovInfo logic).  The full resolver lives in
+    ``CourtListenerGUI._resolve_pdf_url``; callers that need the full
+    resolution should use that instead.
+    """
+    local = item.get("local_path") or item.get("localPath") or ""
+    if local:
+        return "https://storage.courtlistener.com/" + local.lstrip("/")
+    url = item.get("download_url") or ""
+    if url:
+        return url
+    return None
 
 
 def main() -> None:
