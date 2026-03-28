@@ -89,6 +89,207 @@ _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 # Examples: "410 F.2d 1234", "12 F. Supp. 2d 567", "100 Cal. 400"
 _CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+)\s+(\d+)")
 
+# Bluebook (21st ed.) abbreviations keyed by CourtListener court ID.
+# SCOTUS is absent intentionally — the court name is omitted for SCOTUS cites.
+_COURT_BLUEBOOK: dict[str, str] = {
+    # Federal circuits
+    "ca1":   "1st Cir.",
+    "ca2":   "2d Cir.",
+    "ca3":   "3d Cir.",
+    "ca4":   "4th Cir.",
+    "ca5":   "5th Cir.",
+    "ca6":   "6th Cir.",
+    "ca7":   "7th Cir.",
+    "ca8":   "8th Cir.",
+    "ca9":   "9th Cir.",
+    "ca10":  "10th Cir.",
+    "ca11":  "11th Cir.",
+    "cadc":  "D.C. Cir.",
+    "cafc":  "Fed. Cir.",
+    "cavet": "Vet. App.",
+    "caaf":  "C.A.A.F.",
+    # Federal district courts
+    "akd":   "D. Alaska",
+    "almd":  "M.D. Ala.",   "alnd":  "N.D. Ala.",   "alsd":  "S.D. Ala.",
+    "ared":  "E.D. Ark.",   "arwd":  "W.D. Ark.",
+    "azd":   "D. Ariz.",
+    "cacd":  "C.D. Cal.",   "caed":  "E.D. Cal.",
+    "cand":  "N.D. Cal.",   "casd":  "S.D. Cal.",
+    "cod":   "D. Colo.",
+    "ctd":   "D. Conn.",
+    "ded":   "D. Del.",
+    "dcd":   "D.D.C.",
+    "flmd":  "M.D. Fla.",   "flnd":  "N.D. Fla.",   "flsd":  "S.D. Fla.",
+    "gamd":  "M.D. Ga.",    "gand":  "N.D. Ga.",     "gasd":  "S.D. Ga.",
+    "gud":   "D. Guam",
+    "hid":   "D. Haw.",
+    "idd":   "D. Idaho",
+    "ilcd":  "C.D. Ill.",   "ilnd":  "N.D. Ill.",    "ilsd":  "S.D. Ill.",
+    "innd":  "N.D. Ind.",   "insd":  "S.D. Ind.",
+    "iand":  "N.D. Iowa",   "iasd":  "S.D. Iowa",
+    "ksd":   "D. Kan.",
+    "kyed":  "E.D. Ky.",    "kywd":  "W.D. Ky.",
+    "laed":  "E.D. La.",    "lamd":  "M.D. La.",     "lawd":  "W.D. La.",
+    "med":   "D. Me.",
+    "mdd":   "D. Md.",
+    "mad":   "D. Mass.",
+    "mied":  "E.D. Mich.",  "miwd":  "W.D. Mich.",
+    "mnd":   "D. Minn.",
+    "msnd":  "N.D. Miss.",  "mssd":  "S.D. Miss.",
+    "moed":  "E.D. Mo.",    "mowd":  "W.D. Mo.",
+    "mtd":   "D. Mont.",
+    "ned":   "D. Neb.",
+    "nvd":   "D. Nev.",
+    "nhd":   "D.N.H.",
+    "njd":   "D.N.J.",
+    "nmd":   "D.N.M.",
+    "nmid":  "D.N. Mar. I.",
+    "nyed":  "E.D.N.Y.",    "nynd":  "N.D.N.Y.",
+    "nysd":  "S.D.N.Y.",    "nywd":  "W.D.N.Y.",
+    "nced":  "E.D.N.C.",    "ncmd":  "M.D.N.C.",     "ncwd":  "W.D.N.C.",
+    "ndd":   "D.N.D.",
+    "ohnd":  "N.D. Ohio",   "ohsd":  "S.D. Ohio",
+    "oked":  "E.D. Okla.",  "oknd":  "N.D. Okla.",   "okwd":  "W.D. Okla.",
+    "ord":   "D. Or.",
+    "paed":  "E.D. Pa.",    "pamd":  "M.D. Pa.",     "pawd":  "W.D. Pa.",
+    "prd":   "D.P.R.",
+    "rid":   "D.R.I.",
+    "scd":   "D.S.C.",
+    "sdd":   "D.S.D.",
+    "tned":  "E.D. Tenn.",  "tnmd":  "M.D. Tenn.",   "tnwd":  "W.D. Tenn.",
+    "txed":  "E.D. Tex.",   "txnd":  "N.D. Tex.",
+    "txsd":  "S.D. Tex.",   "txwd":  "W.D. Tex.",
+    "utd":   "D. Utah",
+    "vtd":   "D. Vt.",
+    "vaed":  "E.D. Va.",    "vawd":  "W.D. Va.",
+    "vid":   "D.V.I.",
+    "waed":  "E.D. Wash.",  "wawd":  "W.D. Wash.",
+    "wvnd":  "N.D. W. Va.", "wvsd":  "S.D. W. Va.",
+    "wied":  "E.D. Wis.",   "wiwd":  "W.D. Wis.",
+    "wyd":   "D. Wyo.",
+    # Specialised federal courts
+    "cit":   "Ct. Int'l Trade",
+    "uscfc": "Fed. Cl.",
+    "tax":   "T.C.",
+    "bap1":  "B.A.P. 1st Cir.", "bap2": "B.A.P. 2d Cir.",
+    "bap6":  "B.A.P. 6th Cir.", "bap8": "B.A.P. 8th Cir.",
+    "bap9":  "B.A.P. 9th Cir.", "bap10": "B.A.P. 10th Cir.",
+    # State supreme courts (CourtListener IDs)
+    "ala":   "Ala.", "alactapp": "Ala. Crim. App.", "alacivapp": "Ala. Civ. App.",
+    "alaska": "Alaska",
+    "ariz":  "Ariz.", "arizctapp": "Ariz. Ct. App.",
+    "ark":   "Ark.", "arkctapp": "Ark. Ct. App.",
+    "cal":   "Cal.", "calctapp": "Cal. Ct. App.",
+    "colo":  "Colo.", "coloctapp": "Colo. App.",
+    "conn":  "Conn.", "connappct": "Conn. App.",
+    "del":   "Del.", "delsuperct": "Del. Super. Ct.",
+    "dc":    "D.C.",
+    "fla":   "Fla.", "fladistctapp": "Fla. Dist. Ct. App.",
+    "ga":    "Ga.", "gactapp": "Ga. Ct. App.",
+    "haw":   "Haw.", "hawapp": "Haw. Ct. App.",
+    "idaho": "Idaho", "idahoctapp": "Idaho Ct. App.",
+    "ill":   "Ill.", "illappct": "Ill. App. Ct.",
+    "ind":   "Ind.", "indctapp": "Ind. Ct. App.",
+    "iowa":  "Iowa", "iowactapp": "Iowa Ct. App.",
+    "kan":   "Kan.", "kanctapp": "Kan. Ct. App.",
+    "ky":    "Ky.", "kyctapp": "Ky. Ct. App.",
+    "la":    "La.", "lactapp": "La. Ct. App.",
+    "me":    "Me.",
+    "md":    "Md.", "mdctspecapp": "Md. App.",
+    "mass":  "Mass.", "massappct": "Mass. App. Ct.",
+    "mich":  "Mich.", "michctapp": "Mich. Ct. App.",
+    "minn":  "Minn.", "minnctapp": "Minn. Ct. App.",
+    "miss":  "Miss.", "missctapp": "Miss. Ct. App.",
+    "mo":    "Mo.", "moctapp": "Mo. Ct. App.",
+    "mont":  "Mont.",
+    "neb":   "Neb.", "nebctapp": "Neb. Ct. App.",
+    "nev":   "Nev.",
+    "nh":    "N.H.",
+    "nj":    "N.J.", "njsuperctappdiv": "N.J. Super. Ct. App. Div.",
+    "nm":    "N.M.", "nmctapp": "N.M. Ct. App.",
+    "ny":    "N.Y.", "nyappdiv": "N.Y. App. Div.",
+    "nc":    "N.C.", "ncctapp": "N.C. Ct. App.",
+    "nd":    "N.D.",
+    "ohio":  "Ohio", "ohioctapp": "Ohio Ct. App.",
+    "okla":  "Okla.", "oklacrimapp": "Okla. Crim. App.", "oklacivapp": "Okla. Civ. App.",
+    "or":    "Or.", "orctapp": "Or. Ct. App.",
+    "pa":    "Pa.", "pasuperct": "Pa. Super. Ct.", "pacommwct": "Pa. Commw. Ct.",
+    "ri":    "R.I.",
+    "sc":    "S.C.", "scctapp": "S.C. Ct. App.",
+    "sd":    "S.D.",
+    "tenn":  "Tenn.", "tennctapp": "Tenn. Ct. App.", "tenncrimapp": "Tenn. Crim. App.",
+    "tex":   "Tex.", "texapp": "Tex. App.",
+    "utah":  "Utah", "utahctapp": "Utah Ct. App.",
+    "vt":    "Vt.",
+    "va":    "Va.", "vactapp": "Va. Ct. App.",
+    "wash":  "Wash.", "washctapp": "Wash. Ct. App.",
+    "wva":   "W. Va.",
+    "wis":   "Wis.", "wisctapp": "Wis. Ct. App.",
+    "wyo":   "Wyo.",
+}
+
+
+def _build_default_filename(item: dict) -> str:
+    """
+    Return a sanitized default filename (without extension) for saving an opinion.
+
+    Format: ``Case Name, Reporter Cite, (Court YEAR)``
+    For SCOTUS the court abbreviation is omitted: ``Case Name, Reporter Cite, (YEAR)``
+    Falls back gracefully when citation or date are missing.
+    """
+    # Case name
+    case_name = re.sub(
+        r"<[^>]+>", "",
+        item.get("caseName") or item.get("case_name") or "opinion"
+    ).strip()
+
+    # Best citation: prefer U.S. Reports for SCOTUS, else first non-Lexis cite
+    citations = item.get("citation", [])
+    if isinstance(citations, list):
+        clean = [re.sub(r"<[^>]+>", "", c).strip() for c in citations
+                 if "lexis" not in c.lower()]
+        us_cite = next((c for c in clean if " U.S. " in c), None)
+        citation_str = us_cite or (clean[0] if clean else "")
+    else:
+        raw = str(citations).strip()
+        citation_str = "" if "lexis" in raw.lower() else re.sub(r"<[^>]+>", "", raw).strip()
+
+    # Year from date filed
+    date_filed = item.get("dateFiled") or item.get("date_filed") or ""
+    year = date_filed[:4] if len(date_filed) >= 4 else ""
+
+    # Court abbreviation (absent for SCOTUS)
+    court_id = str(item.get("court_id") or item.get("court") or "").strip().lower()
+    is_scotus = "scotus" in court_id
+    if is_scotus:
+        court_abbr = ""
+    else:
+        court_abbr = _COURT_BLUEBOOK.get(court_id, "")
+        if not court_abbr:
+            # Fall back to whatever the API gave us for the court display name
+            court_abbr = str(item.get("court") or court_id).strip()
+
+    # Build the parenthetical: (Court YEAR) or (YEAR) for SCOTUS
+    if court_abbr and year:
+        paren = f"({court_abbr} {year})"
+    elif year:
+        paren = f"({year})"
+    elif court_abbr:
+        paren = f"({court_abbr})"
+    else:
+        paren = ""
+
+    # Assemble parts, skipping empty ones
+    parts = [p for p in [case_name, citation_str, paren] if p]
+    raw_name = ", ".join(parts)
+
+    # Sanitize: keep alphanumeric, spaces, and common filename-safe punctuation
+    safe = "".join(
+        c if c.isalnum() or c in " .,()-_'" else "_"
+        for c in raw_name
+    )[:120].strip()
+    return safe
+
 
 def _us_reports_loc_url(citation: str) -> Optional[str]:
     """
@@ -776,10 +977,7 @@ class CourtListenerGUI:
 
         idx, item = selected
 
-        case_name = re.sub(r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or "opinion").strip()
-        safe_name = "".join(
-            c if c.isalnum() or c in " -_" else "_" for c in case_name
-        )[:80].strip()
+        safe_name = _build_default_filename(item)
 
         save_path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
