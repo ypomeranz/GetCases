@@ -1632,10 +1632,14 @@ class _CitingOpinionsWindow:
                 op_id = known_op_id
                 if op_id is None:
                     self._win.after(0, self._status_var.set, "Resolving opinion ID…")
-                    ops = client.list_opinions(
-                        cluster=int(cluster_id), fields="id", page_size=3
+                    cluster = client.get_cluster(
+                        int(cluster_id), fields="sub_opinions"
                     )
-                    ids = [o["id"] for o in ops.get("results", []) if o.get("id")]
+                    sub_ops = cluster.get("sub_opinions") or []
+                    # sub_opinions is a list of opinion URLs like
+                    # "https://.../opinions/12345/" — extract the first ID
+                    ids = [_extract_opinion_id(u) for u in sub_ops]
+                    ids = [i for i in ids if i is not None]
                     op_id = ids[0] if ids else None
                     self._cited_op_id = op_id   # cache for subsequent pages
 
