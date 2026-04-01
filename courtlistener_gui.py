@@ -497,7 +497,7 @@ def _assemble_case_text(client, item: dict) -> str:
     lines: list[str] = []
 
     cluster_id = item.get("cluster_id") or item.get("id")
-    print(f"[text] fetching cluster {cluster_id}")
+    # print(f"[text] fetching cluster {cluster_id}")
     cluster = client.get_cluster(
         int(cluster_id),
         fields="case_name,citations,judges,attorneys,syllabus,headnotes,sub_opinions",
@@ -549,8 +549,8 @@ def _assemble_case_text(client, item: dict) -> str:
                 {"fields": "ordering_key,type,html_with_citations,html,plain_text"},
             )
             opinions.append(op)
-        except Exception as exc:
-            print(f"[text] failed to fetch sub-opinion {url}: {exc}")
+        except Exception:
+            pass  # print(f"[text] failed to fetch sub-opinion {url}: {exc}")
 
     # Sort by ordering_key ascending; None sorts last
     opinions.sort(key=lambda o: (o.get("ordering_key") is None, o.get("ordering_key") or 0))
@@ -1065,13 +1065,13 @@ class CourtListenerGUI:
 
         def run() -> None:
             try:
-                print(f"\n[download] raw item keys: {list(item.keys())}")
-                print(f"[download] local_path   = {item.get('local_path') or item.get('localPath')!r}")
-                print(f"[download] download_url = {item.get('download_url')!r}")
-                print(f"[download] cluster_id   = {item.get('cluster_id') or item.get('id')!r}")
+                # print(f"\n[download] raw item keys: {list(item.keys())}")
+                # print(f"[download] local_path   = {item.get('local_path') or item.get('localPath')!r}")
+                # print(f"[download] download_url = {item.get('download_url')!r}")
+                # print(f"[download] cluster_id   = {item.get('cluster_id') or item.get('id')!r}")
 
                 pdf_url = self._resolve_pdf_url(client, item)
-                print(f"[download] resolved url = {pdf_url!r}")
+                # print(f"[download] resolved url = {pdf_url!r}")
 
                 if not pdf_url:
                     # Last-ditch: assemble full case text from CourtListener
@@ -1083,7 +1083,7 @@ class CourtListenerGUI:
                                 0, self._status_var.set,
                                 "No PDF found — fetching opinion text from CourtListener…"
                             )
-                            print(f"[download] no PDF found; assembling text for cluster {cluster_id}")
+                            # print(f"[download] no PDF found; assembling text for cluster {cluster_id}")
                             text = _assemble_case_text(client, item)
                             if text.strip():
                                 txt_path = os.path.splitext(save_path)[0] + ".txt"
@@ -1091,8 +1091,8 @@ class CourtListenerGUI:
                                     f.write(text)
                                 self.root.after(0, self._on_text_download_done, txt_path)
                                 return
-                        except Exception as exc:
-                            print(f"[download] text assembly failed: {exc}")
+                        except Exception:
+                            pass  # print(f"[download] text assembly failed: {exc}")
                     self.root.after(
                         0,
                         self._on_error,
@@ -1101,7 +1101,7 @@ class CourtListenerGUI:
                     return
 
                 self.root.after(0, self._status_var.set, f"Downloading… {pdf_url}")
-                print(f"[download] fetching {pdf_url}")
+                # print(f"[download] fetching {pdf_url}")
                 # Only send the CourtListener API key to CourtListener itself.
                 # Use a browser-like UA for all other hosts; government CDNs
                 # (LOC, GovInfo) reject Python's default User-Agent.
@@ -1110,7 +1110,7 @@ class CourtListenerGUI:
                 else:
                     response = _anon_session.get(pdf_url, timeout=60, stream=True)
                 ct = response.headers.get("content-type", "")
-                print(f"[download] HTTP {response.status_code}  content-type: {ct}")
+                # print(f"[download] HTTP {response.status_code}  content-type: {ct}")
                 response.raise_for_status()
 
                 with open(save_path, "wb") as f:
@@ -1153,9 +1153,9 @@ class CourtListenerGUI:
                 resp = _anon_session.head(url, timeout=10, allow_redirects=True)
                 if resp.status_code == 200:
                     return True
-                print(f"[resolve] {label} returned {resp.status_code}: {url}")
-            except Exception as exc:
-                print(f"[resolve] {label} check failed ({exc}): {url}")
+                # print(f"[resolve] {label} returned {resp.status_code}: {url}")
+            except Exception:
+                pass  # print(f"[resolve] {label} check failed ({exc}): {url}")
             return False
 
         # 0. Official US Reports PDF.
@@ -1171,16 +1171,16 @@ class CourtListenerGUI:
             loc_url = _us_reports_loc_url(us_cite)
             if loc_url:
                 if _head_ok(loc_url, "LOC US Reports"):
-                    print(f"[resolve] using LOC US Reports PDF: {loc_url}")
+                    # print(f"[resolve] using LOC US Reports PDF: {loc_url}")
                     return loc_url
             govinfo_urls = _us_reports_govinfo_url(us_cite)
             if govinfo_urls:
                 link_url, direct_url = govinfo_urls
                 if _head_ok(link_url, "GovInfo link"):
-                    print(f"[resolve] using GovInfo link URL: {link_url}")
+                    # print(f"[resolve] using GovInfo link URL: {link_url}")
                     return link_url
                 if _head_ok(direct_url, "GovInfo direct PDF"):
-                    print(f"[resolve] using GovInfo direct PDF URL: {direct_url}")
+                    # print(f"[resolve] using GovInfo direct PDF URL: {direct_url}")
                     return direct_url
 
         # 0.5. For non-SCOTUS cases try the Harvard CAP static.case.law copy
@@ -1201,15 +1201,15 @@ class CourtListenerGUI:
                     scl_url = _static_case_law_url(cite)
                     if not scl_url:
                         continue
-                    print(f"[resolve] checking static.case.law: {scl_url}")
+                    # print(f"[resolve] checking static.case.law: {scl_url}")
                     try:
                         head = _anon_session.head(scl_url, timeout=10, allow_redirects=True)
                         if head.status_code == 200:
-                            print(f"[resolve] using static.case.law PDF: {scl_url}")
+                            # print(f"[resolve] using static.case.law PDF: {scl_url}")
                             return scl_url
-                        print(f"[resolve] static.case.law returned {head.status_code} for {cite!r}")
-                    except Exception as exc:
-                        print(f"[resolve] static.case.law check failed: {exc}")
+                        # print(f"[resolve] static.case.law returned {head.status_code} for {cite!r}")
+                    except Exception:
+                        pass  # print(f"[resolve] static.case.law check failed: {exc}")
                 return None
 
             result = _try_static_case_law(cites)
@@ -1221,7 +1221,7 @@ class CourtListenerGUI:
             cluster_id_for_cites = item.get("cluster_id") or item.get("id")
             if cluster_id_for_cites:
                 try:
-                    print(f"[resolve] fetching cluster {cluster_id_for_cites} for alternate citations")
+                    # print(f"[resolve] fetching cluster {cluster_id_for_cites} for alternate citations")
                     cites_resp = client.get_cluster(int(cluster_id_for_cites), fields="citations")
                     alt_cites: list[str] = []
                     for c in (cites_resp.get("citations") or []):
@@ -1235,19 +1235,19 @@ class CourtListenerGUI:
                                 alt_cites.append(f"{vol} {rep} {page}")
                     new_cites = [c for c in alt_cites if c not in tried_cites]
                     if new_cites:
-                        print(f"[resolve] trying {len(new_cites)} alternate cite(s) from cluster")
+                        # print(f"[resolve] trying {len(new_cites)} alternate cite(s) from cluster")
                         result = _try_static_case_law(new_cites)
                         if result:
                             return result
-                except Exception as exc:
-                    print(f"[resolve] cluster cite fetch failed: {exc}")
+                except Exception:
+                    pass  # print(f"[resolve] cluster cite fetch failed: {exc}")
 
         # 1. local_path already present on the search result
         local = item.get("local_path") or item.get("localPath") or ""
         if local:
             url = storage_base + local.lstrip("/")
             if _head_ok(url, "local_path (search result)"):
-                print(f"[resolve] using local_path from search result: {local}")
+                # print(f"[resolve] using local_path from search result: {local}")
                 return url
 
         # 2. Fetch the opinion directly to get its local_path (preferred over
@@ -1257,24 +1257,24 @@ class CourtListenerGUI:
         fetched_op: Optional[dict] = None
         if opinion_id:
             try:
-                print(f"[resolve] fetching opinion {opinion_id} for local_path")
+                # print(f"[resolve] fetching opinion {opinion_id} for local_path")
                 fetched_op = client.get_opinion(int(opinion_id))
-                print(f"[resolve] opinion local_path = {fetched_op.get('local_path')!r}")
-                print(f"[resolve] opinion download_url = {fetched_op.get('download_url')!r}")
+                # print(f"[resolve] opinion local_path = {fetched_op.get('local_path')!r}")
+                # print(f"[resolve] opinion download_url = {fetched_op.get('download_url')!r}")
                 local = fetched_op.get("local_path") or ""
                 if local:
                     url = storage_base + local.lstrip("/")
                     if _head_ok(url, "local_path (opinion record)"):
-                        print(f"[resolve] using local_path from opinion record")
+                        # print(f"[resolve] using local_path from opinion record")
                         return url
-            except Exception as exc:
-                print(f"[resolve] direct opinion fetch failed: {exc}")
+            except Exception:
+                pass  # print(f"[resolve] direct opinion fetch failed: {exc}")
 
         # 3. download_url from the search result (original court source)
         url = item.get("download_url") or ""
         if url:
             if _head_ok(url, "download_url (search result)"):
-                print(f"[resolve] using download_url from search result: {url}")
+                # print(f"[resolve] using download_url from search result: {url}")
                 return url
 
         # 4. download_url from the fetched opinion record
@@ -1282,20 +1282,20 @@ class CourtListenerGUI:
             dl = fetched_op.get("download_url") or ""
             if dl:
                 if _head_ok(dl, "download_url (opinion record)"):
-                    print(f"[resolve] using download_url from opinion record: {dl}")
+                    # print(f"[resolve] using download_url from opinion record: {dl}")
                     return dl
 
         # 5. Fall back to cluster → sub_opinions walk
         cluster_id = item.get("cluster_id") or item.get("id")
         if cluster_id:
             try:
-                print(f"[resolve] fetching cluster {cluster_id}")
+                # print(f"[resolve] fetching cluster {cluster_id}")
                 cluster = client.get_cluster(int(cluster_id), fields="sub_opinions")
-                print(f"[resolve] sub_opinions = {cluster.get('sub_opinions')!r}")
+                # print(f"[resolve] sub_opinions = {cluster.get('sub_opinions')!r}")
                 for op_url in cluster.get("sub_opinions", []):
-                    print(f"[resolve] fetching sub-opinion {op_url}")
+                    # print(f"[resolve] fetching sub-opinion {op_url}")
                     op = client._get_url(op_url, {"fields": "download_url,local_path"})
-                    print(f"[resolve]   local_path={op.get('local_path')!r}  download_url={op.get('download_url')!r}")
+                    # print(f"[resolve]   local_path={op.get('local_path')!r}  download_url={op.get('download_url')!r}")
                     local = op.get("local_path") or ""
                     if local:
                         url = storage_base + local.lstrip("/")
@@ -1305,8 +1305,8 @@ class CourtListenerGUI:
                     if dl:
                         if _head_ok(dl, "download_url (sub-opinion)"):
                             return dl
-            except Exception as exc:
-                print(f"[resolve] cluster walk failed: {exc}")
+            except Exception:
+                pass  # print(f"[resolve] cluster walk failed: {exc}")
 
         return None
 
@@ -1351,10 +1351,10 @@ class CourtListenerGUI:
         def run() -> None:
             result = None
             if citation_str:
-                print(f"[scholar] trying citation: {citation_str!r}")
+                # print(f"[scholar] trying citation: {citation_str!r}")
                 result = fetcher.fetch_by_citation(citation_str)
             if result is None and case_name:
-                print(f"[scholar] falling back to case name: {case_name!r} ({year})")
+                # print(f"[scholar] falling back to case name: {case_name!r} ({year})")
                 result = fetcher.fetch_by_name(case_name, year)
 
             self.root.after(0, self._on_scholar_result, result)
