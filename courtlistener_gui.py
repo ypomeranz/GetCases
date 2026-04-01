@@ -1677,35 +1677,29 @@ class _CitingOpinionsWindow:
             except Exception:
                 return None
 
-        def start_bg_fetch(start_url: str, loaded_so_far: int, total: int) -> None:
-            """Fetch all remaining pages and append results to the treeview."""
+        _FIRST_PAGE = 20  # number of cases to detail-fetch before showing results
+
+        def start_bg_details(remaining: list[dict], loaded_so_far: int, total: int) -> None:
+            """Resolve case details for entries beyond the first page in the background."""
             def run_bg() -> None:
                 loaded = loaded_so_far
-                url: Optional[str] = start_url
-                while url and not bg_stop.is_set():
-                    try:
-                        page_data = client._get_url(url)
-                        entries = page_data.get("results", [])
-                        url = page_data.get("next")
-                        if not entries:
-                            if not url:
-                                self._win.after(
-                                    0, self._append_bg_results, [], loaded, total, True
-                                )
-                            continue
-                        with ThreadPoolExecutor(max_workers=8) as pool:
-                            raw = list(pool.map(fetch_case, entries))
-                        if bg_stop.is_set():
-                            return
-                        batch = [r for r in raw if r is not None]
-                        loaded += len(batch)
-                        is_final = not bool(url)
-                        self._win.after(
-                            0, self._append_bg_results, batch, loaded, total, is_final
-                        )
-                    except Exception:
-                        import traceback; traceback.print_exc()
-                        break
+                # Process in batches matching the API page size so UI updates
+                # progressively rather than all at once at the very end.
+                batch_size = _FIRST_PAGE
+                for start in range(0, len(remaining), batch_size):
+                    if bg_stop.is_set():
+                        return
+                    chunk = remaining[start:start + batch_size]
+                    with ThreadPoolExecutor(max_workers=8) as pool:
+                        raw = list(pool.map(fetch_case, chunk))
+                    if bg_stop.is_set():
+                        return
+                    batch = [r for r in raw if r is not None]
+                    loaded += len(batch)
+                    is_final = (start + batch_size) >= len(remaining)
+                    self._win.after(
+                        0, self._append_bg_results, batch, loaded, total, is_final
+                    )
             threading.Thread(target=run_bg, daemon=True).start()
 
         def run() -> None:
@@ -1735,27 +1729,44 @@ class _CitingOpinionsWindow:
                 if bg_stop.is_set():
                     return
 
-                # ── Step 2: fetch FIRST page only, show immediately ───
+                # ── Step 2: fetch ALL pages to get the full depth-sorted list ──
                 self._win.after(0, self._status_var.set, "Fetching citing opinions…")
-                page_data = client.list_citing_opinions(cited_opinion_id=op_id)
-                first_entries = page_data.get("results", [])
-                next_api_url: Optional[str] = page_data.get("next")
-                total_count: int = page_data.get("count", len(first_entries))
+                all_entries: list[dict] = []
+                next_api_url: Optional[str] = None
+                while True:
+                    if next_api_url:
+                        page_data = client._get_url(next_api_url)
+                    else:
+                        page_data = client.list_citing_opinions(cited_opinion_id=op_id)
+                    all_entries.extend(page_data.get("results", []))
+                    next_api_url = page_data.get("next")
+                    self._win.after(
+                        0, self._status_var.set,
+                        f"Fetched {len(all_entries)} citing opinions…",
+                    )
+                    if not next_api_url:
+                        break
+
+                all_entries.sort(key=lambda e: e.get("depth", 0), reverse=True)
+                total_count = len(all_entries)
 
                 if bg_stop.is_set():
                     return
 
-                if not first_entries:
+                if not all_entries:
                     self._win.after(0, self._on_page_ready, [], 0, None)
                     return
 
-                # ── Step 3: resolve case details for the first page ───
+                # ── Step 3: resolve case details for the top N entries ────────
+                first_page = all_entries[:_FIRST_PAGE]
+                rest = all_entries[_FIRST_PAGE:]
+
                 self._win.after(
                     0, self._status_var.set,
-                    f"Fetching details for first {len(first_entries)} cases…",
+                    f"Fetching details for top {len(first_page)} cases…",
                 )
                 with ThreadPoolExecutor(max_workers=8) as pool:
-                    raw = list(pool.map(fetch_case, first_entries))
+                    raw = list(pool.map(fetch_case, first_page))
 
                 if bg_stop.is_set():
                     return
@@ -1763,14 +1774,14 @@ class _CitingOpinionsWindow:
                 results = [r for r in raw if r is not None]
                 results.sort(key=lambda r: r.get("_depth", 0), reverse=True)
 
-                if next_api_url:
-                    # Display first batch immediately; kick off background fetch
+                if rest:
+                    # Show first batch immediately; resolve the rest in background
                     self._win.after(
                         0, self._on_first_batch_ready, results, total_count
                     )
-                    start_bg_fetch(next_api_url, len(results), total_count)
+                    start_bg_details(rest, len(results), total_count)
                 else:
-                    # All results fit in the first page – show and finish
+                    # Everything fit in the first batch
                     self._win.after(0, self._on_page_ready, results, total_count, None)
 
             except Exception as exc:
