@@ -1669,8 +1669,14 @@ class _CitingOpinionsWindow:
                     )
 
                 entries = cite_data.get("results", [])
-                total = cite_data.get("count", len(entries))
+                # opinions-cited is cursor-paginated; count may be a URL
+                # (link to the count endpoint) rather than an integer.
+                raw_count = cite_data.get("count")
+                total = raw_count if isinstance(raw_count, int) else len(entries)
                 next_url = cite_data.get("next")
+
+                # Sort by depth descending — the endpoint doesn't guarantee order
+                entries.sort(key=lambda e: e.get("depth", 0), reverse=True)
 
                 if not entries:
                     self._win.after(0, self._on_page_ready, [], total, next_url)
