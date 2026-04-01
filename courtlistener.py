@@ -456,8 +456,6 @@ class CourtListenerClient:
             return self._get_url(next_url)
         params: dict[str, Any] = {
             "cited_opinion": cited_opinion_id,
-            "ordering": ordering,
-            "fields": fields,
             "page_size": page_size,
         }
         return self._get("opinions-cited/", self._clean_params(params))
