@@ -93,12 +93,19 @@ _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 _CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+)\s+(\d+)")
 
 _CLUSTER_ID_RE = re.compile(r"/clusters/(\d+)/?")
+_COURT_ID_RE = re.compile(r"/courts/([^/]+)/?")
 
 
 def _extract_cluster_id(url: str) -> Optional[int]:
     """Parse a cluster ID out of a CourtListener clusters URL."""
     m = _CLUSTER_ID_RE.search(str(url))
     return int(m.group(1)) if m else None
+
+
+def _extract_court_id(url: str) -> str:
+    """Parse a court slug out of a CourtListener courts URL (e.g. 'scotus', 'ca9')."""
+    m = _COURT_ID_RE.search(str(url))
+    return m.group(1) if m else ""
 
 
 def _cluster_citations_to_strings(citations) -> list[str]:
@@ -1658,11 +1665,12 @@ class _CitingOpinionsWindow:
                 if cid is None:
                     return None
                 cluster_rec = client.get_cluster(
-                    int(cid), fields="case_name,citations,date_filed"
+                    int(cid), fields="case_name,citations,date_filed,court"
                 )
                 cite_strs = _cluster_citations_to_strings(
                     cluster_rec.get("citations", [])
                 )
+                court_id = _extract_court_id(str(cluster_rec.get("court", "")))
                 return {
                     "caseName":   cluster_rec.get("case_name", ""),
                     "case_name":  cluster_rec.get("case_name", ""),
@@ -1670,8 +1678,8 @@ class _CitingOpinionsWindow:
                     "dateFiled":  cluster_rec.get("date_filed", ""),
                     "date_filed": cluster_rec.get("date_filed", ""),
                     "cluster_id": cid,
-                    "court": "",
-                    "court_id": "",
+                    "court":    court_id,
+                    "court_id": court_id,
                     "_depth": entry.get("depth", 0),
                 }
             except Exception:
