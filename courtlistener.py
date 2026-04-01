@@ -106,11 +106,13 @@ class CourtListenerClient:
         """Perform a GET request and return parsed JSON."""
         url = urljoin(BASE_URL, endpoint.lstrip("/"))
         response: Response = self._session.get(url, params=params, timeout=self._timeout)
+        # print(f"[GET] {response.request.url}")
         self._raise_for_status(response)
         return response.json()
 
     def _get_url(self, url: str, params: dict[str, Any] | None = None) -> dict:
         """Perform a GET request against an absolute URL (for pagination)."""
+        # print(f"[GET] {url}")
         response: Response = self._session.get(url, params=params, timeout=self._timeout)
         self._raise_for_status(response)
         return response.json()
@@ -415,6 +417,46 @@ class CourtListenerClient:
         if extra:
             params.update(extra)
         return self._get("opinions/", self._clean_params(params))
+
+    def list_citing_opinions(
+        self,
+        *,
+        cited_opinion_id: int,
+        ordering: str = "-depth",
+        fields: str | None = None,
+        page_size: int = 20,
+        next_url: str | None = None,
+    ) -> dict:
+        """
+        Return citation objects for opinions that cite *cited_opinion_id*,
+        sorted by ``depth`` (number of times cited within that document)
+        descending by default.
+
+        Parameters
+        ----------
+        cited_opinion_id:
+            The numeric ID of the opinion being cited.
+        ordering:
+            Sort field.  ``"-depth"`` (default) puts the most thoroughly
+            citing opinions first.
+        fields:
+            Comma-separated list of fields to include in the response.
+        page_size:
+            Results per page (max 20 for cursor-paginated endpoints).
+        next_url:
+            If provided, fetch this URL directly (used for pagination).
+
+        Returns
+        -------
+        dict
+            Paginated response with ``results``, ``count``, ``next``,
+            and ``previous`` keys.  Each result contains at minimum:
+            ``citing_opinion`` (URL), ``cited_opinion`` (URL),
+            ``depth`` (int).
+        """
+        if next_url:
+            return self._get_url(next_url)
+        return self._get("opinions-cited/", {"cited_opinion": cited_opinion_id})
 
     def get_opinion_text(self, opinion_id: int) -> str:
         """
