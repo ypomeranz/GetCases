@@ -1636,108 +1636,93 @@ class _CitingOpinionsWindow:
                 op_id = known_op_id
                 if op_id is None:
                     self._win.after(0, self._status_var.set, "Resolving opinion ID…")
-                    cluster = client.get_cluster(
+                    cluster_rec = client.get_cluster(
                         int(cluster_id), fields="sub_opinions"
                     )
-                    sub_ops = cluster.get("sub_opinions") or []
-                    # sub_opinions is a list of opinion URLs like
-                    # "https://.../opinions/12345/" — extract the first ID
+                    sub_ops = cluster_rec.get("sub_opinions") or []
                     ids = [_extract_opinion_id(u) for u in sub_ops]
                     ids = [i for i in ids if i is not None]
                     op_id = ids[0] if ids else None
-                    self._cited_op_id = op_id   # cache for subsequent pages
+                    self._cited_op_id = op_id
 
-                # ── Step 2: citations page sorted by depth ─────────────
                 if op_id is None:
                     # No opinion ID found; fall back to plain search
                     self._win.after(0, self._status_var.set, "Fetching (search fallback)…")
-                    if cursor_url:
-                        data = client._get_url(cursor_url)
-                    else:
-                        data = client.search(
-                            f"cites:({cluster_id})", type="o", page_size=20
-                        )
+                    data = client.search(
+                        f"cites:({cluster_id})", type="o", page_size=20
+                    )
                     self._win.after(0, self._on_fallback_results, data)
                     return
 
-                self._win.after(0, self._status_var.set, "Fetching citations…")
-                if cursor_url:
-                    cite_data = client._get_url(cursor_url)
-                else:
-                    cite_data = client.list_citing_opinions(
-                        cited_opinion_id=op_id, page_size=20
+                # ── Step 2: fetch ALL pages from opinions-cited ────────
+                self._win.after(0, self._status_var.set, "Fetching citing opinions…")
+                all_entries: list[dict] = []
+                next_api_url: Optional[str] = None
+                while True:
+                    if next_api_url:
+                        page_data = client._get_url(next_api_url)
+                    else:
+                        page_data = client.list_citing_opinions(cited_opinion_id=op_id)
+                    all_entries.extend(page_data.get("results", []))
+                    next_api_url = page_data.get("next")
+                    self._win.after(
+                        0, self._status_var.set,
+                        f"Fetched {len(all_entries)} citing opinions…",
                     )
+                    if not next_api_url:
+                        break
 
-                entries = cite_data.get("results", [])
-                # opinions-cited is cursor-paginated; count may be a URL
-                # (link to the count endpoint) rather than an integer.
-                raw_count = cite_data.get("count")
-                total = raw_count if isinstance(raw_count, int) else len(entries)
-                next_url = cite_data.get("next")
+                # Sort all entries by depth descending
+                all_entries.sort(key=lambda e: e.get("depth", 0), reverse=True)
 
-                # Sort by depth descending — the endpoint doesn't guarantee order
-                entries.sort(key=lambda e: e.get("depth", 0), reverse=True)
-
-                if not entries:
-                    self._win.after(0, self._on_page_ready, [], total, next_url)
+                if not all_entries:
+                    self._win.after(0, self._on_page_ready, [], 0, None)
                     return
 
-                # ── Step 3: opinion URL → cluster ID (parallel) ────────
-                self._win.after(0, self._status_var.set,
-                                f"Fetching {len(entries)} case records…")
+                # ── Step 3: resolve each citing opinion → case details ─
+                self._win.after(
+                    0, self._status_var.set,
+                    f"Fetching details for {len(all_entries)} cases…",
+                )
 
-                def fetch_cluster_id(entry: dict):
+                def fetch_case(entry: dict) -> Optional[dict]:
                     op_url = str(entry.get("citing_opinion", ""))
                     citing_op_id = _extract_opinion_id(op_url)
                     if citing_op_id is None:
-                        return entry, None
+                        return None
                     try:
                         opinion = client.get_opinion(citing_op_id, fields="cluster")
                         cid = _extract_cluster_id(str(opinion.get("cluster", "")))
-                        return entry, cid
-                    except Exception:
-                        return entry, None
-
-                with ThreadPoolExecutor(max_workers=8) as pool:
-                    entry_cid = list(pool.map(fetch_cluster_id, entries))
-
-                # ── Step 4: cluster data (parallel) ───────────────────
-                def fetch_cluster(ec):
-                    entry, cid = ec
-                    if cid is None:
-                        return entry, cid, None
-                    try:
-                        cluster = client.get_cluster(
+                        if cid is None:
+                            return None
+                        cluster_rec = client.get_cluster(
                             int(cid), fields="case_name,citations,date_filed"
                         )
-                        return entry, cid, cluster
+                        cite_strs = _cluster_citations_to_strings(
+                            cluster_rec.get("citations", [])
+                        )
+                        return {
+                            "caseName":   cluster_rec.get("case_name", ""),
+                            "case_name":  cluster_rec.get("case_name", ""),
+                            "citation":   cite_strs,
+                            "dateFiled":  cluster_rec.get("date_filed", ""),
+                            "date_filed": cluster_rec.get("date_filed", ""),
+                            "cluster_id": cid,
+                            "court": "",
+                            "court_id": "",
+                            "_depth": entry.get("depth", 0),
+                        }
                     except Exception:
-                        return entry, cid, None
+                        return None
 
                 with ThreadPoolExecutor(max_workers=8) as pool:
-                    triples = list(pool.map(fetch_cluster, entry_cid))
+                    raw = list(pool.map(fetch_case, all_entries))
 
-                # ── Assemble result dicts ──────────────────────────────
-                results: list[dict] = []
-                for entry, cid, cluster in triples:
-                    if cluster is None:
-                        continue
-                    cite_strs = _cluster_citations_to_strings(
-                        cluster.get("citations", [])
-                    )
-                    results.append({
-                        "caseName":   cluster.get("case_name", ""),
-                        "case_name":  cluster.get("case_name", ""),
-                        "citation":   cite_strs,
-                        "dateFiled":  cluster.get("date_filed", ""),
-                        "date_filed": cluster.get("date_filed", ""),
-                        "cluster_id": cid,
-                        "court": "",      # would require docket fetch
-                        "court_id": "",
-                        "_depth": entry.get("depth", 0),
-                    })
+                results = [r for r in raw if r is not None]
+                # Re-sort after parallel fetch (map preserves order, but be safe)
+                results.sort(key=lambda r: r.get("_depth", 0), reverse=True)
 
-                self._win.after(0, self._on_page_ready, results, total, next_url)
+                self._win.after(0, self._on_page_ready, results, len(results), None)
 
             except Exception as exc:
                 import traceback; traceback.print_exc()

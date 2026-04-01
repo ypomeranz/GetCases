@@ -454,11 +454,7 @@ class CourtListenerClient:
         """
         if next_url:
             return self._get_url(next_url)
-        params: dict[str, Any] = {
-            "cited_opinion": cited_opinion_id,
-            "page_size": page_size,
-        }
-        return self._get("opinions-cited/", self._clean_params(params))
+        return self._get("opinions-cited/", {"cited_opinion": cited_opinion_id})
 
     def get_opinion_text(self, opinion_id: int) -> str:
         """
