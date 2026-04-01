@@ -1665,12 +1665,16 @@ class _CitingOpinionsWindow:
                 if cid is None:
                     return None
                 cluster_rec = client.get_cluster(
-                    int(cid), fields="case_name,citations,date_filed,court"
+                    int(cid), fields="case_name,citations,date_filed,docket"
                 )
                 cite_strs = _cluster_citations_to_strings(
                     cluster_rec.get("citations", [])
                 )
-                court_id = _extract_court_id(str(cluster_rec.get("court", "")))
+                court_id = ""
+                docket_url = str(cluster_rec.get("docket", ""))
+                if docket_url:
+                    docket_rec = client._get_url(docket_url, {"fields": "court"})
+                    court_id = _extract_court_id(str(docket_rec.get("court", "")))
                 return {
                     "caseName":   cluster_rec.get("case_name", ""),
                     "case_name":  cluster_rec.get("case_name", ""),
