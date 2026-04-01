@@ -1508,6 +1508,10 @@ class _CitingOpinionsWindow:
         self._total_count: int = 0
         self._page_results: list[dict] = []
 
+        # Background fetch cancellation: replaced each time _load_page() is
+        # called so any in-flight background thread knows to stop.
+        self._bg_stop = threading.Event()
+
         case_name = re.sub(
             r"<[^>]+>",
             "",
@@ -1518,6 +1522,7 @@ class _CitingOpinionsWindow:
         self._win.title(f"Citing: {case_name}")
         self._win.geometry("950x480")
         self._win.minsize(700, 300)
+        self._win.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui(case_name)
         self._load_page()
@@ -1608,6 +1613,15 @@ class _CitingOpinionsWindow:
     # Data loading  (Phase 1 – search results)
     # ------------------------------------------------------------------
 
+    def _on_close(self) -> None:
+        self._bg_stop.set()
+        self._win.destroy()
+
+    def _cancel_bg_fetch(self) -> None:
+        """Signal any running background fetch to stop and arm a fresh event."""
+        self._bg_stop.set()
+        self._bg_stop = threading.Event()
+
     def _set_buttons_loading(self) -> None:
         self._prev_btn.config(state="disabled")
         self._next_btn.config(state="disabled")
@@ -1622,13 +1636,77 @@ class _CitingOpinionsWindow:
     def _load_page(self) -> None:
         self._set_buttons_loading()
         self._status_var.set("Loading…")
-        cursor_url = self._cursor_history[self._history_idx]   # None on pg 1
+        self._cancel_bg_fetch()
+        bg_stop = self._bg_stop   # capture this run's stop-event for closures
         cluster_id = self._cluster_id
         # Re-use the cited opinion ID resolved on page 1
         known_op_id = self._cited_op_id
         client = self._app._get_client()
         if client is None:
             return
+
+        def fetch_case(entry: dict) -> Optional[dict]:
+            if bg_stop.is_set():
+                return None
+            op_url = str(entry.get("citing_opinion", ""))
+            citing_op_id = _extract_opinion_id(op_url)
+            if citing_op_id is None:
+                return None
+            try:
+                opinion = client.get_opinion(citing_op_id, fields="cluster")
+                cid = _extract_cluster_id(str(opinion.get("cluster", "")))
+                if cid is None:
+                    return None
+                cluster_rec = client.get_cluster(
+                    int(cid), fields="case_name,citations,date_filed"
+                )
+                cite_strs = _cluster_citations_to_strings(
+                    cluster_rec.get("citations", [])
+                )
+                return {
+                    "caseName":   cluster_rec.get("case_name", ""),
+                    "case_name":  cluster_rec.get("case_name", ""),
+                    "citation":   cite_strs,
+                    "dateFiled":  cluster_rec.get("date_filed", ""),
+                    "date_filed": cluster_rec.get("date_filed", ""),
+                    "cluster_id": cid,
+                    "court": "",
+                    "court_id": "",
+                    "_depth": entry.get("depth", 0),
+                }
+            except Exception:
+                return None
+
+        def start_bg_fetch(start_url: str, loaded_so_far: int, total: int) -> None:
+            """Fetch all remaining pages and append results to the treeview."""
+            def run_bg() -> None:
+                loaded = loaded_so_far
+                url: Optional[str] = start_url
+                while url and not bg_stop.is_set():
+                    try:
+                        page_data = client._get_url(url)
+                        entries = page_data.get("results", [])
+                        url = page_data.get("next")
+                        if not entries:
+                            if not url:
+                                self._win.after(
+                                    0, self._append_bg_results, [], loaded, total, True
+                                )
+                            continue
+                        with ThreadPoolExecutor(max_workers=8) as pool:
+                            raw = list(pool.map(fetch_case, entries))
+                        if bg_stop.is_set():
+                            return
+                        batch = [r for r in raw if r is not None]
+                        loaded += len(batch)
+                        is_final = not bool(url)
+                        self._win.after(
+                            0, self._append_bg_results, batch, loaded, total, is_final
+                        )
+                    except Exception:
+                        import traceback; traceback.print_exc()
+                        break
+            threading.Thread(target=run_bg, daemon=True).start()
 
         def run() -> None:
             try:
@@ -1654,75 +1732,46 @@ class _CitingOpinionsWindow:
                     self._win.after(0, self._on_fallback_results, data)
                     return
 
-                # ── Step 2: fetch ALL pages from opinions-cited ────────
+                if bg_stop.is_set():
+                    return
+
+                # ── Step 2: fetch FIRST page only, show immediately ───
                 self._win.after(0, self._status_var.set, "Fetching citing opinions…")
-                all_entries: list[dict] = []
-                next_api_url: Optional[str] = None
-                while True:
-                    if next_api_url:
-                        page_data = client._get_url(next_api_url)
-                    else:
-                        page_data = client.list_citing_opinions(cited_opinion_id=op_id)
-                    all_entries.extend(page_data.get("results", []))
-                    next_api_url = page_data.get("next")
-                    self._win.after(
-                        0, self._status_var.set,
-                        f"Fetched {len(all_entries)} citing opinions…",
-                    )
-                    if not next_api_url:
-                        break
+                page_data = client.list_citing_opinions(cited_opinion_id=op_id)
+                first_entries = page_data.get("results", [])
+                next_api_url: Optional[str] = page_data.get("next")
+                total_count: int = page_data.get("count", len(first_entries))
 
-                # Sort all entries by depth descending
-                all_entries.sort(key=lambda e: e.get("depth", 0), reverse=True)
+                if bg_stop.is_set():
+                    return
 
-                if not all_entries:
+                if not first_entries:
                     self._win.after(0, self._on_page_ready, [], 0, None)
                     return
 
-                # ── Step 3: resolve each citing opinion → case details ─
+                # ── Step 3: resolve case details for the first page ───
                 self._win.after(
                     0, self._status_var.set,
-                    f"Fetching details for {len(all_entries)} cases…",
+                    f"Fetching details for first {len(first_entries)} cases…",
                 )
-
-                def fetch_case(entry: dict) -> Optional[dict]:
-                    op_url = str(entry.get("citing_opinion", ""))
-                    citing_op_id = _extract_opinion_id(op_url)
-                    if citing_op_id is None:
-                        return None
-                    try:
-                        opinion = client.get_opinion(citing_op_id, fields="cluster")
-                        cid = _extract_cluster_id(str(opinion.get("cluster", "")))
-                        if cid is None:
-                            return None
-                        cluster_rec = client.get_cluster(
-                            int(cid), fields="case_name,citations,date_filed"
-                        )
-                        cite_strs = _cluster_citations_to_strings(
-                            cluster_rec.get("citations", [])
-                        )
-                        return {
-                            "caseName":   cluster_rec.get("case_name", ""),
-                            "case_name":  cluster_rec.get("case_name", ""),
-                            "citation":   cite_strs,
-                            "dateFiled":  cluster_rec.get("date_filed", ""),
-                            "date_filed": cluster_rec.get("date_filed", ""),
-                            "cluster_id": cid,
-                            "court": "",
-                            "court_id": "",
-                            "_depth": entry.get("depth", 0),
-                        }
-                    except Exception:
-                        return None
-
                 with ThreadPoolExecutor(max_workers=8) as pool:
-                    raw = list(pool.map(fetch_case, all_entries))
+                    raw = list(pool.map(fetch_case, first_entries))
+
+                if bg_stop.is_set():
+                    return
 
                 results = [r for r in raw if r is not None]
-                # Re-sort after parallel fetch (map preserves order, but be safe)
                 results.sort(key=lambda r: r.get("_depth", 0), reverse=True)
 
-                self._win.after(0, self._on_page_ready, results, len(results), None)
+                if next_api_url:
+                    # Display first batch immediately; kick off background fetch
+                    self._win.after(
+                        0, self._on_first_batch_ready, results, total_count
+                    )
+                    start_bg_fetch(next_api_url, len(results), total_count)
+                else:
+                    # All results fit in the first page – show and finish
+                    self._win.after(0, self._on_page_ready, results, total_count, None)
 
             except Exception as exc:
                 import traceback; traceback.print_exc()
@@ -1749,6 +1798,53 @@ class _CitingOpinionsWindow:
             self._tree.insert("", "end", iid=str(i), values=row)
 
         self._update_status_and_nav()
+
+    def _on_first_batch_ready(self, results: list[dict], total: int) -> None:
+        """Display the first page of results while more are loading in the background."""
+        self._page_results = list(results)
+        self._total_count = total
+        self._next_cursor = None
+
+        self._tree.delete(*self._tree.get_children())
+        for i, item in enumerate(results):
+            depth = item.get("_depth", 0)
+            row = self._format_row(item, depth=str(depth))
+            self._tree.insert("", "end", iid=str(i), values=row)
+
+        shown = len(results)
+        self._page_var.set(f"Page {self._page_num()}")
+        self._status_var.set(
+            f"Showing {shown:,} of {total:,} citing opinions · Loading more…"
+        )
+        self._prev_btn.config(state="normal" if self._history_idx > 0 else "disabled")
+        self._next_btn.config(state="disabled")
+        has = bool(results)
+        self._dl_btn.config(state="normal" if has else "disabled")
+        self._scholar_btn.config(state="normal" if has else "disabled")
+
+    def _append_bg_results(
+        self, batch: list[dict], loaded: int, total: int, final: bool
+    ) -> None:
+        """Append a background-fetched batch of results to the treeview."""
+        offset = len(self._page_results)
+        self._page_results.extend(batch)
+        for i, item in enumerate(batch):
+            depth = item.get("_depth", 0)
+            row = self._format_row(item, depth=str(depth))
+            self._tree.insert("", "end", iid=str(offset + i), values=row)
+
+        if final:
+            self._status_var.set(
+                f"Page {self._page_num()} · {loaded:,} of {total:,} citing opinions"
+                if total else f"Page {self._page_num()} · {loaded:,} results"
+            )
+            has = bool(self._page_results)
+            self._dl_btn.config(state="normal" if has else "disabled")
+            self._scholar_btn.config(state="normal" if has else "disabled")
+        else:
+            self._status_var.set(
+                f"Showing {loaded:,} of {total:,} citing opinions · Loading more…"
+            )
 
     def _on_fallback_results(self, data: dict) -> None:
         """Populate treeview from plain search API results (no depth)."""
