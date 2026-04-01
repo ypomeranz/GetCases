@@ -305,8 +305,8 @@ def _build_default_filename(item: dict) -> str:
     """
     Return a sanitized default filename (without extension) for saving an opinion.
 
-    Format: ``Case Name, Reporter Cite, (Court YEAR)``
-    For SCOTUS the court abbreviation is omitted: ``Case Name, Reporter Cite, (YEAR)``
+    Format: ``Case Name, Reporter Cite (Court YEAR)``
+    For SCOTUS the court abbreviation is omitted: ``Case Name, Reporter Cite (YEAR)``
     Falls back gracefully when citation or date are missing.
     """
     # Case name
@@ -343,9 +343,13 @@ def _build_default_filename(item: dict) -> str:
     else:
         paren = ""
 
-    # Assemble parts, skipping empty ones
-    parts = [p for p in [case_name, citation_str, paren] if p]
-    raw_name = ", ".join(parts)
+    # Assemble parts, skipping empty ones.
+    # Join case name + citation with a comma, then append the parenthetical
+    # with a space only (no comma before it).
+    main_parts = [p for p in [case_name, citation_str] if p]
+    raw_name = ", ".join(main_parts)
+    if paren:
+        raw_name = f"{raw_name} {paren}" if raw_name else paren
 
     # Sanitize: keep alphanumeric, spaces, and common filename-safe punctuation
     safe = "".join(
