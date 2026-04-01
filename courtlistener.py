@@ -460,7 +460,7 @@ class CourtListenerClient:
             "fields": fields,
             "page_size": page_size,
         }
-        return self._get("citations/", self._clean_params(params))
+        return self._get("opinions-cited/", self._clean_params(params))
 
     def get_opinion_text(self, opinion_id: int) -> str:
         """
