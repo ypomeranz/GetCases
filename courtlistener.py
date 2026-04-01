@@ -106,13 +106,13 @@ class CourtListenerClient:
         """Perform a GET request and return parsed JSON."""
         url = urljoin(BASE_URL, endpoint.lstrip("/"))
         response: Response = self._session.get(url, params=params, timeout=self._timeout)
-        # print(f"[GET] {response.request.url}")
+        print(f"[GET] {response.request.url}")
         self._raise_for_status(response)
         return response.json()
 
     def _get_url(self, url: str, params: dict[str, Any] | None = None) -> dict:
         """Perform a GET request against an absolute URL (for pagination)."""
-        # print(f"[GET] {url}")
+        print(f"[GET] {url}")
         response: Response = self._session.get(url, params=params, timeout=self._timeout)
         self._raise_for_status(response)
         return response.json()
