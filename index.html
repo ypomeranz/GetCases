@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CourtListener Case Law Search</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header>
+  <h1>CourtListener Case Law Search</h1>
+  <button type="button" id="settings-btn" class="ghost">Settings</button>
+</header>
+
+<section class="panel" id="search-panel">
+  <div class="row">
+    <label class="grow">
+      <span>Query</span>
+      <input type="text" id="query" placeholder='e.g. "Roe v Wade", "miranda warning", "first amendment"' autocomplete="off">
+    </label>
+    <button type="button" id="search-btn">Search</button>
+  </div>
+  <div class="row">
+    <label>
+      <span>Court</span>
+      <select id="court">
+        <option value="">(any)</option>
+        <option value="scotus">scotus</option>
+        <option value="ca1">ca1</option>
+        <option value="ca2">ca2</option>
+        <option value="ca3">ca3</option>
+        <option value="ca4">ca4</option>
+        <option value="ca5">ca5</option>
+        <option value="ca6">ca6</option>
+        <option value="ca7">ca7</option>
+        <option value="ca8">ca8</option>
+        <option value="ca9">ca9</option>
+        <option value="ca10">ca10</option>
+        <option value="ca11">ca11</option>
+        <option value="cadc">cadc</option>
+        <option value="cafc">cafc</option>
+      </select>
+    </label>
+    <label>
+      <span>Filed from</span>
+      <input type="date" id="date-from">
+    </label>
+    <label>
+      <span>to</span>
+      <input type="date" id="date-to">
+    </label>
+    <label>
+      <span>Max results</span>
+      <input type="number" id="page-size" value="20" min="5" max="20">
+    </label>
+  </div>
+</section>
+
+<section class="panel" id="results-panel">
+  <div class="results-header">
+    <h2>Results</h2>
+    <span id="status">Enter a query and click Search.</span>
+  </div>
+
+  <div class="split">
+    <div class="left">
+      <div class="table-wrap">
+        <table id="results-table" class="results">
+          <thead>
+            <tr>
+              <th data-sort="case_name">Case Name</th>
+              <th data-sort="court">Court</th>
+              <th data-sort="date_filed">Date Filed</th>
+              <th data-sort="citation">Citation</th>
+              <th data-sort="status">Status</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="orders-section">
+        <div class="orders-label">Orders (≤ 2 citations)</div>
+        <div class="table-wrap orders-wrap">
+          <table id="orders-table" class="results">
+            <thead>
+              <tr>
+                <th data-sort="case_name">Case Name</th>
+                <th data-sort="court">Court</th>
+                <th data-sort="date_filed">Date Filed</th>
+                <th data-sort="citation">Citation</th>
+                <th data-sort="status">Status</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <aside class="right">
+      <div class="preview-label">Preview</div>
+      <div id="preview" class="preview">Select a result to preview.</div>
+    </aside>
+  </div>
+
+  <div class="action-bar">
+    <div id="action-status" class="muted"></div>
+    <div class="actions">
+      <button type="button" id="cite-btn" disabled>Citing Opinions</button>
+      <button type="button" id="scholar-btn" disabled title="Opens Google Scholar in a new tab — direct scraping is blocked by the browser">Open in Scholar</button>
+      <button type="button" id="text-btn" disabled>View Text</button>
+      <button type="button" id="pdf-btn" disabled>Download PDF</button>
+    </div>
+  </div>
+</section>
+
+<dialog id="settings-dialog">
+  <form method="dialog">
+    <h3>CourtListener API Token</h3>
+    <p class="muted">
+      Get a free token at
+      <a href="https://www.courtlistener.com/sign-in/" target="_blank" rel="noopener">courtlistener.com/sign-in</a>.
+      Stored locally in your browser only.
+    </p>
+    <label>
+      <span>Token</span>
+      <input type="password" id="token-input" autocomplete="off">
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" id="token-show"> Show token
+    </label>
+    <div class="dialog-actions">
+      <button type="button" id="token-cancel">Cancel</button>
+      <button type="button" id="token-save" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="pdf-dialog">
+  <form method="dialog">
+    <h3>PDF Sources</h3>
+    <p class="muted">
+      Browsers can't pre-validate cross-origin URLs, so try them in order.
+      The first source is usually the official one.
+    </p>
+    <ul id="pdf-candidates" class="link-list"></ul>
+    <p class="muted small" id="pdf-fallback-note" hidden>
+      No direct PDF found for this case. You can still view the assembled text.
+    </p>
+    <div class="dialog-actions">
+      <button type="button" id="pdf-close" class="primary">Close</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="text-dialog">
+  <form method="dialog">
+    <h3 id="text-dialog-title">Opinion Text</h3>
+    <div id="text-meta" class="muted small"></div>
+    <pre id="text-body" class="text-body"></pre>
+    <div class="dialog-actions">
+      <button type="button" id="text-save">Save as .txt</button>
+      <button type="button" id="text-close" class="primary">Close</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="citing-dialog">
+  <form method="dialog">
+    <h3 id="citing-title">Citing Opinions</h3>
+    <div id="citing-status" class="muted small">Loading…</div>
+    <div class="table-wrap citing-wrap">
+      <table id="citing-table" class="results">
+        <thead>
+          <tr>
+            <th>Case Name</th>
+            <th>Court</th>
+            <th>Date Filed</th>
+            <th>Citation</th>
+            <th>Depth</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" id="citing-pdf" disabled>Download PDF</button>
+      <button type="button" id="citing-text" disabled>View Text</button>
+      <button type="button" id="citing-scholar" disabled>Open in Scholar</button>
+      <button type="button" id="citing-close" class="primary">Close</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>
