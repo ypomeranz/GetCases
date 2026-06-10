@@ -1431,7 +1431,7 @@ def _extract_opinion_id(url: str) -> Optional[int]:
 _TEXT_CITE_RE = re.compile(
     r"\b\d{1,4}\s+"
     r"(?:U\.\s?S\.(?!\s?C)|S\.\s?Ct\.|L\.\s?Ed\.(?:\s?2d)?|"
-    r"F\.\s?Supp\.(?:\s?[23]d)?|F\.\s?(?:2d|3d|4th)|F\.\s?App'x|Fed\.\s?Appx\.|B\.R\.|"
+    r"F\.\s?Supp\.(?:\s?[23]d)?|F\.\s?(?:2d|3d|4th)|F\.\s?App[’']x|Fed\.\s?Appx\.|B\.R\.|"
     r"A\.(?:2d|3d)?|P\.(?:2d|3d)?|N\.E\.(?:2d|3d)?|N\.W\.(?:2d)?|S\.E\.(?:2d)?|"
     r"S\.W\.(?:2d|3d)?|So\.(?:\s?[23]d)?|Cal\.\s?Rptr\.(?:\s?[23]d)?|"
     r"N\.Y\.S\.(?:2d|3d)?|Ohio\s?St\.\s?(?:2d|3d)?|Ill\.\s?2d|Wis\.\s?2d|Wn\.\s?(?:2d|App\.))"
@@ -1752,6 +1752,7 @@ class _ScholarTextWindow:
             if m.start() > pos:
                 txt.insert("end", span.text[pos:m.start()], tuple(tags))
             cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
+            cite = cite.replace("’", "'")  # straight apostrophe for the search query
             ltags = tags + ["citelink", self._new_link(("cite", cite))]
             txt.insert("end", m.group(0), tuple(ltags))
             pos = m.end()

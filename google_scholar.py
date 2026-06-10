@@ -97,6 +97,56 @@ _BLOCK_TAGS = _H_TAGS | {
 }
 _FMT_KEYS = ("italic", "bold", "underline", "small", "sup")
 
+_D_OPEN, _D_CLOSE = "“", "”"   # " "
+_S_OPEN, _S_CLOSE = "‘", "’"   # ' '
+# Characters that typically precede an opening quote: start of text,
+# whitespace, opening brackets, dashes, or another (already-curled) quote.
+_QUOTE_OPENERS = set(" \t\n\r\f([{-–—" + _D_OPEN + _S_OPEN + "'\"")
+
+
+def educate_quotes(text: str) -> str:
+    """
+    Convert straight quotes to typographic open/close quotes
+    (SmartyPants-style heuristics).
+
+    A quote is treated as opening when it follows the start of the text,
+    whitespace, an opening bracket, a dash, or another opening quote
+    (covering nested quotes like "'…'"); otherwise it closes.  A single
+    quote between/after letters is an apostrophe (don't, Jones'), and one
+    before a digit is a decade contraction ('70s).
+    """
+    out = list(text)
+    for i, ch in enumerate(text):
+        if ch == '"':
+            prev = out[i - 1] if i else ""
+            out[i] = _D_OPEN if (not prev or prev in _QUOTE_OPENERS) else _D_CLOSE
+        elif ch == "'":
+            prev = out[i - 1] if i else ""
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            if prev and prev.isalnum():
+                out[i] = _S_CLOSE      # apostrophe: don't, Jones', App'x
+            elif nxt.isdigit():
+                out[i] = _S_CLOSE      # decade contraction: '70s
+            elif (not prev or prev in _QUOTE_OPENERS) and nxt and not nxt.isspace():
+                out[i] = _S_OPEN
+            else:
+                out[i] = _S_CLOSE
+    return "".join(out)
+
+
+def _educate_block_quotes(block: "Block") -> None:
+    """Curl quotes across a whole block so pairing context survives span
+    boundaries (e.g. a quote directly before an italicized word)."""
+    full = "".join(s.text for s in block.spans)
+    fixed = educate_quotes(full)
+    if fixed == full:
+        return
+    pos = 0
+    for s in block.spans:
+        end = pos + len(s.text)
+        s.text = fixed[pos:end]
+        pos = end
+
 
 def parse_opinion_blocks(html: str) -> list[Block]:
     """
@@ -221,6 +271,8 @@ def parse_opinion_blocks(html: str) -> list[Block]:
 
     walk(root, {}, "para")
     flush("para")
+    for block in blocks:
+        _educate_block_quotes(block)
     return blocks
 
 
