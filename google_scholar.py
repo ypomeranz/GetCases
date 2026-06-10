@@ -237,7 +237,13 @@ def parse_opinion_blocks(html: str) -> list[Block]:
                         href = SCHOLAR_BASE + href
                     t = _WS_RE.sub(" ", child.get_text()).strip()
                     if t:
-                        emit(t, fmt, link=href)
+                        # Scholar nests its italics inside the anchor, which
+                        # get_text() flattens — so italicize case-name links
+                        # ourselves.  Links starting with a digit are
+                        # short-form reporter cites ("410 U. S., at 154"),
+                        # which stay roman.
+                        link_fmt = fmt if t[:1].isdigit() else {**fmt, "italic": True}
+                        emit(t, link_fmt, link=href)
                     continue
                 walk(child, fmt, kind)  # footnote anchors etc. → plain text
                 continue

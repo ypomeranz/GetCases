@@ -1456,11 +1456,12 @@ def _rtf_escape(s: str) -> str:
     return "".join(out)
 
 
-# Color table indices: 1 = star-pagination marker, 2 = citation links
+# Color table index 1 = star-pagination marker.  Citation links stay black
+# in copied/exported text; the blue is only an on-screen affordance.
 _RTF_HEADER = (
     "{\\rtf1\\ansi\\deff0"
     "{\\fonttbl{\\f0\\froman Times New Roman;}}"
-    "{\\colortbl ;\\red142\\green68\\blue173;\\red26\\green86\\blue176;}"
+    "{\\colortbl ;\\red142\\green68\\blue173;}"
     "\\f0\\fs22\n"
 )
 
@@ -1487,8 +1488,6 @@ def _run_to_rtf(seg: str, active: set[str]) -> str:
         codes.append("\\ul")
     if "pagenum" in active:
         codes.append("\\cf1\\b")
-    elif "citelink" in active:
-        codes.append("\\cf2")
     esc = _rtf_escape(seg)
     return "{" + "".join(codes) + " " + esc + "}" if codes else esc
 
