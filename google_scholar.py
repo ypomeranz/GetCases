@@ -205,12 +205,12 @@ def parse_opinion_blocks(html: str) -> list[Block]:
             blocks.append(Block(kind=kind, spans=cur))
         cur = []
 
-    def walk(node: Tag, fmt: dict, kind: str) -> None:
+    def walk(node: Tag, fmt: dict, kind: str, link: str = "") -> None:
         for child in node.children:
             if isinstance(child, Comment):
                 continue
             if isinstance(child, NavigableString):
-                emit(str(child), fmt)
+                emit(str(child), fmt, link=link)
                 continue
             if not isinstance(child, Tag):
                 continue
@@ -235,17 +235,11 @@ def parse_opinion_blocks(html: str) -> list[Block]:
                 if "scholar_case" in href:
                     if href.startswith("/"):
                         href = SCHOLAR_BASE + href
-                    t = _WS_RE.sub(" ", child.get_text()).strip()
-                    if t:
-                        # Scholar nests its italics inside the anchor, which
-                        # get_text() flattens — so italicize case-name links
-                        # ourselves.  Links starting with a digit are
-                        # short-form reporter cites ("410 U. S., at 154"),
-                        # which stay roman.
-                        link_fmt = fmt if t[:1].isdigit() else {**fmt, "italic": True}
-                        emit(t, link_fmt, link=href)
+                    # Recurse so the markup inside the anchor (Scholar nests
+                    # its italics inside the link) is preserved verbatim.
+                    walk(child, fmt, kind, link=href)
                     continue
-                walk(child, fmt, kind)  # footnote anchors etc. → plain text
+                walk(child, fmt, kind, link=link)  # footnote anchors etc.
                 continue
             if name in _BLOCK_TAGS:
                 flush(kind)
@@ -259,21 +253,21 @@ def parse_opinion_blocks(html: str) -> list[Block]:
                     child_fmt = {**fmt, "bold": True}
                 else:
                     child_kind = kind
-                walk(child, child_fmt, child_kind)
+                walk(child, child_fmt, child_kind, link=link)
                 flush(child_kind)
                 continue
             if name in ("i", "em", "cite"):
-                walk(child, {**fmt, "italic": True}, kind)
+                walk(child, {**fmt, "italic": True}, kind, link=link)
             elif name in ("b", "strong"):
-                walk(child, {**fmt, "bold": True}, kind)
+                walk(child, {**fmt, "bold": True}, kind, link=link)
             elif name == "u":
-                walk(child, {**fmt, "underline": True}, kind)
+                walk(child, {**fmt, "underline": True}, kind, link=link)
             elif name == "small":
-                walk(child, {**fmt, "small": True}, kind)
+                walk(child, {**fmt, "small": True}, kind, link=link)
             elif name in ("sup", "sub"):
-                walk(child, {**fmt, "sup": True}, kind)
+                walk(child, {**fmt, "sup": True}, kind, link=link)
             else:
-                walk(child, fmt, kind)
+                walk(child, fmt, kind, link=link)
 
     walk(root, {}, "para")
     flush("para")
