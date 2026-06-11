@@ -29,12 +29,17 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 from typing import Optional
 
 import requests as _requests
 
-from courtlistener import COURTS, CourtListenerClient, CourtListenerError
+from courtlistener import CourtListenerClient, CourtListenerError
+from court_catalog import (
+    CATALOG as _COURT_CATALOG,
+    COURT_BLUEBOOK as _COURT_BLUEBOOK,
+    all_court_ids as _all_court_ids,
+)
 
 _CONFIG_PATH = Path.home() / ".config" / "courtlistener" / "config.json"
 
@@ -168,144 +173,6 @@ def _pick_citation(citations) -> str:
 
     return pool[0] if pool else ""
 
-# Bluebook (21st ed.) abbreviations keyed by CourtListener court ID.
-# SCOTUS is absent intentionally — the court name is omitted for SCOTUS cites.
-_COURT_BLUEBOOK: dict[str, str] = {
-    # Federal circuits
-    "ca1":   "1st Cir.",
-    "ca2":   "2d Cir.",
-    "ca3":   "3d Cir.",
-    "ca4":   "4th Cir.",
-    "ca5":   "5th Cir.",
-    "ca6":   "6th Cir.",
-    "ca7":   "7th Cir.",
-    "ca8":   "8th Cir.",
-    "ca9":   "9th Cir.",
-    "ca10":  "10th Cir.",
-    "ca11":  "11th Cir.",
-    "cadc":  "D.C. Cir.",
-    "cafc":  "Fed. Cir.",
-    "cavet": "Vet. App.",
-    "caaf":  "C.A.A.F.",
-    # Federal district courts
-    "akd":   "D. Alaska",
-    "almd":  "M.D. Ala.",   "alnd":  "N.D. Ala.",   "alsd":  "S.D. Ala.",
-    "ared":  "E.D. Ark.",   "arwd":  "W.D. Ark.",
-    "azd":   "D. Ariz.",
-    "cacd":  "C.D. Cal.",   "caed":  "E.D. Cal.",
-    "cand":  "N.D. Cal.",   "casd":  "S.D. Cal.",
-    "cod":   "D. Colo.",
-    "ctd":   "D. Conn.",
-    "ded":   "D. Del.",
-    "dcd":   "D.D.C.",
-    "flmd":  "M.D. Fla.",   "flnd":  "N.D. Fla.",   "flsd":  "S.D. Fla.",
-    "gamd":  "M.D. Ga.",    "gand":  "N.D. Ga.",     "gasd":  "S.D. Ga.",
-    "gud":   "D. Guam",
-    "hid":   "D. Haw.",
-    "idd":   "D. Idaho",
-    "ilcd":  "C.D. Ill.",   "ilnd":  "N.D. Ill.",    "ilsd":  "S.D. Ill.",
-    "innd":  "N.D. Ind.",   "insd":  "S.D. Ind.",
-    "iand":  "N.D. Iowa",   "iasd":  "S.D. Iowa",
-    "ksd":   "D. Kan.",
-    "kyed":  "E.D. Ky.",    "kywd":  "W.D. Ky.",
-    "laed":  "E.D. La.",    "lamd":  "M.D. La.",     "lawd":  "W.D. La.",
-    "med":   "D. Me.",
-    "mdd":   "D. Md.",
-    "mad":   "D. Mass.",
-    "mied":  "E.D. Mich.",  "miwd":  "W.D. Mich.",
-    "mnd":   "D. Minn.",
-    "msnd":  "N.D. Miss.",  "mssd":  "S.D. Miss.",
-    "moed":  "E.D. Mo.",    "mowd":  "W.D. Mo.",
-    "mtd":   "D. Mont.",
-    "ned":   "D. Neb.",
-    "nvd":   "D. Nev.",
-    "nhd":   "D.N.H.",
-    "njd":   "D.N.J.",
-    "nmd":   "D.N.M.",
-    "nmid":  "D.N. Mar. I.",
-    "nyed":  "E.D.N.Y.",    "nynd":  "N.D.N.Y.",
-    "nysd":  "S.D.N.Y.",    "nywd":  "W.D.N.Y.",
-    "nced":  "E.D.N.C.",    "ncmd":  "M.D.N.C.",     "ncwd":  "W.D.N.C.",
-    "ndd":   "D.N.D.",
-    "ohnd":  "N.D. Ohio",   "ohsd":  "S.D. Ohio",
-    "oked":  "E.D. Okla.",  "oknd":  "N.D. Okla.",   "okwd":  "W.D. Okla.",
-    "ord":   "D. Or.",
-    "paed":  "E.D. Pa.",    "pamd":  "M.D. Pa.",     "pawd":  "W.D. Pa.",
-    "prd":   "D.P.R.",
-    "rid":   "D.R.I.",
-    "scd":   "D.S.C.",
-    "sdd":   "D.S.D.",
-    "tned":  "E.D. Tenn.",  "tnmd":  "M.D. Tenn.",   "tnwd":  "W.D. Tenn.",
-    "txed":  "E.D. Tex.",   "txnd":  "N.D. Tex.",
-    "txsd":  "S.D. Tex.",   "txwd":  "W.D. Tex.",
-    "utd":   "D. Utah",
-    "vtd":   "D. Vt.",
-    "vaed":  "E.D. Va.",    "vawd":  "W.D. Va.",
-    "vid":   "D.V.I.",
-    "waed":  "E.D. Wash.",  "wawd":  "W.D. Wash.",
-    "wvnd":  "N.D. W. Va.", "wvsd":  "S.D. W. Va.",
-    "wied":  "E.D. Wis.",   "wiwd":  "W.D. Wis.",
-    "wyd":   "D. Wyo.",
-    # Specialised federal courts
-    "cit":   "Ct. Int'l Trade",
-    "uscfc": "Fed. Cl.",
-    "tax":   "T.C.",
-    "bap1":  "B.A.P. 1st Cir.", "bap2": "B.A.P. 2d Cir.",
-    "bap6":  "B.A.P. 6th Cir.", "bap8": "B.A.P. 8th Cir.",
-    "bap9":  "B.A.P. 9th Cir.", "bap10": "B.A.P. 10th Cir.",
-    # State supreme courts (CourtListener IDs)
-    "ala":   "Ala.", "alactapp": "Ala. Crim. App.", "alacivapp": "Ala. Civ. App.",
-    "alaska": "Alaska",
-    "ariz":  "Ariz.", "arizctapp": "Ariz. Ct. App.",
-    "ark":   "Ark.", "arkctapp": "Ark. Ct. App.",
-    "cal":   "Cal.", "calctapp": "Cal. Ct. App.",
-    "colo":  "Colo.", "coloctapp": "Colo. App.",
-    "conn":  "Conn.", "connappct": "Conn. App.",
-    "del":   "Del.", "delsuperct": "Del. Super. Ct.",
-    "dc":    "D.C.",
-    "fla":   "Fla.", "fladistctapp": "Fla. Dist. Ct. App.",
-    "ga":    "Ga.", "gactapp": "Ga. Ct. App.",
-    "haw":   "Haw.", "hawapp": "Haw. Ct. App.",
-    "idaho": "Idaho", "idahoctapp": "Idaho Ct. App.",
-    "ill":   "Ill.", "illappct": "Ill. App. Ct.",
-    "ind":   "Ind.", "indctapp": "Ind. Ct. App.",
-    "iowa":  "Iowa", "iowactapp": "Iowa Ct. App.",
-    "kan":   "Kan.", "kanctapp": "Kan. Ct. App.",
-    "ky":    "Ky.", "kyctapp": "Ky. Ct. App.",
-    "la":    "La.", "lactapp": "La. Ct. App.",
-    "me":    "Me.",
-    "md":    "Md.", "mdctspecapp": "Md. App.",
-    "mass":  "Mass.", "massappct": "Mass. App. Ct.",
-    "mich":  "Mich.", "michctapp": "Mich. Ct. App.",
-    "minn":  "Minn.", "minnctapp": "Minn. Ct. App.",
-    "miss":  "Miss.", "missctapp": "Miss. Ct. App.",
-    "mo":    "Mo.", "moctapp": "Mo. Ct. App.",
-    "mont":  "Mont.",
-    "neb":   "Neb.", "nebctapp": "Neb. Ct. App.",
-    "nev":   "Nev.",
-    "nh":    "N.H.",
-    "nj":    "N.J.", "njsuperctappdiv": "N.J. Super. Ct. App. Div.",
-    "nm":    "N.M.", "nmctapp": "N.M. Ct. App.",
-    "ny":    "N.Y.", "nyappdiv": "N.Y. App. Div.",
-    "nc":    "N.C.", "ncctapp": "N.C. Ct. App.",
-    "nd":    "N.D.",
-    "ohio":  "Ohio", "ohioctapp": "Ohio Ct. App.",
-    "okla":  "Okla.", "oklacrimapp": "Okla. Crim. App.", "oklacivapp": "Okla. Civ. App.",
-    "or":    "Or.", "orctapp": "Or. Ct. App.",
-    "pa":    "Pa.", "pasuperct": "Pa. Super. Ct.", "pacommwct": "Pa. Commw. Ct.",
-    "ri":    "R.I.",
-    "sc":    "S.C.", "scctapp": "S.C. Ct. App.",
-    "sd":    "S.D.",
-    "tenn":  "Tenn.", "tennctapp": "Tenn. Ct. App.", "tenncrimapp": "Tenn. Crim. App.",
-    "tex":   "Tex.", "texapp": "Tex. App.",
-    "utah":  "Utah", "utahctapp": "Utah Ct. App.",
-    "vt":    "Vt.",
-    "va":    "Va.", "vactapp": "Va. Ct. App.",
-    "wash":  "Wash.", "washctapp": "Wash. Ct. App.",
-    "wva":   "W. Va.",
-    "wis":   "Wis.", "wisctapp": "Wis. Ct. App.",
-    "wyo":   "Wyo.",
-}
 
 
 def _build_default_filename(item: dict) -> str:
@@ -574,7 +441,13 @@ def _assemble_case_text(client, item: dict) -> str:
 
 
 try:
-    from google_scholar import GoogleScholarFetcher
+    from google_scholar import (
+        GoogleScholarFetcher,
+        blocks_to_text,
+        parse_opinion_blocks,
+        segment_blocks,
+        text_similarity,
+    )
 
     _SCHOLAR_AVAILABLE = True
 except ImportError:
@@ -590,6 +463,8 @@ class CourtListenerGUI:
 
         self._client: Optional[CourtListenerClient] = None
         self._results: list[dict] = []
+        self._scholar_results: list = []  # ScholarResult objects
+        self._selected_courts: set[str] = set()  # empty = all courts
         self._search_thread: Optional[threading.Thread] = None
         self._scholar: Optional["GoogleScholarFetcher"] = None
 
@@ -636,16 +511,12 @@ class CourtListenerGUI:
         row2 = ttk.Frame(search_frame)
         row2.pack(fill="x")
 
-        ttk.Label(row2, text="Court:").pack(side="left")
-        self._court_var = tk.StringVar(value="(any)")
-        court_choices = ["(any)"] + sorted(COURTS.keys())
-        ttk.Combobox(
+        self._courts_btn_var = tk.StringVar(value="Courts: All ▾")
+        ttk.Button(
             row2,
-            textvariable=self._court_var,
-            values=court_choices,
-            width=10,
-            state="readonly",
-        ).pack(side="left", padx=(4, 12))
+            textvariable=self._courts_btn_var,
+            command=self._show_court_picker,
+        ).pack(side="left", padx=(0, 12))
 
         ttk.Label(row2, text="Filed from:").pack(side="left")
         self._date_from_var = tk.StringVar()
@@ -696,12 +567,32 @@ class CourtListenerGUI:
             side="left", fill="x", expand=True
         )
 
+        # --- Compact preview strip, spans the full width above the status bar
+        preview_frame = ttk.LabelFrame(results_frame, text="Preview", padding=2)
+        preview_frame.pack(side="bottom", fill="x", pady=(4, 0))
+        self._preview_text = tk.Text(
+            preview_frame,
+            wrap="word",
+            height=4,
+            state="disabled",
+            font=("TkDefaultFont", 9),
+            relief="flat",
+            background="#f5f5f5",
+        )
+        self._preview_text.pack(fill="x", expand=True)
+
         paned = ttk.PanedWindow(results_frame, orient="horizontal")
         paned.pack(fill="both", expand=True)
 
-        # -- Left pane: main results tree + orders tree --
+        # -- Left pane: CourtListener results (main tree + orders tree) --
         left_frame = ttk.Frame(paned)
         paned.add(left_frame, weight=3)
+        ttk.Label(
+            left_frame,
+            text="CourtListener",
+            foreground="gray",
+            font=("TkDefaultFont", 9, "italic"),
+        ).pack(anchor="w")
 
         cols = ("case_name", "court", "date_filed", "citation", "status")
 
@@ -746,26 +637,46 @@ class CourtListenerGUI:
         )
         self._orders_tree.bind("<Button-3>", lambda e: self._on_right_click(e, self._orders_tree))
 
-        # -- Right pane: preview panel (narrow — user can drag sash to resize) --
-        right_frame = ttk.LabelFrame(paned, text="Preview", padding=4, width=160)
-        paned.add(right_frame, weight=1)
+        # -- Right pane: Google Scholar results --
+        scholar_pane = ttk.Frame(paned)
+        paned.add(scholar_pane, weight=2)
+        sch_header = ttk.Frame(scholar_pane)
+        sch_header.pack(fill="x")
+        ttk.Label(
+            sch_header,
+            text="Google Scholar",
+            foreground="gray",
+            font=("TkDefaultFont", 9, "italic"),
+        ).pack(side="left")
+        self._scholar_status_var = tk.StringVar(value="")
+        ttk.Label(
+            sch_header, textvariable=self._scholar_status_var, foreground="gray"
+        ).pack(side="right")
 
-        preview_inner = ttk.Frame(right_frame)
-        preview_inner.pack(fill="both", expand=True)
-        self._preview_text = tk.Text(
-            preview_inner,
-            wrap="word",
-            state="disabled",
-            font=("TkDefaultFont", 9),
-            relief="flat",
-            background="#f5f5f5",
+        sch_tree_frame = ttk.Frame(scholar_pane)
+        sch_tree_frame.pack(fill="both", expand=True)
+        self._scholar_tree = ttk.Treeview(
+            sch_tree_frame,
+            columns=("case", "source"),
+            show="headings",
+            selectmode="browse",
         )
-        preview_vsb = ttk.Scrollbar(
-            preview_inner, orient="vertical", command=self._preview_text.yview
+        self._scholar_tree.heading("case", text="Case")
+        self._scholar_tree.heading("source", text="Court / Year")
+        self._scholar_tree.column("case", width=250, minwidth=120)
+        self._scholar_tree.column("source", width=140, minwidth=80)
+        svsb = ttk.Scrollbar(
+            sch_tree_frame, orient="vertical", command=self._scholar_tree.yview
         )
-        self._preview_text.configure(yscrollcommand=preview_vsb.set)
-        preview_vsb.pack(side="right", fill="y")
-        self._preview_text.pack(side="left", fill="both", expand=True)
+        self._scholar_tree.configure(yscrollcommand=svsb.set)
+        self._scholar_tree.pack(side="left", fill="both", expand=True)
+        svsb.pack(side="right", fill="y")
+        self._scholar_tree.bind(
+            "<<TreeviewSelect>>", lambda _e: self._on_scholar_row_select()
+        )
+        self._scholar_tree.bind(
+            "<Double-1>", lambda _e: self._open_selected_scholar_result()
+        )
 
 
     # ------------------------------------------------------------------
@@ -806,6 +717,27 @@ class CourtListenerGUI:
         ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(
             side="right", padx=4
         )
+
+    # ------------------------------------------------------------------
+    # Court picker
+    # ------------------------------------------------------------------
+
+    def _show_court_picker(self) -> None:
+        _CourtPickerDialog(self.root, self._selected_courts, self._on_courts_applied)
+
+    def _on_courts_applied(self, selected: set[str]) -> None:
+        # Selecting everything is the same as no filter
+        if selected >= _all_court_ids():
+            selected = set()
+        self._selected_courts = selected
+        if not selected:
+            self._courts_btn_var.set("Courts: All ▾")
+        elif len(selected) == 1:
+            cid = next(iter(selected))
+            label = "SCOTUS" if cid == "scotus" else _COURT_BLUEBOOK.get(cid, cid)
+            self._courts_btn_var.set(f"Courts: {label} ▾")
+        else:
+            self._courts_btn_var.set(f"Courts: {len(selected)} selected ▾")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -875,13 +807,37 @@ class CourtListenerGUI:
         sel = source_tree.selection()
         if not sel:
             return
-        # Deselect the other tree so only one row is ever active
+        # Deselect the other trees so only one row is ever active
         other = self._orders_tree if source_tree is self._tree else self._tree
         if other.selection():
             other.selection_remove(*other.selection())
+        if self._scholar_tree.selection():
+            self._scholar_tree.selection_remove(*self._scholar_tree.selection())
         self._download_btn.config(state="normal")
         self._scholar_btn.config(state="normal")
         self._show_preview(self._iid_to_idx(sel[0]))
+
+    def _on_scholar_row_select(self) -> None:
+        sel = self._scholar_tree.selection()
+        if not sel:
+            return
+        for tree in (self._tree, self._orders_tree):
+            if tree.selection():
+                tree.selection_remove(*tree.selection())
+        self._download_btn.config(state="disabled")  # no CourtListener record
+        self._scholar_btn.config(state="normal")
+        idx = int(sel[0])
+        if 0 <= idx < len(self._scholar_results):
+            r = self._scholar_results[idx]
+            self._set_preview(r.snippet or "(no snippet on the results page)")
+
+    def _selected_scholar_result(self):
+        sel = self._scholar_tree.selection()
+        if sel:
+            idx = int(sel[0])
+            if 0 <= idx < len(self._scholar_results):
+                return self._scholar_results[idx]
+        return None
 
     def _on_right_click(self, event: tk.Event, tree: ttk.Treeview) -> None:
         """Right-click: open the 'Citing Opinions' window for the clicked row."""
@@ -927,9 +883,8 @@ class CourtListenerGUI:
             messagebox.showwarning("Empty Query", "Please enter a search query.")
             return
 
-        court = self._court_var.get()
-        if court == "(any)":
-            court = None
+        # CourtListener accepts space-separated court IDs; empty set = all
+        court = " ".join(sorted(self._selected_courts)) or None
         date_from = self._date_from_var.get().strip() or None
         date_to = self._date_to_var.get().strip() or None
         page_size = self._page_size_var.get()
@@ -943,11 +898,31 @@ class CourtListenerGUI:
             self._tree.delete(row)
         for row in self._orders_tree.get_children():
             self._orders_tree.delete(row)
+        for row in self._scholar_tree.get_children():
+            self._scholar_tree.delete(row)
         self._results.clear()
+        self._scholar_results = []
         self._preview_cache.clear()
-        self._preview_text.config(state="normal")
-        self._preview_text.delete("1.0", "end")
-        self._preview_text.config(state="disabled")
+        self._set_preview("")
+
+        # Google Scholar search runs in parallel with the CourtListener one
+        if _SCHOLAR_AVAILABLE:
+            if self._scholar is None:
+                self._scholar = GoogleScholarFetcher()
+            fetcher = self._scholar
+            self._scholar_status_var.set("Searching…")
+
+            def scholar_run() -> None:
+                try:
+                    res = fetcher.search_cases(query, limit=15)
+                except Exception as exc:
+                    print(f"[scholar] search failed: {exc}")
+                    res = []
+                self.root.after(0, self._on_scholar_search_results, res)
+
+            threading.Thread(target=scholar_run, daemon=True).start()
+        else:
+            self._scholar_status_var.set("(needs beautifulsoup4)")
 
         def run() -> None:
             try:
@@ -1015,16 +990,18 @@ class CourtListenerGUI:
         else:
             self._status_var.set("No results found.")
 
-    def _show_preview(self, idx: int) -> None:
-        """Populate the right-hand preview panel for result at *idx*."""
+    def _set_preview(self, text: str) -> None:
         self._preview_text.config(state="normal")
         self._preview_text.delete("1.0", "end")
-        text = self._preview_cache.get(idx, "")
-        self._preview_text.insert(
-            "1.0",
-            text if text else "(No preview available — download PDF for full opinion)",
-        )
+        self._preview_text.insert("1.0", text)
         self._preview_text.config(state="disabled")
+
+    def _show_preview(self, idx: int) -> None:
+        """Populate the preview strip for CourtListener result at *idx*."""
+        text = self._preview_cache.get(idx, "")
+        self._set_preview(
+            text if text else "(No preview available — download PDF for full opinion)"
+        )
 
     def _on_error(self, message: str) -> None:
         self._search_btn.config(state="normal")
@@ -1326,7 +1303,43 @@ class CourtListenerGUI:
             self._scholar = GoogleScholarFetcher()
         return self._scholar
 
+    def _on_scholar_search_results(self, results: list) -> None:
+        self._scholar_results = results
+        for row in self._scholar_tree.get_children():
+            self._scholar_tree.delete(row)
+        for i, r in enumerate(results):
+            self._scholar_tree.insert("", "end", iid=str(i), values=(r.title, r.source))
+        self._scholar_status_var.set(
+            f"{len(results)} results" if results else "no results (blocked?)"
+        )
+
+    def _open_selected_scholar_result(self) -> None:
+        r = self._selected_scholar_result()
+        if r is not None:
+            self._open_scholar_url(r.url)
+
+    def _open_scholar_url(self, url: str) -> None:
+        """Open a Scholar case page (from the Scholar results column)."""
+        fetcher = self._get_scholar()
+        if fetcher is None:
+            return
+        self._status_var.set("Fetching opinion from Google Scholar…")
+
+        def run() -> None:
+            result = fetcher.fetch_by_url(url)
+            self.root.after(
+                0, self._on_scholar_result, result, None, None,
+                "opened from Scholar search",
+            )
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _fetch_scholar_text(self) -> None:
+        # A row in the Scholar results column: open it directly, unverified.
+        if self._selected_scholar_result() is not None:
+            self._open_selected_scholar_result()
+            return
+
         selected = self._get_selected_item()
         if not selected:
             messagebox.showinfo("No Selection", "Please select a case first.")
@@ -1335,50 +1348,57 @@ class CourtListenerGUI:
         fetcher = self._get_scholar()
         if fetcher is None:
             return
-
+        client = self._get_client()
         _, item = selected
-
-        citation_str = _pick_citation(item.get("citation", []))
-        case_name = item.get("caseName") or item.get("case_name") or ""
-        date_filed = item.get("dateFiled") or item.get("date_filed") or ""
-        year = date_filed[:4] if date_filed else None
 
         self._download_btn.config(state="disabled")
         self._scholar_btn.config(state="disabled")
         self._search_btn.config(state="disabled")
         self._status_var.set("Searching Google Scholar…")
 
-        def run() -> None:
-            result = None
-            if citation_str:
-                print(f"[scholar] trying citation: {citation_str!r}")
-                result = fetcher.fetch_by_citation(citation_str)
-            if result is None and case_name:
-                print(f"[scholar] falling back to case name: {case_name!r} ({year})")
-                result = fetcher.fetch_by_name(case_name, year)
+        def status_cb(msg: str) -> None:
+            self.root.after(0, self._status_var.set, msg)
 
-            self.root.after(0, self._on_scholar_result, result)
+        def run() -> None:
+            try:
+                result, cl_text, note = _find_scholar_for_item(
+                    client, fetcher, item, status_cb
+                )
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                result, cl_text, note = None, None, str(exc)
+            self.root.after(0, self._on_scholar_result, result, item, cl_text, note)
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _on_scholar_result(self, result: Optional[tuple[str, str]]) -> None:
+    def _on_scholar_result(
+        self,
+        result: Optional[tuple[str, str]],
+        item: Optional[dict] = None,
+        cl_text: Optional[str] = None,
+        note: str = "",
+    ) -> None:
         self._restore_buttons()
         if result is None:
-            self._status_var.set("Google Scholar: no text found.")
+            self._status_var.set("Google Scholar text unavailable.")
             messagebox.showwarning(
-                "Scholar Not Found",
-                "Could not find this opinion on Google Scholar.\n\n"
-                "Google may have blocked the request, or the case may not be indexed.\n"
-                "Check the terminal for details.",
+                "Scholar Text Unavailable",
+                "Could not find a Google Scholar opinion matching this case.\n\n"
+                + (f"({note})\n\n" if note else "")
+                + "Google may have blocked the request, the case may not be "
+                "indexed, or every candidate differed too much from the "
+                "CourtListener text.",
             )
             return
 
-        url, text = result
-        self._status_var.set(f"Scholar text loaded from {url}")
-        self._show_scholar_window(url, text)
-
-    def _show_scholar_window(self, url: str, text: str) -> None:
-        _show_text_window(self.root, url, text)
+        url, html = result
+        self._status_var.set(
+            f"Scholar text loaded — {note}" if note else f"Scholar text loaded from {url}"
+        )
+        _ScholarTextWindow(
+            self.root, self, url, html, item=item, cl_text=cl_text, note=note
+        )
 
     def _restore_buttons(self) -> None:
         self._download_btn.config(state="normal")
@@ -1410,6 +1430,134 @@ class CourtListenerGUI:
             subprocess.Popen(["xdg-open", path])
 
 
+class _CourtPickerDialog:
+    """
+    Checkbox-tree dialog for choosing which courts to search.
+
+    The tree mirrors ``court_catalog.CATALOG``: Federal (Supreme Court,
+    Courts of Appeals, District Courts, Specialized) and State (each state
+    with its appellate courts).  Clicking a group toggles everything under
+    it; groups show ☑ / ☐ / ◪ for all / none / some selected.  An empty
+    selection means "all courts" (no filter).
+    """
+
+    _GLYPH_ALL, _GLYPH_NONE, _GLYPH_SOME = "☑", "☐", "◪"
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        selected: set[str],
+        on_apply,
+    ) -> None:
+        self._on_apply = on_apply
+        self._checked: set[str] = set(selected)
+        self._labels: dict[str, str] = {}        # tree iid → bare label
+        self._group_leaves: dict[str, set[str]] = {}  # group iid → descendant ids
+
+        win = tk.Toplevel(parent)
+        self._win = win
+        win.title("Select Courts")
+        win.geometry("440x560")
+        win.minsize(360, 400)
+        win.transient(parent)
+        win.grab_set()
+
+        tree_frame = ttk.Frame(win)
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        self._tree = ttk.Treeview(tree_frame, show="tree", selectmode="none")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._tree.pack(side="left", fill="both", expand=True)
+
+        self._build_nodes("", _COURT_CATALOG)
+        # Open the two top-level branches so the structure is visible
+        for iid in self._tree.get_children(""):
+            self._tree.item(iid, open=True)
+        self._refresh_glyphs()
+        self._tree.bind("<Button-1>", self._on_click)
+
+        bot = ttk.Frame(win)
+        bot.pack(fill="x", padx=8, pady=(0, 8))
+        self._count_var = tk.StringVar()
+        ttk.Label(bot, textvariable=self._count_var, foreground="gray").pack(
+            side="left"
+        )
+        ttk.Button(bot, text="Apply", command=self._apply).pack(side="right")
+        ttk.Button(bot, text="Cancel", command=win.destroy).pack(
+            side="right", padx=4
+        )
+        ttk.Button(bot, text="Clear", command=self._clear).pack(side="right", padx=4)
+        self._update_count()
+
+    # -- tree construction ---------------------------------------------------
+
+    def _build_nodes(self, parent_iid: str, nodes) -> set[str]:
+        leaves: set[str] = set()
+        for label_or_id, payload in nodes:
+            if isinstance(payload, list):
+                iid = self._tree.insert(parent_iid, "end", text=label_or_id)
+                self._labels[iid] = label_or_id
+                sub = self._build_nodes(iid, payload)
+                self._group_leaves[iid] = sub
+                leaves |= sub
+            else:
+                cid, label = label_or_id, payload
+                self._tree.insert(parent_iid, "end", iid=cid, text=label)
+                self._labels[cid] = label
+                leaves.add(cid)
+        return leaves
+
+    # -- interaction -----------------------------------------------------------
+
+    def _on_click(self, event: tk.Event) -> None:
+        # Let clicks on the expander triangle expand/collapse as usual
+        if "indicator" in self._tree.identify_element(event.x, event.y):
+            return
+        iid = self._tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid in self._group_leaves:
+            leaves = self._group_leaves[iid]
+            if leaves <= self._checked:
+                self._checked -= leaves
+            else:
+                self._checked |= leaves
+        else:
+            self._checked.symmetric_difference_update({iid})
+        self._refresh_glyphs()
+        self._update_count()
+
+    def _refresh_glyphs(self) -> None:
+        for iid, label in self._labels.items():
+            if iid in self._group_leaves:
+                leaves = self._group_leaves[iid]
+                if leaves and leaves <= self._checked:
+                    glyph = self._GLYPH_ALL
+                elif leaves & self._checked:
+                    glyph = self._GLYPH_SOME
+                else:
+                    glyph = self._GLYPH_NONE
+            else:
+                glyph = self._GLYPH_ALL if iid in self._checked else self._GLYPH_NONE
+            self._tree.item(iid, text=f"{glyph} {label}")
+
+    def _update_count(self) -> None:
+        n = len(self._checked)
+        self._count_var.set(
+            "All courts (no filter)" if n == 0 else f"{n} court(s) selected"
+        )
+
+    def _clear(self) -> None:
+        self._checked.clear()
+        self._refresh_glyphs()
+        self._update_count()
+
+    def _apply(self) -> None:
+        self._on_apply(set(self._checked))
+        self._win.destroy()
+
+
 _OP_ID_RE = re.compile(r"/opinions/(\d+)/?")
 
 
@@ -1419,50 +1567,1051 @@ def _extract_opinion_id(url: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def _show_text_window(parent: tk.Misc, url: str, text: str) -> None:
-    """Open a read-only text window showing *text* fetched from *url*."""
-    win = tk.Toplevel(parent)
-    win.title("Google Scholar Opinion Text")
-    win.geometry("800x600")
+# ---------------------------------------------------------------------------
+# RTF generation + rich clipboard (used by the Scholar text window)
+# ---------------------------------------------------------------------------
 
-    url_frame = ttk.Frame(win)
-    url_frame.pack(fill="x", padx=8, pady=(8, 0))
-    ttk.Label(url_frame, text="Source:").pack(side="left")
-    url_var = tk.StringVar(value=url)
-    ttk.Entry(url_frame, textvariable=url_var, state="readonly").pack(
-        side="left", fill="x", expand=True, padx=4
-    )
+# Citations recognized inside opinion text (made clickable → Scholar lookup).
+# Pattern: volume, reporter abbreviation, page.
+_TEXT_CITE_RE = re.compile(
+    r"\b\d{1,4}\s+"
+    r"(?:U\.\s?S\.(?!\s?C)|S\.\s?Ct\.|L\.\s?Ed\.(?:\s?2d)?|"
+    r"F\.\s?Supp\.(?:\s?[23]d)?|F\.\s?(?:2d|3d|4th)|F\.\s?App[’']x|Fed\.\s?Appx\.|B\.R\.|"
+    r"A\.(?:2d|3d)?|P\.(?:2d|3d)?|N\.E\.(?:2d|3d)?|N\.W\.(?:2d)?|S\.E\.(?:2d)?|"
+    r"S\.W\.(?:2d|3d)?|So\.(?:\s?[23]d)?|Cal\.\s?Rptr\.(?:\s?[23]d)?|"
+    r"N\.Y\.S\.(?:2d|3d)?|Ohio\s?St\.\s?(?:2d|3d)?|Ill\.\s?2d|Wis\.\s?2d|Wn\.\s?(?:2d|App\.))"
+    r"\s+\d{1,5}\b"
+)
 
-    text_frame = ttk.Frame(win)
-    text_frame.pack(fill="both", expand=True, padx=8, pady=4)
-    txt = tk.Text(text_frame, wrap="word", font=("TkDefaultFont", 10))
-    vsb = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
-    txt.configure(yscrollcommand=vsb.set)
-    vsb.pack(side="right", fill="y")
-    txt.pack(side="left", fill="both", expand=True)
-    txt.insert("1.0", text)
-    txt.config(state="disabled")
 
-    def save_text() -> None:
+# A citation line in the Scholar header: each parallel cite sits on its own
+# centered line, e.g. "306 Md. 556 (1986)" / "510 A.2d 562" / "87 F.4th 563 (2023)"
+_HEADER_CITE_RE = re.compile(
+    r"^\s*(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})\s*(?:\(|$)"
+)
+
+# Marker opening a footnote body, e.g. "[4] …" or "* …" (fallback when the
+# parser found no footnote anchor ids)
+_FN_BODY_MARK_RE = re.compile(r"^\s*(?:\[([^\]\s]{1,6})\]|(\*{1,3}|†|‡))(?=\s|$)")
+
+
+def _rtf_escape(s: str) -> str:
+    out: list[str] = []
+    for ch in s:
+        if ch in "\\{}":
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\line ")
+        elif ord(ch) < 128:
+            out.append(ch)
+        else:
+            cp = ord(ch)
+            if cp > 32767:  # RTF \u takes a signed 16-bit value
+                cp -= 65536
+            out.append(f"\\u{cp}?")
+    return "".join(out)
+
+
+# Color table index 1 = star-pagination marker.  Citation links stay black
+# in copied/exported text; the blue is only an on-screen affordance.
+_RTF_HEADER = (
+    "{\\rtf1\\ansi\\deff0"
+    "{\\fonttbl{\\f0\\froman Times New Roman;}}"
+    "{\\colortbl ;\\red142\\green68\\blue173;}"
+    "\\f0\\fs22\n"
+)
+
+
+def _rtf_document(body: str, two_columns: bool = False) -> str:
+    sect = "\\sectd\\sbknone\\cols2\\colsx432\n" if two_columns else ""
+    return _RTF_HEADER + sect + body + "}"
+
+
+def _run_to_rtf(seg: str, active: set[str]) -> str:
+    codes: list[str] = []
+    for t in active:
+        if t.startswith("fnt_") and len(t) == 8:
+            italic, bold, small, sup = (c == "1" for c in t[4:])
+            if italic:
+                codes.append("\\i")
+            if bold:
+                codes.append("\\b")
+            if small:
+                codes.append("\\fs18")
+            if sup:
+                codes.append("\\super\\fs16")
+    if "underline" in active:
+        codes.append("\\ul")
+    if "pagenum" in active:
+        codes.append("\\cf1\\b")
+    esc = _rtf_escape(seg)
+    return "{" + "".join(codes) + " " + esc + "}" if codes else esc
+
+
+def _dump_to_rtf(txt: tk.Text, start: str, end: str) -> str:
+    """Convert a Tk Text range (with the Scholar window's tags) to an RTF body."""
+    out: list[str] = []
+    # Seed with tags already open at *start*; dump only reports transitions.
+    active: set[str] = set(txt.tag_names(start))
+    active.discard("sel")
+    par_open = False
+
+    def par_prefix() -> str:
+        if "center" in active:
+            return "\\pard\\qc\\sa120 "
+        if "blockquote" in active:
+            return "\\pard\\li720\\ri720\\sa120 "
+        return "\\pard\\sa120 "
+
+    for key, value, _index in txt.dump(start, end, text=True, tag=True):
+        if key == "tagon":
+            active.add(value)
+        elif key == "tagoff":
+            active.discard(value)
+        elif key == "text":
+            for i, seg in enumerate(value.split("\n")):
+                if i and par_open:
+                    out.append("\\par\n")
+                    par_open = False
+                if seg:
+                    if not par_open:
+                        out.append(par_prefix())
+                        par_open = True
+                    out.append(_run_to_rtf(seg, active))
+    if par_open:
+        out.append("\\par\n")
+    return "".join(out)
+
+
+def _copy_rich_clipboard(widget: tk.Misc, rtf: str, plain: str) -> str:
+    """
+    Put *rtf* on the system clipboard (with *plain* as fallback where the
+    platform allows both).  Returns a short description of what was copied.
+    """
+    rtf_bytes = rtf.encode("ascii", "replace")
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GlobalAlloc.restype = ctypes.c_void_p
+            kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+            user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+            user32.SetClipboardData.restype = ctypes.c_void_p
+            user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+
+            CF_UNICODETEXT = 13
+            GMEM_MOVEABLE = 0x0002
+            cf_rtf = user32.RegisterClipboardFormatW("Rich Text Format")
+
+            def set_data(fmt: int, data: bytes) -> None:
+                handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                ptr = kernel32.GlobalLock(handle)
+                ctypes.memmove(ptr, data, len(data))
+                kernel32.GlobalUnlock(handle)
+                user32.SetClipboardData(fmt, handle)
+
+            if not user32.OpenClipboard(None):
+                raise OSError("OpenClipboard failed")
+            try:
+                user32.EmptyClipboard()
+                set_data(cf_rtf, rtf_bytes + b"\x00")
+                set_data(CF_UNICODETEXT, plain.encode("utf-16-le") + b"\x00\x00")
+            finally:
+                user32.CloseClipboard()
+            return "formatted text (RTF)"
+        except Exception as exc:
+            print(f"[copy] Windows RTF clipboard failed: {exc}")
+    elif sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["pbcopy", "-Prefer", "rtf"], input=rtf_bytes, check=True, timeout=10
+            )
+            return "formatted text (RTF)"
+        except Exception as exc:
+            print(f"[copy] pbcopy RTF failed: {exc}")
+    else:
+        candidates = []
+        if os.environ.get("WAYLAND_DISPLAY"):
+            candidates.append(["wl-copy", "--type", "text/rtf"])
+        candidates.append(["xclip", "-selection", "clipboard", "-t", "text/rtf"])
+        for cmd in candidates:
+            try:
+                subprocess.run(cmd, input=rtf_bytes, check=True, timeout=10)
+                return "formatted text (RTF)"
+            except Exception as exc:
+                print(f"[copy] {cmd[0]} RTF failed: {exc}")
+    widget.clipboard_clear()
+    widget.clipboard_append(plain)
+    return "plain text (no RTF clipboard tool available)"
+
+
+# Minimum word-shingle containment between the Scholar candidate and the
+# CourtListener text to accept them as the same opinion.  Containment is
+# stricter than an intuitive "percent similar": same-opinion pairs score
+# well above this even across OCR/edition differences, while different
+# opinions score near zero.
+_SCHOLAR_MATCH_THRESHOLD = 0.60
+
+
+def _find_scholar_for_item(
+    client: Optional[CourtListenerClient],
+    fetcher: "GoogleScholarFetcher",
+    item: dict,
+    status,
+) -> tuple[Optional[tuple[str, str]], Optional[str], str]:
+    """
+    Locate this CourtListener case's opinion on Google Scholar, verifying
+    candidates against the CourtListener text before accepting them.
+
+    Search stages, in order:
+      1. the primary citation (walking down the results list),
+      2. alternate reporter citations from the CourtListener cluster,
+      3. the case name (with variants such as United States ↔ US).
+
+    Returns (result, cl_text, note): *result* is (url, opinion_html) or
+    None if no candidate was similar enough; *cl_text* is the assembled
+    CourtListener text (so the viewer's toggle is instant); *note*
+    describes the verification outcome.
+    """
+    cluster_id = item.get("cluster_id") or item.get("id")
+    vkey = f"verified:cluster:{cluster_id}" if cluster_id else ""
+    if vkey:
+        cached = fetcher.get_cached(vkey)
+        if cached:
+            return cached, None, "verified match (cached)"
+
+    cl_text: Optional[str] = None
+    if client is not None and cluster_id:
+        status("Fetching CourtListener text for comparison…")
+        try:
+            cl_text = _assemble_case_text(client, item)
+        except Exception as exc:
+            print(f"[verify] CourtListener text unavailable: {exc}")
+
+    tried: set[str] = set()
+    best_sim = 0.0
+
+    def try_url(url: str) -> Optional[tuple[str, str]]:
+        nonlocal best_sim
+        if url in tried:
+            return None
+        tried.add(url)
+        res = fetcher.fetch_by_url(url)
+        if not res:
+            return None
+        if cl_text is None:
+            return res  # nothing to verify against; accept the first hit
+        sim = text_similarity(blocks_to_text(parse_opinion_blocks(res[1])), cl_text)
+        print(f"[verify] similarity {sim:.2f} for {url}")
+        best_sim = max(best_sim, sim)
+        return res if sim >= _SCHOLAR_MATCH_THRESHOLD else None
+
+    # --- assemble the search stages ---
+    primary = _pick_citation(item.get("citation", []))
+    alt_cites: list[str] = []
+    raw = item.get("citation")
+    if isinstance(raw, list):
+        alt_cites += [c for c in raw if c and c != primary]
+    if client is not None and cluster_id:
+        try:
+            rec = client.get_cluster(int(cluster_id), fields="citations")
+            for c in _cluster_citations_to_strings(rec.get("citations")):
+                if c != primary and c not in alt_cites:
+                    alt_cites.append(c)
+        except Exception as exc:
+            print(f"[verify] cluster citations fetch failed: {exc}")
+    alt_cites = [c for c in alt_cites if not _NOISE_CITE_RE.search(c)][:4]
+
+    case_name = re.sub(
+        r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or ""
+    ).strip()
+    date_filed = item.get("dateFiled") or item.get("date_filed") or ""
+    year = date_filed[:4] if len(date_filed) >= 4 else ""
+    name_variants: list[str] = []
+    if case_name:
+        name_variants.append(case_name)
+        v = re.sub(r"\bUnited States\b", "US", case_name)
+        if v not in name_variants:
+            name_variants.append(v)
+        v = re.sub(r"\bU\.? ?S\.?\b", "United States", case_name)
+        if v not in name_variants:
+            name_variants.append(v)
+
+    stages: list[tuple[str, int, str]] = []  # (query, results to try, description)
+    if primary:
+        stages.append((f'"{primary}"', 4, f"citation {primary}"))
+    for c in alt_cites:
+        stages.append((f'"{c}"', 2, f"alternate citation {c}"))
+    for nm in name_variants:
+        q = f"{nm} {year}".strip()
+        stages.append((q, 3, f"case name {nm!r}"))
+
+    fetches = 0
+    _MAX_FETCHES = 10
+    for q, take, desc in stages:
+        if fetches >= _MAX_FETCHES:
+            break
+        status(f"Searching Scholar by {desc}…")
+        results = fetcher.search_cases(q, limit=take)
+        for r in results[:take]:
+            if fetches >= _MAX_FETCHES:
+                break
+            fetches += 1
+            status(f"Comparing candidate: {r.title[:60]}…")
+            hit = try_url(r.url)
+            if hit:
+                if cl_text is not None and vkey:
+                    fetcher.put_cached(vkey, *hit)
+                note = (
+                    "verified against CourtListener"
+                    if cl_text is not None
+                    else "unverified (no CourtListener text to compare)"
+                )
+                return hit, cl_text, note
+
+    print(f"[verify] gave up; best similarity {best_sim:.2f}")
+    return None, cl_text, f"best candidate similarity {best_sim:.0%}"
+
+
+class _ScholarTextWindow:
+    """
+    Rich viewer for a Google Scholar opinion.
+
+    Renders the opinion with its original formatting (paragraphs, centering,
+    italics, footnote markers), highlights the reporter star-pagination
+    markers, makes case citations clickable (fetching the cited case from
+    Scholar in a new window), and offers:
+      • Copy + Cite — copies selection (or all) with formatting and appends
+        a Bluebook citation pin-cited from the star pagination,
+      • Export RTF — two-column RTF named after the Bluebook caption,
+      • Save as .txt,
+      • a toggle to the CourtListener version of the text.
+    """
+
+    _PAGENUM_COLOR = "#8e44ad"   # muted purple — visible but not loud
+    _LINK_COLOR = "#1a56b0"
+    _DISSENT_COLOR = "#a31515"   # dark red
+    _CONCUR_COLOR = "#1a7a3c"    # dark green
+    _PART_COLOR_TAGS = {"dissent": "part-dissent", "concurrence": "part-concurrence"}
+    _PART_LABEL_COLORS = {"dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR}
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        app: "CourtListenerGUI",
+        url: str,
+        opinion_html: str,
+        item: Optional[dict] = None,
+        cl_text: Optional[str] = None,
+        note: str = "",
+    ) -> None:
+        self._app = app
+        self._item = item or {}
+        self._scholar_url = url
+        self._note = note
+        self._blocks = parse_opinion_blocks(opinion_html)
+        self._scholar_text = blocks_to_text(self._blocks) or _strip_html(opinion_html)
+        self._parts = segment_blocks(self._blocks)
+        self._current_part: Optional[int] = None  # None = full opinion
+        # Page in effect at the start of each part, for pin cites when a
+        # single part is displayed (no preceding star marker on screen).
+        self._part_start_pages: list[Optional[int]] = []
+        page: Optional[int] = None
+        for part in self._parts:
+            self._part_start_pages.append(page)
+            for b in part.blocks:
+                for s in b.spans:
+                    if s.pagenum:
+                        m = re.search(r"\d+", s.text)
+                        if m:
+                            page = int(m.group(0))
+        self._cl_text: Optional[str] = cl_text
+        self._mode = "scholar"
+        self._link_actions: dict[str, tuple[str, str]] = {}
+        self._link_n = 0
+        self._fonts: dict[str, tkfont.Font] = {}
+        self._bb = self._compute_bluebook_parts()
+
+        self._win = tk.Toplevel(parent)
+        self._win.title(self._bb["name"] or "Google Scholar Opinion Text")
+        self._win.geometry("860x680")
+        self._win.minsize(500, 300)
+        self._build_ui()
+        self._render_scholar()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        win = self._win
+
+        url_frame = ttk.Frame(win)
+        url_frame.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(url_frame, text="Source:").pack(side="left")
+        self._source_var = tk.StringVar(value=self._scholar_url)
+        ttk.Entry(url_frame, textvariable=self._source_var, state="readonly").pack(
+            side="left", fill="x", expand=True, padx=4
+        )
+
+        # Part navigation: what you're viewing, and a selector to filter
+        view_frame = ttk.Frame(win)
+        view_frame.pack(fill="x", padx=8, pady=(6, 0))
+        ttk.Label(view_frame, text="Viewing:").pack(side="left")
+        self._view_label_var = tk.StringVar(value="Full opinion")
+        self._view_label = ttk.Label(
+            view_frame,
+            textvariable=self._view_label_var,
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        self._view_label.pack(side="left", padx=(4, 12))
+        part_values = ["Full opinion"] + [
+            f"{i + 1}. {p.label}" for i, p in enumerate(self._parts)
+        ]
+        self._part_combo = ttk.Combobox(
+            view_frame, state="readonly", width=44, values=part_values
+        )
+        self._part_combo.current(0)
+        self._part_combo.pack(side="right")
+        self._part_combo.bind("<<ComboboxSelected>>", self._on_part_selected)
+        if len(self._parts) <= 1:
+            self._part_combo.config(state="disabled")
+
+        text_frame = ttk.Frame(win)
+        text_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        base = tkfont.Font(family="Georgia", size=11)
+        self._fonts["base"] = base
+        self._family = base.actual("family")
+        self._base_size = base.actual("size")
+        txt = tk.Text(text_frame, wrap="word", font=base, padx=14, pady=10)
+        self._text = txt
+        vsb = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+
+        txt.tag_configure("center", justify="center")
+        txt.tag_configure("blockquote", lmargin1=36, lmargin2=36, rmargin=36)
+        txt.tag_configure("heading", spacing1=6, spacing3=4)
+        txt.tag_configure("underline", underline=True)
+        # Part colors (configured before pagenum/citelink so those keep
+        # priority and stay purple/blue inside colored parts)
+        txt.tag_configure("part-dissent", foreground=self._DISSENT_COLOR)
+        txt.tag_configure("part-concurrence", foreground=self._CONCUR_COLOR)
+        fnhead_font = tkfont.Font(
+            family=self._family, size=max(self._base_size - 2, 8), weight="bold"
+        )
+        self._fonts["fnhead"] = fnhead_font
+        txt.tag_configure(
+            "fnhead", font=fnhead_font, foreground="#666666", spacing1=10
+        )
+        pagenum_font = tkfont.Font(
+            family=self._family, size=max(self._base_size - 1, 8), weight="bold"
+        )
+        self._fonts["pagenum"] = pagenum_font
+        txt.tag_configure(
+            "pagenum", font=pagenum_font, foreground=self._PAGENUM_COLOR
+        )
+        txt.tag_configure("citelink", foreground=self._LINK_COLOR)
+        txt.tag_bind("citelink", "<Enter>", lambda _e: txt.config(cursor="hand2"))
+        txt.tag_bind("citelink", "<Leave>", lambda _e: txt.config(cursor=""))
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btn_frame, text="Copy + Cite", command=self._copy_formatted).pack(
+            side="right", padx=(4, 0)
+        )
+        ttk.Button(btn_frame, text="Export RTF…", command=self._export_rtf).pack(
+            side="right", padx=4
+        )
+        ttk.Button(btn_frame, text="Save as .txt…", command=self._save_txt).pack(
+            side="right", padx=4
+        )
+        self._toggle_btn = ttk.Button(
+            btn_frame, text="CourtListener Text", command=self._toggle_source
+        )
+        self._toggle_btn.pack(side="right", padx=4)
+
+        self._status_var = tk.StringVar()
+        ttk.Label(btn_frame, textvariable=self._status_var, foreground="gray").pack(
+            side="left", fill="x", expand=True
+        )
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
+
+    def _font_tag(self, italic: bool, bold: bool, small: bool, sup: bool) -> str:
+        name = "fnt_" + "".join("1" if f else "0" for f in (italic, bold, small, sup))
+        if name not in self._fonts:
+            size = self._base_size - (3 if sup else 2 if small else 0)
+            f = tkfont.Font(
+                family=self._family,
+                size=max(size, 7),
+                slant="italic" if italic else "roman",
+                weight="bold" if bold else "normal",
+            )
+            self._fonts[name] = f
+            self._text.tag_configure(name, font=f, offset=4 if sup else 0)
+        return name
+
+    def _new_link(self, action: tuple[str, str]) -> str:
+        self._link_n += 1
+        tag = f"lnk{self._link_n}"
+        self._link_actions[tag] = action
+        self._text.tag_bind(
+            tag, "<Button-1>", lambda _e, t=tag: self._follow_link(t)
+        )
+        return tag
+
+    def _insert_span(self, span, block_tags: tuple) -> None:
+        txt = self._text
+        tags = list(block_tags)
+        if span.pagenum:
+            m = re.search(r"\d+", span.text)
+            if m:
+                self._cur_page = int(m.group(0))
+            tags.append("pagenum")
+            txt.insert("end", span.text, tuple(tags))
+            return
+        if span.fnref and span.fnref not in self._fnref_pages:
+            # Page in effect where the footnote is referenced — that's the
+            # page a Bluebook "n.N" pin cite uses.
+            self._fnref_pages[span.fnref] = self._cur_page
+        tags.append(self._font_tag(span.italic, span.bold, span.small, span.sup))
+        if span.underline:
+            tags.append("underline")
+        if span.link:
+            tags += ["citelink", self._new_link(("url", span.link))]
+            txt.insert("end", span.text, tuple(tags))
+            return
+        # Plain text: make recognizable citations clickable
+        pos = 0
+        for m in _TEXT_CITE_RE.finditer(span.text):
+            if m.start() > pos:
+                txt.insert("end", span.text[pos:m.start()], tuple(tags))
+            cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
+            cite = cite.replace("’", "'")  # straight apostrophe for the search query
+            ltags = tags + ["citelink", self._new_link(("cite", cite))]
+            txt.insert("end", m.group(0), tuple(ltags))
+            pos = m.end()
+        if pos < len(span.text):
+            txt.insert("end", span.text[pos:], tuple(tags))
+
+    def _render_footnotes(self, footnotes: list, part_tag: Optional[str]) -> None:
+        """Insert a part's footnote blocks, recording each note's rendered
+        region and number so copied selections can be pin-cited (page n.N)."""
+        txt = self._text
+        open_region: Optional[list] = None  # [start_index, note_number, page]
+
+        def close_region() -> None:
+            nonlocal open_region
+            if open_region is not None:
+                self._fn_regions.append(
+                    (open_region[0], txt.index("end-1c"),
+                     open_region[1], open_region[2])
+                )
+                open_region = None
+
+        for block in footnotes:
+            first = block.spans[0] if block.spans else None
+            num = ""
+            page: Optional[int] = None
+            if first is not None and first.fndef:
+                num = first.text.strip().strip("[]")
+                page = self._fnref_pages.get(first.fndef)
+            else:
+                body_text = "".join(
+                    s.text for s in block.spans if not s.pagenum
+                ).lstrip()
+                m = _FN_BODY_MARK_RE.match(body_text)
+                if m:
+                    num = (m.group(1) or m.group(2) or "").strip()
+            if num:
+                close_region()
+                open_region = [txt.index("end-1c"), num, page]
+            self._insert_block(block, part_tag)
+        close_region()
+
+    def _insert_block(self, block, part_tag: Optional[str]) -> None:
+        if block.kind == "center":
+            block_tags: tuple = ("center",)
+        elif block.kind == "blockquote":
+            block_tags = ("blockquote",)
+        elif block.kind == "heading":
+            block_tags = ("heading",)
+        else:
+            block_tags = ()
+        if part_tag:
+            block_tags = block_tags + (part_tag,)
+        for span in block.spans:
+            self._insert_span(span, block_tags)
+        self._text.insert("end", "\n\n", block_tags)
+
+    def _render_scholar(self) -> None:
+        txt = self._text
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        self._link_actions.clear()
+        self._fnref_pages: dict[str, Optional[int]] = {}
+        self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
+        self._cur_page: Optional[int] = None
+        if not self._parts:
+            txt.insert("1.0", self._scholar_text)
+        else:
+            if self._current_part is None:
+                shown = list(enumerate(self._parts))
+            else:
+                shown = [(self._current_part, self._parts[self._current_part])]
+            for pi, part in shown:
+                if self._part_start_pages:
+                    self._cur_page = self._part_start_pages[pi] or self._cur_page
+                part_tag = self._PART_COLOR_TAGS.get(part.kind)
+                for block in part.blocks:
+                    self._insert_block(block, part_tag)
+                if part.footnotes:
+                    fnhead_tags = ("fnhead",) + ((part_tag,) if part_tag else ())
+                    txt.insert("end", "Footnotes\n\n", fnhead_tags)
+                    self._render_footnotes(part.footnotes, part_tag)
+        txt.config(state="disabled")
+        self._mode = "scholar"
+        self._source_var.set(self._scholar_url)
+        self._toggle_btn.config(text="CourtListener Text", state="normal")
+        if len(self._parts) > 1:
+            self._part_combo.config(state="readonly")
+        if self._current_part is None:
+            self._view_label_var.set("Full opinion")
+            self._view_label.config(foreground="black")
+        else:
+            part = self._parts[self._current_part]
+            self._view_label_var.set(part.label)
+            self._view_label.config(
+                foreground=self._PART_LABEL_COLORS.get(part.kind, "black")
+            )
+        extra = f" | {self._note}" if self._note else ""
+        self._status_var.set(
+            f"{len(self._scholar_text):,} characters | Google Scholar version{extra}"
+        )
+
+    def _on_part_selected(self, _event=None) -> None:
+        idx = self._part_combo.current()
+        self._current_part = None if idx <= 0 else idx - 1
+        self._render_scholar()  # selecting a part always shows the Scholar text
+
+    def _show_courtlistener(self) -> None:
+        txt = self._text
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        txt.insert("1.0", self._cl_text or "(no text)")
+        txt.config(state="disabled")
+        self._mode = "courtlistener"
+        self._source_var.set("CourtListener (assembled from the REST API)")
+        self._toggle_btn.config(text="Google Scholar Text", state="normal")
+        self._part_combo.config(state="disabled")
+        self._view_label_var.set("CourtListener text")
+        self._view_label.config(foreground="black")
+        self._status_var.set(
+            f"{len(self._cl_text or ''):,} characters | CourtListener version"
+        )
+
+    # ------------------------------------------------------------------
+    # Bluebook citation
+    # ------------------------------------------------------------------
+
+    def _compute_bluebook_parts(self) -> dict[str, str]:
+        item = self._item
+        name = re.sub(
+            r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or ""
+        ).strip()
+
+        # Scholar's header lists each parallel cite on its own line.  When
+        # the page has star pagination, pick the reporter the stars follow
+        # (the first star falls just past that cite's first page); without
+        # stars, prefer a recognized national/regional reporter, the
+        # Bluebook default for state cases.
+        header = "  ".join(
+            b.text() for b in self._blocks[:8] if b.kind in ("center", "heading")
+        )
+        cands: list[tuple[str, int]] = []
+        for b in self._blocks[:8]:
+            if b.kind not in ("center", "heading"):
+                continue
+            t = re.sub(r"\s+", " ", b.text()).strip()
+            t = re.sub(r"\bU\.\s+S\.", "U.S.", t)
+            t = re.sub(r"\b(\d{1,4})\s+US\s+(\d{1,5})\b", r"\1 U.S. \2", t)
+            m = _HEADER_CITE_RE.match(t)
+            if m:
+                vol, rep, page = m.group(1), m.group(2).strip(" ,"), m.group(3)
+                cands.append((f"{vol} {rep} {page}", int(page)))
+        cite = ""
+        if cands:
+            first_star: Optional[int] = None
+            for b in self._blocks:
+                for s in b.spans:
+                    if s.pagenum:
+                        mm = re.search(r"\d+", s.text)
+                        if mm:
+                            first_star = int(mm.group(0))
+                            break
+                if first_star is not None:
+                    break
+            if first_star is not None:
+                fits = [
+                    (first_star - p, c)
+                    for c, p in cands
+                    if 0 <= first_star - p <= 400
+                ]
+                if fits:
+                    cite = min(fits)[1]
+            if not cite:
+                cite = next(
+                    (c for c, _p in cands if _TEXT_CITE_RE.fullmatch(c)),
+                    cands[0][0],
+                )
+        if not cite:
+            header_norm = re.sub(r"\bU\.\s+S\.", "U.S.", header)
+            header_norm = re.sub(
+                r"\b(\d{1,4})\s+US\s+(\d{1,5})\b", r"\1 U.S. \2", header_norm
+            )
+            m = _TEXT_CITE_RE.search(header_norm)
+            if m:
+                cite = re.sub(r"\s+", " ", m.group(0))
+        if not cite:
+            cite = _pick_citation(item.get("citation", []))
+
+        date_filed = item.get("dateFiled") or item.get("date_filed") or ""
+        year = date_filed[:4] if len(date_filed) >= 4 else ""
+        if not year:
+            years = re.findall(r"\b(1[6-9]\d{2}|20\d{2})\b", header)
+            if years:
+                year = years[-1]
+
+        if not name and self._blocks:
+            first = self._blocks[0].text().strip()
+            name = re.split(r",\s*\d{1,4}\s", first)[0].strip().rstrip(",")[:120]
+
+        court_id = str(item.get("court_id") or "").strip().lower()
+        is_scotus = "scotus" in court_id or bool(
+            re.match(r"\d+\s+(U\.S\.|S\.\s?Ct\.|L\.\s?Ed\.)", cite)
+        )
+        court_abbr = ""
+        if not is_scotus:
+            court_abbr = _COURT_BLUEBOOK.get(court_id, "")
+            if not court_abbr and court_id:
+                court_abbr = str(item.get("court") or court_id).strip()
+        return {"name": name, "cite": cite, "court": court_abbr, "year": year}
+
+    def _bluebook_citation(self, pin: Optional[str]) -> tuple[str, str]:
+        """Return (plain, rtf-fragment) forms of the Bluebook citation."""
+        bb = self._bb
+        name, cite, court, year = bb["name"], bb["cite"], bb["court"], bb["year"]
+        rest = ""
+        if cite:
+            rest = f", {cite}"
+            if pin:
+                m = _CITE_PARSE_RE.match(cite)
+                if not (m and pin == m.group(3)):  # skip pin equal to first page
+                    rest += f", {pin}"
+        paren_inner = " ".join(p for p in (court, year) if p)
+        if paren_inner:
+            rest += f" ({paren_inner})"
+        rest += "."
+        if name:
+            plain = f"{name}{rest}"
+            rtf = (
+                "\\par\\pard\\sa120 {\\i "
+                + _rtf_escape(name)
+                + "}"
+                + _rtf_escape(rest)
+                + "\\par\n"
+            )
+        else:
+            plain = rest.lstrip(", ")
+            rtf = "\\par\\pard\\sa120 " + _rtf_escape(plain) + "\\par\n"
+        return plain, rtf
+
+    @staticmethod
+    def _page_num_from(s: str) -> Optional[int]:
+        m = re.search(r"\d+", s)
+        return int(m.group(0)) if m else None
+
+    def _pin_for_range(self, start: str, end: str) -> Optional[str]:
+        """Pinpoint page(s) for the text between *start* and *end*, derived
+        from the star-pagination markers (Bluebook-style range, e.g. 120-21)."""
+        txt = self._text
+        start_page: Optional[int] = None
+        prev = txt.tag_prevrange("pagenum", start)
+        if prev:
+            start_page = self._page_num_from(txt.get(*prev))
+        else:
+            # No star marker on screen before the selection: in a part view
+            # use the page in effect where the part begins; otherwise the
+            # text sits on the cite's first page.
+            if self._current_part is not None and self._part_start_pages:
+                start_page = self._part_start_pages[self._current_part]
+            if start_page is None:
+                m = _CITE_PARSE_RE.match(self._bb["cite"])
+                if m:
+                    start_page = int(m.group(3))
+        if start_page is None:
+            return None
+        end_page = start_page
+        idx = start
+        while True:
+            rng = txt.tag_nextrange("pagenum", idx, end)
+            if not rng:
+                break
+            p = self._page_num_from(txt.get(*rng))
+            if p is not None:
+                end_page = p
+            idx = rng[1]
+        if end_page <= start_page:
+            return str(start_page)
+        sa, sb = str(start_page), str(end_page)
+        if len(sa) == len(sb) and len(sa) > 2 and sa[:-2] == sb[:-2]:
+            sb = sb[-2:]  # Bluebook: drop repetitious digits, keep last two
+        return f"{sa}-{sb}"
+
+    @staticmethod
+    def _format_note_numbers(nums: list[str]) -> str:
+        """Bluebook note pins: n.4 / nn.4-5 (consecutive) / nn.4 & 6."""
+        runs: list[list[str]] = []
+        for n in nums:
+            if (
+                runs
+                and n.isdigit()
+                and runs[-1][-1].isdigit()
+                and int(n) == int(runs[-1][-1]) + 1
+            ):
+                runs[-1].append(n)
+            else:
+                runs.append([n])
+        parts = [f"{r[0]}-{r[-1]}" if len(r) > 1 else r[0] for r in runs]
+        prefix = "nn." if len(nums) > 1 else "n."
+        return prefix + " & ".join(parts)
+
+    def _pin_with_footnotes(self, start: str, end: str) -> Optional[str]:
+        """
+        Pinpoint for the selection, footnote-aware (Bluebook rule 3.2(b)):
+        material in a footnote cites as "page n.N"; several notes as
+        "nn.4-5" / "nn.4 & 6"; text plus a note on the same page as
+        "page & n.N".
+        """
+        txt = self._text
+        regions = [
+            r for r in self._fn_regions
+            if txt.compare(r[0], "<", end) and txt.compare(r[1], ">", start)
+        ]
+        if not regions:
+            return self._pin_for_range(start, end)
+
+        fallback_page: Optional[int] = None
+        m = _CITE_PARSE_RE.match(self._bb["cite"])
+        if m:
+            fallback_page = int(m.group(3))
+
+        # Group selected notes by the page they're cited on (document order)
+        page_groups: dict[Optional[int], list[str]] = {}
+        for _rs, _re, num, page in regions:
+            page_groups.setdefault(page, []).append(num)
+        note_strs = []
+        for page, nums in page_groups.items():
+            p = page if page is not None else fallback_page
+            s = self._format_note_numbers(nums)
+            note_strs.append(f"{p} {s}" if p is not None else s)
+        notes = ", ".join(note_strs)
+
+        # Does the selection also cover opinion text before the notes?
+        first_rs = regions[0][0]
+        text_before = (
+            txt.compare(start, "<", first_rs)
+            and txt.get(start, first_rs).strip() != ""
+        )
+        if not text_before:
+            return notes
+        text_pin = self._pin_for_range(start, first_rs)
+        if text_pin is None:
+            return notes
+        if len(page_groups) == 1:
+            (page, nums), = page_groups.items()
+            p = page if page is not None else fallback_page
+            if p is not None and text_pin == str(p):
+                return f"{text_pin} & {self._format_note_numbers(nums)}"
+        return f"{text_pin}, {notes}"
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def _copy_formatted(self) -> None:
+        txt = self._text
+        try:
+            start, end = txt.index("sel.first"), txt.index("sel.last")
+            selected = True
+        except tk.TclError:
+            start, end = "1.0", "end-1c"
+            selected = False
+        pin = (
+            self._pin_with_footnotes(start, end)
+            if (selected and self._mode == "scholar")
+            else None
+        )
+        plain_cite, rtf_cite = self._bluebook_citation(pin)
+        body = _dump_to_rtf(txt, start, end)
+        rtf = _rtf_document(body + rtf_cite)
+        plain = txt.get(start, end).rstrip() + "\n\n" + plain_cite + "\n"
+        how = _copy_rich_clipboard(self._win, rtf, plain)
+        what = "selection" if selected else "full text"
+        self._status_var.set(f"Copied {what} as {how}; citation appended.")
+
+    def _filename_item(self) -> dict:
+        if self._item:
+            return self._item
+        bb = self._bb
+        return {
+            "caseName": bb["name"],
+            "citation": [bb["cite"]] if bb["cite"] else [],
+            "dateFiled": f"{bb['year']}-01-01" if bb["year"] else "",
+            "court_id": "scotus" if not bb["court"] else "",
+            "court": bb["court"],
+        }
+
+    def _export_rtf(self) -> None:
+        body = _dump_to_rtf(self._text, "1.0", "end-1c")
+        rtf = _rtf_document(body, two_columns=True)
+        default = _build_default_filename(self._filename_item())
+        path = filedialog.asksaveasfilename(
+            defaultextension=".rtf",
+            filetypes=[("Rich Text Format", "*.rtf"), ("All files", "*.*")],
+            initialfile=f"{default}.rtf",
+            title="Export Opinion as RTF (two columns)",
+            parent=self._win,
+        )
+        if not path:
+            return
+        with open(path, "w", encoding="ascii", errors="replace") as f:
+            f.write(rtf)
+        self._status_var.set(f"Exported RTF: {path}")
+        if messagebox.askyesno(
+            "Export Complete", f"RTF saved to:\n{path}\n\nOpen it now?", parent=self._win
+        ):
+            CourtListenerGUI._open_file(path)
+
+    def _current_text(self) -> str:
+        if self._mode == "courtlistener":
+            return self._cl_text or ""
+        return self._scholar_text
+
+    def _save_txt(self) -> None:
+        default = _build_default_filename(self._filename_item())
         path = filedialog.asksaveasfilename(
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=f"{default}.txt",
             title="Save Opinion Text",
-            parent=win,
+            parent=self._win,
         )
         if path:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
-            messagebox.showinfo("Saved", f"Text saved to:\n{path}", parent=win)
+                f.write(self._current_text())
+            messagebox.showinfo("Saved", f"Text saved to:\n{path}", parent=self._win)
 
-    btn_frame = ttk.Frame(win)
-    btn_frame.pack(fill="x", padx=8, pady=(0, 8))
-    ttk.Button(btn_frame, text="Save as .txt…", command=save_text).pack(side="right")
-    ttk.Label(
-        btn_frame,
-        text=f"{len(text):,} characters  |  cached locally",
-        foreground="gray",
-    ).pack(side="left")
+    # ------------------------------------------------------------------
+    # Citation links
+    # ------------------------------------------------------------------
+
+    def _post(self, fn, *args) -> None:
+        try:
+            self._win.after(0, fn, *args)
+        except tk.TclError:
+            pass  # window closed while a background fetch was running
+
+    def _follow_link(self, tag: str) -> None:
+        action = self._link_actions.get(tag)
+        if not action:
+            return
+        kind, value = action
+        fetcher = self._app._get_scholar()
+        if fetcher is None:
+            return
+        label = value if kind == "cite" else "cited case"
+        self._status_var.set(f"Fetching {label} from Google Scholar…")
+
+        def run() -> None:
+            if kind == "url":
+                result = fetcher.fetch_by_url(value)
+            else:
+                result = fetcher.fetch_by_citation(value)
+            self._post(self._on_link_ready, result)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_link_ready(self, result: Optional[tuple[str, str]]) -> None:
+        if not result:
+            self._status_var.set("Google Scholar: cited case not found (or blocked).")
+            return
+        url, html = result
+        self._status_var.set("Cited case loaded.")
+        _ScholarTextWindow(self._win, self._app, url, html, item=None)
+
+    # ------------------------------------------------------------------
+    # CourtListener toggle
+    # ------------------------------------------------------------------
+
+    def _toggle_source(self) -> None:
+        if self._mode == "courtlistener":
+            self._render_scholar()
+            return
+        if self._cl_text is not None:
+            self._show_courtlistener()
+            return
+        client = self._app._get_client()
+        if client is None:
+            return
+        self._toggle_btn.config(state="disabled")
+        self._status_var.set("Fetching CourtListener text…")
+        item = dict(self._item)
+        cite = self._bb["cite"]
+
+        def run() -> None:
+            try:
+                target = item
+                if not (target.get("cluster_id") or target.get("id")):
+                    # Opened from a citation link — locate the case on
+                    # CourtListener by its citation.
+                    if not cite:
+                        raise RuntimeError(
+                            "No citation available to locate this case on CourtListener."
+                        )
+                    data = client.search(f"citation:({cite})", type="o", page_size=1)
+                    results = data.get("results") or []
+                    if not results:
+                        data = client.search(f'"{cite}"', type="o", page_size=1)
+                        results = data.get("results") or []
+                    if not results:
+                        raise RuntimeError(f"No CourtListener match for {cite!r}.")
+                    target = results[0]
+                text = _assemble_case_text(client, target)
+                self._post(self._on_cl_ready, text)
+            except Exception as exc:
+                self._post(self._on_cl_error, str(exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_cl_ready(self, text: str) -> None:
+        self._cl_text = text
+        self._show_courtlistener()
+
+    def _on_cl_error(self, msg: str) -> None:
+        self._toggle_btn.config(state="normal")
+        self._status_var.set(f"CourtListener: {msg}")
+        messagebox.showerror("CourtListener", msg, parent=self._win)
 
 
 class _CitingOpinionsWindow:
@@ -2021,43 +3170,57 @@ class _CitingOpinionsWindow:
         fetcher = self._app._get_scholar()
         if fetcher is None:
             return
-
-        citation_str = _pick_citation(item.get("citation", []))
-        case_name = re.sub(
-            r"<[^>]+>",
-            "",
-            item.get("caseName") or item.get("case_name") or "",
-        ).strip()
-        date_filed = item.get("dateFiled") or item.get("date_filed") or ""
-        year = date_filed[:4] if date_filed else None
+        client = self._app._get_client()
 
         self._scholar_btn.config(state="disabled")
         self._status_var.set("Searching Google Scholar…")
 
+        def status_cb(msg: str) -> None:
+            try:
+                self._win.after(0, self._status_var.set, msg)
+            except tk.TclError:
+                pass
+
         def run() -> None:
-            result = None
-            if citation_str:
-                result = fetcher.fetch_by_citation(citation_str)
-            if result is None and case_name:
-                result = fetcher.fetch_by_name(case_name, year)
-            self._win.after(0, self._on_scholar_done, result)
+            try:
+                result, cl_text, note = _find_scholar_for_item(
+                    client, fetcher, item, status_cb
+                )
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                result, cl_text, note = None, None, str(exc)
+            try:
+                self._win.after(0, self._on_scholar_done, result, item, cl_text, note)
+            except tk.TclError:
+                pass
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _on_scholar_done(self, result: Optional[tuple[str, str]]) -> None:
+    def _on_scholar_done(
+        self,
+        result: Optional[tuple[str, str]],
+        item: Optional[dict] = None,
+        cl_text: Optional[str] = None,
+        note: str = "",
+    ) -> None:
         self._restore_buttons()
         if result is None:
-            self._status_var.set("Google Scholar: not found.")
+            self._status_var.set("Google Scholar text unavailable.")
             messagebox.showwarning(
-                "Scholar Not Found",
-                "Could not find this opinion on Google Scholar.\n\n"
-                "Google may have blocked the request, or the case may not be indexed.",
+                "Scholar Text Unavailable",
+                "Could not find a Google Scholar opinion matching this case.\n\n"
+                + (f"({note})" if note else ""),
                 parent=self._win,
             )
             return
-        url, text = result
-        self._status_var.set(f"Scholar text loaded from {url}")
-        _show_text_window(self._win, url, text)
+        url, html = result
+        self._status_var.set(
+            f"Scholar text loaded — {note}" if note else f"Scholar text loaded from {url}"
+        )
+        _ScholarTextWindow(
+            self._win, self._app, url, html, item=item, cl_text=cl_text, note=note
+        )
 
 
 def main() -> None:
