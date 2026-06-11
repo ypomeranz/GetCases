@@ -543,7 +543,12 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     parts: list[OpinionPart] = []
     if maj_idx is not None and maj_idx < first_sep:
         if maj_idx > 0:
-            parts.append(OpinionPart("Header & Syllabus", "header", list(blocks[:maj_idx])))
+            # SCOTUS-style pages (attribution phrase) carry a syllabus;
+            # lower-court pages found via the author line don't.
+            header_label = (
+                "Header & Syllabus" if maj_phrase_idx is not None else "Header"
+            )
+            parts.append(OpinionPart(header_label, "header", list(blocks[:maj_idx])))
         parts.append(
             OpinionPart("Majority Opinion", "majority", list(blocks[maj_idx:first_sep]))
         )
