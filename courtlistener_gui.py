@@ -2455,14 +2455,27 @@ class _ScholarTextWindow:
         phrase = t[m.start():].rstrip(" .:;")
         phrase = re.sub(r"\s*\[[^\]]{1,6}\]$", "", phrase)  # trailing footnote marker
         head = t[: m.start()].strip().rstrip(", ")
-        title = (
-            "C.J."
-            if re.search(r"CHIEF\s+JUSTICE|Chief\s+Judge|C\.\s?J\.", head, re.IGNORECASE)
-            else "J."
-        )
         head = re.sub(r"^(?:MR\.|MRS\.|MS\.)\s+", "", head, flags=re.IGNORECASE)
-        head = re.sub(r"^(?:CHIEF\s+)?JUSTICE\s+", "", head, flags=re.IGNORECASE)
-        name = _fix_name_case(head.split(",")[0].strip())
+        # The chief-justice test must look only at the author's own
+        # designation — "JUSTICE THOMAS, with whom THE CHIEF JUSTICE and
+        # JUSTICE ALITO join, dissenting" is Thomas, J., not C.J.
+        segs = [s.strip() for s in head.split(",")]
+        author_seg = segs[0]
+        role_seg = segs[1] if len(segs) > 1 else ""
+        is_chief = bool(
+            re.match(r"(?:THE\s+)?CHIEF\s+JUSTICE\b", author_seg, re.IGNORECASE)
+        ) or bool(
+            re.fullmatch(
+                r"(?:THE\s+)?(?:Chief\s+(?:Justice|Judge)|C\.\s?J\.)",
+                role_seg,
+                re.IGNORECASE,
+            )
+        )
+        title = "C.J." if is_chief else "J."
+        name = re.sub(
+            r"^(?:THE\s+)?(?:CHIEF\s+)?JUSTICE\s+", "", author_seg, flags=re.IGNORECASE
+        ).strip()
+        name = _fix_name_case(name)
         if not name:
             return ""
         return f"{name}, {title}, {phrase}"
