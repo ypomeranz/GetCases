@@ -1584,6 +1584,13 @@ _TEXT_CITE_RE = re.compile(
 )
 
 
+# A citation line in the Scholar header: each parallel cite sits on its own
+# centered line, e.g. "306 Md. 556 (1986)" / "510 A.2d 562" / "87 F.4th 563 (2023)"
+_HEADER_CITE_RE = re.compile(
+    r"^\s*(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})\s*(?:\(|$)"
+)
+
+
 def _rtf_escape(s: str) -> str:
     out: list[str] = []
     for ch in s:
@@ -2174,17 +2181,58 @@ class _ScholarTextWindow:
             r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or ""
         ).strip()
 
-        # Scholar's header lists the parallel cites; the first one is the
-        # reporter its star pagination follows.
+        # Scholar's header lists each parallel cite on its own line.  When
+        # the page has star pagination, pick the reporter the stars follow
+        # (the first star falls just past that cite's first page); without
+        # stars, prefer a recognized national/regional reporter, the
+        # Bluebook default for state cases.
         header = "  ".join(
-            b.text() for b in self._blocks[:6] if b.kind in ("center", "heading")
+            b.text() for b in self._blocks[:8] if b.kind in ("center", "heading")
         )
-        header_norm = re.sub(r"\bU\.\s+S\.", "U.S.", header)
-        header_norm = re.sub(r"\b(\d{1,4})\s+US\s+(\d{1,5})\b", r"\1 U.S. \2", header_norm)
+        cands: list[tuple[str, int]] = []
+        for b in self._blocks[:8]:
+            if b.kind not in ("center", "heading"):
+                continue
+            t = re.sub(r"\s+", " ", b.text()).strip()
+            t = re.sub(r"\bU\.\s+S\.", "U.S.", t)
+            t = re.sub(r"\b(\d{1,4})\s+US\s+(\d{1,5})\b", r"\1 U.S. \2", t)
+            m = _HEADER_CITE_RE.match(t)
+            if m:
+                vol, rep, page = m.group(1), m.group(2).strip(" ,"), m.group(3)
+                cands.append((f"{vol} {rep} {page}", int(page)))
         cite = ""
-        m = _TEXT_CITE_RE.search(header_norm)
-        if m:
-            cite = re.sub(r"\s+", " ", m.group(0))
+        if cands:
+            first_star: Optional[int] = None
+            for b in self._blocks:
+                for s in b.spans:
+                    if s.pagenum:
+                        mm = re.search(r"\d+", s.text)
+                        if mm:
+                            first_star = int(mm.group(0))
+                            break
+                if first_star is not None:
+                    break
+            if first_star is not None:
+                fits = [
+                    (first_star - p, c)
+                    for c, p in cands
+                    if 0 <= first_star - p <= 400
+                ]
+                if fits:
+                    cite = min(fits)[1]
+            if not cite:
+                cite = next(
+                    (c for c, _p in cands if _TEXT_CITE_RE.fullmatch(c)),
+                    cands[0][0],
+                )
+        if not cite:
+            header_norm = re.sub(r"\bU\.\s+S\.", "U.S.", header)
+            header_norm = re.sub(
+                r"\b(\d{1,4})\s+US\s+(\d{1,5})\b", r"\1 U.S. \2", header_norm
+            )
+            m = _TEXT_CITE_RE.search(header_norm)
+            if m:
+                cite = re.sub(r"\s+", " ", m.group(0))
         if not cite:
             cite = _pick_citation(item.get("citation", []))
 
