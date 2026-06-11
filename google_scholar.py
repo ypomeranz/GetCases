@@ -76,6 +76,8 @@ class Span:
     sup: bool = False
     pagenum: bool = False  # reporter star-pagination marker, e.g. "*123"
     link: str = ""         # absolute scholar_case URL for a cited case
+    fnref: str = ""        # footnote anchor id for an in-text reference
+    fndef: str = ""        # footnote anchor id opening a footnote body
 
 
 @dataclass
@@ -183,11 +185,21 @@ def parse_opinion_blocks(html: str) -> list[Block]:
     root = soup.find(id="gs_opinion") or soup
     for bad in root.find_all(["script", "style"]):
         bad.decompose()
+    for bad in root.find_all(id="gs_dont_print"):  # "Save trees…" promo line
+        bad.decompose()
 
     blocks: list[Block] = []
     cur: list[Span] = []
 
-    def emit(text: str, fmt: dict, *, pagenum: bool = False, link: str = "") -> None:
+    def emit(
+        text: str,
+        fmt: dict,
+        *,
+        pagenum: bool = False,
+        link: str = "",
+        fnref: str = "",
+        fndef: str = "",
+    ) -> None:
         text = _WS_RE.sub(" ", text)
         if not text:
             return
@@ -204,6 +216,7 @@ def parse_opinion_blocks(html: str) -> list[Block]:
             last is not None
             and not pagenum
             and not last.pagenum
+            and not (fnref or fndef or last.fnref or last.fndef)
             and link == last.link
             and all(getattr(last, k) == fmt.get(k, False) for k in _FMT_KEYS)
         ):
@@ -214,6 +227,8 @@ def parse_opinion_blocks(html: str) -> list[Block]:
                     text=text,
                     pagenum=pagenum,
                     link=link,
+                    fnref=fnref,
+                    fndef=fndef,
                     **{k: fmt.get(k, False) for k in _FMT_KEYS},
                 )
             )
@@ -246,13 +261,28 @@ def parse_opinion_blocks(html: str) -> list[Block]:
                 continue
             if name == "a":
                 classes = [c.lower() for c in (child.get("class") or [])]
-                if "gsl_pagenum" in classes:
+                if "gsl_pagenum" in classes or "gsl_pagenum2" in classes:
+                    # Scholar emits the marker twice: a bare margin label
+                    # ("115", gsl_pagenum) and the inline star form
+                    # ("*115", gsl_pagenum2).  Keep only the starred one.
                     t = _WS_RE.sub(" ", child.get_text()).strip()
-                    if t:
+                    if "*" in t:
                         emit(t, fmt, pagenum=True)
                     continue
-                if "gsl_pagenum2" in classes:
-                    continue  # hidden duplicate page anchor
+                aname = str(child.get("name") or child.get("id") or "")
+                if "gsl_hash" in classes and aname:
+                    # Footnote anchors: in-text reference name="r[N]" links
+                    # to the body anchor name="[N]"; N is globally unique
+                    # even though the displayed marker restarts per opinion.
+                    t = _WS_RE.sub(" ", child.get_text()).strip()
+                    if aname.startswith("r["):
+                        if t:
+                            emit(t, fmt, fnref=aname[1:])
+                        continue
+                    if aname.startswith("["):
+                        if t:
+                            emit(t, fmt, fndef=aname)
+                        continue
                 href = child.get("href") or ""
                 if "scholar_case" in href:
                     if href.startswith("/"):
@@ -372,25 +402,34 @@ _FN_MARK_RE = re.compile(r"^(?:\[([^\]\s]{1,6})\]|(\*{1,3}|†|‡))(?=\s|$)")
 _FN_REF_RE = re.compile(r"^\[?([^\[\]\s]{1,6})\]?$")
 
 
+def _content_text(b: Block) -> str:
+    """Block text without page markers, whitespace-normalized — page
+    markers can open a block ("*116 MR. JUSTICE BLACKMUN delivered…") and
+    would defeat the start-anchored classification patterns."""
+    return _WS_RE.sub(" ", "".join(s.text for s in b.spans if not s.pagenum)).strip()
+
+
 def _split_footnote_run(blocks: list[Block]) -> tuple[list[Block], list[Block]]:
     """
     Split off the trailing footnote section Scholar appends after the last
     opinion.  Returns (content_blocks, footnote_blocks).
 
-    The run starts at the earliest marker-led block from which marker-led
-    blocks dominate through to the end (continuation paragraphs of a long
-    footnote don't repeat the marker, so a perfect run isn't required —
-    but an opinion paragraph that merely begins with "[1]" won't qualify
-    because ordinary text follows it).
+    Preferred: the first block opening with a footnote-body anchor
+    (name="[N]") starts the section.  Fallback for pages without those
+    anchors: the earliest marker-led block from which marker-led blocks
+    dominate through to the end.
     """
+    for i, b in enumerate(blocks):
+        if i and b.spans and b.spans[0].fndef:
+            return blocks[:i], blocks[i:]
     starts = [
-        i for i, b in enumerate(blocks) if _FN_MARK_RE.match(b.text().lstrip())
+        i for i, b in enumerate(blocks) if _FN_MARK_RE.match(_content_text(b))
     ]
     for s in starts:
         if s == 0:
             continue  # a document can't be all footnotes
         run = blocks[s:]
-        marked = sum(1 for b in run if _FN_MARK_RE.match(b.text().lstrip()))
+        marked = sum(1 for b in run if _FN_MARK_RE.match(_content_text(b)))
         if marked >= max(1, len(run) // 2):
             return blocks[:s], run
     return blocks, []
@@ -400,13 +439,29 @@ def _assign_footnotes(parts: list[OpinionPart], run: list[Block]) -> None:
     """
     Attach each footnote body to the part containing its in-text reference.
 
-    Each separate opinion restarts footnote numbering, so markers alone are
-    ambiguous ("[1]" appears once per opinion).  Both references and bodies
-    appear in document order, so a pointer walks the reference list: each
-    body binds to the next not-yet-consumed reference bearing its marker.
+    Preferred: Scholar's footnote anchors carry a globally unique id
+    (reference name="r[N]" ↔ body name="[N]"), so each body joins its part
+    exactly.  Fallback for pages without those anchors: each opinion
+    restarts numbering at [1], so bodies are matched to references by
+    document order — a pointer walks the reference list and each body
+    binds to the next not-yet-consumed reference bearing its marker.
     """
     if not parts:
         return
+    ref_part: dict[str, int] = {}  # footnote anchor id → part index
+    for pi, part in enumerate(parts):
+        for b in part.blocks:
+            for s in b.spans:
+                if s.fnref and s.fnref not in ref_part:
+                    ref_part[s.fnref] = pi
+    if ref_part and any(b.spans and b.spans[0].fndef for b in run):
+        target = len(parts) - 1
+        for b in run:
+            if b.spans and b.spans[0].fndef:
+                target = ref_part.get(b.spans[0].fndef, len(parts) - 1)
+            parts[target].footnotes.append(b)
+        return
+
     refs: list[tuple[str, int]] = []  # (marker, part index), in document order
     for pi, part in enumerate(parts):
         for b in part.blocks:
@@ -418,7 +473,7 @@ def _assign_footnotes(parts: list[OpinionPart], run: list[Block]) -> None:
 
     bodies: list[tuple[str, list[Block]]] = []
     for b in run:
-        m = _FN_MARK_RE.match(b.text().lstrip())
+        m = _FN_MARK_RE.match(_content_text(b))
         if m:
             bodies.append((m.group(1) or m.group(2), [b]))
         elif bodies:
@@ -454,7 +509,7 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     maj_phrase_idx: Optional[int] = None
     maj_author_idx: Optional[int] = None
     for i, b in enumerate(blocks):
-        t = re.sub(r"\s+", " ", b.text()).strip()
+        t = _content_text(b)
         if not t:
             continue
         if len(t) <= 300 and _SEP_HEADER_RE.match(t) and not _NOT_SEP_RE.search(t):
