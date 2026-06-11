@@ -106,9 +106,12 @@ class OpinionPart:
     label: str
     kind: str  # header | majority | concurrence | dissent
     blocks: list[Block] = field(default_factory=list)
+    footnotes: list[Block] = field(default_factory=list)
 
 
 _WS_RE = re.compile(r"\s+")
+# Google's promo line at the foot of every scholar_case page
+_SAVE_TREES_RE = re.compile(r"^save trees\b", re.IGNORECASE)
 _H_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _BLOCK_TAGS = _H_TAGS | {
     "p", "div", "blockquote", "center", "pre", "table", "tbody", "thead",
@@ -290,6 +293,7 @@ def parse_opinion_blocks(html: str) -> list[Block]:
 
     walk(root, {}, "para")
     flush("para")
+    blocks = [b for b in blocks if not _SAVE_TREES_RE.match(b.text().strip())]
     for block in blocks:
         _educate_block_quotes(block)
     return blocks
@@ -361,11 +365,89 @@ _AUTHOR_LINE_RE = re.compile(
 )
 
 
+# Footnote-body blocks start with the same marker the in-text superscript
+# shows: "[54] …", "[*] …", or occasionally a bare "* …".
+_FN_MARK_RE = re.compile(r"^(?:\[([^\]\s]{1,6})\]|(\*{1,3}|†|‡))(?=\s|$)")
+# In-text reference: a superscript span whose whole text is the marker.
+_FN_REF_RE = re.compile(r"^\[?([^\[\]\s]{1,6})\]?$")
+
+
+def _split_footnote_run(blocks: list[Block]) -> tuple[list[Block], list[Block]]:
+    """
+    Split off the trailing footnote section Scholar appends after the last
+    opinion.  Returns (content_blocks, footnote_blocks).
+
+    The run starts at the earliest marker-led block from which marker-led
+    blocks dominate through to the end (continuation paragraphs of a long
+    footnote don't repeat the marker, so a perfect run isn't required —
+    but an opinion paragraph that merely begins with "[1]" won't qualify
+    because ordinary text follows it).
+    """
+    starts = [
+        i for i, b in enumerate(blocks) if _FN_MARK_RE.match(b.text().lstrip())
+    ]
+    for s in starts:
+        if s == 0:
+            continue  # a document can't be all footnotes
+        run = blocks[s:]
+        marked = sum(1 for b in run if _FN_MARK_RE.match(b.text().lstrip()))
+        if marked >= max(1, len(run) // 2):
+            return blocks[:s], run
+    return blocks, []
+
+
+def _assign_footnotes(parts: list[OpinionPart], run: list[Block]) -> None:
+    """
+    Attach each footnote body to the part containing its in-text reference.
+
+    Each separate opinion restarts footnote numbering, so markers alone are
+    ambiguous ("[1]" appears once per opinion).  Both references and bodies
+    appear in document order, so a pointer walks the reference list: each
+    body binds to the next not-yet-consumed reference bearing its marker.
+    """
+    if not parts:
+        return
+    refs: list[tuple[str, int]] = []  # (marker, part index), in document order
+    for pi, part in enumerate(parts):
+        for b in part.blocks:
+            for s in b.spans:
+                if s.sup:
+                    m = _FN_REF_RE.match(s.text.strip())
+                    if m:
+                        refs.append((m.group(1), pi))
+
+    bodies: list[tuple[str, list[Block]]] = []
+    for b in run:
+        m = _FN_MARK_RE.match(b.text().lstrip())
+        if m:
+            bodies.append((m.group(1) or m.group(2), [b]))
+        elif bodies:
+            bodies[-1][1].append(b)  # continuation paragraph of the previous note
+        else:
+            parts[-1].footnotes.append(b)
+
+    ptr = 0
+    for marker, blks in bodies:
+        target = len(parts) - 1
+        j = next((k for k in range(ptr, len(refs)) if refs[k][0] == marker), None)
+        if j is None:
+            j = next((k for k in range(len(refs)) if refs[k][0] == marker), None)
+        if j is not None:
+            target = refs[j][1]
+            ptr = j + 1
+        parts[target].footnotes.extend(blks)
+
+
 def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     """
     Split parsed opinion blocks into parts: header (caption/syllabus),
-    majority opinion, and each concurrence/dissent.
+    majority opinion, and each concurrence/dissent.  The trailing footnote
+    section is split off and each footnote is attached to the part that
+    references it (``OpinionPart.footnotes``).
     """
+    if not blocks:
+        return []
+    blocks, fn_run = _split_footnote_run(blocks)
     if not blocks:
         return []
     boundaries: list[tuple[int, str, str]] = []  # (block index, kind, label)
@@ -416,7 +498,10 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     for k, (idx, kind, label) in enumerate(boundaries):
         end = boundaries[k + 1][0] if k + 1 < len(boundaries) else len(blocks)
         parts.append(OpinionPart(label, kind, list(blocks[idx:end])))
-    return [p for p in parts if p.blocks]
+    parts = [p for p in parts if p.blocks]
+    if fn_run:
+        _assign_footnotes(parts, fn_run)
+    return parts
 
 
 class GoogleScholarFetcher:

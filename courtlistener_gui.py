@@ -1981,6 +1981,13 @@ class _ScholarTextWindow:
         # priority and stay purple/blue inside colored parts)
         txt.tag_configure("part-dissent", foreground=self._DISSENT_COLOR)
         txt.tag_configure("part-concurrence", foreground=self._CONCUR_COLOR)
+        fnhead_font = tkfont.Font(
+            family=self._family, size=max(self._base_size - 2, 8), weight="bold"
+        )
+        self._fonts["fnhead"] = fnhead_font
+        txt.tag_configure(
+            "fnhead", font=fnhead_font, foreground="#666666", spacing1=10
+        )
         pagenum_font = tkfont.Font(
             family=self._family, size=max(self._base_size - 1, 8), weight="bold"
         )
@@ -2067,6 +2074,21 @@ class _ScholarTextWindow:
         if pos < len(span.text):
             txt.insert("end", span.text[pos:], tuple(tags))
 
+    def _insert_block(self, block, part_tag: Optional[str]) -> None:
+        if block.kind == "center":
+            block_tags: tuple = ("center",)
+        elif block.kind == "blockquote":
+            block_tags = ("blockquote",)
+        elif block.kind == "heading":
+            block_tags = ("heading",)
+        else:
+            block_tags = ()
+        if part_tag:
+            block_tags = block_tags + (part_tag,)
+        for span in block.spans:
+            self._insert_span(span, block_tags)
+        self._text.insert("end", "\n\n", block_tags)
+
     def _render_scholar(self) -> None:
         txt = self._text
         txt.config(state="normal")
@@ -2083,19 +2105,12 @@ class _ScholarTextWindow:
             for part in shown:
                 part_tag = self._PART_COLOR_TAGS.get(part.kind)
                 for block in part.blocks:
-                    if block.kind == "center":
-                        block_tags: tuple = ("center",)
-                    elif block.kind == "blockquote":
-                        block_tags = ("blockquote",)
-                    elif block.kind == "heading":
-                        block_tags = ("heading",)
-                    else:
-                        block_tags = ()
-                    if part_tag:
-                        block_tags = block_tags + (part_tag,)
-                    for span in block.spans:
-                        self._insert_span(span, block_tags)
-                    txt.insert("end", "\n\n", block_tags)
+                    self._insert_block(block, part_tag)
+                if part.footnotes:
+                    fnhead_tags = ("fnhead",) + ((part_tag,) if part_tag else ())
+                    txt.insert("end", "Footnotes\n\n", fnhead_tags)
+                    for block in part.footnotes:
+                        self._insert_block(block, part_tag)
         txt.config(state="disabled")
         self._mode = "scholar"
         self._source_var.set(self._scholar_url)
