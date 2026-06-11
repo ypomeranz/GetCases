@@ -1590,6 +1590,10 @@ _HEADER_CITE_RE = re.compile(
     r"^\s*(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})\s*(?:\(|$)"
 )
 
+# Marker opening a footnote body, e.g. "[4] …" or "* …" (fallback when the
+# parser found no footnote anchor ids)
+_FN_BODY_MARK_RE = re.compile(r"^\s*(?:\[([^\]\s]{1,6})\]|(\*{1,3}|†|‡))(?=\s|$)")
+
 
 def _rtf_escape(s: str) -> str:
     out: list[str] = []
@@ -2070,9 +2074,16 @@ class _ScholarTextWindow:
         txt = self._text
         tags = list(block_tags)
         if span.pagenum:
+            m = re.search(r"\d+", span.text)
+            if m:
+                self._cur_page = int(m.group(0))
             tags.append("pagenum")
             txt.insert("end", span.text, tuple(tags))
             return
+        if span.fnref and span.fnref not in self._fnref_pages:
+            # Page in effect where the footnote is referenced — that's the
+            # page a Bluebook "n.N" pin cite uses.
+            self._fnref_pages[span.fnref] = self._cur_page
         tags.append(self._font_tag(span.italic, span.bold, span.small, span.sup))
         if span.underline:
             tags.append("underline")
@@ -2092,6 +2103,41 @@ class _ScholarTextWindow:
             pos = m.end()
         if pos < len(span.text):
             txt.insert("end", span.text[pos:], tuple(tags))
+
+    def _render_footnotes(self, footnotes: list, part_tag: Optional[str]) -> None:
+        """Insert a part's footnote blocks, recording each note's rendered
+        region and number so copied selections can be pin-cited (page n.N)."""
+        txt = self._text
+        open_region: Optional[list] = None  # [start_index, note_number, page]
+
+        def close_region() -> None:
+            nonlocal open_region
+            if open_region is not None:
+                self._fn_regions.append(
+                    (open_region[0], txt.index("end-1c"),
+                     open_region[1], open_region[2])
+                )
+                open_region = None
+
+        for block in footnotes:
+            first = block.spans[0] if block.spans else None
+            num = ""
+            page: Optional[int] = None
+            if first is not None and first.fndef:
+                num = first.text.strip().strip("[]")
+                page = self._fnref_pages.get(first.fndef)
+            else:
+                body_text = "".join(
+                    s.text for s in block.spans if not s.pagenum
+                ).lstrip()
+                m = _FN_BODY_MARK_RE.match(body_text)
+                if m:
+                    num = (m.group(1) or m.group(2) or "").strip()
+            if num:
+                close_region()
+                open_region = [txt.index("end-1c"), num, page]
+            self._insert_block(block, part_tag)
+        close_region()
 
     def _insert_block(self, block, part_tag: Optional[str]) -> None:
         if block.kind == "center":
@@ -2113,23 +2159,26 @@ class _ScholarTextWindow:
         txt.config(state="normal")
         txt.delete("1.0", "end")
         self._link_actions.clear()
+        self._fnref_pages: dict[str, Optional[int]] = {}
+        self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
+        self._cur_page: Optional[int] = None
         if not self._parts:
             txt.insert("1.0", self._scholar_text)
         else:
-            shown = (
-                self._parts
-                if self._current_part is None
-                else [self._parts[self._current_part]]
-            )
-            for part in shown:
+            if self._current_part is None:
+                shown = list(enumerate(self._parts))
+            else:
+                shown = [(self._current_part, self._parts[self._current_part])]
+            for pi, part in shown:
+                if self._part_start_pages:
+                    self._cur_page = self._part_start_pages[pi] or self._cur_page
                 part_tag = self._PART_COLOR_TAGS.get(part.kind)
                 for block in part.blocks:
                     self._insert_block(block, part_tag)
                 if part.footnotes:
                     fnhead_tags = ("fnhead",) + ((part_tag,) if part_tag else ())
                     txt.insert("end", "Footnotes\n\n", fnhead_tags)
-                    for block in part.footnotes:
-                        self._insert_block(block, part_tag)
+                    self._render_footnotes(part.footnotes, part_tag)
         txt.config(state="disabled")
         self._mode = "scholar"
         self._source_var.set(self._scholar_url)
@@ -2329,6 +2378,73 @@ class _ScholarTextWindow:
             sb = sb[-2:]  # Bluebook: drop repetitious digits, keep last two
         return f"{sa}-{sb}"
 
+    @staticmethod
+    def _format_note_numbers(nums: list[str]) -> str:
+        """Bluebook note pins: n.4 / nn.4-5 (consecutive) / nn.4 & 6."""
+        runs: list[list[str]] = []
+        for n in nums:
+            if (
+                runs
+                and n.isdigit()
+                and runs[-1][-1].isdigit()
+                and int(n) == int(runs[-1][-1]) + 1
+            ):
+                runs[-1].append(n)
+            else:
+                runs.append([n])
+        parts = [f"{r[0]}-{r[-1]}" if len(r) > 1 else r[0] for r in runs]
+        prefix = "nn." if len(nums) > 1 else "n."
+        return prefix + " & ".join(parts)
+
+    def _pin_with_footnotes(self, start: str, end: str) -> Optional[str]:
+        """
+        Pinpoint for the selection, footnote-aware (Bluebook rule 3.2(b)):
+        material in a footnote cites as "page n.N"; several notes as
+        "nn.4-5" / "nn.4 & 6"; text plus a note on the same page as
+        "page & n.N".
+        """
+        txt = self._text
+        regions = [
+            r for r in self._fn_regions
+            if txt.compare(r[0], "<", end) and txt.compare(r[1], ">", start)
+        ]
+        if not regions:
+            return self._pin_for_range(start, end)
+
+        fallback_page: Optional[int] = None
+        m = _CITE_PARSE_RE.match(self._bb["cite"])
+        if m:
+            fallback_page = int(m.group(3))
+
+        # Group selected notes by the page they're cited on (document order)
+        page_groups: dict[Optional[int], list[str]] = {}
+        for _rs, _re, num, page in regions:
+            page_groups.setdefault(page, []).append(num)
+        note_strs = []
+        for page, nums in page_groups.items():
+            p = page if page is not None else fallback_page
+            s = self._format_note_numbers(nums)
+            note_strs.append(f"{p} {s}" if p is not None else s)
+        notes = ", ".join(note_strs)
+
+        # Does the selection also cover opinion text before the notes?
+        first_rs = regions[0][0]
+        text_before = (
+            txt.compare(start, "<", first_rs)
+            and txt.get(start, first_rs).strip() != ""
+        )
+        if not text_before:
+            return notes
+        text_pin = self._pin_for_range(start, first_rs)
+        if text_pin is None:
+            return notes
+        if len(page_groups) == 1:
+            (page, nums), = page_groups.items()
+            p = page if page is not None else fallback_page
+            if p is not None and text_pin == str(p):
+                return f"{text_pin} & {self._format_note_numbers(nums)}"
+        return f"{text_pin}, {notes}"
+
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
@@ -2342,7 +2458,7 @@ class _ScholarTextWindow:
             start, end = "1.0", "end-1c"
             selected = False
         pin = (
-            self._pin_for_range(start, end)
+            self._pin_with_footnotes(start, end)
             if (selected and self._mode == "scholar")
             else None
         )
