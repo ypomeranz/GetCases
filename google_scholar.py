@@ -89,6 +89,25 @@ class Block:
         return "".join(s.text for s in self.spans)
 
 
+@dataclass
+class ScholarResult:
+    """One row parsed from a Scholar case-law results page."""
+
+    title: str
+    url: str
+    source: str = ""   # the green byline, e.g. "Supreme Court, 1973"
+    snippet: str = ""
+
+
+@dataclass
+class OpinionPart:
+    """A section of an opinion: header, majority, concurrence, or dissent."""
+
+    label: str
+    kind: str  # header | majority | concurrence | dissent
+    blocks: list[Block] = field(default_factory=list)
+
+
 _WS_RE = re.compile(r"\s+")
 _H_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _BLOCK_TAGS = _H_TAGS | {
@@ -282,6 +301,124 @@ def blocks_to_text(blocks: list[Block]) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+def text_similarity(a: str, b: str, n: int = 4) -> float:
+    """
+    Word n-gram shingle containment between two texts, in [0, 1].
+
+    Containment (|A∩B| / min(|A|, |B|)) rather than Jaccard, so the score
+    is not penalized when one source includes extra material the other
+    lacks (syllabus, headnotes, parallel cites).  Texts of the same
+    opinion typically score far above 0.6; different opinions score
+    near 0 even when they discuss the same subject.
+    """
+    def shingles(t: str) -> set[str]:
+        words = re.findall(r"[a-z0-9]+", t.lower())
+        return {" ".join(words[i: i + n]) for i in range(len(words) - n + 1)}
+
+    sa, sb = shingles(a), shingles(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / min(len(sa), len(sb))
+
+
+# --- Opinion segmentation -------------------------------------------------
+# A separate-opinion header starts its own block and names a justice/judge
+# plus "concurring"/"dissenting", e.g.:
+#   MR. JUSTICE STEWART, concurring.
+#   Justice O'CONNOR, with whom Justice BRENNAN joins, dissenting.
+#   KOZINSKI, Circuit Judge, dissenting:
+_SEP_HEADER_RE = re.compile(
+    r"^\s*(?:MR\.\s+|MRS\.\s+|MS\.\s+)?"
+    r"(?:(?:CHIEF\s+)?JUSTICE\s+\S+|"
+    r"[A-Z][\w.'’-]*(?:\s+[A-Z][\w.'’-]*){0,3}\s*,\s*"
+    r"(?:C\.\s*J\.|JJ?\.|(?:Chief\s+|Senior\s+|Presiding\s+)?"
+    r"(?:Circuit\s+|District\s+|Bankruptcy\s+)?Judge))"
+    r".{0,200}?\b(?:concurring|dissenting)",
+    re.IGNORECASE | re.DOTALL,
+)
+# Syllabus disposition lines ("BLACKMUN, J., delivered the opinion…;
+# STEWART, J., filed a concurring opinion…") look like separate-opinion
+# headers but are not.
+_NOT_SEP_RE = re.compile(r"\b(?:filed|delivered|announced)\b", re.IGNORECASE)
+
+# The majority opinion starts at an attribution block such as
+# "MR. JUSTICE BLACKMUN delivered the opinion of the Court." or "PER CURIAM."
+_MAJ_PHRASE_RE = re.compile(
+    r"delivered the opinion|announced the judgment|^\s*PER\s+CURIAM\b",
+    re.IGNORECASE,
+)
+_MAJ_ATTRIB_RE = re.compile(
+    r"^\s*(?:MR\.\s+|MRS\.\s+|MS\.\s+)?"
+    r"(?:(?:CHIEF\s+)?JUSTICE\s+\S+|"
+    r"[A-Z][\w.'’-]+(?:\s+[A-Z][\w.'’-]+){0,3},\s*(?:C\.\s*)?J\.|PER\s+CURIAM)",
+    re.IGNORECASE,
+)
+# Lower-court style author line standing alone: "KOZINSKI, Circuit Judge:"
+_AUTHOR_LINE_RE = re.compile(
+    r"^\s*[A-Z][\w.'’ -]{0,50},\s*(?:(?:Chief|Senior|Presiding)\s+)?"
+    r"(?:(?:Circuit|District|Bankruptcy)\s+)?(?:Judge|Justice|C\.?\s?J\.|J\.)"
+    r"\s*[.:;—-]?\s*$"
+)
+
+
+def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
+    """
+    Split parsed opinion blocks into parts: header (caption/syllabus),
+    majority opinion, and each concurrence/dissent.
+    """
+    if not blocks:
+        return []
+    boundaries: list[tuple[int, str, str]] = []  # (block index, kind, label)
+    maj_phrase_idx: Optional[int] = None
+    maj_author_idx: Optional[int] = None
+    for i, b in enumerate(blocks):
+        t = re.sub(r"\s+", " ", b.text()).strip()
+        if not t:
+            continue
+        if len(t) <= 300 and _SEP_HEADER_RE.match(t) and not _NOT_SEP_RE.search(t):
+            kind = "dissent" if re.search(r"dissent", t, re.IGNORECASE) else "concurrence"
+            label = t if len(t) <= 90 else t[:87] + "…"
+            boundaries.append((i, kind, label))
+            continue
+        if not boundaries:
+            if _MAJ_PHRASE_RE.search(t[:160]) and _MAJ_ATTRIB_RE.match(t):
+                # Keep the LAST candidate: the syllabus disposition line
+                # ("BLACKMUN, J., delivered…") precedes the true opinion
+                # start ("MR. JUSTICE BLACKMUN delivered…").
+                maj_phrase_idx = i
+            elif maj_author_idx is None and len(t) <= 120 and _AUTHOR_LINE_RE.match(t):
+                maj_author_idx = i
+    maj_idx = maj_phrase_idx if maj_phrase_idx is not None else maj_author_idx
+    first_sep = boundaries[0][0] if boundaries else len(blocks)
+
+    parts: list[OpinionPart] = []
+    if maj_idx is not None and maj_idx < first_sep:
+        if maj_idx > 0:
+            parts.append(OpinionPart("Header & Syllabus", "header", list(blocks[:maj_idx])))
+        parts.append(
+            OpinionPart("Majority Opinion", "majority", list(blocks[maj_idx:first_sep]))
+        )
+    else:
+        # No attribution found: treat the leading centered caption as header
+        j = 0
+        while j < first_sep and blocks[j].kind in ("center", "heading"):
+            j += 1
+        if 0 < j < first_sep:
+            parts.append(OpinionPart("Header", "header", list(blocks[:j])))
+        if first_sep > j:
+            parts.append(
+                OpinionPart(
+                    "Majority Opinion" if boundaries else "Opinion",
+                    "majority",
+                    list(blocks[j:first_sep]),
+                )
+            )
+    for k, (idx, kind, label) in enumerate(boundaries):
+        end = boundaries[k + 1][0] if k + 1 < len(boundaries) else len(blocks)
+        parts.append(OpinionPart(label, kind, list(blocks[idx:end])))
+    return [p for p in parts if p.blocks]
+
+
 class GoogleScholarFetcher:
     """
     Fetch and cache US case law text from Google Scholar.
@@ -322,6 +459,11 @@ class GoogleScholarFetcher:
         except sqlite3.OperationalError:
             pass  # column already exists
         self._db.commit()
+
+        # Per-session memory cache for search-results pages (not persisted:
+        # rankings change, and re-searching identical queries within a
+        # session is the case worth optimizing).
+        self._search_cache: dict[str, list[ScholarResult]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -392,6 +534,77 @@ class GoogleScholarFetcher:
         if result:
             self._cache_put(key, *result)
         return result
+
+    def search_cases(self, query: str, limit: int = 10) -> list["ScholarResult"]:
+        """
+        Search Scholar case law (all state and federal courts) and return
+        parsed results: title, case URL, byline, and snippet.
+
+        Results are cached in memory for the session.
+        """
+        key = query.strip()
+        if key in self._search_cache:
+            return self._search_cache[key][:limit]
+        url = f"{SCHOLAR_BASE}/scholar?q={quote_plus(query)}&as_sdt=2006"
+        print(f"[scholar] searching {url}")
+        try:
+            resp = self._get(url)
+        except Exception as exc:
+            print(f"[scholar] search request failed: {exc}")
+            return []
+        results = self._parse_results(resp.text)
+        print(f"[scholar] parsed {len(results)} case results")
+        self._search_cache[key] = results
+        return results[:limit]
+
+    @staticmethod
+    def _parse_results(html: str) -> list["ScholarResult"]:
+        """Extract case-law rows from a Scholar results page."""
+        soup = BeautifulSoup(html, "html.parser")
+        out: list[ScholarResult] = []
+        seen: set[str] = set()
+        for div in soup.find_all("div", class_="gs_r"):
+            h3 = div.find("h3", class_="gs_rt")
+            if not h3:
+                continue
+            a = h3.find("a", href=True)
+            if not a or "scholar_case" not in a["href"]:
+                continue
+            href = a["href"]
+            if href.startswith("/"):
+                href = SCHOLAR_BASE + href
+            if href in seen:
+                continue
+            seen.add(href)
+            title = _WS_RE.sub(" ", a.get_text()).strip()
+            gs_a = div.find("div", class_="gs_a")
+            source = _WS_RE.sub(" ", gs_a.get_text()).strip() if gs_a else ""
+            rs = div.find("div", class_="gs_rs")
+            snippet = _WS_RE.sub(" ", rs.get_text()).strip() if rs else ""
+            out.append(ScholarResult(title=title, url=href, source=source, snippet=snippet))
+        if not out:
+            # Markup changed?  Fall back to bare scholar_case anchors.
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "scholar_case" not in href:
+                    continue
+                if href.startswith("/"):
+                    href = SCHOLAR_BASE + href
+                if href in seen:
+                    continue
+                seen.add(href)
+                title = _WS_RE.sub(" ", a.get_text()).strip()
+                if title:
+                    out.append(ScholarResult(title=title, url=href))
+        return out
+
+    def get_cached(self, key: str) -> Optional[tuple[str, str]]:
+        """Look up an arbitrary cache key; returns (url, opinion_html) or None."""
+        return self._cache_get(key)
+
+    def put_cached(self, key: str, url: str, html: str) -> None:
+        """Store (url, opinion_html) under an arbitrary cache key."""
+        self._cache_put(key, url, html)
 
     def fetch_by_url(self, url: str) -> Optional[tuple[str, str]]:
         """

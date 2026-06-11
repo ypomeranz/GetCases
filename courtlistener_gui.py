@@ -578,6 +578,8 @@ try:
         GoogleScholarFetcher,
         blocks_to_text,
         parse_opinion_blocks,
+        segment_blocks,
+        text_similarity,
     )
 
     _SCHOLAR_AVAILABLE = True
@@ -594,6 +596,7 @@ class CourtListenerGUI:
 
         self._client: Optional[CourtListenerClient] = None
         self._results: list[dict] = []
+        self._scholar_results: list = []  # ScholarResult objects
         self._search_thread: Optional[threading.Thread] = None
         self._scholar: Optional["GoogleScholarFetcher"] = None
 
@@ -700,12 +703,32 @@ class CourtListenerGUI:
             side="left", fill="x", expand=True
         )
 
+        # --- Compact preview strip, spans the full width above the status bar
+        preview_frame = ttk.LabelFrame(results_frame, text="Preview", padding=2)
+        preview_frame.pack(side="bottom", fill="x", pady=(4, 0))
+        self._preview_text = tk.Text(
+            preview_frame,
+            wrap="word",
+            height=4,
+            state="disabled",
+            font=("TkDefaultFont", 9),
+            relief="flat",
+            background="#f5f5f5",
+        )
+        self._preview_text.pack(fill="x", expand=True)
+
         paned = ttk.PanedWindow(results_frame, orient="horizontal")
         paned.pack(fill="both", expand=True)
 
-        # -- Left pane: main results tree + orders tree --
+        # -- Left pane: CourtListener results (main tree + orders tree) --
         left_frame = ttk.Frame(paned)
         paned.add(left_frame, weight=3)
+        ttk.Label(
+            left_frame,
+            text="CourtListener",
+            foreground="gray",
+            font=("TkDefaultFont", 9, "italic"),
+        ).pack(anchor="w")
 
         cols = ("case_name", "court", "date_filed", "citation", "status")
 
@@ -750,26 +773,46 @@ class CourtListenerGUI:
         )
         self._orders_tree.bind("<Button-3>", lambda e: self._on_right_click(e, self._orders_tree))
 
-        # -- Right pane: preview panel (narrow — user can drag sash to resize) --
-        right_frame = ttk.LabelFrame(paned, text="Preview", padding=4, width=160)
-        paned.add(right_frame, weight=1)
+        # -- Right pane: Google Scholar results --
+        scholar_pane = ttk.Frame(paned)
+        paned.add(scholar_pane, weight=2)
+        sch_header = ttk.Frame(scholar_pane)
+        sch_header.pack(fill="x")
+        ttk.Label(
+            sch_header,
+            text="Google Scholar",
+            foreground="gray",
+            font=("TkDefaultFont", 9, "italic"),
+        ).pack(side="left")
+        self._scholar_status_var = tk.StringVar(value="")
+        ttk.Label(
+            sch_header, textvariable=self._scholar_status_var, foreground="gray"
+        ).pack(side="right")
 
-        preview_inner = ttk.Frame(right_frame)
-        preview_inner.pack(fill="both", expand=True)
-        self._preview_text = tk.Text(
-            preview_inner,
-            wrap="word",
-            state="disabled",
-            font=("TkDefaultFont", 9),
-            relief="flat",
-            background="#f5f5f5",
+        sch_tree_frame = ttk.Frame(scholar_pane)
+        sch_tree_frame.pack(fill="both", expand=True)
+        self._scholar_tree = ttk.Treeview(
+            sch_tree_frame,
+            columns=("case", "source"),
+            show="headings",
+            selectmode="browse",
         )
-        preview_vsb = ttk.Scrollbar(
-            preview_inner, orient="vertical", command=self._preview_text.yview
+        self._scholar_tree.heading("case", text="Case")
+        self._scholar_tree.heading("source", text="Court / Year")
+        self._scholar_tree.column("case", width=250, minwidth=120)
+        self._scholar_tree.column("source", width=140, minwidth=80)
+        svsb = ttk.Scrollbar(
+            sch_tree_frame, orient="vertical", command=self._scholar_tree.yview
         )
-        self._preview_text.configure(yscrollcommand=preview_vsb.set)
-        preview_vsb.pack(side="right", fill="y")
-        self._preview_text.pack(side="left", fill="both", expand=True)
+        self._scholar_tree.configure(yscrollcommand=svsb.set)
+        self._scholar_tree.pack(side="left", fill="both", expand=True)
+        svsb.pack(side="right", fill="y")
+        self._scholar_tree.bind(
+            "<<TreeviewSelect>>", lambda _e: self._on_scholar_row_select()
+        )
+        self._scholar_tree.bind(
+            "<Double-1>", lambda _e: self._open_selected_scholar_result()
+        )
 
 
     # ------------------------------------------------------------------
@@ -879,13 +922,37 @@ class CourtListenerGUI:
         sel = source_tree.selection()
         if not sel:
             return
-        # Deselect the other tree so only one row is ever active
+        # Deselect the other trees so only one row is ever active
         other = self._orders_tree if source_tree is self._tree else self._tree
         if other.selection():
             other.selection_remove(*other.selection())
+        if self._scholar_tree.selection():
+            self._scholar_tree.selection_remove(*self._scholar_tree.selection())
         self._download_btn.config(state="normal")
         self._scholar_btn.config(state="normal")
         self._show_preview(self._iid_to_idx(sel[0]))
+
+    def _on_scholar_row_select(self) -> None:
+        sel = self._scholar_tree.selection()
+        if not sel:
+            return
+        for tree in (self._tree, self._orders_tree):
+            if tree.selection():
+                tree.selection_remove(*tree.selection())
+        self._download_btn.config(state="disabled")  # no CourtListener record
+        self._scholar_btn.config(state="normal")
+        idx = int(sel[0])
+        if 0 <= idx < len(self._scholar_results):
+            r = self._scholar_results[idx]
+            self._set_preview(r.snippet or "(no snippet on the results page)")
+
+    def _selected_scholar_result(self):
+        sel = self._scholar_tree.selection()
+        if sel:
+            idx = int(sel[0])
+            if 0 <= idx < len(self._scholar_results):
+                return self._scholar_results[idx]
+        return None
 
     def _on_right_click(self, event: tk.Event, tree: ttk.Treeview) -> None:
         """Right-click: open the 'Citing Opinions' window for the clicked row."""
@@ -947,11 +1014,31 @@ class CourtListenerGUI:
             self._tree.delete(row)
         for row in self._orders_tree.get_children():
             self._orders_tree.delete(row)
+        for row in self._scholar_tree.get_children():
+            self._scholar_tree.delete(row)
         self._results.clear()
+        self._scholar_results = []
         self._preview_cache.clear()
-        self._preview_text.config(state="normal")
-        self._preview_text.delete("1.0", "end")
-        self._preview_text.config(state="disabled")
+        self._set_preview("")
+
+        # Google Scholar search runs in parallel with the CourtListener one
+        if _SCHOLAR_AVAILABLE:
+            if self._scholar is None:
+                self._scholar = GoogleScholarFetcher()
+            fetcher = self._scholar
+            self._scholar_status_var.set("Searching…")
+
+            def scholar_run() -> None:
+                try:
+                    res = fetcher.search_cases(query, limit=15)
+                except Exception as exc:
+                    print(f"[scholar] search failed: {exc}")
+                    res = []
+                self.root.after(0, self._on_scholar_search_results, res)
+
+            threading.Thread(target=scholar_run, daemon=True).start()
+        else:
+            self._scholar_status_var.set("(needs beautifulsoup4)")
 
         def run() -> None:
             try:
@@ -1019,16 +1106,18 @@ class CourtListenerGUI:
         else:
             self._status_var.set("No results found.")
 
-    def _show_preview(self, idx: int) -> None:
-        """Populate the right-hand preview panel for result at *idx*."""
+    def _set_preview(self, text: str) -> None:
         self._preview_text.config(state="normal")
         self._preview_text.delete("1.0", "end")
-        text = self._preview_cache.get(idx, "")
-        self._preview_text.insert(
-            "1.0",
-            text if text else "(No preview available — download PDF for full opinion)",
-        )
+        self._preview_text.insert("1.0", text)
         self._preview_text.config(state="disabled")
+
+    def _show_preview(self, idx: int) -> None:
+        """Populate the preview strip for CourtListener result at *idx*."""
+        text = self._preview_cache.get(idx, "")
+        self._set_preview(
+            text if text else "(No preview available — download PDF for full opinion)"
+        )
 
     def _on_error(self, message: str) -> None:
         self._search_btn.config(state="normal")
@@ -1330,7 +1419,43 @@ class CourtListenerGUI:
             self._scholar = GoogleScholarFetcher()
         return self._scholar
 
+    def _on_scholar_search_results(self, results: list) -> None:
+        self._scholar_results = results
+        for row in self._scholar_tree.get_children():
+            self._scholar_tree.delete(row)
+        for i, r in enumerate(results):
+            self._scholar_tree.insert("", "end", iid=str(i), values=(r.title, r.source))
+        self._scholar_status_var.set(
+            f"{len(results)} results" if results else "no results (blocked?)"
+        )
+
+    def _open_selected_scholar_result(self) -> None:
+        r = self._selected_scholar_result()
+        if r is not None:
+            self._open_scholar_url(r.url)
+
+    def _open_scholar_url(self, url: str) -> None:
+        """Open a Scholar case page (from the Scholar results column)."""
+        fetcher = self._get_scholar()
+        if fetcher is None:
+            return
+        self._status_var.set("Fetching opinion from Google Scholar…")
+
+        def run() -> None:
+            result = fetcher.fetch_by_url(url)
+            self.root.after(
+                0, self._on_scholar_result, result, None, None,
+                "opened from Scholar search",
+            )
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _fetch_scholar_text(self) -> None:
+        # A row in the Scholar results column: open it directly, unverified.
+        if self._selected_scholar_result() is not None:
+            self._open_selected_scholar_result()
+            return
+
         selected = self._get_selected_item()
         if not selected:
             messagebox.showinfo("No Selection", "Please select a case first.")
@@ -1339,49 +1464,57 @@ class CourtListenerGUI:
         fetcher = self._get_scholar()
         if fetcher is None:
             return
-
+        client = self._get_client()
         _, item = selected
-
-        citation_str = _pick_citation(item.get("citation", []))
-        case_name = item.get("caseName") or item.get("case_name") or ""
-        date_filed = item.get("dateFiled") or item.get("date_filed") or ""
-        year = date_filed[:4] if date_filed else None
 
         self._download_btn.config(state="disabled")
         self._scholar_btn.config(state="disabled")
         self._search_btn.config(state="disabled")
         self._status_var.set("Searching Google Scholar…")
 
-        def run() -> None:
-            result = None
-            if citation_str:
-                print(f"[scholar] trying citation: {citation_str!r}")
-                result = fetcher.fetch_by_citation(citation_str)
-            if result is None and case_name:
-                print(f"[scholar] falling back to case name: {case_name!r} ({year})")
-                result = fetcher.fetch_by_name(case_name, year)
+        def status_cb(msg: str) -> None:
+            self.root.after(0, self._status_var.set, msg)
 
-            self.root.after(0, self._on_scholar_result, result, item)
+        def run() -> None:
+            try:
+                result, cl_text, note = _find_scholar_for_item(
+                    client, fetcher, item, status_cb
+                )
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                result, cl_text, note = None, None, str(exc)
+            self.root.after(0, self._on_scholar_result, result, item, cl_text, note)
 
         threading.Thread(target=run, daemon=True).start()
 
     def _on_scholar_result(
-        self, result: Optional[tuple[str, str]], item: Optional[dict] = None
+        self,
+        result: Optional[tuple[str, str]],
+        item: Optional[dict] = None,
+        cl_text: Optional[str] = None,
+        note: str = "",
     ) -> None:
         self._restore_buttons()
         if result is None:
-            self._status_var.set("Google Scholar: no text found.")
+            self._status_var.set("Google Scholar text unavailable.")
             messagebox.showwarning(
-                "Scholar Not Found",
-                "Could not find this opinion on Google Scholar.\n\n"
-                "Google may have blocked the request, or the case may not be indexed.\n"
-                "Check the terminal for details.",
+                "Scholar Text Unavailable",
+                "Could not find a Google Scholar opinion matching this case.\n\n"
+                + (f"({note})\n\n" if note else "")
+                + "Google may have blocked the request, the case may not be "
+                "indexed, or every candidate differed too much from the "
+                "CourtListener text.",
             )
             return
 
         url, html = result
-        self._status_var.set(f"Scholar text loaded from {url}")
-        _ScholarTextWindow(self.root, self, url, html, item=item)
+        self._status_var.set(
+            f"Scholar text loaded — {note}" if note else f"Scholar text loaded from {url}"
+        )
+        _ScholarTextWindow(
+            self.root, self, url, html, item=item, cl_text=cl_text, note=note
+        )
 
     def _restore_buttons(self) -> None:
         self._download_btn.config(state="normal")
@@ -1595,6 +1728,134 @@ def _copy_rich_clipboard(widget: tk.Misc, rtf: str, plain: str) -> str:
     return "plain text (no RTF clipboard tool available)"
 
 
+# Minimum word-shingle containment between the Scholar candidate and the
+# CourtListener text to accept them as the same opinion.  Containment is
+# stricter than an intuitive "percent similar": same-opinion pairs score
+# well above this even across OCR/edition differences, while different
+# opinions score near zero.
+_SCHOLAR_MATCH_THRESHOLD = 0.60
+
+
+def _find_scholar_for_item(
+    client: Optional[CourtListenerClient],
+    fetcher: "GoogleScholarFetcher",
+    item: dict,
+    status,
+) -> tuple[Optional[tuple[str, str]], Optional[str], str]:
+    """
+    Locate this CourtListener case's opinion on Google Scholar, verifying
+    candidates against the CourtListener text before accepting them.
+
+    Search stages, in order:
+      1. the primary citation (walking down the results list),
+      2. alternate reporter citations from the CourtListener cluster,
+      3. the case name (with variants such as United States ↔ US).
+
+    Returns (result, cl_text, note): *result* is (url, opinion_html) or
+    None if no candidate was similar enough; *cl_text* is the assembled
+    CourtListener text (so the viewer's toggle is instant); *note*
+    describes the verification outcome.
+    """
+    cluster_id = item.get("cluster_id") or item.get("id")
+    vkey = f"verified:cluster:{cluster_id}" if cluster_id else ""
+    if vkey:
+        cached = fetcher.get_cached(vkey)
+        if cached:
+            return cached, None, "verified match (cached)"
+
+    cl_text: Optional[str] = None
+    if client is not None and cluster_id:
+        status("Fetching CourtListener text for comparison…")
+        try:
+            cl_text = _assemble_case_text(client, item)
+        except Exception as exc:
+            print(f"[verify] CourtListener text unavailable: {exc}")
+
+    tried: set[str] = set()
+    best_sim = 0.0
+
+    def try_url(url: str) -> Optional[tuple[str, str]]:
+        nonlocal best_sim
+        if url in tried:
+            return None
+        tried.add(url)
+        res = fetcher.fetch_by_url(url)
+        if not res:
+            return None
+        if cl_text is None:
+            return res  # nothing to verify against; accept the first hit
+        sim = text_similarity(blocks_to_text(parse_opinion_blocks(res[1])), cl_text)
+        print(f"[verify] similarity {sim:.2f} for {url}")
+        best_sim = max(best_sim, sim)
+        return res if sim >= _SCHOLAR_MATCH_THRESHOLD else None
+
+    # --- assemble the search stages ---
+    primary = _pick_citation(item.get("citation", []))
+    alt_cites: list[str] = []
+    raw = item.get("citation")
+    if isinstance(raw, list):
+        alt_cites += [c for c in raw if c and c != primary]
+    if client is not None and cluster_id:
+        try:
+            rec = client.get_cluster(int(cluster_id), fields="citations")
+            for c in _cluster_citations_to_strings(rec.get("citations")):
+                if c != primary and c not in alt_cites:
+                    alt_cites.append(c)
+        except Exception as exc:
+            print(f"[verify] cluster citations fetch failed: {exc}")
+    alt_cites = [c for c in alt_cites if not _NOISE_CITE_RE.search(c)][:4]
+
+    case_name = re.sub(
+        r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or ""
+    ).strip()
+    date_filed = item.get("dateFiled") or item.get("date_filed") or ""
+    year = date_filed[:4] if len(date_filed) >= 4 else ""
+    name_variants: list[str] = []
+    if case_name:
+        name_variants.append(case_name)
+        v = re.sub(r"\bUnited States\b", "US", case_name)
+        if v not in name_variants:
+            name_variants.append(v)
+        v = re.sub(r"\bU\.? ?S\.?\b", "United States", case_name)
+        if v not in name_variants:
+            name_variants.append(v)
+
+    stages: list[tuple[str, int, str]] = []  # (query, results to try, description)
+    if primary:
+        stages.append((f'"{primary}"', 4, f"citation {primary}"))
+    for c in alt_cites:
+        stages.append((f'"{c}"', 2, f"alternate citation {c}"))
+    for nm in name_variants:
+        q = f"{nm} {year}".strip()
+        stages.append((q, 3, f"case name {nm!r}"))
+
+    fetches = 0
+    _MAX_FETCHES = 10
+    for q, take, desc in stages:
+        if fetches >= _MAX_FETCHES:
+            break
+        status(f"Searching Scholar by {desc}…")
+        results = fetcher.search_cases(q, limit=take)
+        for r in results[:take]:
+            if fetches >= _MAX_FETCHES:
+                break
+            fetches += 1
+            status(f"Comparing candidate: {r.title[:60]}…")
+            hit = try_url(r.url)
+            if hit:
+                if cl_text is not None and vkey:
+                    fetcher.put_cached(vkey, *hit)
+                note = (
+                    "verified against CourtListener"
+                    if cl_text is not None
+                    else "unverified (no CourtListener text to compare)"
+                )
+                return hit, cl_text, note
+
+    print(f"[verify] gave up; best similarity {best_sim:.2f}")
+    return None, cl_text, f"best candidate similarity {best_sim:.0%}"
+
+
 class _ScholarTextWindow:
     """
     Rich viewer for a Google Scholar opinion.
@@ -1612,6 +1873,10 @@ class _ScholarTextWindow:
 
     _PAGENUM_COLOR = "#8e44ad"   # muted purple — visible but not loud
     _LINK_COLOR = "#1a56b0"
+    _DISSENT_COLOR = "#a31515"   # dark red
+    _CONCUR_COLOR = "#1a7a3c"    # dark green
+    _PART_COLOR_TAGS = {"dissent": "part-dissent", "concurrence": "part-concurrence"}
+    _PART_LABEL_COLORS = {"dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR}
 
     def __init__(
         self,
@@ -1620,13 +1885,30 @@ class _ScholarTextWindow:
         url: str,
         opinion_html: str,
         item: Optional[dict] = None,
+        cl_text: Optional[str] = None,
+        note: str = "",
     ) -> None:
         self._app = app
         self._item = item or {}
         self._scholar_url = url
+        self._note = note
         self._blocks = parse_opinion_blocks(opinion_html)
         self._scholar_text = blocks_to_text(self._blocks) or _strip_html(opinion_html)
-        self._cl_text: Optional[str] = None
+        self._parts = segment_blocks(self._blocks)
+        self._current_part: Optional[int] = None  # None = full opinion
+        # Page in effect at the start of each part, for pin cites when a
+        # single part is displayed (no preceding star marker on screen).
+        self._part_start_pages: list[Optional[int]] = []
+        page: Optional[int] = None
+        for part in self._parts:
+            self._part_start_pages.append(page)
+            for b in part.blocks:
+                for s in b.spans:
+                    if s.pagenum:
+                        m = re.search(r"\d+", s.text)
+                        if m:
+                            page = int(m.group(0))
+        self._cl_text: Optional[str] = cl_text
         self._mode = "scholar"
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
@@ -1635,7 +1917,7 @@ class _ScholarTextWindow:
 
         self._win = tk.Toplevel(parent)
         self._win.title(self._bb["name"] or "Google Scholar Opinion Text")
-        self._win.geometry("860x640")
+        self._win.geometry("860x680")
         self._win.minsize(500, 300)
         self._build_ui()
         self._render_scholar()
@@ -1655,6 +1937,29 @@ class _ScholarTextWindow:
             side="left", fill="x", expand=True, padx=4
         )
 
+        # Part navigation: what you're viewing, and a selector to filter
+        view_frame = ttk.Frame(win)
+        view_frame.pack(fill="x", padx=8, pady=(6, 0))
+        ttk.Label(view_frame, text="Viewing:").pack(side="left")
+        self._view_label_var = tk.StringVar(value="Full opinion")
+        self._view_label = ttk.Label(
+            view_frame,
+            textvariable=self._view_label_var,
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        self._view_label.pack(side="left", padx=(4, 12))
+        part_values = ["Full opinion"] + [
+            f"{i + 1}. {p.label}" for i, p in enumerate(self._parts)
+        ]
+        self._part_combo = ttk.Combobox(
+            view_frame, state="readonly", width=44, values=part_values
+        )
+        self._part_combo.current(0)
+        self._part_combo.pack(side="right")
+        self._part_combo.bind("<<ComboboxSelected>>", self._on_part_selected)
+        if len(self._parts) <= 1:
+            self._part_combo.config(state="disabled")
+
         text_frame = ttk.Frame(win)
         text_frame.pack(fill="both", expand=True, padx=8, pady=4)
         base = tkfont.Font(family="Georgia", size=11)
@@ -1672,6 +1977,10 @@ class _ScholarTextWindow:
         txt.tag_configure("blockquote", lmargin1=36, lmargin2=36, rmargin=36)
         txt.tag_configure("heading", spacing1=6, spacing3=4)
         txt.tag_configure("underline", underline=True)
+        # Part colors (configured before pagenum/citelink so those keep
+        # priority and stay purple/blue inside colored parts)
+        txt.tag_configure("part-dissent", foreground=self._DISSENT_COLOR)
+        txt.tag_configure("part-concurrence", foreground=self._CONCUR_COLOR)
         pagenum_font = tkfont.Font(
             family=self._family, size=max(self._base_size - 1, 8), weight="bold"
         )
@@ -1763,28 +2072,54 @@ class _ScholarTextWindow:
         txt.config(state="normal")
         txt.delete("1.0", "end")
         self._link_actions.clear()
-        if not self._blocks:
+        if not self._parts:
             txt.insert("1.0", self._scholar_text)
         else:
-            for block in self._blocks:
-                if block.kind == "center":
-                    block_tags: tuple = ("center",)
-                elif block.kind == "blockquote":
-                    block_tags = ("blockquote",)
-                elif block.kind == "heading":
-                    block_tags = ("heading",)
-                else:
-                    block_tags = ()
-                for span in block.spans:
-                    self._insert_span(span, block_tags)
-                txt.insert("end", "\n\n", block_tags)
+            shown = (
+                self._parts
+                if self._current_part is None
+                else [self._parts[self._current_part]]
+            )
+            for part in shown:
+                part_tag = self._PART_COLOR_TAGS.get(part.kind)
+                for block in part.blocks:
+                    if block.kind == "center":
+                        block_tags: tuple = ("center",)
+                    elif block.kind == "blockquote":
+                        block_tags = ("blockquote",)
+                    elif block.kind == "heading":
+                        block_tags = ("heading",)
+                    else:
+                        block_tags = ()
+                    if part_tag:
+                        block_tags = block_tags + (part_tag,)
+                    for span in block.spans:
+                        self._insert_span(span, block_tags)
+                    txt.insert("end", "\n\n", block_tags)
         txt.config(state="disabled")
         self._mode = "scholar"
         self._source_var.set(self._scholar_url)
         self._toggle_btn.config(text="CourtListener Text", state="normal")
+        if len(self._parts) > 1:
+            self._part_combo.config(state="readonly")
+        if self._current_part is None:
+            self._view_label_var.set("Full opinion")
+            self._view_label.config(foreground="black")
+        else:
+            part = self._parts[self._current_part]
+            self._view_label_var.set(part.label)
+            self._view_label.config(
+                foreground=self._PART_LABEL_COLORS.get(part.kind, "black")
+            )
+        extra = f" | {self._note}" if self._note else ""
         self._status_var.set(
-            f"{len(self._scholar_text):,} characters | Google Scholar version"
+            f"{len(self._scholar_text):,} characters | Google Scholar version{extra}"
         )
+
+    def _on_part_selected(self, _event=None) -> None:
+        idx = self._part_combo.current()
+        self._current_part = None if idx <= 0 else idx - 1
+        self._render_scholar()  # selecting a part always shows the Scholar text
 
     def _show_courtlistener(self) -> None:
         txt = self._text
@@ -1795,6 +2130,9 @@ class _ScholarTextWindow:
         self._mode = "courtlistener"
         self._source_var.set("CourtListener (assembled from the REST API)")
         self._toggle_btn.config(text="Google Scholar Text", state="normal")
+        self._part_combo.config(state="disabled")
+        self._view_label_var.set("CourtListener text")
+        self._view_label.config(foreground="black")
         self._status_var.set(
             f"{len(self._cl_text or ''):,} characters | CourtListener version"
         )
@@ -1888,10 +2226,15 @@ class _ScholarTextWindow:
         if prev:
             start_page = self._page_num_from(txt.get(*prev))
         else:
-            # Before the first star marker the text sits on the cite's first page
-            m = _CITE_PARSE_RE.match(self._bb["cite"])
-            if m:
-                start_page = int(m.group(3))
+            # No star marker on screen before the selection: in a part view
+            # use the page in effect where the part begins; otherwise the
+            # text sits on the cite's first page.
+            if self._current_part is not None and self._part_start_pages:
+                start_page = self._part_start_pages[self._current_part]
+            if start_page is None:
+                m = _CITE_PARSE_RE.match(self._bb["cite"])
+                if m:
+                    start_page = int(m.group(3))
         if start_page is None:
             return None
         end_page = start_page
@@ -2636,45 +2979,57 @@ class _CitingOpinionsWindow:
         fetcher = self._app._get_scholar()
         if fetcher is None:
             return
-
-        citation_str = _pick_citation(item.get("citation", []))
-        case_name = re.sub(
-            r"<[^>]+>",
-            "",
-            item.get("caseName") or item.get("case_name") or "",
-        ).strip()
-        date_filed = item.get("dateFiled") or item.get("date_filed") or ""
-        year = date_filed[:4] if date_filed else None
+        client = self._app._get_client()
 
         self._scholar_btn.config(state="disabled")
         self._status_var.set("Searching Google Scholar…")
 
+        def status_cb(msg: str) -> None:
+            try:
+                self._win.after(0, self._status_var.set, msg)
+            except tk.TclError:
+                pass
+
         def run() -> None:
-            result = None
-            if citation_str:
-                result = fetcher.fetch_by_citation(citation_str)
-            if result is None and case_name:
-                result = fetcher.fetch_by_name(case_name, year)
-            self._win.after(0, self._on_scholar_done, result, item)
+            try:
+                result, cl_text, note = _find_scholar_for_item(
+                    client, fetcher, item, status_cb
+                )
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                result, cl_text, note = None, None, str(exc)
+            try:
+                self._win.after(0, self._on_scholar_done, result, item, cl_text, note)
+            except tk.TclError:
+                pass
 
         threading.Thread(target=run, daemon=True).start()
 
     def _on_scholar_done(
-        self, result: Optional[tuple[str, str]], item: Optional[dict] = None
+        self,
+        result: Optional[tuple[str, str]],
+        item: Optional[dict] = None,
+        cl_text: Optional[str] = None,
+        note: str = "",
     ) -> None:
         self._restore_buttons()
         if result is None:
-            self._status_var.set("Google Scholar: not found.")
+            self._status_var.set("Google Scholar text unavailable.")
             messagebox.showwarning(
-                "Scholar Not Found",
-                "Could not find this opinion on Google Scholar.\n\n"
-                "Google may have blocked the request, or the case may not be indexed.",
+                "Scholar Text Unavailable",
+                "Could not find a Google Scholar opinion matching this case.\n\n"
+                + (f"({note})" if note else ""),
                 parent=self._win,
             )
             return
         url, html = result
-        self._status_var.set(f"Scholar text loaded from {url}")
-        _ScholarTextWindow(self._win, self._app, url, html, item=item)
+        self._status_var.set(
+            f"Scholar text loaded — {note}" if note else f"Scholar text loaded from {url}"
+        )
+        _ScholarTextWindow(
+            self._win, self._app, url, html, item=item, cl_text=cl_text, note=note
+        )
 
 
 def main() -> None:
