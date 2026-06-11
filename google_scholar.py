@@ -187,6 +187,9 @@ def parse_opinion_blocks(html: str) -> list[Block]:
         bad.decompose()
     for bad in root.find_all(id="gs_dont_print"):  # "Save trees…" promo line
         bad.decompose()
+    # Most pages duplicate each page marker (bare margin label + inline
+    # star form); some older ones carry only the bare form.
+    has_pagenum2 = root.find("a", class_="gsl_pagenum2") is not None
 
     blocks: list[Block] = []
     cur: list[Span] = []
@@ -264,10 +267,12 @@ def parse_opinion_blocks(html: str) -> list[Block]:
                 if "gsl_pagenum" in classes or "gsl_pagenum2" in classes:
                     # Scholar emits the marker twice: a bare margin label
                     # ("115", gsl_pagenum) and the inline star form
-                    # ("*115", gsl_pagenum2).  Keep only the starred one.
+                    # ("*115", gsl_pagenum2).  Keep one, always star-prefixed.
                     t = _WS_RE.sub(" ", child.get_text()).strip()
-                    if "*" in t:
-                        emit(t, fmt, pagenum=True)
+                    if t and (
+                        "gsl_pagenum2" in classes or not has_pagenum2
+                    ):
+                        emit("*" + t.lstrip("*"), fmt, pagenum=True)
                     continue
                 aname = str(child.get("name") or child.get("id") or "")
                 if "gsl_hash" in classes and aname:
@@ -394,17 +399,24 @@ _AUTHOR_LINE_RE = re.compile(
     r"\s*[.:;—-]?\s*$"
 )
 # Caption front matter that belongs in the header even though it isn't
-# centered: how the case arrived, counsel listings, the panel line.
+# centered: how the case arrived and counsel listings (in their several
+# house styles: "argued the cause" (SCOTUS), "on brief" (4th Cir.),
+# "…, Attorney, …, for Plaintiff-Appellant" (7th Cir.)).
 _FRONT_MATTER_RE = re.compile(
     r"^(?:APPEALS?\s+FROM|CERTIORARI\s+TO|ON\s+WRITS?\s+OF|ON\s+PETITION|"
     r"ON\s+APPLICATION|ON\s+APPEAL|IN\s+RE\b|No\.\s*\d|Nos\.\s*\d|Syllabus\b|"
     r"Argued\b|Reargued\b|Decided\b|Submitted\b|Filed\b|Released\b|"
-    r"Before[:,]?\s)"
+    r"Petition\s+for\b)"
     r"|\bre?argued\s+the\s+cause|\bon\s+the\s+briefs?\b|\bbriefs?\s+(?:of|for|was|were)\b"
-    r"|\bfor\s+(?:the\s+)?(?:appell(?:ant|ee)s?|petitioners?|respondents?)\b"
+    r"|,\s*Attorneys?\s*(?:,|at\b)|\bfor\s+(?:the\s+)?(?:appell(?:ant|ee)s?|"
+    r"petitioners?|respondents?|plaintiffs?(?:-appell\w+)?|defendants?(?:-appell\w+)?)\b"
     r"|\bamic(?:us|i)\s+curiae\b|\battorneys?\s+general\b|\bof\s+counsel\b",
     re.IGNORECASE,
 )
+# The judges line ("Before SYKES, Chief Judge, and …").  In opinions with
+# no authorship attribution — e.g. orders denying rehearing en banc — it
+# opens the body rather than closing the header.
+_PANEL_LINE_RE = re.compile(r"^Before\b", re.IGNORECASE)
 
 
 # Footnote-body blocks start with the same marker the in-text superscript
@@ -555,7 +567,7 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     else:
         # No attribution found: the header is the leading centered caption
         # plus any front-matter paragraphs (how the case arrived, counsel
-        # listings, the panel line) that follow it.
+        # listings) that follow it.  The panel line starts the body.
         j = 0
         while j < first_sep:
             b = blocks[j]
@@ -563,7 +575,9 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
             if b.kind in ("center", "heading") or not t:
                 j += 1
                 continue
-            if len(t) <= 400 and _FRONT_MATTER_RE.search(t[:80]):
+            if _PANEL_LINE_RE.match(t):
+                break
+            if len(t) <= 600 and _FRONT_MATTER_RE.search(t):
                 j += 1
                 continue
             break

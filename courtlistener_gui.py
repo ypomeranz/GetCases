@@ -32,12 +32,75 @@ from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from typing import Optional
 
+
+def _ensure_dependencies() -> None:
+    """
+    Check for the third-party packages this GUI needs and offer to
+    pip-install any that are missing before the imports below run.
+
+    ``requests`` is required; ``beautifulsoup4`` enables the Google
+    Scholar features (declining just disables them).
+    """
+    import importlib
+    import importlib.util
+
+    def missing_packages() -> list[str]:
+        return [
+            pip_name
+            for module, pip_name in (
+                ("requests", "requests"),
+                ("bs4", "beautifulsoup4"),
+            )
+            if importlib.util.find_spec(module) is None
+        ]
+
+    missing = missing_packages()
+    if not missing:
+        return
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        if messagebox.askyesno(
+            "Missing Packages",
+            "This application needs the following Python package(s), "
+            "which are not installed:\n\n    " + ", ".join(missing)
+            + "\n\nInstall them now with pip?",
+        ):
+            proc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", *missing],
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode != 0:
+                messagebox.showerror(
+                    "Install Failed",
+                    "pip install failed:\n\n" + (proc.stderr or proc.stdout)[-800:],
+                )
+            else:
+                importlib.invalidate_caches()
+                messagebox.showinfo(
+                    "Packages Installed", "Installed: " + ", ".join(missing)
+                )
+        if importlib.util.find_spec("requests") is None:
+            messagebox.showerror(
+                "Missing Dependency",
+                "The 'requests' package is required to run this application.\n\n"
+                "Install it with:\n    pip install requests",
+            )
+            sys.exit(1)
+    finally:
+        root.destroy()
+
+
+_ensure_dependencies()
+
 import requests as _requests
 
 from courtlistener import CourtListenerClient, CourtListenerError
 from court_catalog import (
     CATALOG as _COURT_CATALOG,
     COURT_BLUEBOOK as _COURT_BLUEBOOK,
+    STATE_COURTS as _STATE_COURTS,
     all_court_ids as _all_court_ids,
 )
 
@@ -175,12 +238,56 @@ def _pick_citation(citations) -> str:
 
 
 
+# Strip reporter series designators ("2d", "4th") and volume/page digits
+# before comparing reporter words against a court abbreviation.
+_REPORTER_SERIES_RE = re.compile(r"\b\d*(?:2d|3d|4th|5th|6th)\b\.?|\b\d+\b")
+
+_SCOTUS_REPORTERS = {"U.S.", "S. Ct.", "S.Ct.", "L. Ed.", "L. Ed. 2d", "L.Ed.", "L.Ed.2d"}
+
+
+def _court_for_paren(citation: str, court_id: str, fallback: str = "") -> str:
+    """
+    Court abbreviation for a Bluebook date parenthetical, omitting or
+    trimming whatever the reporter title already conveys (rule 10.4):
+
+      60 Fed. Cl. 600        → ()          reporter names the court
+      306 Md. 556            → ()          official state reporter, highest court
+      100 Cal. App. 4th 454  → ()          official reporter names the court
+      75 Cal. Rptr. 2d 1     → (Ct. App.)  reporter conveys the state only
+      12 N.Y.S.2d 345        → (App. Div.) reporter conveys the state only
+      510 A.2d 562           → (Md.)       regional reporter conveys nothing
+    """
+    court_id = (court_id or "").strip().lower()
+    m = _CITE_PARSE_RE.match(citation or "")
+    reporter = m.group(2).strip() if m else ""
+    if "scotus" in court_id or reporter in _SCOTUS_REPORTERS:
+        return ""
+    abbr = _COURT_BLUEBOOK.get(court_id, "") or (fallback or "").strip()
+    if not abbr or not reporter:
+        return abbr
+    rep_tokens = [t for t in _REPORTER_SERIES_RE.sub(" ", reporter).split() if t]
+    ct_tokens = abbr.split()
+    meaningful = [t for t in ct_tokens if t != "Ct."]
+    if meaningful and all(t in rep_tokens for t in meaningful):
+        return ""
+    if (
+        rep_tokens
+        and len(ct_tokens) > 1
+        and rep_tokens[0].replace(".", "").lower().startswith(
+            ct_tokens[0].replace(".", "").lower()
+        )
+    ):
+        return " ".join(ct_tokens[1:])
+    return abbr
+
+
 def _build_default_filename(item: dict) -> str:
     """
     Return a sanitized default filename (without extension) for saving an opinion.
 
     Format: ``Case Name, Reporter Cite (Court YEAR)``
-    For SCOTUS the court abbreviation is omitted: ``Case Name, Reporter Cite (YEAR)``
+    The court abbreviation follows Bluebook rule 10.4 — omitted for SCOTUS
+    and whenever the reporter already conveys it (e.g. ``60 Fed. Cl. 600``).
     Falls back gracefully when citation or date are missing.
     """
     # Case name
@@ -196,16 +303,11 @@ def _build_default_filename(item: dict) -> str:
     date_filed = item.get("dateFiled") or item.get("date_filed") or ""
     year = date_filed[:4] if len(date_filed) >= 4 else ""
 
-    # Court abbreviation (absent for SCOTUS)
+    # Court abbreviation — omitted when SCOTUS or conveyed by the reporter
     court_id = str(item.get("court_id") or item.get("court") or "").strip().lower()
-    is_scotus = "scotus" in court_id
-    if is_scotus:
-        court_abbr = ""
-    else:
-        court_abbr = _COURT_BLUEBOOK.get(court_id, "")
-        if not court_abbr:
-            # Fall back to whatever the API gave us for the court display name
-            court_abbr = str(item.get("court") or court_id).strip()
+    court_abbr = _court_for_paren(
+        citation_str, court_id, str(item.get("court") or court_id).strip()
+    )
 
     # Build the parenthetical: (Court YEAR) or (YEAR) for SCOTUS
     if court_abbr and year:
@@ -1595,6 +1697,129 @@ _HEADER_CITE_RE = re.compile(
 _FN_BODY_MARK_RE = re.compile(r"^\s*(?:\[([^\]\s]{1,6})\]|(\*{1,3}|†|‡))(?=\s|$)")
 
 
+def _fix_name_case(name: str) -> str:
+    """Render an all-caps surname from an opinion header in normal case:
+    REHNQUIST → Rehnquist, O'CONNOR → O'Connor, McAULIFFE → McAuliffe."""
+    def fix(wd: str) -> str:
+        alpha = [c for c in wd if c.isalpha()]
+        if len(alpha) <= 2 or sum(c.isupper() for c in alpha) <= len(alpha) // 2:
+            return wd  # already mixed case (Wood, St.)
+        out = "'".join(
+            p[:1].upper() + p[1:].lower() if p else p for p in wd.split("'")
+        )
+        if out.startswith("Mc") and len(out) > 2:
+            out = "Mc" + out[2].upper() + out[3:]
+        return out
+
+    return " ".join(fix(w) for w in name.split())
+
+
+_CAPTION_SMALL_WORDS = {
+    "of", "the", "and", "on", "in", "for", "a", "an", "ex", "rel", "re", "et", "al",
+}
+
+
+def _titlecase_caps(s: str) -> str:
+    """Normal-case an all-caps caption fragment: 'MERCY HOSPITAL' →
+    'Mercy Hospital', 'UNITED STATES' → 'United States', 'IN RE GAULT' →
+    'In re Gault'.  Mixed-case words and abbreviations pass through."""
+    out: list[str] = []
+    for i, w in enumerate(s.split()):
+        if not w.isupper() or re.fullmatch(r"(?:[A-Z]\.)+,?", w):
+            out.append(w)
+            continue
+        core = w.lower()
+        if i > 0 and core.strip(".,'") in _CAPTION_SMALL_WORDS:
+            out.append(core)
+            continue
+        word = "'".join(p[:1].upper() + p[1:] if p else p for p in core.split("'"))
+        if word.startswith("Mc") and len(word) > 2:
+            word = "Mc" + word[2].upper() + word[3:]
+        out.append(word)
+    return " ".join(out)
+
+
+def _caption_party(s: str) -> str:
+    """One side of a Scholar caption → its Bluebook party name.  Drops the
+    procedural designation and 'et al.'; when Scholar mixes cases, the
+    all-caps run is the operative name ('Brent BREWBAKER' → 'Brewbaker',
+    'UNITED STATES of America' → 'United States')."""
+    s = s.split(",")[0].strip().strip(".;")
+    s = re.sub(r"\s+et\s+al\.?$", "", s, flags=re.IGNORECASE).strip()
+    tokens = s.split()
+    caps = [w for w in tokens if w.isupper() and len(w.strip(".,'")) > 1]
+    if caps and len(caps) < len(tokens):
+        s = " ".join(caps)
+    return _titlecase_caps(s)
+
+
+_CIRCUIT_ORDINALS = {
+    "first": "ca1", "second": "ca2", "third": "ca3", "fourth": "ca4",
+    "fifth": "ca5", "sixth": "ca6", "seventh": "ca7", "eighth": "ca8",
+    "ninth": "ca9", "tenth": "ca10", "eleventh": "ca11",
+}
+
+
+def _scholar_court_id(blocks) -> str:
+    """CourtListener court ID inferred from the Scholar header's court line
+    (used when a case was opened from Scholar with no CourtListener record)."""
+    for b in blocks[:8]:
+        if b.kind != "center":
+            continue
+        t = re.sub(r"\s+", " ", b.text()).strip().rstrip(".").lower()
+        if not t or "court" not in t or "district court" in t or "bankruptcy" in t:
+            continue
+        if "supreme court" in t and "united states" in t:
+            return "scotus"
+        m = re.search(
+            r"court of appeals,? (?:for the )?(\w+(?: of columbia)?) circuit", t
+        )
+        if m:
+            word = m.group(1)
+            if word == "federal":
+                return "cafc"
+            if "columbia" in word:
+                return "cadc"
+            return _CIRCUIT_ORDINALS.get(word, "")
+        for state, courts in _STATE_COURTS:
+            if state.lower() not in t:
+                continue
+            high = courts[0][0]
+            inter = courts[1][0] if len(courts) > 1 else ""
+            if "appellate division" in t:
+                return "nyappdiv" if high == "ny" else (inter or high)
+            if "court of criminal appeals" in t:
+                crim = next((cid for cid, _a, _l in courts if "crim" in cid), "")
+                return crim or inter or high
+            if "court of appeals" in t:
+                # the court of last resort in Maryland, New York, and D.C.
+                return high if high in ("md", "ny", "dc") else (inter or high)
+            if "supreme" in t:
+                return high
+            if "court of appeal" in t:  # California style
+                return inter or high
+            return high
+    return ""
+
+
+def _scholar_caption_name(blocks) -> str:
+    """Bluebook case name derived from the Scholar page's party caption."""
+    for b in blocks[:8]:
+        if b.kind != "center":
+            continue
+        t = re.sub(r"\s+", " ", b.text()).strip().rstrip(".")
+        if not t or _HEADER_CITE_RE.match(t) or t.startswith(("No.", "Nos.")):
+            continue
+        sides = re.split(r"\s+[vV]s?\.\s+", t, maxsplit=1)
+        if len(sides) == 2:
+            left, right = _caption_party(sides[0]), _caption_party(sides[1])
+            if left and right:
+                return f"{left} v. {right}"
+        if re.match(r"(?:IN\s+RE|EX\s+PARTE|(?:IN\s+THE\s+)?MATTER\s+OF)\b", t, re.IGNORECASE):
+            return _titlecase_caps(t.split(",")[0].strip())
+    return ""
+
+
 def _rtf_escape(s: str) -> str:
     out: list[str] = []
     for ch in s:
@@ -1612,22 +1837,28 @@ def _rtf_escape(s: str) -> str:
     return "".join(out)
 
 
-# Color table index 1 = star-pagination marker.  Citation links stay black
-# in copied/exported text; the blue is only an on-screen affordance.
+# Color table: 1 = star-pagination marker (purple), 2 = dissent (dark red),
+# 3 = concurrence (dark green).  Citation links stay black in copied and
+# exported text; the blue is only an on-screen affordance.  Part colors are
+# applied only in exports, not clipboard copies.
 _RTF_HEADER = (
     "{\\rtf1\\ansi\\deff0"
     "{\\fonttbl{\\f0\\froman Times New Roman;}}"
-    "{\\colortbl ;\\red142\\green68\\blue173;}"
+    "{\\colortbl ;\\red142\\green68\\blue173;"
+    "\\red163\\green21\\blue21;\\red26\\green122\\blue60;}"
     "\\f0\\fs22\n"
 )
 
 
-def _rtf_document(body: str, two_columns: bool = False) -> str:
+def _rtf_document(
+    body: str, two_columns: bool = False, page_footer: bool = False
+) -> str:
     sect = "\\sectd\\sbknone\\cols2\\colsx432\n" if two_columns else ""
-    return _RTF_HEADER + sect + body + "}"
+    footer = "{\\footer\\pard\\qc\\fs18\\chpgn\\par}\n" if page_footer else ""
+    return _RTF_HEADER + sect + footer + body + "}"
 
 
-def _run_to_rtf(seg: str, active: set[str]) -> str:
+def _run_to_rtf(seg: str, active: set[str], part_colors: bool = False) -> str:
     codes: list[str] = []
     for t in active:
         if t.startswith("fnt_") and len(t) == 8:
@@ -1644,11 +1875,17 @@ def _run_to_rtf(seg: str, active: set[str]) -> str:
         codes.append("\\ul")
     if "pagenum" in active:
         codes.append("\\cf1\\b")
+    elif part_colors and "part-dissent" in active:
+        codes.append("\\cf2")
+    elif part_colors and "part-concurrence" in active:
+        codes.append("\\cf3")
     esc = _rtf_escape(seg)
     return "{" + "".join(codes) + " " + esc + "}" if codes else esc
 
 
-def _dump_to_rtf(txt: tk.Text, start: str, end: str) -> str:
+def _dump_to_rtf(
+    txt: tk.Text, start: str, end: str, part_colors: bool = False
+) -> str:
     """Convert a Tk Text range (with the Scholar window's tags) to an RTF body."""
     out: list[str] = []
     # Seed with tags already open at *start*; dump only reports transitions.
@@ -1677,7 +1914,7 @@ def _dump_to_rtf(txt: tk.Text, start: str, end: str) -> str:
                     if not par_open:
                         out.append(par_prefix())
                         par_open = True
-                    out.append(_run_to_rtf(seg, active))
+                    out.append(_run_to_rtf(seg, active, part_colors))
     if par_open:
         out.append("\\par\n")
     return "".join(out)
@@ -2021,6 +2258,7 @@ class _ScholarTextWindow:
         txt.tag_configure("citelink", foreground=self._LINK_COLOR)
         txt.tag_bind("citelink", "<Enter>", lambda _e: txt.config(cursor="hand2"))
         txt.tag_bind("citelink", "<Leave>", lambda _e: txt.config(cursor=""))
+        txt.tag_configure("jumpflash", background="#fff2a8")
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill="x", padx=8, pady=(0, 8))
@@ -2087,6 +2325,18 @@ class _ScholarTextWindow:
         tags.append(self._font_tag(span.italic, span.bold, span.small, span.sup))
         if span.underline:
             tags.append("underline")
+        if span.fnref:
+            # In-text footnote marker: click jumps to the footnote body
+            self._fn_ref_pos.setdefault(span.fnref, txt.index("end-1c"))
+            tags += ["citelink", self._new_link(("fnref", span.fnref))]
+            txt.insert("end", span.text, tuple(tags))
+            return
+        if span.fndef:
+            # Footnote-body marker: click jumps back to the reference
+            self._fn_def_pos[span.fndef] = txt.index("end-1c")
+            tags += ["citelink", self._new_link(("fndef", span.fndef))]
+            txt.insert("end", span.text, tuple(tags))
+            return
         if span.link:
             tags += ["citelink", self._new_link(("url", span.link))]
             txt.insert("end", span.text, tuple(tags))
@@ -2161,6 +2411,9 @@ class _ScholarTextWindow:
         self._link_actions.clear()
         self._fnref_pages: dict[str, Optional[int]] = {}
         self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
+        self._part_regions: list[tuple[str, str, int]] = []
+        self._fn_ref_pos: dict[str, str] = {}  # footnote id → in-text marker index
+        self._fn_def_pos: dict[str, str] = {}  # footnote id → body marker index
         self._cur_page: Optional[int] = None
         if not self._parts:
             txt.insert("1.0", self._scholar_text)
@@ -2170,6 +2423,7 @@ class _ScholarTextWindow:
             else:
                 shown = [(self._current_part, self._parts[self._current_part])]
             for pi, part in shown:
+                part_start = txt.index("end-1c")
                 if self._part_start_pages:
                     self._cur_page = self._part_start_pages[pi] or self._cur_page
                 part_tag = self._PART_COLOR_TAGS.get(part.kind)
@@ -2179,6 +2433,7 @@ class _ScholarTextWindow:
                     fnhead_tags = ("fnhead",) + ((part_tag,) if part_tag else ())
                     txt.insert("end", "Footnotes\n\n", fnhead_tags)
                     self._render_footnotes(part.footnotes, part_tag)
+                self._part_regions.append((part_start, txt.index("end-1c"), pi))
         txt.config(state="disabled")
         self._mode = "scholar"
         self._source_var.set(self._scholar_url)
@@ -2292,22 +2547,110 @@ class _ScholarTextWindow:
             if years:
                 year = years[-1]
 
+        if not name:
+            name = _scholar_caption_name(self._blocks)
         if not name and self._blocks:
             first = self._blocks[0].text().strip()
             name = re.split(r",\s*\d{1,4}\s", first)[0].strip().rstrip(",")[:120]
 
         court_id = str(item.get("court_id") or "").strip().lower()
+        if not court_id:
+            court_id = _scholar_court_id(self._blocks)
         is_scotus = "scotus" in court_id or bool(
             re.match(r"\d+\s+(U\.S\.|S\.\s?Ct\.|L\.\s?Ed\.)", cite)
         )
         court_abbr = ""
         if not is_scotus:
-            court_abbr = _COURT_BLUEBOOK.get(court_id, "")
-            if not court_abbr and court_id:
-                court_abbr = str(item.get("court") or court_id).strip()
+            fallback = str(item.get("court") or court_id).strip() if court_id else ""
+            court_abbr = _court_for_paren(cite, court_id, fallback)
         return {"name": name, "cite": cite, "court": court_abbr, "year": year}
 
-    def _bluebook_citation(self, pin: Optional[str]) -> tuple[str, str]:
+    def _writer_parenthetical(self, part) -> str:
+        """
+        Bluebook writer parenthetical for a separate opinion (rule 10.6.1):
+        "Rehnquist, J., dissenting", "Wood, J., dissenting from the denial
+        of rehearing en banc", or "per curiam" for unsigned opinions.
+        Empty for the header and signed majority opinions.
+        """
+        def block_text(b) -> str:
+            t = re.sub(r"\s+", " ", b.text()).strip()
+            return re.sub(r"^(?:\*\d+\s+)+", "", t)  # leading page markers
+
+        if part.kind == "majority":
+            for b in part.blocks[:3]:
+                bt = block_text(b)
+                if re.match(r"PER\s+CURIAM\b", bt, re.IGNORECASE):
+                    return "per curiam"
+                # "JUSTICE O'CONNOR announced the judgment of the Court…" —
+                # a lead opinion without a majority (Bluebook rule 10.6.1)
+                if re.search(
+                    r"announced the judgment of the Court", bt, re.IGNORECASE
+                ):
+                    return "plurality opinion"
+            return ""
+        if part.kind not in ("concurrence", "dissent") or not part.blocks:
+            return ""
+        t = block_text(part.blocks[0])
+        m = re.search(r"\b(?:concurring|dissenting)\b", t, re.IGNORECASE)
+        if not m:
+            return ""
+        phrase = t[m.start():].rstrip(" .:;")
+        phrase = re.sub(r"\s*\[[^\]]{1,6}\]$", "", phrase)  # trailing footnote marker
+        head = t[: m.start()].strip().rstrip(", ")
+        head = re.sub(r"^(?:MR\.|MRS\.|MS\.)\s+", "", head, flags=re.IGNORECASE)
+        # The chief-justice test must look only at the author's own
+        # designation — "JUSTICE THOMAS, with whom THE CHIEF JUSTICE and
+        # JUSTICE ALITO join, dissenting" is Thomas, J., not C.J.
+        segs = [s.strip() for s in head.split(",")]
+        author_seg = segs[0]
+        role_seg = segs[1] if len(segs) > 1 else ""
+        is_chief = bool(
+            re.match(r"(?:THE\s+)?CHIEF\s+JUSTICE\b", author_seg, re.IGNORECASE)
+        ) or bool(
+            re.fullmatch(
+                r"(?:THE\s+)?(?:Chief\s+(?:Justice|Judge)|C\.\s?J\.)",
+                role_seg,
+                re.IGNORECASE,
+            )
+        )
+        title = "C.J." if is_chief else "J."
+        name = re.sub(
+            r"^(?:THE\s+)?(?:CHIEF\s+)?JUSTICE\s+", "", author_seg, flags=re.IGNORECASE
+        ).strip()
+        name = _fix_name_case(name)
+        if not name:
+            return ""
+        return f"{name}, {title}, {phrase}"
+
+    def _majority_author(self, part) -> str:
+        """Running-head label for the lead opinion: 'Blackmun, J.',
+        'Sykes, C.J.', 'per curiam', or '' when no author is identified."""
+        for b in part.blocks[:3]:
+            t = re.sub(r"\s+", " ", b.text()).strip()
+            t = re.sub(r"^(?:\*\d+\s+)+", "", t)
+            if re.match(r"PER\s+CURIAM\b", t, re.IGNORECASE):
+                return "per curiam"
+            m = re.match(
+                r"(?:(?:MR\.|MRS\.|MS\.)\s+)?(CHIEF\s+)?JUSTICE\s+([A-Z][\w.'’-]+)\s+"
+                r"(?:delivered|announced)",
+                t,
+            )
+            if m:
+                title = "C.J." if m.group(1) else "J."
+                return f"{_fix_name_case(m.group(2))}, {title}"
+            m = re.match(
+                r"([A-Z][\w.'’ -]{0,40}?),\s*((?:Chief\s+)?(?:Senior\s+)?"
+                r"(?:Circuit\s+|District\s+)?Judge)\s*[.:;]?\s*$",
+                t,
+            )
+            if m:
+                title = "C.J." if re.search(r"\bChief\b", m.group(2)) else "J."
+                return f"{_fix_name_case(m.group(1).split(',')[0])}, {title}"
+        return ""
+
+    def _bluebook_citation(
+        self, pin: Optional[str], writer: str = ""
+    ) -> tuple[str, str]:
         """Return (plain, rtf-fragment) forms of the Bluebook citation."""
         bb = self._bb
         name, cite, court, year = bb["name"], bb["cite"], bb["court"], bb["year"]
@@ -2321,6 +2664,8 @@ class _ScholarTextWindow:
         paren_inner = " ".join(p for p in (court, year) if p)
         if paren_inner:
             rest += f" ({paren_inner})"
+        if writer:
+            rest += f" ({writer})"
         rest += "."
         if name:
             plain = f"{name}{rest}"
@@ -2462,7 +2807,17 @@ class _ScholarTextWindow:
             if (selected and self._mode == "scholar")
             else None
         )
-        plain_cite, rtf_cite = self._bluebook_citation(pin)
+        writer = ""
+        if self._mode == "scholar" and self._parts:
+            pi = self._current_part
+            if pi is None and selected:
+                for rs, rend, p in self._part_regions:
+                    if txt.compare(start, ">=", rs) and txt.compare(start, "<", rend):
+                        pi = p
+                        break
+            if pi is not None:
+                writer = self._writer_parenthetical(self._parts[pi])
+        plain_cite, rtf_cite = self._bluebook_citation(pin, writer)
         body = _dump_to_rtf(txt, start, end)
         rtf = _rtf_document(body + rtf_cite)
         plain = txt.get(start, end).rstrip() + "\n\n" + plain_cite + "\n"
@@ -2482,9 +2837,69 @@ class _ScholarTextWindow:
             "court": bb["court"],
         }
 
+    def _build_export_rtf(self) -> str:
+        """
+        Two-column RTF of the full opinion, one section per separate
+        opinion: the header and majority share the first section, and each
+        concurrence/dissent starts a new page (numbering continues).  Every
+        section carries a running head with the Bluebook citation and the
+        opinion's author, and a page-number footer.  Part colors are kept.
+        """
+        txt = self._text
+        case_line = self._bluebook_citation(None)[0].rstrip(".")
+
+        main_end = -1
+        for i, (_rs, _re, pi) in enumerate(self._part_regions):
+            if self._parts[pi].kind in ("header", "majority"):
+                main_end = i
+            else:
+                break
+        main_regions = self._part_regions[: main_end + 1]
+        rest_regions = self._part_regions[main_end + 1:]
+
+        sections: list[tuple[str, str, str]] = []  # (author label, start, end)
+        if main_regions:
+            maj = next(
+                (self._parts[pi] for _rs, _re, pi in main_regions
+                 if self._parts[pi].kind == "majority"),
+                None,
+            )
+            label = self._majority_author(maj) if maj is not None else ""
+            sections.append((label, main_regions[0][0], main_regions[-1][1]))
+        for rs, rend, pi in rest_regions:
+            sections.append((self._writer_parenthetical(self._parts[pi]), rs, rend))
+
+        out: list[str] = []
+        for i, (label, rs, rend) in enumerate(sections):
+            out.append(
+                "\\sectd\\sbknone\\cols2\\colsx432\n"
+                if i == 0
+                else "\\sect\\sectd\\sbkpage\\cols2\\colsx432\n"
+            )
+            head = f"{case_line} — {label}" if label else case_line
+            out.append(
+                "{\\header\\pard\\qc\\fs18\\i " + _rtf_escape(head) + "\\par}\n"
+            )
+            out.append("{\\footer\\pard\\qc\\fs18\\chpgn\\par}\n")
+            out.append(_dump_to_rtf(txt, rs, rend, part_colors=True))
+        return _RTF_HEADER + "".join(out) + "}"
+
     def _export_rtf(self) -> None:
-        body = _dump_to_rtf(self._text, "1.0", "end-1c")
-        rtf = _rtf_document(body, two_columns=True)
+        if self._mode == "scholar" and self._parts:
+            # Export the full opinion even from a single-part view
+            prev = self._current_part
+            if prev is not None:
+                self._current_part = None
+                self._render_scholar()
+            try:
+                rtf = self._build_export_rtf()
+            finally:
+                if prev is not None:
+                    self._current_part = prev
+                    self._render_scholar()
+        else:
+            body = _dump_to_rtf(self._text, "1.0", "end-1c")
+            rtf = _rtf_document(body, two_columns=True, page_footer=True)
         default = _build_default_filename(self._filename_item())
         path = filedialog.asksaveasfilename(
             defaultextension=".rtf",
@@ -2532,11 +2947,30 @@ class _ScholarTextWindow:
         except tk.TclError:
             pass  # window closed while a background fetch was running
 
+    def _jump_to(self, pos: str) -> None:
+        txt = self._text
+        txt.see(pos)
+        txt.tag_remove("jumpflash", "1.0", "end")
+        txt.tag_add("jumpflash", f"{pos} linestart", f"{pos} lineend")
+        self._win.after(
+            1400, lambda: txt.tag_remove("jumpflash", "1.0", "end")
+        )
+
     def _follow_link(self, tag: str) -> None:
         action = self._link_actions.get(tag)
         if not action:
             return
         kind, value = action
+        if kind == "fnref":
+            pos = self._fn_def_pos.get(value)
+            if pos:
+                self._jump_to(pos)
+            return
+        if kind == "fndef":
+            pos = self._fn_ref_pos.get(value)
+            if pos:
+                self._jump_to(pos)
+            return
         fetcher = self._app._get_scholar()
         if fetcher is None:
             return
