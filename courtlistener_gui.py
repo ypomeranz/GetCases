@@ -34,7 +34,12 @@ from typing import Optional
 
 import requests as _requests
 
-from courtlistener import COURTS, CourtListenerClient, CourtListenerError
+from courtlistener import CourtListenerClient, CourtListenerError
+from court_catalog import (
+    CATALOG as _COURT_CATALOG,
+    COURT_BLUEBOOK as _COURT_BLUEBOOK,
+    all_court_ids as _all_court_ids,
+)
 
 _CONFIG_PATH = Path.home() / ".config" / "courtlistener" / "config.json"
 
@@ -168,144 +173,6 @@ def _pick_citation(citations) -> str:
 
     return pool[0] if pool else ""
 
-# Bluebook (21st ed.) abbreviations keyed by CourtListener court ID.
-# SCOTUS is absent intentionally — the court name is omitted for SCOTUS cites.
-_COURT_BLUEBOOK: dict[str, str] = {
-    # Federal circuits
-    "ca1":   "1st Cir.",
-    "ca2":   "2d Cir.",
-    "ca3":   "3d Cir.",
-    "ca4":   "4th Cir.",
-    "ca5":   "5th Cir.",
-    "ca6":   "6th Cir.",
-    "ca7":   "7th Cir.",
-    "ca8":   "8th Cir.",
-    "ca9":   "9th Cir.",
-    "ca10":  "10th Cir.",
-    "ca11":  "11th Cir.",
-    "cadc":  "D.C. Cir.",
-    "cafc":  "Fed. Cir.",
-    "cavet": "Vet. App.",
-    "caaf":  "C.A.A.F.",
-    # Federal district courts
-    "akd":   "D. Alaska",
-    "almd":  "M.D. Ala.",   "alnd":  "N.D. Ala.",   "alsd":  "S.D. Ala.",
-    "ared":  "E.D. Ark.",   "arwd":  "W.D. Ark.",
-    "azd":   "D. Ariz.",
-    "cacd":  "C.D. Cal.",   "caed":  "E.D. Cal.",
-    "cand":  "N.D. Cal.",   "casd":  "S.D. Cal.",
-    "cod":   "D. Colo.",
-    "ctd":   "D. Conn.",
-    "ded":   "D. Del.",
-    "dcd":   "D.D.C.",
-    "flmd":  "M.D. Fla.",   "flnd":  "N.D. Fla.",   "flsd":  "S.D. Fla.",
-    "gamd":  "M.D. Ga.",    "gand":  "N.D. Ga.",     "gasd":  "S.D. Ga.",
-    "gud":   "D. Guam",
-    "hid":   "D. Haw.",
-    "idd":   "D. Idaho",
-    "ilcd":  "C.D. Ill.",   "ilnd":  "N.D. Ill.",    "ilsd":  "S.D. Ill.",
-    "innd":  "N.D. Ind.",   "insd":  "S.D. Ind.",
-    "iand":  "N.D. Iowa",   "iasd":  "S.D. Iowa",
-    "ksd":   "D. Kan.",
-    "kyed":  "E.D. Ky.",    "kywd":  "W.D. Ky.",
-    "laed":  "E.D. La.",    "lamd":  "M.D. La.",     "lawd":  "W.D. La.",
-    "med":   "D. Me.",
-    "mdd":   "D. Md.",
-    "mad":   "D. Mass.",
-    "mied":  "E.D. Mich.",  "miwd":  "W.D. Mich.",
-    "mnd":   "D. Minn.",
-    "msnd":  "N.D. Miss.",  "mssd":  "S.D. Miss.",
-    "moed":  "E.D. Mo.",    "mowd":  "W.D. Mo.",
-    "mtd":   "D. Mont.",
-    "ned":   "D. Neb.",
-    "nvd":   "D. Nev.",
-    "nhd":   "D.N.H.",
-    "njd":   "D.N.J.",
-    "nmd":   "D.N.M.",
-    "nmid":  "D.N. Mar. I.",
-    "nyed":  "E.D.N.Y.",    "nynd":  "N.D.N.Y.",
-    "nysd":  "S.D.N.Y.",    "nywd":  "W.D.N.Y.",
-    "nced":  "E.D.N.C.",    "ncmd":  "M.D.N.C.",     "ncwd":  "W.D.N.C.",
-    "ndd":   "D.N.D.",
-    "ohnd":  "N.D. Ohio",   "ohsd":  "S.D. Ohio",
-    "oked":  "E.D. Okla.",  "oknd":  "N.D. Okla.",   "okwd":  "W.D. Okla.",
-    "ord":   "D. Or.",
-    "paed":  "E.D. Pa.",    "pamd":  "M.D. Pa.",     "pawd":  "W.D. Pa.",
-    "prd":   "D.P.R.",
-    "rid":   "D.R.I.",
-    "scd":   "D.S.C.",
-    "sdd":   "D.S.D.",
-    "tned":  "E.D. Tenn.",  "tnmd":  "M.D. Tenn.",   "tnwd":  "W.D. Tenn.",
-    "txed":  "E.D. Tex.",   "txnd":  "N.D. Tex.",
-    "txsd":  "S.D. Tex.",   "txwd":  "W.D. Tex.",
-    "utd":   "D. Utah",
-    "vtd":   "D. Vt.",
-    "vaed":  "E.D. Va.",    "vawd":  "W.D. Va.",
-    "vid":   "D.V.I.",
-    "waed":  "E.D. Wash.",  "wawd":  "W.D. Wash.",
-    "wvnd":  "N.D. W. Va.", "wvsd":  "S.D. W. Va.",
-    "wied":  "E.D. Wis.",   "wiwd":  "W.D. Wis.",
-    "wyd":   "D. Wyo.",
-    # Specialised federal courts
-    "cit":   "Ct. Int'l Trade",
-    "uscfc": "Fed. Cl.",
-    "tax":   "T.C.",
-    "bap1":  "B.A.P. 1st Cir.", "bap2": "B.A.P. 2d Cir.",
-    "bap6":  "B.A.P. 6th Cir.", "bap8": "B.A.P. 8th Cir.",
-    "bap9":  "B.A.P. 9th Cir.", "bap10": "B.A.P. 10th Cir.",
-    # State supreme courts (CourtListener IDs)
-    "ala":   "Ala.", "alactapp": "Ala. Crim. App.", "alacivapp": "Ala. Civ. App.",
-    "alaska": "Alaska",
-    "ariz":  "Ariz.", "arizctapp": "Ariz. Ct. App.",
-    "ark":   "Ark.", "arkctapp": "Ark. Ct. App.",
-    "cal":   "Cal.", "calctapp": "Cal. Ct. App.",
-    "colo":  "Colo.", "coloctapp": "Colo. App.",
-    "conn":  "Conn.", "connappct": "Conn. App.",
-    "del":   "Del.", "delsuperct": "Del. Super. Ct.",
-    "dc":    "D.C.",
-    "fla":   "Fla.", "fladistctapp": "Fla. Dist. Ct. App.",
-    "ga":    "Ga.", "gactapp": "Ga. Ct. App.",
-    "haw":   "Haw.", "hawapp": "Haw. Ct. App.",
-    "idaho": "Idaho", "idahoctapp": "Idaho Ct. App.",
-    "ill":   "Ill.", "illappct": "Ill. App. Ct.",
-    "ind":   "Ind.", "indctapp": "Ind. Ct. App.",
-    "iowa":  "Iowa", "iowactapp": "Iowa Ct. App.",
-    "kan":   "Kan.", "kanctapp": "Kan. Ct. App.",
-    "ky":    "Ky.", "kyctapp": "Ky. Ct. App.",
-    "la":    "La.", "lactapp": "La. Ct. App.",
-    "me":    "Me.",
-    "md":    "Md.", "mdctspecapp": "Md. App.",
-    "mass":  "Mass.", "massappct": "Mass. App. Ct.",
-    "mich":  "Mich.", "michctapp": "Mich. Ct. App.",
-    "minn":  "Minn.", "minnctapp": "Minn. Ct. App.",
-    "miss":  "Miss.", "missctapp": "Miss. Ct. App.",
-    "mo":    "Mo.", "moctapp": "Mo. Ct. App.",
-    "mont":  "Mont.",
-    "neb":   "Neb.", "nebctapp": "Neb. Ct. App.",
-    "nev":   "Nev.",
-    "nh":    "N.H.",
-    "nj":    "N.J.", "njsuperctappdiv": "N.J. Super. Ct. App. Div.",
-    "nm":    "N.M.", "nmctapp": "N.M. Ct. App.",
-    "ny":    "N.Y.", "nyappdiv": "N.Y. App. Div.",
-    "nc":    "N.C.", "ncctapp": "N.C. Ct. App.",
-    "nd":    "N.D.",
-    "ohio":  "Ohio", "ohioctapp": "Ohio Ct. App.",
-    "okla":  "Okla.", "oklacrimapp": "Okla. Crim. App.", "oklacivapp": "Okla. Civ. App.",
-    "or":    "Or.", "orctapp": "Or. Ct. App.",
-    "pa":    "Pa.", "pasuperct": "Pa. Super. Ct.", "pacommwct": "Pa. Commw. Ct.",
-    "ri":    "R.I.",
-    "sc":    "S.C.", "scctapp": "S.C. Ct. App.",
-    "sd":    "S.D.",
-    "tenn":  "Tenn.", "tennctapp": "Tenn. Ct. App.", "tenncrimapp": "Tenn. Crim. App.",
-    "tex":   "Tex.", "texapp": "Tex. App.",
-    "utah":  "Utah", "utahctapp": "Utah Ct. App.",
-    "vt":    "Vt.",
-    "va":    "Va.", "vactapp": "Va. Ct. App.",
-    "wash":  "Wash.", "washctapp": "Wash. Ct. App.",
-    "wva":   "W. Va.",
-    "wis":   "Wis.", "wisctapp": "Wis. Ct. App.",
-    "wyo":   "Wyo.",
-}
 
 
 def _build_default_filename(item: dict) -> str:
@@ -597,6 +464,7 @@ class CourtListenerGUI:
         self._client: Optional[CourtListenerClient] = None
         self._results: list[dict] = []
         self._scholar_results: list = []  # ScholarResult objects
+        self._selected_courts: set[str] = set()  # empty = all courts
         self._search_thread: Optional[threading.Thread] = None
         self._scholar: Optional["GoogleScholarFetcher"] = None
 
@@ -643,16 +511,12 @@ class CourtListenerGUI:
         row2 = ttk.Frame(search_frame)
         row2.pack(fill="x")
 
-        ttk.Label(row2, text="Court:").pack(side="left")
-        self._court_var = tk.StringVar(value="(any)")
-        court_choices = ["(any)"] + sorted(COURTS.keys())
-        ttk.Combobox(
+        self._courts_btn_var = tk.StringVar(value="Courts: All ▾")
+        ttk.Button(
             row2,
-            textvariable=self._court_var,
-            values=court_choices,
-            width=10,
-            state="readonly",
-        ).pack(side="left", padx=(4, 12))
+            textvariable=self._courts_btn_var,
+            command=self._show_court_picker,
+        ).pack(side="left", padx=(0, 12))
 
         ttk.Label(row2, text="Filed from:").pack(side="left")
         self._date_from_var = tk.StringVar()
@@ -855,6 +719,27 @@ class CourtListenerGUI:
         )
 
     # ------------------------------------------------------------------
+    # Court picker
+    # ------------------------------------------------------------------
+
+    def _show_court_picker(self) -> None:
+        _CourtPickerDialog(self.root, self._selected_courts, self._on_courts_applied)
+
+    def _on_courts_applied(self, selected: set[str]) -> None:
+        # Selecting everything is the same as no filter
+        if selected >= _all_court_ids():
+            selected = set()
+        self._selected_courts = selected
+        if not selected:
+            self._courts_btn_var.set("Courts: All ▾")
+        elif len(selected) == 1:
+            cid = next(iter(selected))
+            label = "SCOTUS" if cid == "scotus" else _COURT_BLUEBOOK.get(cid, cid)
+            self._courts_btn_var.set(f"Courts: {label} ▾")
+        else:
+            self._courts_btn_var.set(f"Courts: {len(selected)} selected ▾")
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -998,9 +883,8 @@ class CourtListenerGUI:
             messagebox.showwarning("Empty Query", "Please enter a search query.")
             return
 
-        court = self._court_var.get()
-        if court == "(any)":
-            court = None
+        # CourtListener accepts space-separated court IDs; empty set = all
+        court = " ".join(sorted(self._selected_courts)) or None
         date_from = self._date_from_var.get().strip() or None
         date_to = self._date_to_var.get().strip() or None
         page_size = self._page_size_var.get()
@@ -1544,6 +1428,134 @@ class CourtListenerGUI:
             subprocess.Popen(["open", path])
         else:
             subprocess.Popen(["xdg-open", path])
+
+
+class _CourtPickerDialog:
+    """
+    Checkbox-tree dialog for choosing which courts to search.
+
+    The tree mirrors ``court_catalog.CATALOG``: Federal (Supreme Court,
+    Courts of Appeals, District Courts, Specialized) and State (each state
+    with its appellate courts).  Clicking a group toggles everything under
+    it; groups show ☑ / ☐ / ◪ for all / none / some selected.  An empty
+    selection means "all courts" (no filter).
+    """
+
+    _GLYPH_ALL, _GLYPH_NONE, _GLYPH_SOME = "☑", "☐", "◪"
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        selected: set[str],
+        on_apply,
+    ) -> None:
+        self._on_apply = on_apply
+        self._checked: set[str] = set(selected)
+        self._labels: dict[str, str] = {}        # tree iid → bare label
+        self._group_leaves: dict[str, set[str]] = {}  # group iid → descendant ids
+
+        win = tk.Toplevel(parent)
+        self._win = win
+        win.title("Select Courts")
+        win.geometry("440x560")
+        win.minsize(360, 400)
+        win.transient(parent)
+        win.grab_set()
+
+        tree_frame = ttk.Frame(win)
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        self._tree = ttk.Treeview(tree_frame, show="tree", selectmode="none")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._tree.pack(side="left", fill="both", expand=True)
+
+        self._build_nodes("", _COURT_CATALOG)
+        # Open the two top-level branches so the structure is visible
+        for iid in self._tree.get_children(""):
+            self._tree.item(iid, open=True)
+        self._refresh_glyphs()
+        self._tree.bind("<Button-1>", self._on_click)
+
+        bot = ttk.Frame(win)
+        bot.pack(fill="x", padx=8, pady=(0, 8))
+        self._count_var = tk.StringVar()
+        ttk.Label(bot, textvariable=self._count_var, foreground="gray").pack(
+            side="left"
+        )
+        ttk.Button(bot, text="Apply", command=self._apply).pack(side="right")
+        ttk.Button(bot, text="Cancel", command=win.destroy).pack(
+            side="right", padx=4
+        )
+        ttk.Button(bot, text="Clear", command=self._clear).pack(side="right", padx=4)
+        self._update_count()
+
+    # -- tree construction ---------------------------------------------------
+
+    def _build_nodes(self, parent_iid: str, nodes) -> set[str]:
+        leaves: set[str] = set()
+        for label_or_id, payload in nodes:
+            if isinstance(payload, list):
+                iid = self._tree.insert(parent_iid, "end", text=label_or_id)
+                self._labels[iid] = label_or_id
+                sub = self._build_nodes(iid, payload)
+                self._group_leaves[iid] = sub
+                leaves |= sub
+            else:
+                cid, label = label_or_id, payload
+                self._tree.insert(parent_iid, "end", iid=cid, text=label)
+                self._labels[cid] = label
+                leaves.add(cid)
+        return leaves
+
+    # -- interaction -----------------------------------------------------------
+
+    def _on_click(self, event: tk.Event) -> None:
+        # Let clicks on the expander triangle expand/collapse as usual
+        if "indicator" in self._tree.identify_element(event.x, event.y):
+            return
+        iid = self._tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid in self._group_leaves:
+            leaves = self._group_leaves[iid]
+            if leaves <= self._checked:
+                self._checked -= leaves
+            else:
+                self._checked |= leaves
+        else:
+            self._checked.symmetric_difference_update({iid})
+        self._refresh_glyphs()
+        self._update_count()
+
+    def _refresh_glyphs(self) -> None:
+        for iid, label in self._labels.items():
+            if iid in self._group_leaves:
+                leaves = self._group_leaves[iid]
+                if leaves and leaves <= self._checked:
+                    glyph = self._GLYPH_ALL
+                elif leaves & self._checked:
+                    glyph = self._GLYPH_SOME
+                else:
+                    glyph = self._GLYPH_NONE
+            else:
+                glyph = self._GLYPH_ALL if iid in self._checked else self._GLYPH_NONE
+            self._tree.item(iid, text=f"{glyph} {label}")
+
+    def _update_count(self) -> None:
+        n = len(self._checked)
+        self._count_var.set(
+            "All courts (no filter)" if n == 0 else f"{n} court(s) selected"
+        )
+
+    def _clear(self) -> None:
+        self._checked.clear()
+        self._refresh_glyphs()
+        self._update_count()
+
+    def _apply(self) -> None:
+        self._on_apply(set(self._checked))
+        self._win.destroy()
 
 
 _OP_ID_RE = re.compile(r"/opinions/(\d+)/?")

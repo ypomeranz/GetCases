@@ -393,6 +393,18 @@ _AUTHOR_LINE_RE = re.compile(
     r"(?:(?:Circuit|District|Bankruptcy)\s+)?(?:Judge|Justice|C\.?\s?J\.|J\.)"
     r"\s*[.:;—-]?\s*$"
 )
+# Caption front matter that belongs in the header even though it isn't
+# centered: how the case arrived, counsel listings, the panel line.
+_FRONT_MATTER_RE = re.compile(
+    r"^(?:APPEALS?\s+FROM|CERTIORARI\s+TO|ON\s+WRITS?\s+OF|ON\s+PETITION|"
+    r"ON\s+APPLICATION|ON\s+APPEAL|IN\s+RE\b|No\.\s*\d|Nos\.\s*\d|Syllabus\b|"
+    r"Argued\b|Reargued\b|Decided\b|Submitted\b|Filed\b|Released\b|"
+    r"Before[:,]?\s)"
+    r"|\bre?argued\s+the\s+cause|\bon\s+the\s+briefs?\b|\bbriefs?\s+(?:of|for|was|were)\b"
+    r"|\bfor\s+(?:the\s+)?(?:appell(?:ant|ee)s?|petitioners?|respondents?)\b"
+    r"|\bamic(?:us|i)\s+curiae\b|\battorneys?\s+general\b|\bof\s+counsel\b",
+    re.IGNORECASE,
+)
 
 
 # Footnote-body blocks start with the same marker the in-text superscript
@@ -536,10 +548,20 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
             OpinionPart("Majority Opinion", "majority", list(blocks[maj_idx:first_sep]))
         )
     else:
-        # No attribution found: treat the leading centered caption as header
+        # No attribution found: the header is the leading centered caption
+        # plus any front-matter paragraphs (how the case arrived, counsel
+        # listings, the panel line) that follow it.
         j = 0
-        while j < first_sep and blocks[j].kind in ("center", "heading"):
-            j += 1
+        while j < first_sep:
+            b = blocks[j]
+            t = _content_text(b)
+            if b.kind in ("center", "heading") or not t:
+                j += 1
+                continue
+            if len(t) <= 400 and _FRONT_MATTER_RE.search(t[:80]):
+                j += 1
+                continue
+            break
         if 0 < j < first_sep:
             parts.append(OpinionPart("Header", "header", list(blocks[:j])))
         if first_sep > j:
