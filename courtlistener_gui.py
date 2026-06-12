@@ -2627,6 +2627,9 @@ class _ScholarTextWindow:
         txt.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
+        self._text_frame, self._vsb = text_frame, vsb
+        self._details_frame: Optional[ttk.Frame] = None
+        self._details_loaded = False
 
         txt.tag_configure("center", justify="center")
         txt.tag_configure("blockquote", lmargin1=36, lmargin2=36, rmargin=36)
@@ -2679,6 +2682,11 @@ class _ScholarTextWindow:
         ttk.Button(
             btn_frame, text="A+", width=3, command=lambda: self._zoom(+1)
         ).pack(side="left", padx=(2, 8))
+        self._details_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            btn_frame, text="Case details", variable=self._details_var,
+            command=self._toggle_details,
+        ).pack(side="left", padx=(0, 8))
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
             win.bind(seq, lambda _e: self._zoom(+1))
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
@@ -3429,6 +3437,180 @@ class _ScholarTextWindow:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self._current_text())
             messagebox.showinfo("Saved", f"Text saved to:\n{path}", parent=self._win)
+
+    # ------------------------------------------------------------------
+    # Case details side panel (authors and joins per opinion)
+    # ------------------------------------------------------------------
+
+    def _details_panel(self) -> ttk.Frame:
+        if self._details_frame is None:
+            f = ttk.Frame(self._text_frame)
+            ttk.Label(
+                f, text="Opinions & Joins",
+                font=("TkDefaultFont", 9, "bold"),
+            ).pack(anchor="w", padx=6, pady=(4, 2))
+            body = tk.Text(
+                f, width=34, wrap="word", font=("TkDefaultFont", 9),
+                state="disabled", padx=8, pady=4, relief="flat",
+                background="#f7f5ef",
+            )
+            dvsb = ttk.Scrollbar(f, orient="vertical", command=body.yview)
+            body.configure(yscrollcommand=dvsb.set)
+            dvsb.pack(side="right", fill="y")
+            body.pack(side="left", fill="both", expand=True)
+            body.tag_configure("h", font=("TkDefaultFont", 9, "bold"),
+                               spacing1=10)
+            body.tag_configure("lbl", font=("TkDefaultFont", 9, "italic"),
+                               foreground="#666666")
+            self._details_text = body
+            self._details_frame = f
+        return self._details_frame
+
+    def _toggle_details(self) -> None:
+        if self._details_var.get():
+            self._details_panel().pack(side="right", fill="y",
+                                       before=self._vsb)
+            if not self._details_loaded:
+                self._load_details()
+        elif self._details_frame is not None:
+            self._details_frame.pack_forget()
+
+    def _set_details(self, lines: list[tuple[str, str]]) -> None:
+        body = self._details_text
+        body.config(state="normal")
+        body.delete("1.0", "end")
+        for style, text in lines:
+            body.insert("end", text + "\n", (style,) if style else ())
+        body.config(state="disabled")
+
+    def _load_details(self) -> None:
+        """Fetch authorship/join data from CourtListener (author_str /
+        joined_by_str per sub-opinion — well populated for SCOTUS); when
+        that yields nothing, fall back to what the Scholar text itself
+        says (the syllabus line-up paragraph and separator headers)."""
+        self._details_loaded = True
+        self._set_details([("lbl", "Loading case details…")])
+        client = (
+            self._app._get_client()
+            if self._app._token_var.get().strip() else None
+        )
+        item = dict(self._item)
+        cite = self._bb["cite"]
+
+        def run() -> None:
+            lines: list[tuple[str, str]] = []
+            try:
+                if client is None:
+                    raise RuntimeError("no CourtListener token configured")
+                cid = item.get("cluster_id") or item.get("id")
+                if not cid:
+                    if not cite:
+                        raise RuntimeError("no citation to locate the case")
+                    data = client.search(f"citation:({cite})", type="o",
+                                         page_size=1)
+                    results = data.get("results") or []
+                    if not results:
+                        data = client.search(f'"{cite}"', type="o",
+                                             page_size=1)
+                        results = data.get("results") or []
+                    if not results:
+                        raise RuntimeError("case not found on CourtListener")
+                    cid = (results[0].get("cluster_id")
+                           or results[0].get("id"))
+                cluster = client.get_cluster(
+                    int(cid), fields="judges,sub_opinions")
+                ops = []
+                for url in cluster.get("sub_opinions") or []:
+                    try:
+                        ops.append(client._get_url(url, {
+                            "fields": "ordering_key,type,author_str,"
+                                      "joined_by_str,per_curiam",
+                        }))
+                    except Exception as exc:
+                        print(f"[details] sub-opinion fetch failed: {exc}")
+                ops.sort(key=lambda o: (o.get("ordering_key") is None,
+                                        o.get("ordering_key") or 0))
+                lines = self._details_lines_cl(cluster, ops)
+            except Exception as exc:
+                print(f"[details] {exc}")
+            if not lines:
+                lines = self._details_lines_parts()
+            if not lines:
+                lines = [("lbl", "No authorship details available "
+                                 "for this case.")]
+            self._post(self._set_details, lines)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _details_lines_cl(cluster: dict, ops: list[dict]
+                          ) -> list[tuple[str, str]]:
+        lines: list[tuple[str, str]] = []
+        judges = _strip_html(cluster.get("judges") or "").strip()
+        if judges:
+            lines += [("h", "Panel"), ("", judges)]
+        any_data = bool(judges)
+        for op in ops:
+            label = _OPINION_TYPE_LABELS.get(op.get("type") or "",
+                                             "Opinion")
+            author = (op.get("author_str") or "").strip()
+            joined = (op.get("joined_by_str") or "").strip()
+            if op.get("per_curiam") and not author:
+                author = "Per curiam"
+            lines.append(("h", label))
+            if author:
+                lines.append(("", f"Author: {author}"))
+            if joined:
+                lines.append(("", f"Joined by: {joined}"))
+            if author or joined:
+                any_data = True
+            else:
+                lines.append(("lbl", "No authorship data"))
+        # all-empty CourtListener data -> let the Scholar fallback try
+        return lines if any_data else []
+
+    def _details_lines_parts(self) -> list[tuple[str, str]]:
+        """Authorship gleaned from the Scholar text: the syllabus
+        "delivered the opinion … joined" paragraph plus each separate
+        opinion's header line."""
+        def clean(raw: str) -> str:
+            t = re.sub(r"\s+", " ", raw).strip()
+            return re.sub(r"^(?:\*\d+\s+)+", "", t)  # leading page markers
+
+        lines: list[tuple[str, str]] = []
+        header = next((p for p in self._parts if p.kind == "header"), None)
+        if header is not None:
+            for b in header.blocks:
+                t = clean(b.text())
+                if len(t) < 900 and re.search(
+                    r"delivered the opinion|announced the judgment"
+                    r"|filed (?:a|an) (?:concurring|dissenting)"
+                    r"|join(?:ed|ing)\b",
+                    t, re.IGNORECASE,
+                ):
+                    if not lines:
+                        lines.append(("h", "Line-up"))
+                    lines.append(("", _fix_name_case(t)))
+        for part in self._parts:
+            if part.kind == "header":
+                continue
+            writer = self._writer_parenthetical(part)
+            if part.kind == "majority":
+                lines.append(("h", "Per Curiam" if writer == "per curiam"
+                              else "Majority / Lead Opinion"))
+                for b in part.blocks[:3]:
+                    t = clean(b.text())
+                    if len(t) <= 200 and re.search(
+                        r"delivered the opinion|announced the judgment",
+                        t, re.IGNORECASE,
+                    ):
+                        lines.append(("", _fix_name_case(t)))
+                        break
+            else:
+                lines.append(("h", "Dissent" if part.kind == "dissent"
+                              else "Concurrence"))
+                lines.append(("", _fix_name_case(clean(part.label))))
+        return lines
 
     # ------------------------------------------------------------------
     # Citation links
