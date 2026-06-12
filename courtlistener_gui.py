@@ -98,6 +98,7 @@ import requests as _requests
 
 from bluebook_names import abbreviate_case_name
 from courtlistener import CourtListenerClient, CourtListenerError
+import us_code
 from court_catalog import (
     CATALOG as _COURT_CATALOG,
     COURT_BLUEBOOK as _COURT_BLUEBOOK,
@@ -2394,17 +2395,35 @@ class _ScholarTextWindow:
             txt.insert("end", span.text, tuple(tags))
             return
         # Plain text: make recognizable citations clickable
+        self._insert_plain_with_links(span.text, tuple(tags))
+
+    def _insert_plain_with_links(self, text: str, tags: tuple) -> None:
+        """Insert text, turning case citations and U.S. Code citations
+        into clickable links (Scholar lookup / OLRC statute viewer)."""
+        txt = self._text
+        matches: list[tuple[int, int, str, re.Match]] = []
+        for m in _TEXT_CITE_RE.finditer(text):
+            matches.append((m.start(), m.end(), "cite", m))
+        for m in us_code.USC_CITE_RE.finditer(text):
+            matches.append((m.start(), m.end(), "usc", m))
+        matches.sort(key=lambda t: (t[0], -t[1]))
         pos = 0
-        for m in _TEXT_CITE_RE.finditer(span.text):
-            if m.start() > pos:
-                txt.insert("end", span.text[pos:m.start()], tuple(tags))
-            cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
-            cite = cite.replace("’", "'")  # straight apostrophe for the search query
-            ltags = tags + ["citelink", self._new_link(("cite", cite))]
-            txt.insert("end", m.group(0), tuple(ltags))
-            pos = m.end()
-        if pos < len(span.text):
-            txt.insert("end", span.text[pos:], tuple(tags))
+        for start, end, kind, m in matches:
+            if start < pos:
+                continue  # overlapping match — first/longest wins
+            if start > pos:
+                txt.insert("end", text[pos:start], tags)
+            if kind == "cite":
+                cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
+                cite = cite.replace("’", "'")  # straight apostrophe for the search query
+                action = ("cite", cite)
+            else:
+                action = ("usc", us_code.cite_spec(m))
+            ltags = tags + ("citelink", self._new_link(action))
+            txt.insert("end", text[start:end], ltags)
+            pos = end
+        if pos < len(text):
+            txt.insert("end", text[pos:], tags)
 
     def _render_footnotes(self, footnotes: list, part_tag: Optional[str]) -> None:
         """Insert a part's footnote blocks, recording each note's rendered
@@ -2515,7 +2534,7 @@ class _ScholarTextWindow:
         txt = self._text
         txt.config(state="normal")
         txt.delete("1.0", "end")
-        txt.insert("1.0", self._cl_text or "(no text)")
+        self._insert_plain_with_links(self._cl_text or "(no text)", ())
         txt.config(state="disabled")
         self._mode = "courtlistener"
         self._source_var.set("CourtListener (assembled from the REST API)")
@@ -3024,6 +3043,9 @@ class _ScholarTextWindow:
             if pos:
                 self._jump_to(pos)
             return
+        if kind == "usc":
+            self._open_usc(value)
+            return
         fetcher = self._app._get_scholar()
         if fetcher is None:
             return
@@ -3046,6 +3068,27 @@ class _ScholarTextWindow:
         url, html = result
         self._status_var.set("Cited case loaded.")
         _ScholarTextWindow(self._win, self._app, url, html, item=None)
+
+    def _open_usc(self, spec: str) -> None:
+        """Fetch a U.S. Code section from the OLRC and show it."""
+        title, section, subs = spec.split(":", 2)
+        label = us_code.spec_label(spec)
+        self._status_var.set(f"Fetching {label} from uscode.house.gov…")
+
+        def run() -> None:
+            try:
+                doc = us_code.load_section(title, section)
+            except Exception as exc:
+                self._post(self._status_var.set, f"US Code: {exc}")
+                return
+            self._post(self._on_usc_ready, doc, subs, label)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_usc_ready(self, doc, subs: str, label: str) -> None:
+        self._status_var.set(f"{label} loaded.")
+        _USCodeWindow(self._win, doc,
+                      tuple(s for s in subs.split(",") if s))
 
     # ------------------------------------------------------------------
     # CourtListener toggle
@@ -3099,6 +3142,178 @@ class _ScholarTextWindow:
         self._toggle_btn.config(state="normal")
         self._status_var.set(f"CourtListener: {msg}")
         messagebox.showerror("CourtListener", msg, parent=self._win)
+
+
+class _USCodeWindow:
+    """
+    Reader for a U.S. Code section fetched from the Office of the Law
+    Revision Counsel (uscode.house.gov).
+
+    Formatting follows the statutory hierarchy: the section heading and
+    subdivision headings are bold, inline enumerators ("(a)", "(1)(A)")
+    are bold, and each nesting level is indented with a hanging indent so
+    wrapped lines stay aligned under their text.  When the citation that
+    opened the window pin-cites a subdivision ("§ 922(g)(1)"), the view
+    scrolls there and flashes it.  Source credit is shown small below the
+    text; the (often long) editorial/statutory notes sit behind a toggle.
+    """
+
+    def __init__(self, parent: tk.Misc, doc, highlight: tuple = ()) -> None:
+        self._doc = doc
+        self._highlight = tuple(highlight)
+        self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
+        self._win = tk.Toplevel(parent)
+        self._win.title(f"{doc.title} U.S.C. § {doc.section} — U.S. Code (OLRC)")
+        self._win.geometry("760x640")
+        self._win.minsize(440, 280)
+        self._base_size = _OPINION_FONT_PT
+        self._build_ui()
+        self._render()
+
+    def _build_ui(self) -> None:
+        win = self._win
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(top, text="Source:").pack(side="left")
+        src = tk.StringVar(value=self._doc.url)
+        ttk.Entry(top, textvariable=src, state="readonly").pack(
+            side="left", fill="x", expand=True, padx=4
+        )
+        ttk.Button(
+            top, text="Open in Browser",
+            command=lambda: webbrowser.open(self._doc.url),
+        ).pack(side="right")
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=8, pady=4)
+        s = self._base_size
+        fam = "Georgia"
+        self._fonts = {
+            "base": tkfont.Font(family=fam, size=s),
+            "bold": tkfont.Font(family=fam, size=s, weight="bold"),
+            "sechead": tkfont.Font(family=fam, size=s + 2, weight="bold"),
+            "small": tkfont.Font(family=fam, size=max(s - 2, 8)),
+        }
+        txt = tk.Text(frame, wrap="word", font=self._fonts["base"],
+                      padx=14, pady=10)
+        self._text = txt
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+
+        txt.tag_configure("sechead", font=self._fonts["sechead"],
+                          spacing1=4, spacing3=12)
+        txt.tag_configure("headline", font=self._fonts["bold"], spacing1=8)
+        txt.tag_configure("enum", font=self._fonts["bold"])
+        txt.tag_configure("credit", font=self._fonts["small"],
+                          foreground="#555555", spacing1=14)
+        txt.tag_configure("notehead", font=self._fonts["bold"],
+                          foreground="#444444", spacing1=14)
+        txt.tag_configure("notebody", font=self._fonts["small"],
+                          foreground="#444444")
+        for i in range(7):
+            margin = 10 + 26 * i
+            txt.tag_configure(f"ind{i}", lmargin1=margin,
+                              lmargin2=margin + 22, spacing3=6)
+        txt.tag_configure("jumpflash", background="#fff2a8")
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="A−", width=3,
+                   command=lambda: self._zoom(-1)).pack(side="left")
+        ttk.Button(btns, text="A+", width=3,
+                   command=lambda: self._zoom(+1)).pack(side="left",
+                                                        padx=(2, 8))
+        self._notes_var = tk.BooleanVar(value=False)
+        notes_btn = ttk.Checkbutton(
+            btns, text="Show notes", variable=self._notes_var,
+            command=self._render,
+        )
+        notes_btn.pack(side="left", padx=8)
+        if not self._has_notes:
+            notes_btn.config(state="disabled")
+        ttk.Label(
+            btns,
+            text="Current through the latest OLRC release (prelim edition)",
+            foreground="gray",
+        ).pack(side="right")
+        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            win.bind(seq, lambda _e: self._zoom(+1))
+        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
+            win.bind(seq, lambda _e: self._zoom(-1))
+        txt.bind(
+            "<Control-MouseWheel>",
+            lambda e: self._zoom(+1 if e.delta > 0 else -1) or "break",
+        )
+        txt.bind("<Control-Button-4>", lambda _e: self._zoom(+1) or "break")
+        txt.bind("<Control-Button-5>", lambda _e: self._zoom(-1) or "break")
+
+    _ENUM_LEAD_RE = re.compile(r"((?:\((?:\d{1,3}|[a-zA-Z]{1,4})\)\s*)+)")
+
+    def _render(self) -> None:
+        txt = self._text
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        show_notes = self._notes_var.get()
+        path: list[str] = []
+        target = list(self._highlight)
+        target_pos: Optional[str] = None
+        for kind, ind, text in self._doc.paras:
+            if kind.startswith("note") and not show_notes:
+                continue
+            indtag = f"ind{min(ind, 6)}"
+            # Track the enumerator path for the pin-cite jump: a paragraph
+            # at indent level N replaces the path from depth N down.
+            m = self._ENUM_LEAD_RE.match(text) if kind in ("body", "head") \
+                else None
+            lead = m.group(1) if m else ""
+            if lead:
+                enums = re.findall(r"\(([^)]+)\)", lead)
+                path[ind:] = enums
+                if (target and target_pos is None
+                        and path[:len(target)] == target):
+                    target_pos = txt.index("end-1c")
+            if kind == "sechead":
+                txt.insert("end", text + "\n", ("sechead",))
+            elif kind == "head":
+                txt.insert("end", text + "\n", ("headline", indtag))
+            elif kind == "body":
+                if lead:
+                    txt.insert("end", lead.rstrip() + " ",
+                               ("enum", indtag))
+                    txt.insert("end", text[len(lead):].lstrip() + "\n",
+                               (indtag,))
+                else:
+                    txt.insert("end", text + "\n", (indtag,))
+            elif kind == "credit":
+                txt.insert("end", text + "\n", ("credit",))
+            elif kind == "note-head":
+                txt.insert("end", text + "\n", ("notehead",))
+            elif kind == "note-body":
+                txt.insert("end", text + "\n", ("notebody", indtag))
+        txt.config(state="disabled")
+        if target_pos:
+            txt.see(target_pos)
+            txt.tag_add("jumpflash", f"{target_pos} linestart",
+                        f"{target_pos} lineend")
+            self._win.after(
+                1800,
+                lambda: txt.tag_remove("jumpflash", "1.0", "end"),
+            )
+
+    def _zoom(self, delta: int) -> None:
+        global _OPINION_FONT_PT
+        new = max(_OPINION_FONT_MIN,
+                  min(_OPINION_FONT_MAX, self._base_size + delta))
+        if new == self._base_size:
+            return
+        self._base_size = new
+        _OPINION_FONT_PT = new
+        self._fonts["base"].configure(size=new)
+        self._fonts["bold"].configure(size=new)
+        self._fonts["sechead"].configure(size=new + 2)
+        self._fonts["small"].configure(size=max(new - 2, 8))
 
 
 class _CitingOpinionsWindow:
