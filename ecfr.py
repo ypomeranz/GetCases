@@ -171,7 +171,10 @@ def load_section(title: str, section: str) -> CfrSection:
             resp.raise_for_status()
         except Exception as exc:
             raise RuntimeError(f"ecfr.gov: {exc}") from exc
-        paras = parse_section_xml(resp.text)
+        # The API omits the charset in its Content-Type, which would make
+        # requests fall back to Latin-1 and render "§" as "Â§"; the XML
+        # itself is UTF-8.
+        paras = parse_section_xml(resp.content.decode("utf-8", "replace"))
         if paras:
             doc = CfrSection(
                 title=title, section=cand, date=date,

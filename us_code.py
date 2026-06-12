@@ -258,10 +258,13 @@ def load_section(title: str, section: str) -> UscSection:
             resp.raise_for_status()
         except Exception as exc:
             raise RuntimeError(f"uscode.house.gov: {exc}") from exc
-        paras = parse_section(resp.text)
+        # Decode explicitly: a missing charset in the Content-Type would
+        # otherwise turn "§" into "Â§" via requests' Latin-1 fallback
+        page = resp.content.decode("utf-8", "replace")
+        paras = parse_section(page)
         if paras:
             doc = UscSection(title=title, section=cand, url=url, paras=paras)
-            doc.container = _find_container(resp.text)
+            doc.container = _find_container(page)
             with _cache_lock:
                 _cache[key] = doc
             return doc
