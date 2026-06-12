@@ -334,20 +334,24 @@ def parse_section(page_html: str) -> list[tuple[str, int, str]]:
 def _relevel_statute(
     paras: list[tuple[str, int, str]]
 ) -> list[tuple[str, int, str]]:
-    """Replace the print-derived indents of enumerated statute paragraphs
-    with logical depth per the U.S.C. hierarchy, so "(a)(1)" followed by
-    "(2)" indents "(2)" under "(a)".  Unenumerated paragraphs keep their
-    class-derived indent."""
+    """Replace the print-derived indents of statute paragraphs with
+    logical depth per the U.S.C. hierarchy, so "(a)(1)" followed by
+    "(2)" indents "(2)" under "(a)".  An unenumerated paragraph is a
+    continuation of the currently open item and stays at its depth
+    (never shallower than its class indent, so indented block material
+    keeps its offset)."""
     stack: list[tuple[str, str]] = []
     out: list[tuple[str, int, str]] = []
     for kind, ind, text in paras:
         if kind in ("body", "head"):
+            lvl = None
             m = ENUM_LEAD_RE.match(text)
             if m:
                 enums = re.findall(r"\(([^)]+)\)", m.group(1))
                 lvl = infer_enum_level(enums, stack, USC_HIERARCHY)
-                if lvl is not None:
-                    ind = min(lvl, 6)
+            if lvl is None:  # continuation of the open item
+                lvl = max(ind, len(stack) - 1)
+            ind = min(max(lvl, 0), 6)
         out.append((kind, ind, text))
     return out
 
@@ -435,14 +439,17 @@ if __name__ == "__main__":
 <p class="statutory-body-1em">(A) A subparagraph.</p>
 <p class="statutory-body-2em">(i) A clause.</p>
 <p class="statutory-body-2em">(ii) Another clause.</p>
+<p class="statutory-body">Continuation paragraph of clause (ii).</p>
 <p class="statutory-body">(b) Next subsection.</p>
+<p class="statutory-body">Continuation of subsection (b).</p>
 <p class="statutory-body">(c) Then (h)-style:</p>
 <p class="statutory-body">(h) Skip ahead.</p>
 <p class="statutory-body">(i) Letter i, not roman.</p>
 <!-- field-end:statute -->"""
     got_lvls = [(t.split()[0], i) for k, i, t in parse_section(quirk)]
     want_lvls = [("(a)(1)", 0), ("(2)", 1), ("(A)", 2), ("(i)", 3),
-                 ("(ii)", 3), ("(b)", 0), ("(c)", 0), ("(h)", 0),
+                 ("(ii)", 3), ("Continuation", 3), ("(b)", 0),
+                 ("Continuation", 0), ("(c)", 0), ("(h)", 0),
                  ("(i)", 0)]
     check(got_lvls == want_lvls, f"logical relevel: {got_lvls!r}")
 

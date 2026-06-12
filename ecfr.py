@@ -218,14 +218,16 @@ def parse_section_xml(xml: str) -> list[tuple[str, int, str]]:
         elif tag in ("AUTH", "NOTE"):
             paras.append(("note-body", 0, text))
         else:  # P / FP
-            level = 0
+            # No enumerator means a continuation of the open item, which
+            # stays at that item's depth rather than returning flush left
+            level = max(len(stack) - 1, 0)
             lead = _ENUM_LEAD_RE.match(text)
             if lead:
                 enums = re.findall(r"\(([^)]+)\)", lead.group(1))
                 lvl = infer_enum_level(enums, stack, CFR_HIERARCHY)
                 if lvl is not None:
-                    level = min(lvl, 6)
-            paras.append(("body", level, text))
+                    level = lvl
+            paras.append(("body", min(level, 6), text))
     return paras
 
 
@@ -281,6 +283,7 @@ if __name__ == "__main__":
 <P>(2) The agency shall extend the 45-day time limit&mdash;</P>
 <P>(i) when the individual shows reasonable cause;</P>
 <P>(ii) for other reasons considered sufficient.</P>
+<P>An unenumerated continuation of clause (ii).</P>
 <P>(b) At the initial counseling session, Counselors must advise
  individuals in writing.</P>
 <CITA TYPE="N">[57 FR 12146, Apr. 9, 1992, as amended at 64 FR 37659,
@@ -291,7 +294,8 @@ if __name__ == "__main__":
           f"head: {paras[0]!r}")
     got = [(k, i) for k, i, _t in paras]
     check(got == [("sechead", 0), ("body", 0), ("body", 1), ("body", 1),
-                  ("body", 2), ("body", 2), ("body", 0), ("credit", 0)],
+                  ("body", 2), ("body", 2), ("body", 2), ("body", 0),
+                  ("credit", 0)],
           f"kinds/indents: {got!r}")
     check("Counselor" in paras[1][2] and "<I>" not in paras[1][2],
           "inline tags stripped")
