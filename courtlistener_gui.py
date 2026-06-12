@@ -610,7 +610,12 @@ class CourtListenerGUI:
             label="Open Citation List…",
             command=self._show_citation_list_dialog,
         )
+        lookup_menu.add_command(
+            label="Quick Look Up (case or statute)…", accelerator="Ctrl+S",
+            command=self._show_quick_lookup,
+        )
         self.root.bind("<Control-l>", lambda _e: self._show_statute_lookup())
+        self.root.bind("<Control-s>", lambda _e: self._show_quick_lookup())
 
         # --- Search frame ---
         search_frame = ttk.LabelFrame(self.root, text="Search", padding=6)
@@ -803,6 +808,73 @@ class CourtListenerGUI:
     # Settings dialog
     # ------------------------------------------------------------------
 
+    def _post_root(self, fn, *args) -> None:
+        try:
+            self.root.after(0, fn, *args)
+        except tk.TclError:
+            pass
+
+    def _try_open_citation(self, name: str, cite: str, pin: str,
+                           fetcher, client) -> bool:
+        """Resolve one case citation and open its window (call from a
+        worker thread).  Google Scholar by citation first — retrying as a
+        name+citation search — with a pin-cite jump; then the
+        CourtListener text.  Returns False when nothing was found."""
+        if fetcher is not None:
+            result = None
+            try:
+                result = fetcher.fetch_by_citation(cite)
+                if not result and name:
+                    hits = fetcher.search_cases(f"{name} {cite}", limit=1)
+                    if hits:
+                        result = fetcher.fetch_by_url(hits[0].url)
+            except Exception as exc:
+                print(f"[citelist] scholar {cite!r}: {exc}")
+            if result:
+                url, html = result
+
+                def open_scholar() -> None:
+                    try:
+                        w = _ScholarTextWindow(self.root, self, url, html,
+                                               item=None)
+                        if pin:
+                            w.jump_to_cite_page(cite, pin)
+                    except tk.TclError:
+                        pass
+
+                self._post_root(open_scholar)
+                return True
+        if client is not None:
+            try:
+                data = client.search(f"citation:({cite})", type="o",
+                                     page_size=1)
+                results = data.get("results") or []
+                if not results:
+                    data = client.search(f'"{cite}"', type="o",
+                                         page_size=1)
+                    results = data.get("results") or []
+                if results:
+                    target = results[0]
+                    text = _assemble_case_text(client, target)
+                    if text.strip():
+
+                        def open_cl() -> None:
+                            try:
+                                w = _ScholarTextWindow(
+                                    self.root, self, "", "",
+                                    item=target, cl_text=text)
+                                w._show_courtlistener()
+                                # nothing to toggle to — no Scholar text
+                                w._toggle_btn.config(state="disabled")
+                            except tk.TclError:
+                                pass
+
+                        self._post_root(open_cl)
+                        return True
+            except Exception as exc:
+                print(f"[citelist] courtlistener {cite!r}: {exc}")
+        return False
+
     def _show_citation_list_dialog(self) -> None:
         """Dialog that opens a batch of cases: one citation per line
         ("Monroe v. Pape, 365 U.S. 167, 171 (1961)").  Each line is
@@ -859,24 +931,6 @@ class CourtListenerGUI:
             except tk.TclError:
                 pass
 
-        def open_scholar(url: str, html: str, cite: str, pin: str) -> None:
-            try:
-                w = _ScholarTextWindow(self.root, self, url, html, item=None)
-                if pin:
-                    w.jump_to_cite_page(cite, pin)
-            except tk.TclError:
-                pass
-
-        def open_cl(target: dict, text: str) -> None:
-            try:
-                w = _ScholarTextWindow(self.root, self, "", "",
-                                       item=target, cl_text=text)
-                w._show_courtlistener()
-                # nothing to toggle back to — there is no Scholar text
-                w._toggle_btn.config(state="disabled")
-            except tk.TclError:
-                pass
-
         def go() -> None:
             raw = [ln.strip() for ln in box.get("1.0", "end").splitlines()]
             lines = [ln for ln in raw if ln]
@@ -905,42 +959,11 @@ class CourtListenerGUI:
             def run() -> None:
                 for i, (ln, name, cite, pin) in enumerate(entries, 1):
                     post(set_status, f"({i}/{n}) Searching {cite}…")
-                    result = None
-                    if fetcher is not None:
-                        try:
-                            result = fetcher.fetch_by_citation(cite)
-                            if not result and name:
-                                hits = fetcher.search_cases(
-                                    f"{name} {cite}", limit=1)
-                                if hits:
-                                    result = fetcher.fetch_by_url(
-                                        hits[0].url)
-                        except Exception as exc:
-                            print(f"[citelist] scholar {cite!r}: {exc}")
-                    if result:
+                    if self._try_open_citation(name, cite, pin,
+                                               fetcher, client):
                         opened[0] += 1
-                        post(open_scholar, result[0], result[1], cite, pin)
-                        continue
-                    if client is not None:
-                        try:
-                            data = client.search(f"citation:({cite})",
-                                                 type="o", page_size=1)
-                            results = data.get("results") or []
-                            if not results:
-                                data = client.search(f'"{cite}"', type="o",
-                                                     page_size=1)
-                                results = data.get("results") or []
-                            if results:
-                                text = _assemble_case_text(client,
-                                                           results[0])
-                                if text.strip():
-                                    opened[0] += 1
-                                    post(open_cl, results[0], text)
-                                    continue
-                        except Exception as exc:
-                            print(f"[citelist] courtlistener {cite!r}: "
-                                  f"{exc}")
-                    failures.append(ln)
+                    else:
+                        failures.append(ln)
 
                 def finish() -> None:
                     try:
@@ -961,6 +984,85 @@ class CourtListenerGUI:
             threading.Thread(target=run, daemon=True).start()
 
         open_btn.config(command=go)
+
+    def _show_quick_lookup(self) -> None:
+        """Ctrl+S: one-line lookup that takes either a case citation
+        (resolved exactly like a line of the citation-list dialog, pin
+        cite included) or a statute/regulation citation."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Quick Look Up")
+        dlg.resizable(False, False)
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Citation:").grid(row=0, column=0, sticky="w")
+        query_var = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=query_var, width=46)
+        entry.grid(row=0, column=1, padx=6, sticky="we")
+        entry.focus_set()
+        status_var = tk.StringVar(
+            value="e.g.  Monroe v. Pape, 365 U.S. 167, 171   ·   "
+                  "42 USC 1983(b)   ·   29 CFR 1614.105(a)"
+        )
+        ttk.Label(frame, textvariable=status_var, foreground="gray").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+        open_btn = ttk.Button(frame, text="Open")
+        open_btn.grid(row=0, column=2)
+        frame.columnconfigure(1, weight=1)
+
+        def set_status(s: str) -> None:
+            try:
+                status_var.set(s)
+            except tk.TclError:
+                pass
+
+        def go(_e=None) -> None:
+            q = query_var.get().strip()
+            if not q:
+                return
+            # Statute/regulation first: "42 USC 1983" would otherwise
+            # read as volume 42, reporter "USC", page 1983
+            statute = _parse_statute_query(q)
+            if statute:
+                _fetch_statute_window(self.root, statute[0], statute[1],
+                                      set_status)
+                return
+            parsed = _parse_citation_line(q)
+            if not parsed:
+                set_status("Couldn't read that — try a reporter citation "
+                           "or '42 USC 1983'.")
+                return
+            name, cite, pin = parsed
+            fetcher = self._get_scholar() if _SCHOLAR_AVAILABLE else None
+            client = (
+                self._get_client()
+                if self._token_var.get().strip() else None
+            )
+            if fetcher is None and client is None:
+                set_status("Neither Google Scholar nor CourtListener "
+                           "is available.")
+                return
+            open_btn.config(state="disabled")
+            set_status(f"Searching {cite}…")
+
+            def run() -> None:
+                ok = self._try_open_citation(name, cite, pin,
+                                             fetcher, client)
+
+                def finish() -> None:
+                    try:
+                        open_btn.config(state="normal")
+                    except tk.TclError:
+                        return
+                    set_status(f"Opened {cite}." if ok
+                               else f"Not found: {cite}")
+
+                self._post_root(finish)
+
+            threading.Thread(target=run, daemon=True).start()
+
+        open_btn.config(command=go)
+        entry.bind("<Return>", go)
 
     def _show_statute_lookup(self) -> None:
         """Small dialog that opens a statute/regulation by typed citation
