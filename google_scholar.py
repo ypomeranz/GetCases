@@ -22,6 +22,7 @@ Requires:
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import time
@@ -42,14 +43,67 @@ except ImportError as exc:  # pragma: no cover
 
 SCHOLAR_BASE = "https://scholar.google.com"
 
-_HEADERS = {
-    # Realistic browser UA to avoid trivial blocks
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-}
+# A real, current Chrome UA.  Google's bot detection compares the UA against
+# the TLS/HTTP2 fingerprint, so the old "Firefox on Linux" string actually
+# hurt on stacks whose TLS doesn't look like Firefox.  Override with the
+# SCHOLAR_USER_AGENT environment variable (e.g. paste the UA from a browser
+# that works for you).
+_DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _build_headers() -> dict:
+    ua = os.environ.get("SCHOLAR_USER_AGENT", _DEFAULT_UA)
+    return {
+        "User-Agent": ua,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+    }
+
+
+# Google's consent/region cookies — without them EU-region IPs (and many
+# mobile/Chromebook networks routed through them) get bounced to a consent
+# interstitial instead of results.
+_CONSENT_COOKIES = {"CONSENT": "YES+cb", "SOCS": "CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg"}
+
+# curl_cffi impersonates a real browser's TLS + HTTP2 fingerprint, which is
+# what actually gets past Scholar's bot detection on flagged networks.  It's
+# optional: without it we fall back to plain requests (works on lenient
+# networks, e.g. most home connections).
+try:
+    from curl_cffi import requests as _curl_requests  # type: ignore
+
+    _HAS_CURL_CFFI = True
+except Exception:  # pragma: no cover - optional dependency
+    _HAS_CURL_CFFI = False
+
+_HEADERS = _build_headers()
+
+# Markers of a Scholar block / CAPTCHA / consent interstitial page.
+_BLOCK_MARKERS = (
+    "/sorry/",
+    "our systems have detected unusual traffic",
+    "id=\"captcha\"",
+    "g-recaptcha",
+    "please show you're not a robot",
+    "enablejs",  # consent.google.com interstitial
+)
+
 
 _DEFAULT_DELAY = 3.0  # seconds between outbound requests
 _CACHE_PATH = Path.home() / ".cache" / "courtlistener_scholar.db"
@@ -619,9 +673,23 @@ class GoogleScholarFetcher:
     ) -> None:
         self._delay = delay
         self._last_request: float = 0.0
+        self._warmed_up = False
 
-        self._session = requests.Session()
-        self._session.headers.update(_HEADERS)
+        # Prefer curl_cffi (browser-impersonating TLS/HTTP2) when available;
+        # fall back to plain requests otherwise.
+        if _HAS_CURL_CFFI:
+            self._session = _curl_requests.Session(impersonate="chrome124")
+            self._impersonating = True
+            print("[scholar] using curl_cffi (browser TLS impersonation)")
+        else:
+            self._session = requests.Session()
+            self._impersonating = False
+        self._session.headers.update(_build_headers())
+        for name, value in _CONSENT_COOKIES.items():
+            try:
+                self._session.cookies.set(name, value, domain=".google.com")
+            except Exception:
+                pass
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(cache_path), check_same_thread=False)
@@ -728,11 +796,7 @@ class GoogleScholarFetcher:
             return self._search_cache[key][:limit]
         url = f"{SCHOLAR_BASE}/scholar?q={quote_plus(query)}&as_sdt=2006"
         print(f"[scholar] searching {url}")
-        try:
-            resp = self._get(url)
-        except Exception as exc:
-            print(f"[scholar] search request failed: {exc}")
-            return []
+        resp = self._get(url)  # ScholarError on block — let it propagate
         results = self._parse_results(resp.text)
         print(f"[scholar] parsed {len(results)} case results")
         self._search_cache[key] = results
@@ -815,11 +879,63 @@ class GoogleScholarFetcher:
             time.sleep(self._delay - elapsed)
         self._last_request = time.monotonic()
 
+    def _warm_up(self) -> None:
+        """First contact: hit the Scholar home page so the session collects
+        Google's cookies (NID etc.) the way a browser would before searching."""
+        if self._warmed_up:
+            return
+        self._warmed_up = True  # set first so a failure doesn't loop
+        try:
+            self._throttle()
+            self._session.get(SCHOLAR_BASE + "/", timeout=20)
+        except Exception as exc:
+            print(f"[scholar] warm-up request failed (continuing): {exc}")
+
+    @staticmethod
+    def _looks_blocked(resp) -> bool:
+        if getattr(resp, "url", "") and "/sorry/" in str(resp.url):
+            return True
+        # Only inspect smallish HTML bodies — opinion pages are large and
+        # legitimately contain none of these markers.
+        try:
+            body = resp.text
+        except Exception:
+            return False
+        if len(body) > 200_000:
+            return False
+        low = body.lower()
+        return any(m in low for m in _BLOCK_MARKERS)
+
     def _get(self, url: str) -> requests.Response:
-        self._throttle()
-        resp = self._session.get(url, timeout=20)
-        resp.raise_for_status()
-        return resp
+        self._warm_up()
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            self._throttle()
+            try:
+                resp = self._session.get(url, timeout=25)
+            except Exception as exc:
+                last_exc = exc
+                print(f"[scholar] request error (attempt {attempt + 1}): {exc}")
+                time.sleep(2 * (attempt + 1))
+                continue
+            if resp.status_code == 429:
+                print(f"[scholar] HTTP 429 rate-limited (attempt {attempt + 1})")
+                time.sleep(5 * (attempt + 1))
+                continue
+            if resp.status_code in (403, 503) or self._looks_blocked(resp):
+                raise ScholarError(
+                    "Google Scholar is blocking this device's requests "
+                    "(CAPTCHA / unusual-traffic page). This is usually a "
+                    "network/TLS-fingerprint issue. Try: install 'curl_cffi' "
+                    "(pip install curl_cffi) for browser TLS impersonation, "
+                    "set the SCHOLAR_USER_AGENT environment variable to a "
+                    "browser UA that works for you, or use a different network."
+                )
+            resp.raise_for_status()
+            return resp
+        if last_exc:
+            raise last_exc
+        raise ScholarError("Google Scholar request failed after retries.")
 
     def _first_case_url(self, html: str) -> Optional[str]:
         """Return the first scholar_case href found in a Scholar results page."""

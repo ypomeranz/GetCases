@@ -33,41 +33,78 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 from typing import Optional
 
 
+# requests is required; beautifulsoup4 enables the Google Scholar features;
+# curl_cffi is recommended — it impersonates a browser's TLS fingerprint,
+# which is what gets Scholar requests past bot detection on mobile /
+# Chromebook / other flagged networks (plain requests works only on lenient
+# networks).  (module, pip name, role).
+_DEPENDENCIES = [
+    ("requests", "requests", "required"),
+    ("bs4", "beautifulsoup4", "needed for Google Scholar"),
+    ("curl_cffi", "curl_cffi", "recommended — fixes Scholar blocking on mobile/Chromebook"),
+]
+_REQUIRED_MODULES = {"requests"}
+_DEP_DECLINE_PATH = Path.home() / ".config" / "courtlistener" / "declined_deps.json"
+
+
+def _load_declined_deps() -> set[str]:
+    try:
+        return set(json.loads(_DEP_DECLINE_PATH.read_text()))
+    except Exception:
+        return set()
+
+
+def _save_declined_deps(names: set[str]) -> None:
+    try:
+        _DEP_DECLINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _DEP_DECLINE_PATH.write_text(json.dumps(sorted(names)))
+    except Exception:
+        pass
+
+
 def _ensure_dependencies() -> None:
     """
-    Check for the third-party packages this GUI needs and offer to
+    Check for the third-party packages this GUI uses and offer to
     pip-install any that are missing before the imports below run.
 
-    ``requests`` is required; ``beautifulsoup4`` enables the Google
-    Scholar features (declining just disables them).
+    Skipped entirely when GETCASES_SKIP_DEP_CHECK is set (for headless or
+    scripted use).  A declined *optional* package is remembered so the
+    prompt doesn't reappear every launch; required packages always prompt.
     """
     import importlib
     import importlib.util
 
-    def missing_packages() -> list[str]:
-        return [
-            pip_name
-            for module, pip_name in (
-                ("requests", "requests"),
-                ("bs4", "beautifulsoup4"),
-            )
-            if importlib.util.find_spec(module) is None
-        ]
-
-    missing = missing_packages()
-    if not missing:
+    if os.environ.get("GETCASES_SKIP_DEP_CHECK"):
         return
+
+    declined = _load_declined_deps()
+    missing = [
+        (mod, pip, role)
+        for mod, pip, role in _DEPENDENCIES
+        if importlib.util.find_spec(mod) is None
+    ]
+    # Don't re-nag about an optional package the user already declined.
+    to_offer = [
+        (mod, pip, role)
+        for mod, pip, role in missing
+        if mod in _REQUIRED_MODULES or pip not in declined
+    ]
+    if not to_offer:
+        return
+
     root = tk.Tk()
     root.withdraw()
     try:
+        names = [pip for _mod, pip, _role in to_offer]
+        listing = "\n".join(f"    {pip}  ({role})" for _mod, pip, role in to_offer)
         if messagebox.askyesno(
             "Missing Packages",
-            "This application needs the following Python package(s), "
-            "which are not installed:\n\n    " + ", ".join(missing)
+            "This application can use the following Python package(s), "
+            "which are not installed:\n\n" + listing
             + "\n\nInstall them now with pip?",
         ):
             proc = subprocess.run(
-                [sys.executable, "-m", "pip", "install", *missing],
+                [sys.executable, "-m", "pip", "install", *names],
                 capture_output=True,
                 text=True,
             )
@@ -79,8 +116,16 @@ def _ensure_dependencies() -> None:
             else:
                 importlib.invalidate_caches()
                 messagebox.showinfo(
-                    "Packages Installed", "Installed: " + ", ".join(missing)
+                    "Packages Installed", "Installed: " + ", ".join(names)
                 )
+        else:
+            # Remember declined optional packages so we don't ask again.
+            still_missing = {
+                pip
+                for mod, pip, _role in to_offer
+                if importlib.util.find_spec(mod) is None and mod not in _REQUIRED_MODULES
+            }
+            _save_declined_deps(declined | still_missing)
         if importlib.util.find_spec("requests") is None:
             messagebox.showerror(
                 "Missing Dependency",
@@ -1015,12 +1060,14 @@ class CourtListenerGUI:
             self._scholar_status_var.set("Searching…")
 
             def scholar_run() -> None:
+                err = ""
                 try:
                     res = fetcher.search_cases(query, limit=15)
                 except Exception as exc:
                     print(f"[scholar] search failed: {exc}")
                     res = []
-                self.root.after(0, self._on_scholar_search_results, res)
+                    err = str(exc)
+                self.root.after(0, self._on_scholar_search_results, res, err)
 
             threading.Thread(target=scholar_run, daemon=True).start()
         else:
@@ -1405,15 +1452,23 @@ class CourtListenerGUI:
             self._scholar = GoogleScholarFetcher()
         return self._scholar
 
-    def _on_scholar_search_results(self, results: list) -> None:
+    def _on_scholar_search_results(self, results: list, error: str = "") -> None:
         self._scholar_results = results
         for row in self._scholar_tree.get_children():
             self._scholar_tree.delete(row)
         for i, r in enumerate(results):
             self._scholar_tree.insert("", "end", iid=str(i), values=(r.title, r.source))
-        self._scholar_status_var.set(
-            f"{len(results)} results" if results else "no results (blocked?)"
-        )
+        if results:
+            self._scholar_status_var.set(f"{len(results)} results")
+        elif error and "block" in error.lower():
+            self._scholar_status_var.set("blocked — see Help ▸ Scholar Blocked")
+            if not getattr(self, "_scholar_block_warned", False):
+                self._scholar_block_warned = True
+                messagebox.showwarning("Google Scholar Blocked", error)
+        elif error:
+            self._scholar_status_var.set("search error")
+        else:
+            self._scholar_status_var.set("no results")
 
     def _open_selected_scholar_result(self) -> None:
         r = self._selected_scholar_result()
