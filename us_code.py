@@ -171,9 +171,9 @@ class UscSection:
     # (kind, indent, text); kind in {"sechead", "head", "body", "credit",
     # "note-head", "note-body"}
     paras: list[tuple[str, int, str]] = field(default_factory=list)
-    # neighboring sections parsed from the OLRC page's prev/next links
-    prev: tuple[str, str] | None = None
-    next: tuple[str, str] | None = None
+    # deepest container granule from the page breadcrumbs, e.g.
+    # "title26-chapter48" — its table of sections gives document order
+    container: str | None = None
 
     @property
     def kind(self) -> str:
@@ -181,7 +181,19 @@ class UscSection:
 
     def neighbors(self) -> tuple[tuple[str, str] | None,
                                  tuple[str, str] | None]:
-        return self.prev, self.next
+        """Adjacent sections, from the container's table of sections
+        (fetched lazily and cached).  Failures yield (None, None)."""
+        if not self.container:
+            return None, None
+        try:
+            order = _container_sections(self.container)
+            i = next(idx for idx, s in enumerate(order)
+                     if s.lower() == self.section.lower())
+        except Exception:
+            return None, None
+        prev = (self.title, order[i - 1]) if i > 0 else None
+        nxt = (self.title, order[i + 1]) if i + 1 < len(order) else None
+        return prev, nxt
 
     @property
     def heading(self) -> str:
@@ -240,7 +252,7 @@ def load_section(title: str, section: str) -> UscSection:
         paras = parse_section(resp.text)
         if paras:
             doc = UscSection(title=title, section=cand, url=url, paras=paras)
-            doc.prev, doc.next = _find_neighbors(resp.text, cand)
+            doc.container = _find_container(resp.text)
             with _cache_lock:
                 _cache[key] = doc
             return doc
@@ -248,34 +260,94 @@ def load_section(title: str, section: str) -> UscSection:
     raise RuntimeError(f"uscode.house.gov: {last_err}")
 
 
-# The OLRC viewer's previous/next navigation: anchors whose href carries a
-# neighboring section's granuleid.  Classified by the words "prev"/"next"
-# anywhere in the anchor markup (class, title, alt text, or label) so the
-# parse survives cosmetic changes; if neither is found the buttons just
-# stay disabled.
-_NAV_ANCHOR_RE = re.compile(
-    r"<a\b[^>]*href=\"[^\"]*granuleid:USC-prelim-title"
-    r"(\d+[a-zA-Z]?)-section([^&\"#]+)[^\"]*\"[^>]*>.*?</a>",
-    re.IGNORECASE | re.DOTALL,
+# Previous/next navigation.  The OLRC viewer's own prev/next controls are
+# JSF form postbacks (no usable hrefs), so neighbors are derived instead
+# from the page's breadcrumb trail: the deepest container granule (part,
+# subchapter, or chapter) is fetched — streamed, stopping at the end of
+# its "analysis" field — and its table of sections gives document order.
+
+_GRANULE_PATH_RE = re.compile(
+    r"granuleid(?:%3[Aa]|:)USC-prelim-([A-Za-z0-9\-]+)"
 )
 
 
-def _find_neighbors(
-    page_html: str, section: str
-) -> tuple[tuple[str, str] | None, tuple[str, str] | None]:
-    prev = nxt = None
-    for m in _NAV_ANCHOR_RE.finditer(page_html):
-        t, s = m.group(1), m.group(2)
-        if s == section:
+def _find_container(page_html: str) -> str | None:
+    """Deepest non-section granule path in the page's breadcrumb links,
+    e.g. "title26-chapter48"."""
+    best = None
+    for m in _GRANULE_PATH_RE.finditer(page_html):
+        path = m.group(1)
+        if "-section" in path.lower():
             continue
-        anchor = m.group(0).lower()
-        if "prev" in anchor and prev is None:
-            prev = (t, s)
-        elif "next" in anchor and nxt is None:
-            nxt = (t, s)
-        if prev and nxt:
-            break
-    return prev, nxt
+        # breadcrumbs run shallow -> deep, so on equal depth keep the
+        # later one (Subtitle D and Chapter 48 both have one dash)
+        if best is None or path.count("-") >= best.count("-"):
+            best = path
+    return best
+
+
+_ANALYSIS_REGION_RE = re.compile(
+    r"<!--\s*field-start:analysis\s*-->(.*?)<!--\s*field-end:analysis\s*-->",
+    re.DOTALL,
+)
+_ANALYSIS_LEFT_RE = re.compile(
+    r'class="two-column-analysis-style-content-left"[^>]*>(.*?)</div>',
+    re.DOTALL,
+)
+_ANALYSIS_SEC_RE = re.compile(
+    r"\[?(\d+[A-Za-z0-9]*(?:[-–]\d+[A-Za-z0-9]*)?)"
+)
+
+
+def _sections_from_analysis(page_html: str) -> list[str]:
+    """Ordered section numbers from a container page's table of sections.
+    A range entry ("5001 to 5011. Repealed.") contributes its first
+    number; bracketed (repealed/omitted) entries are kept — the OLRC
+    serves a page for them too."""
+    m = _ANALYSIS_REGION_RE.search(page_html)
+    region = m.group(1) if m else ""
+    out: list[str] = []
+    for cell in _ANALYSIS_LEFT_RE.finditer(region):
+        text = _clean(cell.group(1))
+        sec = _ANALYSIS_SEC_RE.match(text)
+        if sec:
+            ident = sec.group(1).replace("–", "-")
+            if not out or out[-1] != ident:
+                out.append(ident)
+    return out
+
+
+_order_cache: dict[str, list[str]] = {}
+
+
+def _container_sections(container: str) -> list[str]:
+    """Ordered sections of a container granule, cached.  The container
+    page holds the whole unit's text, so the response is streamed and cut
+    off once the table of sections has arrived."""
+    with _cache_lock:
+        if container in _order_cache:
+            return _order_cache[container]
+
+    import requests
+
+    url = ("https://uscode.house.gov/view.xhtml?req=granuleid:"
+           f"USC-prelim-{container}&num=0&edition=prelim")
+    resp = requests.get(url, headers=_BROWSER_HEADERS, timeout=30,
+                        stream=True)
+    try:
+        resp.raise_for_status()
+        buf = b""
+        for chunk in resp.iter_content(65536):
+            buf += chunk
+            if b"field-end:analysis" in buf or len(buf) > 2_000_000:
+                break
+    finally:
+        resp.close()
+    order = _sections_from_analysis(buf.decode("utf-8", "replace"))
+    if order:
+        with _cache_lock:
+            _order_cache[container] = order
+    return order
 
 
 # ---------------------------------------------------------------------------
@@ -495,18 +567,43 @@ if __name__ == "__main__":
                  ("(i)", 0)]
     check(got_lvls == want_lvls, f"logical relevel: {got_lvls!r}")
 
-    # Previous/next navigation links
-    nav = """
-<div class="navline">
-<a class="nav-prev" title="Previous Section" href="/view.xhtml?req=granuleid:USC-prelim-title42-section1982&num=0&edition=prelim"><img alt="Previous"/></a>
-<a href="/view.xhtml?req=granuleid:USC-prelim-title42-section1983&num=0&edition=prelim">printer friendly</a>
-<a class="nav-next" title="Next Section" href="/view.xhtml?req=granuleid:USC-prelim-title42-section1983a&num=0&edition=prelim"><img alt="Next"/></a>
-</div>"""
-    check(_find_neighbors(nav, "1983")
-          == (("42", "1982"), ("42", "1983a")),
-          f"neighbors: {_find_neighbors(nav, '1983')!r}")
-    check(_find_neighbors("<p>no nav</p>", "1983") == (None, None),
-          "no neighbors -> (None, None)")
+    # Breadcrumb container extraction (real OLRC breadcrumb form: the
+    # links are URL-encoded and carry jsessionid/saved parameters)
+    crumbs = """
+<a href="/view.xhtml;jsessionid=9600DA?req=granuleid%3AUSC-prelim-title26&amp;saved=%7CZ3%3D%7C&amp;edition=prelim" class="link_class">TITLE 26</a>
+<a href="/view.xhtml;jsessionid=9600DA?req=granuleid%3AUSC-prelim-title26-subtitleD&amp;edition=prelim" class="link_class">Subtitle D</a>
+<a href="/view.xhtml;jsessionid=9600DA?req=granuleid%3AUSC-prelim-title26-chapter48&amp;edition=prelim" class="link_class">CHAPTER 48</a>
+"""
+    check(_find_container(crumbs) == "title26-chapter48",
+          f"container: {_find_container(crumbs)!r}")
+    check(_find_container("<p>nothing</p>") is None, "no container -> None")
+
+    # Table-of-sections parsing (verbatim OLRC analysis markup)
+    analysis = """
+<!-- field-start:analysis -->
+<div class="analysis">
+<div><div class="analysis-head-left">Sec.</div></div>
+<div><div class="two-column-analysis-style-content-left">5000A.</div><div class="two-column-analysis-style-content-right">Requirement to maintain minimum essential coverage.</div></div>
+<div><div class="two-column-analysis-style-content-left">5000B.</div><div class="two-column-analysis-style-content-right">Imposition of tax.</div></div>
+<div><div class="two-column-analysis-style-content-left">5001 to 5011. Repealed.</div><div class="two-column-analysis-style-content-right"></div></div>
+<div><div class="two-column-analysis-style-content-left">[5012.</div><div class="two-column-analysis-style-content-right">Omitted.]</div></div>
+<div><div class="two-column-analysis-style-content-left">2000e&#8211;2.</div><div class="two-column-analysis-style-content-right">Hyphenated.</div></div>
+</div>
+<!-- field-end:analysis -->
+<h3 class="section-head">§5000A. Not part of the analysis</h3>"""
+    order = _sections_from_analysis(analysis)
+    check(order == ["5000A", "5000B", "5001", "5012", "2000e-2"],
+          f"analysis order: {order!r}")
+    doc = UscSection(title="26", section="5000A", url="u",
+                     container="title26-chapter48")
+    _order_cache["title26-chapter48"] = order
+    check(doc.neighbors() == (None, ("26", "5000B")),
+          f"neighbors: {doc.neighbors()!r}")
+    doc2 = UscSection(title="26", section="5000B", url="u",
+                      container="title26-chapter48")
+    check(doc2.neighbors() == (("26", "5000A"), ("26", "5001")),
+          f"neighbors mid: {doc2.neighbors()!r}")
+    _order_cache.clear()
 
     # Fallback: same page without field comments still classifies by class
     stripped = re.sub(r"<!--.*?-->", "", sample, flags=re.DOTALL)
