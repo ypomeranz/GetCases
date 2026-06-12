@@ -88,6 +88,18 @@ class UscSection:
                 return text
         return f"{self.title} U.S.C. § {self.section}"
 
+    @property
+    def label(self) -> str:
+        return f"{self.title} U.S.C. § {self.section}"
+
+    @property
+    def source_name(self) -> str:
+        return "U.S. Code (OLRC)"
+
+    @property
+    def source_note(self) -> str:
+        return "OLRC preliminary edition (current law)"
+
 
 _cache: dict[tuple[str, str], UscSection] = {}
 _cache_lock = threading.Lock()

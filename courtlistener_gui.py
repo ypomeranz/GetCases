@@ -98,6 +98,7 @@ import requests as _requests
 
 from bluebook_names import abbreviate_case_name
 from courtlistener import CourtListenerClient, CourtListenerError
+import ecfr
 import us_code
 from court_catalog import (
     CATALOG as _COURT_CATALOG,
@@ -2398,14 +2399,17 @@ class _ScholarTextWindow:
         self._insert_plain_with_links(span.text, tuple(tags))
 
     def _insert_plain_with_links(self, text: str, tags: tuple) -> None:
-        """Insert text, turning case citations and U.S. Code citations
-        into clickable links (Scholar lookup / OLRC statute viewer)."""
+        """Insert text, turning case citations, U.S. Code citations, and
+        C.F.R. citations into clickable links (Scholar lookup / OLRC and
+        eCFR statute viewers)."""
         txt = self._text
         matches: list[tuple[int, int, str, re.Match]] = []
         for m in _TEXT_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "cite", m))
         for m in us_code.USC_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "usc", m))
+        for m in ecfr.CFR_CITE_RE.finditer(text):
+            matches.append((m.start(), m.end(), "cfr", m))
         matches.sort(key=lambda t: (t[0], -t[1]))
         pos = 0
         for start, end, kind, m in matches:
@@ -2417,8 +2421,10 @@ class _ScholarTextWindow:
                 cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
                 cite = cite.replace("’", "'")  # straight apostrophe for the search query
                 action = ("cite", cite)
-            else:
+            elif kind == "usc":
                 action = ("usc", us_code.cite_spec(m))
+            else:
+                action = ("cfr", ecfr.cite_spec(m))
             ltags = tags + ("citelink", self._new_link(action))
             txt.insert("end", text[start:end], ltags)
             pos = end
@@ -3043,8 +3049,8 @@ class _ScholarTextWindow:
             if pos:
                 self._jump_to(pos)
             return
-        if kind == "usc":
-            self._open_usc(value)
+        if kind in ("usc", "cfr"):
+            self._open_statute(kind, value)
             return
         fetcher = self._app._get_scholar()
         if fetcher is None:
@@ -3069,26 +3075,28 @@ class _ScholarTextWindow:
         self._status_var.set("Cited case loaded.")
         _ScholarTextWindow(self._win, self._app, url, html, item=None)
 
-    def _open_usc(self, spec: str) -> None:
-        """Fetch a U.S. Code section from the OLRC and show it."""
+    def _open_statute(self, kind: str, spec: str) -> None:
+        """Fetch a U.S. Code (OLRC) or C.F.R. (eCFR) section and show it."""
+        mod = us_code if kind == "usc" else ecfr
+        host = "uscode.house.gov" if kind == "usc" else "ecfr.gov"
         title, section, subs = spec.split(":", 2)
-        label = us_code.spec_label(spec)
-        self._status_var.set(f"Fetching {label} from uscode.house.gov…")
+        label = mod.spec_label(spec)
+        self._status_var.set(f"Fetching {label} from {host}…")
 
         def run() -> None:
             try:
-                doc = us_code.load_section(title, section)
+                doc = mod.load_section(title, section)
             except Exception as exc:
-                self._post(self._status_var.set, f"US Code: {exc}")
+                self._post(self._status_var.set, str(exc))
                 return
-            self._post(self._on_usc_ready, doc, subs, label)
+            self._post(self._on_statute_ready, doc, subs, label)
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _on_usc_ready(self, doc, subs: str, label: str) -> None:
+    def _on_statute_ready(self, doc, subs: str, label: str) -> None:
         self._status_var.set(f"{label} loaded.")
-        _USCodeWindow(self._win, doc,
-                      tuple(s for s in subs.split(",") if s))
+        _StatuteWindow(self._win, doc,
+                       tuple(s for s in subs.split(",") if s))
 
     # ------------------------------------------------------------------
     # CourtListener toggle
@@ -3144,10 +3152,12 @@ class _ScholarTextWindow:
         messagebox.showerror("CourtListener", msg, parent=self._win)
 
 
-class _USCodeWindow:
+class _StatuteWindow:
     """
-    Reader for a U.S. Code section fetched from the Office of the Law
-    Revision Counsel (uscode.house.gov).
+    Reader for a statute or regulation section — U.S. Code from the
+    Office of the Law Revision Counsel (uscode.house.gov) or C.F.R. from
+    the eCFR (www.ecfr.gov).  Both sources are parsed into the same
+    (kind, indent, text) stream, so one window serves both.
 
     Formatting follows the statutory hierarchy: the section heading and
     subdivision headings are bold, inline enumerators ("(a)", "(1)(A)")
@@ -3155,7 +3165,7 @@ class _USCodeWindow:
     wrapped lines stay aligned under their text.  When the citation that
     opened the window pin-cites a subdivision ("§ 922(g)(1)"), the view
     scrolls there and flashes it.  Source credit is shown small below the
-    text; the (often long) editorial/statutory notes sit behind a toggle.
+    text; long editorial/statutory notes sit behind a toggle.
     """
 
     def __init__(self, parent: tk.Misc, doc, highlight: tuple = ()) -> None:
@@ -3163,7 +3173,7 @@ class _USCodeWindow:
         self._highlight = tuple(highlight)
         self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
         self._win = tk.Toplevel(parent)
-        self._win.title(f"{doc.title} U.S.C. § {doc.section} — U.S. Code (OLRC)")
+        self._win.title(f"{doc.label} — {doc.source_name}")
         self._win.geometry("760x640")
         self._win.minsize(440, 280)
         self._base_size = _OPINION_FONT_PT
@@ -3233,11 +3243,8 @@ class _USCodeWindow:
         notes_btn.pack(side="left", padx=8)
         if not self._has_notes:
             notes_btn.config(state="disabled")
-        ttk.Label(
-            btns,
-            text="Current through the latest OLRC release (prelim edition)",
-            foreground="gray",
-        ).pack(side="right")
+        ttk.Label(btns, text=self._doc.source_note,
+                  foreground="gray").pack(side="right")
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
             win.bind(seq, lambda _e: self._zoom(+1))
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
