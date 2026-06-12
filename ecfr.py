@@ -96,6 +96,23 @@ class CfrSection:
         tail = "".join(f"({s})" for s in subs)
         return f"{self.title} C.F.R. § {self.section}{tail} ({self.date[:4]})"
 
+    @property
+    def kind(self) -> str:
+        return "cfr"
+
+    def neighbors(self) -> tuple[tuple[str, str] | None,
+                                 tuple[str, str] | None]:
+        """Adjacent sections in the title, from the (cached) structure
+        tree.  Network failures simply yield (None, None)."""
+        try:
+            order = _section_order(self.title, self.date)
+            i = order.index(self.section)
+        except Exception:
+            return None, None
+        prev = (self.title, order[i - 1]) if i > 0 else None
+        nxt = (self.title, order[i + 1]) if i + 1 < len(order) else None
+        return prev, nxt
+
 
 _dates: dict[str, str] = {}
 _cache: dict[tuple[str, str], CfrSection] = {}
@@ -166,6 +183,38 @@ def load_section(title: str, section: str) -> CfrSection:
                 _cache[key] = doc
             return doc
     raise RuntimeError(f"ecfr.gov: {last_err}")
+
+
+_order_cache: dict[str, list[str]] = {}
+
+
+def _sections_from_structure(node: dict) -> list[str]:
+    """Document-order section identifiers from an eCFR structure tree."""
+    out: list[str] = []
+    if node.get("type") == "section" and not node.get("reserved"):
+        ident = node.get("identifier")
+        if ident:
+            out.append(str(ident))
+    for child in node.get("children") or []:
+        out.extend(_sections_from_structure(child))
+    return out
+
+
+def _section_order(title: str, date: str) -> list[str]:
+    """Ordered section identifiers for a title (cached per process)."""
+    with _lock:
+        if title in _order_cache:
+            return _order_cache[title]
+
+    import requests
+
+    resp = requests.get(f"{_API}/structure/{date}/title-{title}.json",
+                        headers=_HEADERS, timeout=60)
+    resp.raise_for_status()
+    order = _sections_from_structure(resp.json())
+    with _lock:
+        _order_cache[title] = order
+    return order
 
 
 # ---------------------------------------------------------------------------
@@ -303,5 +352,23 @@ if __name__ == "__main__":
           f"credit: {paras[-1]!r}")
     check(not any("PART 1614" in t for _k, _i, t in paras),
           "part heading outside DIV8 dropped")
+
+    # Section ordering from a structure tree (for prev/next navigation)
+    tree = {"type": "title", "identifier": "29", "children": [
+        {"type": "chapter", "children": [
+            {"type": "part", "identifier": "1614", "children": [
+                {"type": "subpart", "children": [
+                    {"type": "section", "identifier": "1614.101"},
+                    {"type": "section", "identifier": "1614.102"},
+                    {"type": "section", "identifier": "1614.103",
+                     "reserved": True},
+                    {"type": "section", "identifier": "1614.105"},
+                ]},
+            ]},
+        ]},
+    ]}
+    order = _sections_from_structure(tree)
+    check(order == ["1614.101", "1614.102", "1614.105"],
+          f"structure order (reserved skipped): {order!r}")
 
     raise SystemExit(1 if failed else 0)

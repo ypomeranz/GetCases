@@ -549,6 +549,7 @@ try:
     from google_scholar import (
         GoogleScholarFetcher,
         blocks_to_text,
+        educate_quotes,
         parse_opinion_blocks,
         segment_blocks,
         text_similarity,
@@ -557,6 +558,9 @@ try:
     _SCHOLAR_AVAILABLE = True
 except ImportError:
     _SCHOLAR_AVAILABLE = False
+
+    def educate_quotes(text: str) -> str:  # graceful degradation
+        return text
 
 
 class CourtListenerGUI:
@@ -1708,6 +1712,13 @@ class _CourtPickerDialog:
 
 _OP_ID_RE = re.compile(r"/opinions/(\d+)/?")
 
+# A pinpoint page following a case citation: ", 171" or ", 171-72" — but
+# not the volume of a parallel citation (", 510 A.2d 562"), recognized by
+# the capital letter that follows the number.
+_PINCITE_AFTER_RE = re.compile(
+    r",\s*(\d{1,5})(?:\s*[-–—]\s*\d{1,5})?(?!\d|\s*[A-Z])"
+)
+
 
 def _extract_opinion_id(url: str) -> Optional[int]:
     """Parse an opinion ID out of a CourtListener opinions URL."""
@@ -1929,15 +1940,29 @@ def _run_to_rtf(seg: str, active: set[str], part_colors: bool = False) -> str:
     return "{" + "".join(codes) + " " + esc + "}" if codes else esc
 
 
+def _fn_bookmark(side: str, fid: str) -> str:
+    """RTF bookmark name for a footnote anchor: the in-text reference
+    ("fnref") or the footnote body ("fndef")."""
+    safe = re.sub(r"\W+", "_", str(fid))
+    return ("FNR_" if side == "fnref" else "FNB_") + safe
+
+
 def _dump_to_rtf(
-    txt: tk.Text, start: str, end: str, part_colors: bool = False
+    txt: tk.Text, start: str, end: str, part_colors: bool = False,
+    fn_links: Optional[dict[str, tuple[str, str]]] = None,
 ) -> str:
-    """Convert a Tk Text range (with the Scholar window's tags) to an RTF body."""
+    """Convert a Tk Text range (with the Scholar window's tags) to an RTF
+    body.  `fn_links` maps link-tag names to ("fnref"|"fndef", id);
+    matching runs become RTF bookmark/hyperlink pairs so footnote markers
+    stay clickable in the exported document."""
+    fn_links = fn_links or {}
     out: list[str] = []
     # Seed with tags already open at *start*; dump only reports transitions.
     active: set[str] = set(txt.tag_names(start))
     active.discard("sel")
     par_open = False
+    pending_marks: list[str] = []   # bookmarks to emit at the next run
+    marks_done: set[str] = set()    # bookmark names must be unique
 
     def par_prefix() -> str:
         if "center" in active:
@@ -1946,9 +1971,32 @@ def _dump_to_rtf(
             return "\\pard\\li720\\ri720\\sa120 "
         return "\\pard\\sa120 "
 
+    def queue_mark(tag: str) -> None:
+        side, fid = fn_links[tag]
+        name = _fn_bookmark(side, fid)
+        if name not in marks_done:
+            marks_done.add(name)
+            pending_marks.append(
+                "{\\*\\bkmkstart " + name + "}{\\*\\bkmkend " + name + "}"
+            )
+
+    def fn_target() -> Optional[str]:
+        for t in active:
+            if t in fn_links:
+                side, fid = fn_links[t]
+                # a reference links to the body and vice versa
+                return _fn_bookmark("fndef" if side == "fnref" else "fnref",
+                                    fid)
+        return None
+
+    for t in active:
+        if t in fn_links:
+            queue_mark(t)
     for key, value, _index in txt.dump(start, end, text=True, tag=True):
         if key == "tagon":
             active.add(value)
+            if value in fn_links:
+                queue_mark(value)
         elif key == "tagoff":
             active.discard(value)
         elif key == "text":
@@ -1960,7 +2008,15 @@ def _dump_to_rtf(
                     if not par_open:
                         out.append(par_prefix())
                         par_open = True
-                    out.append(_run_to_rtf(seg, active, part_colors))
+                    if pending_marks:
+                        out.extend(pending_marks)
+                        pending_marks.clear()
+                    run = _run_to_rtf(seg, active, part_colors)
+                    target = fn_target()
+                    if target:
+                        run = ("{\\field{\\*\\fldinst{HYPERLINK \\\\l \""
+                               + target + "\"}}{\\fldrslt " + run + "}}")
+                    out.append(run)
     if par_open:
         out.append("\\par\n")
     return "".join(out)
@@ -2168,6 +2224,130 @@ def _find_scholar_for_item(
     return None, cl_text, f"best candidate similarity {best_sim:.0%}"
 
 
+class _TextFinder:
+    """Ctrl-F find bar for a Text widget: highlights every match, steps
+    through them with Enter / Shift+Enter (also F3 / Shift+F3), and
+    closes with Escape.  Case-insensitive plain-text search."""
+
+    def __init__(self, win: tk.Misc, txt: tk.Text,
+                 before_widget: tk.Misc) -> None:
+        self._win, self._txt = win, txt
+        self._before = before_widget
+        self._visible = False
+        self._matches: list[tuple[str, str]] = []
+        self._cur = -1
+        self._pending: Optional[str] = None  # debounce timer id
+
+        txt.tag_configure("findmatch", background="#fff3b0")
+        txt.tag_configure("findcur", background="#ffb347")
+        bar = self._bar = ttk.Frame(win)
+        ttk.Label(bar, text="Find:").pack(side="left", padx=(8, 4))
+        self._var = tk.StringVar()
+        self._entry = ttk.Entry(bar, textvariable=self._var, width=28)
+        self._entry.pack(side="left")
+        ttk.Button(bar, text="▼", width=2,
+                   command=lambda: self.step(+1)).pack(side="left", padx=2)
+        ttk.Button(bar, text="▲", width=2,
+                   command=lambda: self.step(-1)).pack(side="left")
+        self._count_var = tk.StringVar()
+        ttk.Label(bar, textvariable=self._count_var,
+                  foreground="gray").pack(side="left", padx=8)
+        ttk.Button(bar, text="✕", width=2,
+                   command=self.close).pack(side="right", padx=(0, 4))
+
+        self._entry.bind("<Return>", lambda _e: self.step(+1))
+        self._entry.bind("<Shift-Return>", lambda _e: self.step(-1))
+        self._entry.bind("<KeyRelease>", self._on_key)
+        self._entry.bind("<Escape>", lambda _e: self.close())
+        win.bind("<Control-f>", lambda _e: self.open() or "break")
+        win.bind("<F3>", lambda _e: self.step(+1))
+        win.bind("<Shift-F3>", lambda _e: self.step(-1))
+        win.bind("<Escape>", lambda _e: self.close() if self._visible
+                 else None)
+
+    def open(self) -> None:
+        if not self._visible:
+            self._bar.pack(fill="x", padx=8, pady=(4, 0),
+                           before=self._before)
+            self._visible = True
+        self._entry.focus_set()
+        self._entry.select_range(0, "end")
+        if self._var.get():
+            self.refresh()
+
+    def close(self) -> None:
+        if not self._visible:
+            return
+        self._bar.pack_forget()
+        self._visible = False
+        self._clear_tags()
+        self._count_var.set("")
+        self._txt.focus_set()
+
+    def _clear_tags(self) -> None:
+        self._txt.tag_remove("findmatch", "1.0", "end")
+        self._txt.tag_remove("findcur", "1.0", "end")
+
+    def _on_key(self, event) -> None:
+        if event.keysym in ("Return", "Escape", "F3"):
+            return
+        if self._pending:
+            self._win.after_cancel(self._pending)
+        self._pending = self._win.after(250, self.refresh)
+
+    def refresh(self) -> None:
+        """Re-run the search (also called after the text is re-rendered)."""
+        self._pending = None
+        if not self._visible:
+            return
+        self._clear_tags()
+        self._matches, self._cur = [], -1
+        needle = self._var.get()
+        if not needle:
+            self._count_var.set("")
+            return
+        txt = self._txt
+        idx = "1.0"
+        n = tk.IntVar()
+        while True:
+            idx = txt.search(needle, idx, stopindex="end", nocase=True,
+                             count=n)
+            if not idx or not n.get():
+                break
+            end = f"{idx}+{n.get()}c"
+            self._matches.append((idx, end))
+            txt.tag_add("findmatch", idx, end)
+            idx = end
+        if self._matches:
+            # start at the first match at or below the current view
+            top = txt.index("@0,0")
+            first = next(
+                (i for i, (s, _e) in enumerate(self._matches)
+                 if txt.compare(s, ">=", top)), 0,
+            )
+            self._goto(first)
+        else:
+            self._count_var.set("no matches")
+
+    def step(self, delta: int) -> None:
+        if not self._visible:
+            self.open()
+            return
+        if not self._matches:
+            self.refresh()
+            return
+        self._goto((self._cur + delta) % len(self._matches))
+
+    def _goto(self, i: int) -> None:
+        self._cur = i
+        start, end = self._matches[i]
+        txt = self._txt
+        txt.tag_remove("findcur", "1.0", "end")
+        txt.tag_add("findcur", start, end)
+        txt.see(start)
+        self._count_var.set(f"{i + 1} of {len(self._matches)}")
+
+
 class _ScholarTextWindow:
     """
     Rich viewer for a Google Scholar opinion.
@@ -2311,6 +2491,7 @@ class _ScholarTextWindow:
         txt.tag_bind("citelink", "<Enter>", lambda _e: txt.config(cursor="hand2"))
         txt.tag_bind("citelink", "<Leave>", lambda _e: txt.config(cursor=""))
         txt.tag_configure("jumpflash", background="#fff2a8")
+        self._finder = _TextFinder(win, txt, text_frame)
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill="x", padx=8, pady=(0, 8))
@@ -2412,6 +2593,9 @@ class _ScholarTextWindow:
             m = re.search(r"\d+", span.text)
             if m:
                 self._cur_page = int(m.group(0))
+                # where each star page begins, for pin-cited link arrivals
+                self._page_pos.setdefault(self._cur_page,
+                                          txt.index("end-1c"))
             tags.append("pagenum")
             txt.insert("end", span.text, tuple(tags))
             return
@@ -2463,6 +2647,13 @@ class _ScholarTextWindow:
             if kind == "cite":
                 cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
                 cite = cite.replace("’", "'")  # straight apostrophe for the search query
+                # A pincite right after ("365 U.S. 167, 171") rides along
+                # so the opened case can jump to that page.  A number that
+                # opens a parallel cite ("556, 510 A.2d 562") is excluded
+                # by the capital letter that follows it.
+                pin_m = _PINCITE_AFTER_RE.match(text, end)
+                if pin_m:
+                    cite += "@" + pin_m.group(1)
                 action = ("cite", cite)
             elif kind == "usc":
                 action = ("usc", us_code.cite_spec(m))
@@ -2534,6 +2725,7 @@ class _ScholarTextWindow:
         self._part_regions: list[tuple[str, str, int]] = []
         self._fn_ref_pos: dict[str, str] = {}  # footnote id → in-text marker index
         self._fn_def_pos: dict[str, str] = {}  # footnote id → body marker index
+        self._page_pos: dict[int, str] = {}    # star page → start index
         self._cur_page: Optional[int] = None
         if not self._parts:
             txt.insert("1.0", self._scholar_text)
@@ -2573,6 +2765,7 @@ class _ScholarTextWindow:
         self._status_var.set(
             f"{len(self._scholar_text):,} characters | Google Scholar version{extra}"
         )
+        self._finder.refresh()
 
     def _on_part_selected(self, _event=None) -> None:
         idx = self._part_combo.current()
@@ -2594,6 +2787,7 @@ class _ScholarTextWindow:
         self._status_var.set(
             f"{len(self._cl_text or ''):,} characters | CourtListener version"
         )
+        self._finder.refresh()
 
     # ------------------------------------------------------------------
     # Bluebook citation
@@ -2939,12 +3133,17 @@ class _ScholarTextWindow:
             if pi is not None:
                 writer = self._writer_parenthetical(self._parts[pi])
         plain_cite, rtf_cite = self._bluebook_citation(pin, writer)
-        body = _dump_to_rtf(txt, start, end)
+        body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map())
         rtf = _rtf_document(body + rtf_cite)
         plain = txt.get(start, end).rstrip() + "\n\n" + plain_cite + "\n"
         how = _copy_rich_clipboard(self._win, rtf, plain)
         what = "selection" if selected else "full text"
         self._status_var.set(f"Copied {what} as {how}; citation appended.")
+
+    def _fn_link_map(self) -> dict[str, tuple[str, str]]:
+        """Link tags that anchor footnote jumps, for RTF bookmarks."""
+        return {t: a for t, a in self._link_actions.items()
+                if a[0] in ("fnref", "fndef")}
 
     def _filename_item(self) -> dict:
         if self._item:
@@ -3002,7 +3201,8 @@ class _ScholarTextWindow:
                 "{\\header\\pard\\qc\\fs18\\i " + _rtf_escape(head) + "\\par}\n"
             )
             out.append("{\\footer\\pard\\qc\\fs18\\chpgn\\par}\n")
-            out.append(_dump_to_rtf(txt, rs, rend, part_colors=True))
+            out.append(_dump_to_rtf(txt, rs, rend, part_colors=True,
+                                    fn_links=self._fn_link_map()))
         return _RTF_HEADER + "".join(out) + "}"
 
     def _export_rtf(self) -> None:
@@ -3019,7 +3219,8 @@ class _ScholarTextWindow:
                     self._current_part = prev
                     self._render_scholar()
         else:
-            body = _dump_to_rtf(self._text, "1.0", "end-1c")
+            body = _dump_to_rtf(self._text, "1.0", "end-1c",
+                                fn_links=self._fn_link_map())
             rtf = _rtf_document(body, two_columns=True, page_footer=True)
         default = _build_default_filename(self._filename_item())
         path = filedialog.asksaveasfilename(
@@ -3098,25 +3299,52 @@ class _ScholarTextWindow:
         fetcher = self._app._get_scholar()
         if fetcher is None:
             return
-        label = value if kind == "cite" else "cited case"
+        cite, _, pin = value.partition("@") if kind == "cite" else (value, "", "")
+        label = cite if kind == "cite" else "cited case"
         self._status_var.set(f"Fetching {label} from Google Scholar…")
 
         def run() -> None:
             if kind == "url":
                 result = fetcher.fetch_by_url(value)
             else:
-                result = fetcher.fetch_by_citation(value)
-            self._post(self._on_link_ready, result)
+                result = fetcher.fetch_by_citation(cite)
+            self._post(self._on_link_ready, result, cite, pin)
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _on_link_ready(self, result: Optional[tuple[str, str]]) -> None:
+    def _on_link_ready(self, result: Optional[tuple[str, str]],
+                       cite: str = "", pin: str = "") -> None:
         if not result:
             self._status_var.set("Google Scholar: cited case not found (or blocked).")
             return
         url, html = result
         self._status_var.set("Cited case loaded.")
-        _ScholarTextWindow(self._win, self._app, url, html, item=None)
+        win = _ScholarTextWindow(self._win, self._app, url, html, item=None)
+        if cite and pin:
+            win.jump_to_cite_page(cite, pin)
+
+    def jump_to_cite_page(self, cite: str, pin: str) -> None:
+        """Scroll to and flash the star marker for a pin-cited page, when
+        this window's star pagination follows the same reporter as the
+        citation that was clicked."""
+        m_link = _CITE_PARSE_RE.match(cite)
+        m_here = _CITE_PARSE_RE.match(self._bb["cite"])
+        if not (m_link and m_here):
+            return
+        norm = lambda r: re.sub(r"[\s.]", "", r).lower()
+        if norm(m_link.group(2)) != norm(m_here.group(2)):
+            self._status_var.set(
+                f"Pin page {pin} is in {m_link.group(2).strip()}; this text "
+                f"is paginated by {m_here.group(2).strip()}."
+            )
+            return
+        m_page = re.match(r"\d+", pin)
+        pos = self._page_pos.get(int(m_page.group(0))) if m_page else None
+        if pos:
+            self._jump_to(pos)
+            self._status_var.set(f"Jumped to page *{m_page.group(0)}.")
+        else:
+            self._status_var.set(f"Page *{pin} not marked in this text.")
 
     def _open_statute(self, kind: str, spec: str) -> None:
         """Fetch a U.S. Code (OLRC) or C.F.R. (eCFR) section and show it."""
@@ -3175,6 +3403,22 @@ class _ScholarTextWindow:
         self._status_var.set(f"CourtListener: {msg}")
         messagebox.showerror("CourtListener", msg, parent=self._win)
 
+
+# Cross-references in the U.S. Code's own style: "section 3142(f) of
+# title 18", "section 102 of this title" (resolved against the open doc).
+_USC_XREF_RE = re.compile(
+    r"\bsections?\s+(\d+[a-zA-Z0-9]*(?:[-–—]\d+[a-zA-Z0-9]*)?)"
+    r"((?:\((?:\d{1,3}|[ivxIVX]{2,4}|[a-zA-Z]{1,3})\))*)"
+    r"\s+of\s+(?:[Tt]itle\s+(\d{1,2})|this\s+title)",
+    re.IGNORECASE,
+)
+
+# Bare section references inside a C.F.R. provision ("§ 1614.106(a)"),
+# resolved against the open title.
+_CFR_SECREF_RE = re.compile(
+    r"§§?\s*(\d+[a-zA-Z]?\.\d+[a-zA-Z0-9]*)"
+    r"((?:\((?:\d{1,3}|[ivxIVX]{2,4}|[a-zA-Z]{1,3})\))*)"
+)
 
 # A hand-typed statute/regulation lookup: "42 USC 1983(b)", "29 cfr
 # 1614.105(a)", with or without periods and the section symbol.
@@ -3312,6 +3556,9 @@ class _StatuteWindow:
         self._doc = doc
         self._highlight = tuple(highlight)
         self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
+        self._neighbors: tuple = (None, None)
+        self._link_actions: dict[str, tuple[str, str]] = {}
+        self._link_n = 0
         self._win = tk.Toplevel(parent)
         self._win.title(f"{doc.label} — {doc.source_name}")
         self._win.geometry("760x640")
@@ -3319,20 +3566,31 @@ class _StatuteWindow:
         self._base_size = _OPINION_FONT_PT
         self._build_ui()
         self._render()
+        self._refresh_neighbors()
 
     def _build_ui(self) -> None:
         win = self._win
         top = ttk.Frame(win)
         top.pack(fill="x", padx=8, pady=(8, 0))
         ttk.Label(top, text="Source:").pack(side="left")
-        src = tk.StringVar(value=self._doc.url)
-        ttk.Entry(top, textvariable=src, state="readonly").pack(
+        self._src_var = tk.StringVar(value=self._doc.url)
+        ttk.Entry(top, textvariable=self._src_var, state="readonly").pack(
             side="left", fill="x", expand=True, padx=4
         )
         ttk.Button(
             top, text="Open in Browser",
             command=lambda: webbrowser.open(self._doc.url),
         ).pack(side="right")
+        self._next_btn = ttk.Button(
+            top, text="Next § ▶", width=8, state="disabled",
+            command=lambda: self._go_neighbor(1),
+        )
+        self._next_btn.pack(side="right", padx=(2, 8))
+        self._prev_btn = ttk.Button(
+            top, text="◀ Prev §", width=8, state="disabled",
+            command=lambda: self._go_neighbor(0),
+        )
+        self._prev_btn.pack(side="right")
 
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True, padx=8, pady=4)
@@ -3367,6 +3625,12 @@ class _StatuteWindow:
             txt.tag_configure(f"ind{i}", lmargin1=margin,
                               lmargin2=margin + 22, spacing3=6)
         txt.tag_configure("jumpflash", background="#fff2a8")
+        txt.tag_configure("citelink", foreground="#1a56b0")
+        txt.tag_bind("citelink", "<Enter>",
+                     lambda _e: txt.config(cursor="hand2"))
+        txt.tag_bind("citelink", "<Leave>",
+                     lambda _e: txt.config(cursor=""))
+        self._finder = _TextFinder(win, txt, frame)
 
         btns = ttk.Frame(win)
         btns.pack(fill="x", padx=8, pady=(0, 8))
@@ -3376,13 +3640,13 @@ class _StatuteWindow:
                    command=lambda: self._zoom(+1)).pack(side="left",
                                                         padx=(2, 8))
         self._notes_var = tk.BooleanVar(value=False)
-        notes_btn = ttk.Checkbutton(
+        self._notes_btn = ttk.Checkbutton(
             btns, text="Show notes", variable=self._notes_var,
             command=self._render,
         )
-        notes_btn.pack(side="left", padx=8)
+        self._notes_btn.pack(side="left", padx=8)
         if not self._has_notes:
-            notes_btn.config(state="disabled")
+            self._notes_btn.config(state="disabled")
         ttk.Button(btns, text="Copy + Cite",
                    command=self._copy_cite).pack(side="right", padx=(4, 0))
         ttk.Button(btns, text="Export RTF…",
@@ -3418,6 +3682,7 @@ class _StatuteWindow:
         for kind, ind, text in self._doc.paras:
             if kind.startswith("note") and not show_notes:
                 continue
+            text = educate_quotes(text)
             indtag = f"ind{min(ind, 6)}"
             # Track the enumerator path: a paragraph at indent level N
             # replaces the path from depth N down.
@@ -3439,17 +3704,19 @@ class _StatuteWindow:
                 if lead:
                     txt.insert("end", lead.rstrip() + " ",
                                ("enum", indtag))
-                    txt.insert("end", text[len(lead):].lstrip() + "\n",
-                               (indtag,))
+                    self._insert_refs(text[len(lead):].lstrip(), (indtag,))
                 else:
-                    txt.insert("end", text + "\n", (indtag,))
+                    self._insert_refs(text, (indtag,))
+                txt.insert("end", "\n", (indtag,))
             elif kind == "credit":
                 txt.insert("end", text + "\n", ("credit",))
             elif kind == "note-head":
                 txt.insert("end", text + "\n", ("notehead",))
             elif kind == "note-body":
-                txt.insert("end", text + "\n", ("notebody", indtag))
+                self._insert_refs(text, ("notebody", indtag))
+                txt.insert("end", "\n", ("notebody", indtag))
         txt.config(state="disabled")
+        self._finder.refresh()
         if target_pos:
             txt.see(target_pos)
             txt.tag_add("jumpflash", f"{target_pos} linestart",
@@ -3458,6 +3725,135 @@ class _StatuteWindow:
                 1800,
                 lambda: txt.tag_remove("jumpflash", "1.0", "end"),
             )
+
+    def _insert_refs(self, text: str, tags: tuple) -> None:
+        """Insert paragraph text, linking citations to other U.S. Code /
+        C.F.R. provisions — explicit citations plus the document's own
+        cross-reference style ("section 102 of title 5"; "§ 1614.106")."""
+        refs: list[tuple[int, int, str, str]] = []
+        for m in us_code.USC_CITE_RE.finditer(text):
+            refs.append((m.start(), m.end(), "usc", us_code.cite_spec(m)))
+        for m in ecfr.CFR_CITE_RE.finditer(text):
+            refs.append((m.start(), m.end(), "cfr", ecfr.cite_spec(m)))
+        if self._doc.kind == "usc":
+            for m in _USC_XREF_RE.finditer(text):
+                title = m.group(3) or self._doc.title
+                section = (m.group(1).replace("–", "-").replace("—", "-"))
+                subs = re.findall(r"\(([^)]+)\)", m.group(2) or "")
+                refs.append((m.start(), m.end(), "usc",
+                             f"{title}:{section}:{','.join(subs)}"))
+        else:
+            for m in _CFR_SECREF_RE.finditer(text):
+                subs = re.findall(r"\(([^)]+)\)", m.group(2) or "")
+                refs.append((m.start(), m.end(), "cfr",
+                             f"{self._doc.title}:{m.group(1)}:"
+                             f"{','.join(subs)}"))
+        refs.sort(key=lambda r: (r[0], -r[1]))
+        txt = self._text
+        pos = 0
+        for start, end, kind, spec in refs:
+            if start < pos:
+                continue  # overlapping match — first/longest wins
+            if start > pos:
+                txt.insert("end", text[pos:start], tags)
+            ltags = tags + ("citelink", self._new_link((kind, spec)))
+            txt.insert("end", text[start:end], ltags)
+            pos = end
+        if pos < len(text):
+            txt.insert("end", text[pos:], tags)
+
+    def _new_link(self, action: tuple[str, str]) -> str:
+        self._link_n += 1
+        tag = f"lnk{self._link_n}"
+        self._link_actions[tag] = action
+        self._text.tag_bind(
+            tag, "<Button-1>", lambda _e, t=tag: self._follow_link(t)
+        )
+        return tag
+
+    def _follow_link(self, tag: str) -> None:
+        action = self._link_actions.get(tag)
+        if action:
+            _fetch_statute_window(self._win, action[0], action[1],
+                                  self._status_var.set)
+
+    # ------------------------------------------------------------------
+    # Previous/next provision
+    # ------------------------------------------------------------------
+
+    def _refresh_neighbors(self) -> None:
+        """Resolve the adjacent sections in the background (the C.F.R.
+        side may fetch the title's structure tree) and grey the buttons
+        accordingly."""
+        self._prev_btn.config(state="disabled")
+        self._next_btn.config(state="disabled")
+        doc = self._doc
+
+        def run() -> None:
+            nb = doc.neighbors()
+
+            def apply() -> None:
+                if self._doc is not doc:
+                    return  # user already navigated elsewhere
+                self._neighbors = nb
+                self._prev_btn.config(
+                    state="normal" if nb[0] else "disabled")
+                self._next_btn.config(
+                    state="normal" if nb[1] else "disabled")
+
+            try:
+                self._win.after(0, apply)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _go_neighbor(self, which: int) -> None:
+        target = self._neighbors[which]
+        if not target:
+            return
+        mod = us_code if self._doc.kind == "usc" else ecfr
+        self._prev_btn.config(state="disabled")
+        self._next_btn.config(state="disabled")
+        self._status_var.set(
+            f"Fetching {'previous' if which == 0 else 'next'} section…"
+        )
+
+        def run() -> None:
+            try:
+                doc = mod.load_section(*target)
+            except Exception as exc:
+                msg = str(exc)
+
+                def fail() -> None:
+                    self._status_var.set(msg)
+                    self._refresh_neighbors()
+
+                try:
+                    self._win.after(0, fail)
+                except tk.TclError:
+                    pass
+                return
+            try:
+                self._win.after(0, self._load_doc, doc)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _load_doc(self, doc, highlight: tuple = ()) -> None:
+        """Show another section in this same window (prev/next nav)."""
+        self._doc = doc
+        self._highlight = tuple(highlight)
+        self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
+        self._notes_btn.config(
+            state="normal" if self._has_notes else "disabled")
+        self._win.title(f"{doc.label} — {doc.source_name}")
+        self._src_var.set(doc.url)
+        self._status_var.set(doc.source_note)
+        self._render()
+        self._text.yview_moveto(0.0)
+        self._refresh_neighbors()
 
     def _pin_for(self, index: str) -> tuple:
         """Enumerator path of the paragraph containing a text index, for

@@ -171,6 +171,17 @@ class UscSection:
     # (kind, indent, text); kind in {"sechead", "head", "body", "credit",
     # "note-head", "note-body"}
     paras: list[tuple[str, int, str]] = field(default_factory=list)
+    # neighboring sections parsed from the OLRC page's prev/next links
+    prev: tuple[str, str] | None = None
+    next: tuple[str, str] | None = None
+
+    @property
+    def kind(self) -> str:
+        return "usc"
+
+    def neighbors(self) -> tuple[tuple[str, str] | None,
+                                 tuple[str, str] | None]:
+        return self.prev, self.next
 
     @property
     def heading(self) -> str:
@@ -229,11 +240,42 @@ def load_section(title: str, section: str) -> UscSection:
         paras = parse_section(resp.text)
         if paras:
             doc = UscSection(title=title, section=cand, url=url, paras=paras)
+            doc.prev, doc.next = _find_neighbors(resp.text, cand)
             with _cache_lock:
                 _cache[key] = doc
             return doc
         last_err = f"no text found for {title} U.S.C. § {cand}"
     raise RuntimeError(f"uscode.house.gov: {last_err}")
+
+
+# The OLRC viewer's previous/next navigation: anchors whose href carries a
+# neighboring section's granuleid.  Classified by the words "prev"/"next"
+# anywhere in the anchor markup (class, title, alt text, or label) so the
+# parse survives cosmetic changes; if neither is found the buttons just
+# stay disabled.
+_NAV_ANCHOR_RE = re.compile(
+    r"<a\b[^>]*href=\"[^\"]*granuleid:USC-prelim-title"
+    r"(\d+[a-zA-Z]?)-section([^&\"#]+)[^\"]*\"[^>]*>.*?</a>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _find_neighbors(
+    page_html: str, section: str
+) -> tuple[tuple[str, str] | None, tuple[str, str] | None]:
+    prev = nxt = None
+    for m in _NAV_ANCHOR_RE.finditer(page_html):
+        t, s = m.group(1), m.group(2)
+        if s == section:
+            continue
+        anchor = m.group(0).lower()
+        if "prev" in anchor and prev is None:
+            prev = (t, s)
+        elif "next" in anchor and nxt is None:
+            nxt = (t, s)
+        if prev and nxt:
+            break
+    return prev, nxt
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +494,19 @@ if __name__ == "__main__":
                  ("Continuation", 0), ("(c)", 0), ("(h)", 0),
                  ("(i)", 0)]
     check(got_lvls == want_lvls, f"logical relevel: {got_lvls!r}")
+
+    # Previous/next navigation links
+    nav = """
+<div class="navline">
+<a class="nav-prev" title="Previous Section" href="/view.xhtml?req=granuleid:USC-prelim-title42-section1982&num=0&edition=prelim"><img alt="Previous"/></a>
+<a href="/view.xhtml?req=granuleid:USC-prelim-title42-section1983&num=0&edition=prelim">printer friendly</a>
+<a class="nav-next" title="Next Section" href="/view.xhtml?req=granuleid:USC-prelim-title42-section1983a&num=0&edition=prelim"><img alt="Next"/></a>
+</div>"""
+    check(_find_neighbors(nav, "1983")
+          == (("42", "1982"), ("42", "1983a")),
+          f"neighbors: {_find_neighbors(nav, '1983')!r}")
+    check(_find_neighbors("<p>no nav</p>", "1983") == (None, None),
+          "no neighbors -> (None, None)")
 
     # Fallback: same page without field comments still classifies by class
     stripped = re.sub(r"<!--.*?-->", "", sample, flags=re.DOTALL)
