@@ -606,6 +606,10 @@ class CourtListenerGUI:
             label="U.S. Code / C.F.R. Section…", accelerator="Ctrl+L",
             command=self._show_statute_lookup,
         )
+        lookup_menu.add_command(
+            label="Open Citation List…",
+            command=self._show_citation_list_dialog,
+        )
         self.root.bind("<Control-l>", lambda _e: self._show_statute_lookup())
 
         # --- Search frame ---
@@ -798,6 +802,165 @@ class CourtListenerGUI:
     # ------------------------------------------------------------------
     # Settings dialog
     # ------------------------------------------------------------------
+
+    def _show_citation_list_dialog(self) -> None:
+        """Dialog that opens a batch of cases: one citation per line
+        ("Monroe v. Pape, 365 U.S. 167, 171 (1961)").  Each line is
+        resolved on Google Scholar first (jumping to the pin cite when
+        the text is paginated by that reporter), falling back to the
+        CourtListener text; the lines that resolved nowhere are listed."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Open Citation List")
+        dlg.geometry("560x420")
+        dlg.minsize(440, 320)
+        frame = ttk.Frame(dlg, padding=10)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text="One citation per line — case name optional, pin cite "
+                 "after the page number:",
+        ).pack(anchor="w")
+        ttk.Label(
+            frame, foreground="gray",
+            text="e.g.  Monroe v. Pape, 365 U.S. 167, 171 (1961)",
+        ).pack(anchor="w", pady=(0, 4))
+        box = tk.Text(frame, height=9, wrap="none", undo=True)
+        box.pack(fill="both", expand=True)
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(6, 0))
+        open_btn = ttk.Button(row, text="Open All")
+        open_btn.pack(side="left")
+        status_var = tk.StringVar()
+        ttk.Label(row, textvariable=status_var, foreground="gray").pack(
+            side="left", padx=8, fill="x", expand=True
+        )
+        fail_box = tk.Text(frame, height=4, foreground="#a31515",
+                           state="disabled")
+
+        def post(fn, *args) -> None:
+            try:
+                self.root.after(0, fn, *args)
+            except tk.TclError:
+                pass
+
+        def set_status(s: str) -> None:
+            try:
+                status_var.set(s)
+            except tk.TclError:
+                pass
+
+        def show_failures(lines: list[str]) -> None:
+            try:
+                fail_box.config(state="normal")
+                fail_box.delete("1.0", "end")
+                fail_box.insert("1.0", "\n".join(lines))
+                fail_box.config(state="disabled")
+                fail_box.pack(fill="x", pady=(6, 0))
+            except tk.TclError:
+                pass
+
+        def open_scholar(url: str, html: str, cite: str, pin: str) -> None:
+            try:
+                w = _ScholarTextWindow(self.root, self, url, html, item=None)
+                if pin:
+                    w.jump_to_cite_page(cite, pin)
+            except tk.TclError:
+                pass
+
+        def open_cl(target: dict, text: str) -> None:
+            try:
+                w = _ScholarTextWindow(self.root, self, "", "",
+                                       item=target, cl_text=text)
+                w._show_courtlistener()
+                # nothing to toggle back to — there is no Scholar text
+                w._toggle_btn.config(state="disabled")
+            except tk.TclError:
+                pass
+
+        def go() -> None:
+            raw = [ln.strip() for ln in box.get("1.0", "end").splitlines()]
+            lines = [ln for ln in raw if ln]
+            if not lines:
+                status_var.set("Nothing to open.")
+                return
+            entries, failures = [], []
+            for ln in lines:
+                parsed = _parse_citation_line(ln)
+                if parsed:
+                    entries.append((ln,) + parsed)
+                else:
+                    failures.append(f"{ln}   (no citation recognized)")
+            fetcher = self._get_scholar() if _SCHOLAR_AVAILABLE else None
+            client = (
+                self._get_client()
+                if self._token_var.get().strip() else None
+            )
+            if fetcher is None and client is None:
+                status_var.set("Neither Google Scholar nor CourtListener "
+                               "is available.")
+                return
+            open_btn.config(state="disabled")
+            n, opened = len(entries), [0]
+
+            def run() -> None:
+                for i, (ln, name, cite, pin) in enumerate(entries, 1):
+                    post(set_status, f"({i}/{n}) Searching {cite}…")
+                    result = None
+                    if fetcher is not None:
+                        try:
+                            result = fetcher.fetch_by_citation(cite)
+                            if not result and name:
+                                hits = fetcher.search_cases(
+                                    f"{name} {cite}", limit=1)
+                                if hits:
+                                    result = fetcher.fetch_by_url(
+                                        hits[0].url)
+                        except Exception as exc:
+                            print(f"[citelist] scholar {cite!r}: {exc}")
+                    if result:
+                        opened[0] += 1
+                        post(open_scholar, result[0], result[1], cite, pin)
+                        continue
+                    if client is not None:
+                        try:
+                            data = client.search(f"citation:({cite})",
+                                                 type="o", page_size=1)
+                            results = data.get("results") or []
+                            if not results:
+                                data = client.search(f'"{cite}"', type="o",
+                                                     page_size=1)
+                                results = data.get("results") or []
+                            if results:
+                                text = _assemble_case_text(client,
+                                                           results[0])
+                                if text.strip():
+                                    opened[0] += 1
+                                    post(open_cl, results[0], text)
+                                    continue
+                        except Exception as exc:
+                            print(f"[citelist] courtlistener {cite!r}: "
+                                  f"{exc}")
+                    failures.append(ln)
+
+                def finish() -> None:
+                    try:
+                        open_btn.config(state="normal")
+                    except tk.TclError:
+                        return
+                    if failures:
+                        set_status(
+                            f"Opened {opened[0]} of {len(lines)}; "
+                            f"{len(failures)} not found:"
+                        )
+                        show_failures(failures)
+                    else:
+                        set_status(f"Opened all {opened[0]} citation(s).")
+
+                post(finish)
+
+            threading.Thread(target=run, daemon=True).start()
+
+        open_btn.config(command=go)
 
     def _show_statute_lookup(self) -> None:
         """Small dialog that opens a statute/regulation by typed citation
@@ -3427,6 +3590,30 @@ _CFR_SECREF_RE = re.compile(
     r"§§?\s*(\d+[a-zA-Z]?\.\d+[a-zA-Z0-9]*)"
     r"((?:\((?:\d{1,3}|[ivxIVX]{2,4}|[a-zA-Z]{1,3})\))*)"
 )
+
+# A reporter citation on a hand-typed line: volume, reporter, page.
+# Broader than _TEXT_CITE_RE (any capitalized reporter form, so official
+# state reporters like "306 Md. 556" work) since the input is a citation
+# list, not running prose.
+_LINE_CITE_RE = re.compile(
+    r"(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})(?=[\s,;.)(]|$)"
+)
+
+
+def _parse_citation_line(line: str) -> Optional[tuple[str, str, str]]:
+    """Parse "Name v. Name, 365 U.S. 167, 171 (1961)" into
+    (case name, citation, pin) — name and pin may be empty."""
+    m = _LINE_CITE_RE.search(line)
+    if not m:
+        return None
+    cite = re.sub(r"\s+", " ",
+                  f"{m.group(1)} {m.group(2)} {m.group(3)}")
+    cite = cite.replace("U. S.", "U.S.").replace("’", "'")
+    name = line[: m.start()].strip().rstrip(",;–—- ").strip()
+    pin_m = _PINCITE_AFTER_RE.match(line, m.end())
+    pin = pin_m.group(1) if pin_m else ""
+    return name, cite, pin
+
 
 # A hand-typed statute/regulation lookup: "42 USC 1983(b)", "29 cfr
 # 1614.105(a)", with or without periods and the section symbol.
