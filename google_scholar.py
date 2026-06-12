@@ -137,8 +137,13 @@ def educate_quotes(text: str) -> str:
     whitespace, an opening bracket, a dash, or another opening quote
     (covering nested quotes like "'…'"); otherwise it closes.  A single
     quote between/after letters is an apostrophe (don't, Jones'), and one
-    before a digit is a decade contraction ('70s).
+    before a digit is a decade contraction ('70s).  Typewriter-style
+    backtick openers — GPO statute text quotes terms as `term' (``…'' for
+    doubles) — become proper opening quotes so they pair with the curled
+    close instead of showing as grave accents.
     """
+    text = (text.replace("``", _D_OPEN).replace("''", _D_CLOSE)
+            .replace("`", _S_OPEN))
     out = list(text)
     for i, ch in enumerate(text):
         if ch == '"':
