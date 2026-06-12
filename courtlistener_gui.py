@@ -96,6 +96,7 @@ _ensure_dependencies()
 
 import requests as _requests
 
+from bluebook_names import abbreviate_case_name
 from courtlistener import CourtListenerClient, CourtListenerError
 from court_catalog import (
     CATALOG as _COURT_CATALOG,
@@ -290,11 +291,11 @@ def _build_default_filename(item: dict) -> str:
     and whenever the reporter already conveys it (e.g. ``60 Fed. Cl. 600``).
     Falls back gracefully when citation or date are missing.
     """
-    # Case name
-    case_name = re.sub(
+    # Case name, abbreviated per Bluebook rule 10.2.2 (table T6/T10)
+    case_name = abbreviate_case_name(re.sub(
         r"<[^>]+>", "",
         item.get("caseName") or item.get("case_name") or "opinion"
-    ).strip()
+    ).strip())
 
     # Best citation (U.S. Reports > S.Ct. > Federal Reporters > others)
     citation_str = _pick_citation(item.get("citation", []))
@@ -329,7 +330,7 @@ def _build_default_filename(item: dict) -> str:
 
     # Sanitize: keep alphanumeric, spaces, and common filename-safe punctuation
     safe = "".join(
-        c if c.isalnum() or c in " .,()-_'" else "_"
+        c if c.isalnum() or c in " .,()-_'&" else "_"
         for c in raw_name
     )[:120].strip()
     return safe
@@ -1995,6 +1996,12 @@ def _copy_rich_clipboard(widget: tk.Misc, rtf: str, plain: str) -> str:
 # opinions score near zero.
 _SCHOLAR_MATCH_THRESHOLD = 0.60
 
+# Opinion-text font size (pt), remembered across windows within a session
+# so a reader's A+/A− choice carries over to the next case they open.
+_OPINION_FONT_PT = 11
+_OPINION_FONT_MIN = 7
+_OPINION_FONT_MAX = 24
+
 
 def _find_scholar_for_item(
     client: Optional[CourtListenerClient],
@@ -2222,7 +2229,7 @@ class _ScholarTextWindow:
 
         text_frame = ttk.Frame(win)
         text_frame.pack(fill="both", expand=True, padx=8, pady=4)
-        base = tkfont.Font(family="Georgia", size=11)
+        base = tkfont.Font(family="Georgia", size=_OPINION_FONT_PT)
         self._fonts["base"] = base
         self._family = base.actual("family")
         self._base_size = base.actual("size")
@@ -2276,10 +2283,55 @@ class _ScholarTextWindow:
         )
         self._toggle_btn.pack(side="right", padx=4)
 
+        # Text-size controls (also Ctrl +/−/0 and Ctrl+mouse wheel)
+        ttk.Button(
+            btn_frame, text="A−", width=3, command=lambda: self._zoom(-1)
+        ).pack(side="left")
+        ttk.Button(
+            btn_frame, text="A+", width=3, command=lambda: self._zoom(+1)
+        ).pack(side="left", padx=(2, 8))
+        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            win.bind(seq, lambda _e: self._zoom(+1))
+        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
+            win.bind(seq, lambda _e: self._zoom(-1))
+        win.bind("<Control-0>", lambda _e: self._zoom(0))
+        txt.bind(
+            "<Control-MouseWheel>",
+            lambda e: self._zoom(+1 if e.delta > 0 else -1) or "break",
+        )
+        txt.bind("<Control-Button-4>", lambda _e: self._zoom(+1) or "break")
+        txt.bind("<Control-Button-5>", lambda _e: self._zoom(-1) or "break")
+
         self._status_var = tk.StringVar()
         ttk.Label(btn_frame, textvariable=self._status_var, foreground="gray").pack(
             side="left", fill="x", expand=True
         )
+
+    def _zoom(self, delta: int) -> None:
+        """Grow/shrink every font in the window; delta 0 resets to default.
+        Tk re-renders widgets when a named Font object is reconfigured, so
+        resizing the shared Font instances restyles all existing text."""
+        global _OPINION_FONT_PT
+        new = 11 if delta == 0 else max(
+            _OPINION_FONT_MIN, min(_OPINION_FONT_MAX, self._base_size + delta)
+        )
+        if new == self._base_size:
+            return
+        self._base_size = new
+        _OPINION_FONT_PT = new
+        for name, f in self._fonts.items():
+            if name == "base":
+                f.configure(size=new)
+            elif name == "fnhead":
+                f.configure(size=max(new - 2, 8))
+            elif name == "pagenum":
+                f.configure(size=max(new - 1, 8))
+            elif name.startswith("fnt_"):
+                small, sup = name[6] == "1", name[7] == "1"
+                f.configure(
+                    size=max(new - (3 if sup else 2 if small else 0), 7)
+                )
+        self._status_var.set(f"Text size: {new} pt")
 
     # ------------------------------------------------------------------
     # Rendering
@@ -2563,6 +2615,7 @@ class _ScholarTextWindow:
         if not is_scotus:
             fallback = str(item.get("court") or court_id).strip() if court_id else ""
             court_abbr = _court_for_paren(cite, court_id, fallback)
+        name = abbreviate_case_name(name)
         return {"name": name, "cite": cite, "court": court_abbr, "year": year}
 
     def _writer_parenthetical(self, part) -> str:
