@@ -333,6 +333,155 @@ _GEO_PARTIES = (
     | set(_T10_WORDS)
 )
 
+# "State of X" / "Commonwealth of X" / "People of the State of X" are
+# omitted from party names (rule 10.2.1(f)), leaving the protected
+# geographic name: "State of Washington" -> "Washington".
+_STATE_OF_RE = re.compile(
+    r"^(?:the\s+)?(?:people\s+of\s+(?:the\s+state\s+of\s+)?|"
+    r"state\s+of\s+|commonwealth\s+of\s+)",
+    re.IGNORECASE,
+)
+
+# A municipal party — "City of New York", "Village of Arlington Heights" —
+# is itself a geographic unit: the place name is not abbreviated, only the
+# T6 word in the prefix ("Vill. of Arlington Heights", "Cnty. of
+# Sacramento").  When more follows the place ("City of New York Department
+# of Education") the party is a larger entity and abbreviates normally.
+_MUNICIPAL_RE = re.compile(
+    r"^(City|Town|Township|Village|Borough|County|Parish)\s+of\s+(.+)$",
+    re.IGNORECASE,
+)
+
+# Personal-name suffixes, dropped along with the given name
+_NAME_SUFFIX_RE = re.compile(r",?\s+(?:jr|sr|ii|iii|iv)\.?\s*$", re.IGNORECASE)
+
+# Particles kept with the surname: "Nathan Van Buren" -> "Van Buren"
+# (compared against dot-stripped lowercase tokens)
+_SURNAME_PARTICLES = {
+    "van", "von", "der", "den", "de", "del", "della", "di", "da", "du",
+    "la", "le", "lo", "mac", "mc", "st", "saint", "ter", "ten",
+}
+
+# Common business nouns that are NOT in T6 (Bluebook leaves them
+# unabbreviated) but mark a party as an organization, so a leading
+# given-name-like word is part of a firm name: "Chase Bank", "Sara Lee
+# Foods".  Without this, the given-name pass would truncate them.
+_ORG_WORDS = {
+    "airlines", "airways", "apparel", "bakery", "bank", "brands",
+    "brewery", "brewing", "builders", "church", "cinemas", "club",
+    "dairy", "drug", "drugs", "farms", "foods", "furniture", "gas",
+    "grocery", "hardware", "herald", "homes", "jewelers", "journal",
+    "lines", "lodge", "lumber", "media", "mill", "mills", "ministries",
+    "motors", "news", "oil", "optical", "outfitters", "packing",
+    "pictures", "pizza", "post", "press", "realty", "records", "shop",
+    "shops", "steel", "store", "stores", "studios", "supply", "temple",
+    "theaters", "theatres", "times", "tribune", "trust", "works",
+}
+
+
+# ---------------------------------------------------------------------------
+# Given names (rule 10.2.1(g)): "Ernestine Jackson" cites as "Jackson".
+# Dropping is gated on the first token being a recognized given name so
+# that two-word organizations with no T6 word ("Hobby Lobby", "Planned
+# Parenthood", "Masterpiece Cakeshop") are never truncated; an unrecognized
+# given name simply stays, which is the safe failure.  Names that are also
+# U.S. place names (Virginia, Georgia, Charlotte, Austin, Madison) are
+# included deliberately — the personal-name check runs before the
+# geographic word pass, so "Virginia Smith" becomes "Smith", not "Va.
+# Smith".
+# ---------------------------------------------------------------------------
+
+_GIVEN_NAMES = frozenset("""
+aaron abigail abraham ada adam adrian adrienne agnes aiden aisha alan albert
+alberto alejandro alex alexander alexandra alexis alfred alfreda alice alicia
+alison allan allen allison alma alvin alyssa amanda amber amelia amos amy ana
+andre andrea andres andrew andy angel angela angelica angelo angie anita ann
+anna anne annette annie anthony antoine antonio april archibald archie arlene
+arnold arthur ashley audrey austin barbara barney barry bartholomew beatrice
+becky belinda ben benjamin bernadette bernard bernice bert bertha bertram
+bessie beth bethany betsy betty beulah beverly bill billie billy blake
+blanche bob bobbie bobby bonnie brad bradley brandi brandon brandy brenda
+brent brett brian briana brianna bridget brittany brooke bruce bryan byron
+caleb calvin cameron camille candace candice carl carla carlos carlton carmen
+carol carole caroline carolyn carrie casey cassandra catherine cathy cecil
+cecilia cedric celia cesar chad charlene charles charlie charlotte
+chelsea cheryl chester chris christian christina christine christopher
+christy cindy claire clara clarence claude claudia clayton cleo cletus
+clifford clifton clint clinton clyde cody colin colleen connie conrad
+cornelius corey cory courtney craig cristina crystal curtis cynthia cyrus
+dale damon dan dana daniel danielle danny daphne darlene darnell darrell
+darren darryl dave david dawn dean deanna debbie deborah debra delbert delia
+della delores delmar denise dennis derek derrick desiree devin devon dewey
+dexter diana diane dianne dolores dominic dominique don donald donna donnie
+dora doreen doris dorothy doug douglas duane dustin dwayne dwight dylan earl
+earnest ebony ed eddie edgar edith edmund edna eduardo edward edwin eileen
+elaine elbert eleanor elena eli elias elijah elizabeth ella ellen elliot
+elliott elmer eloise elsa elsie elvira elwood emanuel emil emily emma emmett
+enrique eric erica erik erika erin ernest ernestine ernesto ervin ethan ethel
+eugene eunice eva evan evelyn everett ezekiel ezra faith fannie felicia
+felipe felix ferdinand fernando flora florence floyd forrest frances francis
+francisco frank frankie franklin fred freda freddie frederick gabriel
+gabriela gail garrett garry gary gavin gayle gene geneva genevieve geoffrey
+george georgia gerald geraldine gerard gerardo gilbert gina ginger gladys
+glen glenda glenn gloria gordon grace graham grant greg gregg gregory
+gretchen grover guadalupe guillermo gus gustavo guy gwen gwendolyn hal hank
+hannah harlan harold harriet harriett harry harvey hattie hazel heather
+hector heidi helen henrietta henry herbert herman hilda hiram holly homer
+hope horace hortense howard hubert hugh hugo ian ida ignacio ike ina inez ira
+irene iris irma irving isaac isabel isadore isaiah ismael israel ivan jack
+jackie jacob jacqueline jaime jake james jamie jan jana jane janet janice
+janie jared jasmine jason jasper javier jay jean jeanette jeanne jeff jeffery
+jeffrey jenna jennie jennifer jenny jerald jeremiah jeremy jermaine jerome
+jerry jesse jessica jessie jesus jethro jill jim jimmie jimmy jo joan joann
+joanna joanne jodi jody joe joel joey john johnnie johnny jon jonathan jordan
+jorge jose josefina joseph josephine josh joshua josie joy joyce juan juanita
+judith judy julia julian julie julio julius june justin kaitlyn kara karen
+kari karl karla kate katelyn katherine kathleen kathryn kathy katie katrina
+kay kayla keith kelley kelli kellie kelly kelvin ken kendra kenneth kenny
+kent kerry kevin kim kimberly kirk krista kristen kristi kristin kristina
+kristine kristy kurt kyle lamar lance larry latasha latoya laura lauren
+laurie lavern laverne lawrence leah lela leland lemuel lena leo leon
+leonard leopold leroy lesley leslie lester leticia levi lewis lila lillian
+lillie lily linda lindsay lindsey lionel lisa lloyd logan lois lola lonnie
+lora loren lorena lorenzo loretta lori lorraine louis louise lucas lucia
+lucille lucinda lucy luella luis luke luther lydia lyle lynda lyndon lynn
+mabel mable mack madeline madison mae maggie malcolm mamie mandy manuel marc
+marcella marcia marco marcos marcus margaret margarita margie marguerite
+maria marian marianne marie marilyn mario marion marjorie mark marlene
+marsha marshall martha martin marvin mary mathew matt matthew mattie maude
+maureen maurice mavis max maxine megan meghan melanie melinda melissa melody
+melvin mercedes meredith merle merton michael micheal michele michelle miguel
+mike mildred miles millie milton mindy minerva minnie miranda miriam misty
+mitchell molly mona monica monique morris mortimer moses muriel myra myron
+myrtle nadine nancy naomi natalie natasha nathan nathaniel neal neil nellie
+nelson nettie nicholas nick nicolas nicole nikki nina noah noel nora norma
+norman obadiah olga olive oliver olivia ollie omar opal ophelia ora orville
+oscar oswald otis otto owen pablo pam pamela pansy pat patricia patrick
+patsy patti patty paul paula pauline pearl pearlie pedro peggy penny percy
+perry pete peter phil philip phillip phineas phyllis preston priscilla
+prudence rachael rachel rafael ralph ramon ramona randal randall randolph
+randy raquel raul ray raymond rebecca regina reginald rene renee reuben rex
+rhonda ricardo richard rick rickey ricky rita rob robert roberta roberto
+robin robyn rocky rod roderick rodney rodolfo rodrigo roger roland rolando
+roman ron ronald ronnie roosevelt rosa rosalie roscoe rose rosemary rosetta
+ross rowena roxanne roy ruben ruby rudolph rudy rufus rupert russell rusty
+ruth ryan sabrina sadie sally salvador salvatore sam samantha sammy samuel
+sandra sandy santos sara sarah saul scott sean sergio seth seymour shane
+shannon shari sharon shaun shawn sheila shelby sheldon shelia shelley shelly
+sheri sherman sherri sherry sheryl shirley sidney silas silvia simon sonia
+sonya sophia spencer stacey stacy stan stanley stefanie stella stephanie
+stephen steve steven stuart sue summer susan susannah susie suzanne sybil
+sylvester sylvia tabitha tamara tami tammie tammy tanya tara tasha taylor
+ted terence teresa teri terrance terrell terrence terri terry thaddeus
+thelma theodora theodore theresa thomas tiffany tim timothy tina toby todd
+tom tommie tommy toni tony tonya tracey traci tracy travis trevor tricia
+trisha troy tyler tyrone ulysses ursula valerie vance vanessa velma vera
+verna vernon veronica vicki vickie vicky victor victoria vincent viola
+violet virgil virginia vivian wade wallace walter wanda warren wayne wendell
+wendy wesley wilbert wilbur wilfred willa willard william willie willis
+wilma winfield winifred winston woodrow yesenia yolanda yvette yvonne
+zachary zelda
+""".split())
 
 def _plural(word: str, abbr: str) -> tuple[str, str] | None:
     """Derive the plural entry per T6 ("add s"), or None when the
@@ -362,6 +511,11 @@ def _build_word_map() -> dict[str, str]:
 
 _WORD_MAP = _build_word_map()
 
+# T6 words signal an organization, blocking given-name dropping ("George
+# Washington University").  T10 place names are excluded from that signal:
+# they double as given names far too often (Virginia, Georgia).
+_T6_WORDS = frozenset(_WORD_MAP) - frozenset(_T10_WORDS)
+
 # A token is a run of letters with internal apostrophes/periods, so already-
 # abbreviated forms ("Ass'n", "Inc.") and possessives ("Children's") come
 # through as single tokens that miss the table and pass unchanged.
@@ -377,28 +531,92 @@ _ET_AL_RE = re.compile(r",?\s+et\s+al\.?\s*$", re.IGNORECASE)
 _V_SPLIT_RE = re.compile(r"\s+vs?\.\s+")
 
 
+def _strip_given_names(p: str) -> str | None:
+    """Surname-only form of a personal party name (rule 10.2.1(g)), or
+    None when the party does not safely read as an individual's name."""
+    p = _NAME_SUFFIX_RE.sub("", p)
+    if "," in p or "&" in p or re.search(r"\bof\b", p, re.IGNORECASE):
+        return None
+    tokens = p.split()
+    if not 2 <= len(tokens) <= 4:
+        return None
+    low = [t.replace("’", "'").lower().rstrip(".") for t in tokens]
+    if low[0] not in _GIVEN_NAMES:
+        return None
+    # Every token must look like a name part: a capitalized word, an
+    # initial, or a surname particle — and none may be an organizational
+    # word ("George Washington University" abbreviates instead).
+    for t, tl in zip(tokens, low):
+        if (tl in _T6_WORDS or tl in _ORG_WORDS
+                or not re.fullmatch(r"[A-Z](?:[A-Za-z'’-]+|\.)?", t)):
+            return None
+    if re.fullmatch(r"[A-Z]\.?", tokens[-1]):
+        return None  # anonymized party ("Susan B.", "B. J. F.")
+    # Surname = last token plus any particles ("Nathan Van Buren")
+    i = len(tokens) - 1
+    while i > 1 and low[i - 1] in _SURNAME_PARTICLES:
+        i -= 1
+    # Everything before the surname must itself be a given name, an
+    # initial, or a particle ("John W. Smith" — but not "Chase Manhattan
+    # Bank", whose middle token flunks this check)
+    for t, tl in zip(tokens[1:i], low[1:i]):
+        if not (tl in _GIVEN_NAMES or tl in _SURNAME_PARTICLES
+                or re.fullmatch(r"[A-Z]\.?", t)):
+            return None
+    return " ".join(tokens[i:])
+
+
 def _abbreviate_party(party: str) -> str:
     p = re.sub(r"\s+", " ", party).strip()
     p = _ET_AL_RE.sub("", p)
     p = re.sub(r"^the\s+", "", p, flags=re.IGNORECASE)  # rule 10.2.1(d)
     p = re.sub(r"\bUnited States of America\b", "United States", p,
                flags=re.IGNORECASE)
+    p = _STATE_OF_RE.sub("", p)  # "State of Washington" -> "Washington"
     if p.strip(" ,.").lower() in _GEO_PARTIES:
         return p
+
+    m = _MUNICIPAL_RE.match(p)
+    if m:
+        prefix, place = m.group(1), m.group(2)
+        place_words = [w.replace("’", "'").lower().rstrip(".,'")
+                       for w in place.split()]
+        if (not any(w in _T6_WORDS for w in place_words)
+                and not re.search(r"\bof\b", place, re.IGNORECASE)):
+            return f"{_WORD_MAP.get(prefix.lower(), prefix)} of {place}"
+
+    surname = _strip_given_names(p)
+    if surname is not None:
+        return surname
 
     p = _PHRASE_RE.sub(
         lambda m: _PHRASE_MAP[re.sub(r"\s+", " ", m.group(0).lower())], p
     )
-    return _TOKEN_RE.sub(
-        lambda m: _WORD_MAP.get(m.group(0).replace("’", "'").lower(),
-                                m.group(0)),
-        p,
-    )
+
+    # A state name right after a given name is part of a person's name,
+    # not a geographic unit: "George Washington University" keeps
+    # "Washington" (rule 10.2.2 abbreviates only geographic units).
+    protected: set[int] = set()
+    tokens = list(_TOKEN_RE.finditer(p))
+    for prev, tok in zip(tokens, tokens[1:]):
+        if (tok.group(0).lower() in _T10_WORDS
+                and prev.group(0).lower() in _GIVEN_NAMES):
+            protected.add(tok.start())
+
+    def _sub(m: re.Match) -> str:
+        if m.start() in protected:
+            return m.group(0)
+        return _WORD_MAP.get(m.group(0).replace("’", "'").lower(),
+                             m.group(0))
+
+    return _TOKEN_RE.sub(_sub, p)
 
 
 def abbreviate_case_name(name: str) -> str:
     """Abbreviate a case name for use in a citation or filename per
-    Bluebook rule 10.2.2 (= Indigo Book R8.3).  Safe to call twice."""
+    Bluebook rule 10.2.2 (= Indigo Book R8.3), dropping given names of
+    individuals (rule 10.2.1(g)) and "State of" prefixes (10.2.1(f)).
+    Safe to call twice."""
     name = re.sub(r"\s+", " ", name or "").strip()
     if not name:
         return name
@@ -435,6 +653,32 @@ if __name__ == "__main__":
         ("The Florida Star v. B. J. F.", "Fla. Star v. B. J. F."),
         ("Nat'l Lab. Rels. Bd. v. Jones & Laughlin Steel Corp.",
          "Nat'l Lab. Rels. Bd. v. Jones & Laughlin Steel Corp."),
+        # Given names (rule 10.2.1(g))
+        ("Mercy Hospital, Inc. v. Ernestine Jackson",
+         "Mercy Hosp., Inc. v. Jackson"),
+        ("Jane Roe v. Henry Wade", "Roe v. Wade"),
+        ("John W. Smith, Jr. v. Acme Corporation", "Smith v. Acme Corp."),
+        ("Nathan Van Buren v. United States", "Van Buren v. United States"),
+        ("Virginia Smith v. Texas", "Smith v. Texas"),
+        ("Burwell v. Hobby Lobby Stores, Inc.",
+         "Burwell v. Hobby Lobby Stores, Inc."),
+        ("Planned Parenthood of Southeastern Pennsylvania v. Robert Casey",
+         "Planned Parenthood of Se. Pa. v. Casey"),
+        ("George Washington University v. Violet Aldridge",
+         "George Washington Univ. v. Aldridge"),
+        ("Chase Bank v. Mary McCoy", "Chase Bank v. McCoy"),
+        # Geographic parties (rules 10.2.1(f), 10.2.2)
+        ("State of Washington v. Glucksberg", "Washington v. Glucksberg"),
+        ("People of the State of Illinois v. Gates", "Illinois v. Gates"),
+        ("City of New York v. United States Department of Defense",
+         "City of New York v. U.S. Dep't of Def."),
+        ("Village of Arlington Heights v. "
+         "Metropolitan Housing Development Corporation",
+         "Vill. of Arlington Heights v. Metro. Hous. Dev. Corp."),
+        ("County of Sacramento v. Lewis", "Cnty. of Sacramento v. Lewis"),
+        ("Town of Greece v. Susan Galloway", "Town of Greece v. Galloway"),
+        ("City of New York Department of Parks v. Doe",
+         "City of N.Y. Dep't of Parks v. Doe"),
     ]
     failed = 0
     for raw, want in _CASES:
