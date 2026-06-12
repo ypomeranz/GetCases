@@ -2527,6 +2527,14 @@ class _ScholarTextWindow:
         )
         txt.bind("<Control-Button-4>", lambda _e: self._zoom(+1) or "break")
         txt.bind("<Control-Button-5>", lambda _e: self._zoom(-1) or "break")
+        # Ctrl-C copies with the Bluebook citation appended (the plain
+        # default copy is suppressed); the find bar's entry keeps native
+        # copy since this is bound to the text widget only.
+        for seq in ("<Control-c>", "<Command-c>"):
+            try:
+                txt.bind(seq, lambda _e: self._copy_formatted() or "break")
+            except tk.TclError:
+                pass  # modifier not supported on this platform
 
         self._status_var = tk.StringVar()
         ttk.Label(btn_frame, textvariable=self._status_var, foreground="gray").pack(
@@ -3665,6 +3673,15 @@ class _StatuteWindow:
         )
         txt.bind("<Control-Button-4>", lambda _e: self._zoom(+1) or "break")
         txt.bind("<Control-Button-5>", lambda _e: self._zoom(-1) or "break")
+        # Ctrl-C copies with the Bluebook citation appended, pin-cited to
+        # the selection's subdivision (the plain default copy is
+        # suppressed); the find bar's entry keeps native copy since this
+        # is bound to the text widget only.
+        for seq in ("<Control-c>", "<Command-c>"):
+            try:
+                txt.bind(seq, lambda _e: self._copy_cite() or "break")
+            except tk.TclError:
+                pass  # modifier not supported on this platform
 
     _ENUM_LEAD_RE = re.compile(r"((?:\((?:\d{1,3}|[a-zA-Z]{1,4})\)\s*)+)")
 
