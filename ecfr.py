@@ -90,6 +90,12 @@ class CfrSection:
     def source_note(self) -> str:
         return f"eCFR official edition, current as of {self.date}"
 
+    def bluebook_cite(self, subs: tuple = ()) -> str:
+        """Bluebook citation (rule 14.2): C.F.R. cites carry the year of
+        the edition cited — here the eCFR currency date's year."""
+        tail = "".join(f"({s})" for s in subs)
+        return f"{self.title} C.F.R. § {self.section}{tail} ({self.date[:4]})"
+
 
 _dates: dict[str, str] = {}
 _cache: dict[tuple[str, str], CfrSection] = {}
@@ -163,81 +169,14 @@ def load_section(title: str, section: str) -> CfrSection:
 
 
 # ---------------------------------------------------------------------------
-# Indentation inference from enumerators
-# ---------------------------------------------------------------------------
-
-# CFR drafting hierarchy: (a) -> (1) -> (i) -> (A) -> (1) -> (i)
-_EXPECTED = ("lower", "digit", "roman", "upper", "digit", "roman")
-
-_ROMAN_VALS = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
-
-
-def _roman_to_int(s: str) -> int:
-    total, prev = 0, 0
-    for ch in reversed(s.lower()):
-        v = _ROMAN_VALS.get(ch, 0)
-        total += v if v >= prev else -v
-        prev = max(prev, v)
-    return total
-
-
-def _value(enum: str, kind: str) -> int:
-    """Ordinal of an enumerator under a kind, or 0 if it doesn't fit."""
-    if kind == "digit":
-        return int(enum) if enum.isdigit() else 0
-    if kind in ("lower", "upper"):
-        # single letters a..z, then CFR's repeated letters (aa), (bb), ...
-        ok = enum.islower() if kind == "lower" else enum.isupper()
-        if ok and enum.isalpha() and len(set(enum.lower())) == 1:
-            return 26 * (len(enum) - 1) + ord(enum[0].lower()) - ord("a") + 1
-        return 0
-    if kind == "roman":
-        if enum and all(c in _ROMAN_VALS for c in enum.lower()) \
-                and (enum.islower() or enum.isupper()):
-            return _roman_to_int(enum)
-        return 0
-    return 0
-
-
-def _infer_level(enums: list[str], stack: list[tuple[str, str]]) -> int:
-    """Indent level for a paragraph opening with `enums`, updating `stack`
-    (a list of (kind, value) for the currently open levels) in place."""
-    e = enums[0]
-    level = kind = None
-    # 1) successor of an open level, deepest first — so "(i)" following
-    #    "(h)" continues the subsection level instead of starting romans
-    for lvl in range(len(stack) - 1, -1, -1):
-        k, prev = stack[lvl]
-        if _value(e, k) == _value(prev, k) + 1 and _value(prev, k) > 0:
-            level, kind = lvl, k
-            break
-    # 2) the first value one level deeper
-    if level is None:
-        k = _EXPECTED[min(len(stack), len(_EXPECTED) - 1)]
-        if _value(e, k) == 1:
-            level, kind = len(stack), k
-    # 3) the first value of some shallower level (a fresh "(1)" after
-    #    deep nesting elsewhere)
-    if level is None:
-        for lvl in range(min(len(stack), len(_EXPECTED)) - 1, -1, -1):
-            if _value(e, _EXPECTED[lvl]) == 1:
-                level, kind = lvl, _EXPECTED[lvl]
-                break
-    if level is None:  # give up gracefully: sibling of the deepest level
-        level = max(len(stack) - 1, 0)
-        kind = _EXPECTED[min(level, len(_EXPECTED) - 1)]
-    del stack[level:]
-    stack.append((kind, e))
-    # subsequent enumerators in the same paragraph open deeper levels
-    for extra in enums[1:]:
-        k = _EXPECTED[min(len(stack), len(_EXPECTED) - 1)]
-        stack.append((k, extra))
-    return level
-
-
-# ---------------------------------------------------------------------------
 # XML parsing
+#
+# eCFR XML carries no indentation markup, so nesting is inferred from the
+# enumerators per the CFR drafting hierarchy (a) -> (1) -> (i) -> (A),
+# using the engine shared with the U.S. Code module.
 # ---------------------------------------------------------------------------
+
+from us_code import CFR_HIERARCHY, infer_enum_level  # noqa: E402
 
 _DIV8_RE = re.compile(
     r"<DIV8\b[^>]*TYPE=\"SECTION\"[^>]*>(.*?)</DIV8>",
@@ -279,13 +218,13 @@ def parse_section_xml(xml: str) -> list[tuple[str, int, str]]:
         elif tag in ("AUTH", "NOTE"):
             paras.append(("note-body", 0, text))
         else:  # P / FP
+            level = 0
             lead = _ENUM_LEAD_RE.match(text)
             if lead:
                 enums = re.findall(r"\(([^)]+)\)", lead.group(1))
-                level = _infer_level(enums, stack)
-            else:
-                level = 0
-                stack.clear()
+                lvl = infer_enum_level(enums, stack, CFR_HIERARCHY)
+                if lvl is not None:
+                    level = min(lvl, 6)
             paras.append(("body", level, text))
     return paras
 
@@ -321,12 +260,15 @@ if __name__ == "__main__":
     seq = ["a", "1", "2", "i", "ii", "b", "1", "i", "A", "B", "2", "c",
            "h", "i", "j"]
     stack: list[tuple[str, str]] = []
-    levels = [_infer_level([e], stack) for e in seq]
+    levels = [infer_enum_level([e], stack, CFR_HIERARCHY) for e in seq]
     want_lv = [0, 1, 1, 2, 2, 0, 1, 2, 3, 3, 1, 0, 0, 0, 0]
     check(levels == want_lv, f"levels {list(zip(seq, levels))!r}")
     stack = []
-    check(_infer_level(["a", "1"], stack) == 0 and
-          _infer_level(["i"], stack) == 2, "multi-enum (a)(1) then (i)")
+    check(infer_enum_level(["a", "1"], stack, CFR_HIERARCHY) == 0 and
+          infer_enum_level(["i"], stack, CFR_HIERARCHY) == 2,
+          "multi-enum (a)(1) then (i)")
+    check(infer_enum_level(["See"], stack, CFR_HIERARCHY) is None,
+          "non-enumerator token rejected")
 
     # --- XML parsing, authentic eCFR shape ---
     sample = """<?xml version="1.0"?>

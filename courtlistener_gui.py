@@ -596,6 +596,13 @@ class CourtListenerGUI:
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
         settings_menu.add_command(label="API Token…", command=self._show_settings_dialog)
+        lookup_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Look Up", menu=lookup_menu)
+        lookup_menu.add_command(
+            label="U.S. Code / C.F.R. Section…", accelerator="Ctrl+L",
+            command=self._show_statute_lookup,
+        )
+        self.root.bind("<Control-l>", lambda _e: self._show_statute_lookup())
 
         # --- Search frame ---
         search_frame = ttk.LabelFrame(self.root, text="Search", padding=6)
@@ -787,6 +794,42 @@ class CourtListenerGUI:
     # ------------------------------------------------------------------
     # Settings dialog
     # ------------------------------------------------------------------
+
+    def _show_statute_lookup(self) -> None:
+        """Small dialog that opens a statute/regulation by typed citation
+        ("42 USC 1983(b)", "29 CFR 1614.105(a)") in the statute viewer."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Look Up Statute / Regulation")
+        dlg.resizable(False, False)
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Citation:").grid(row=0, column=0, sticky="w")
+        query_var = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=query_var, width=38)
+        entry.grid(row=0, column=1, padx=6, sticky="we")
+        entry.focus_set()
+        status_var = tk.StringVar(
+            value="e.g.  42 USC 1983(b)   or   29 CFR 1614.105(a)"
+        )
+        ttk.Label(frame, textvariable=status_var, foreground="gray").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+
+        def go(_e=None) -> None:
+            parsed = _parse_statute_query(query_var.get())
+            if not parsed:
+                status_var.set(
+                    "Couldn't read that — try '42 USC 1983' or "
+                    "'29 CFR 1614.105(a)'."
+                )
+                return
+            kind, spec = parsed
+            # Parent on the root so the statute window outlives the dialog
+            _fetch_statute_window(self.root, kind, spec, status_var.set)
+
+        ttk.Button(frame, text="Look Up", command=go).grid(row=0, column=2)
+        entry.bind("<Return>", go)
+        frame.columnconfigure(1, weight=1)
 
     def _show_settings_dialog(self) -> None:
         dlg = tk.Toplevel(self.root)
@@ -3077,26 +3120,7 @@ class _ScholarTextWindow:
 
     def _open_statute(self, kind: str, spec: str) -> None:
         """Fetch a U.S. Code (OLRC) or C.F.R. (eCFR) section and show it."""
-        mod = us_code if kind == "usc" else ecfr
-        host = "uscode.house.gov" if kind == "usc" else "ecfr.gov"
-        title, section, subs = spec.split(":", 2)
-        label = mod.spec_label(spec)
-        self._status_var.set(f"Fetching {label} from {host}…")
-
-        def run() -> None:
-            try:
-                doc = mod.load_section(title, section)
-            except Exception as exc:
-                self._post(self._status_var.set, str(exc))
-                return
-            self._post(self._on_statute_ready, doc, subs, label)
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _on_statute_ready(self, doc, subs: str, label: str) -> None:
-        self._status_var.set(f"{label} loaded.")
-        _StatuteWindow(self._win, doc,
-                       tuple(s for s in subs.split(",") if s))
+        _fetch_statute_window(self._win, kind, spec, self._status_var.set)
 
     # ------------------------------------------------------------------
     # CourtListener toggle
@@ -3150,6 +3174,122 @@ class _ScholarTextWindow:
         self._toggle_btn.config(state="normal")
         self._status_var.set(f"CourtListener: {msg}")
         messagebox.showerror("CourtListener", msg, parent=self._win)
+
+
+# A hand-typed statute/regulation lookup: "42 USC 1983(b)", "29 cfr
+# 1614.105(a)", with or without periods and the section symbol.
+_STATUTE_QUERY_RE = re.compile(
+    r"^\s*(\d{1,2})\s*"
+    r"(u\.?\s*s\.?\s*c\.?\s*a?\.?|c\.?\s*f\.?\s*r\.?)\s*"
+    r"(?:§§?|sec(?:tions?)?\.?)?\s*"
+    r"(\d[\w.–—-]*)"
+    r"((?:\s*\(\w{1,4}\))*)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_statute_query(query: str) -> Optional[tuple[str, str]]:
+    """Parse a typed citation into ("usc"|"cfr", spec), or None."""
+    m = _STATUTE_QUERY_RE.match(query or "")
+    if not m:
+        return None
+    kind = "cfr" if "f" in m.group(2).lower() else "usc"
+    section = m.group(3).rstrip(".").replace("–", "-").replace("—", "-")
+    if not section or (kind == "cfr" and "." not in section):
+        return None  # CFR sections are part.section ("1614.105")
+    subs = re.findall(r"\(([^)]+)\)", m.group(4) or "")
+    return kind, f"{m.group(1)}:{section}:{','.join(subs)}"
+
+
+def _fetch_statute_window(parent: tk.Misc, kind: str, spec: str,
+                          status=lambda _s: None) -> None:
+    """Fetch a U.S. Code (OLRC) or C.F.R. (eCFR) section in a background
+    thread and open a _StatuteWindow over `parent` when it arrives."""
+    mod = us_code if kind == "usc" else ecfr
+    host = "uscode.house.gov" if kind == "usc" else "ecfr.gov"
+    title, section, subs = spec.split(":", 2)
+    label = mod.spec_label(spec)
+
+    def safe_status(s: str) -> None:
+        try:
+            status(s)
+        except tk.TclError:
+            pass  # the window owning the status display was closed
+
+    def post(fn, *args) -> None:
+        try:
+            parent.after(0, fn, *args)
+        except tk.TclError:
+            pass
+
+    safe_status(f"Fetching {label} from {host}…")
+
+    def run() -> None:
+        try:
+            doc = mod.load_section(title, section)
+        except Exception as exc:
+            post(safe_status, str(exc))
+            return
+
+        def show() -> None:
+            safe_status(f"{label} loaded.")
+            _StatuteWindow(parent, doc,
+                           tuple(s for s in subs.split(",") if s))
+
+        post(show)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:
+    """Convert a range of the statute viewer's Text widget (with its
+    sechead/headline/enum/credit/ind* tags) to an RTF body that keeps the
+    bolding and hanging indents."""
+    out: list[str] = []
+    active: set[str] = set(txt.tag_names(start))
+    active.discard("sel")
+    par_open = False
+
+    def par_prefix() -> str:
+        if "sechead" in active:
+            return "\\pard\\sb60\\sa180 "
+        ind = 0
+        for t in active:
+            if t.startswith("ind") and t[3:].isdigit():
+                ind = int(t[3:])
+        return f"\\pard\\li{240 * ind + 180}\\fi-180\\sa100 "
+
+    def run_codes() -> str:
+        codes = ""
+        if active & {"sechead", "headline", "enum", "notehead"}:
+            codes += "\\b"
+        if "sechead" in active:
+            codes += "\\fs26"
+        elif active & {"credit", "notebody"}:
+            codes += "\\fs18"
+        return codes
+
+    for key, value, _index in txt.dump(start, end, text=True, tag=True):
+        if key == "tagon":
+            active.add(value)
+        elif key == "tagoff":
+            active.discard(value)
+        elif key == "text":
+            for i, seg in enumerate(value.split("\n")):
+                if i and par_open:
+                    out.append("\\par\n")
+                    par_open = False
+                if seg:
+                    if not par_open:
+                        out.append(par_prefix())
+                        par_open = True
+                    codes = run_codes()
+                    esc = _rtf_escape(seg)
+                    out.append("{" + codes + " " + esc + "}" if codes
+                               else esc)
+    if par_open:
+        out.append("\\par\n")
+    return "".join(out)
 
 
 class _StatuteWindow:
@@ -3243,8 +3383,14 @@ class _StatuteWindow:
         notes_btn.pack(side="left", padx=8)
         if not self._has_notes:
             notes_btn.config(state="disabled")
-        ttk.Label(btns, text=self._doc.source_note,
-                  foreground="gray").pack(side="right")
+        ttk.Button(btns, text="Copy + Cite",
+                   command=self._copy_cite).pack(side="right", padx=(4, 0))
+        ttk.Button(btns, text="Export RTF…",
+                   command=self._export_rtf).pack(side="right", padx=4)
+        # Status doubles as the provenance note until an action overwrites it
+        self._status_var = tk.StringVar(value=self._doc.source_note)
+        ttk.Label(btns, textvariable=self._status_var,
+                  foreground="gray").pack(side="left", padx=8)
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
             win.bind(seq, lambda _e: self._zoom(+1))
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
@@ -3266,18 +3412,22 @@ class _StatuteWindow:
         path: list[str] = []
         target = list(self._highlight)
         target_pos: Optional[str] = None
+        # (position, enumerator path) per enumerated paragraph, for the
+        # pin-cite jump and for citing a selection in _copy_cite
+        self._anchors: list[tuple[str, tuple]] = []
         for kind, ind, text in self._doc.paras:
             if kind.startswith("note") and not show_notes:
                 continue
             indtag = f"ind{min(ind, 6)}"
-            # Track the enumerator path for the pin-cite jump: a paragraph
-            # at indent level N replaces the path from depth N down.
+            # Track the enumerator path: a paragraph at indent level N
+            # replaces the path from depth N down.
             m = self._ENUM_LEAD_RE.match(text) if kind in ("body", "head") \
                 else None
             lead = m.group(1) if m else ""
             if lead:
                 enums = re.findall(r"\(([^)]+)\)", lead)
                 path[ind:] = enums
+                self._anchors.append((txt.index("end-1c"), tuple(path)))
                 if (target and target_pos is None
                         and path[:len(target)] == target):
                     target_pos = txt.index("end-1c")
@@ -3308,6 +3458,69 @@ class _StatuteWindow:
                 1800,
                 lambda: txt.tag_remove("jumpflash", "1.0", "end"),
             )
+
+    def _pin_for(self, index: str) -> tuple:
+        """Enumerator path of the paragraph containing a text index, for
+        a pinpoint citation of the selection."""
+        txt = self._text
+        best: tuple = ()
+        for pos, path in self._anchors:
+            if txt.compare(pos, "<=", index):
+                best = path
+            else:
+                break
+        return best
+
+    def _copy_cite(self) -> None:
+        """Copy the selection (or all) with formatting, appending the
+        Bluebook citation — pin-cited to the selection's subdivision."""
+        txt = self._text
+        try:
+            start, end = txt.index("sel.first"), txt.index("sel.last")
+            selected = True
+        except tk.TclError:
+            start, end = "1.0", "end-1c"
+            selected = False
+        subs = self._pin_for(start) if selected else ()
+        cite = self._doc.bluebook_cite(subs) + "."
+        body = _dump_statute_rtf(txt, start, end)
+        rtf = _rtf_document(body + "\\pard\\sa120 " + _rtf_escape(cite)
+                            + "\\par\n")
+        plain = txt.get(start, end).rstrip() + "\n\n" + cite + "\n"
+        how = _copy_rich_clipboard(self._win, rtf, plain)
+        what = "selection" if selected else "full text"
+        self._status_var.set(f"Copied {what} as {how}; citation appended.")
+
+    def _export_rtf(self) -> None:
+        """Export the section as RTF with a heading block: the citation,
+        then provenance, then the formatted text."""
+        head = (
+            "\\pard\\qc\\sa60{\\b\\fs30 "
+            + _rtf_escape(self._doc.bluebook_cite()) + "}\\par\n"
+            "\\pard\\qc\\sa240{\\fs18 "
+            + _rtf_escape(f"{self._doc.source_note} — {self._doc.url}")
+            + "}\\par\n"
+        )
+        body = _dump_statute_rtf(self._text, "1.0", "end-1c")
+        rtf = _rtf_document(head + body)
+        default = self._doc.label.replace("§", "Sec.")
+        path = filedialog.asksaveasfilename(
+            defaultextension=".rtf",
+            filetypes=[("Rich Text Format", "*.rtf"), ("All files", "*.*")],
+            initialfile=f"{default}.rtf",
+            title="Export Statute as RTF",
+            parent=self._win,
+        )
+        if not path:
+            return
+        with open(path, "w", encoding="ascii", errors="replace") as f:
+            f.write(rtf)
+        self._status_var.set(f"Exported RTF: {path}")
+        if messagebox.askyesno(
+            "Export Complete", f"RTF saved to:\n{path}\n\nOpen it now?",
+            parent=self._win,
+        ):
+            CourtListenerGUI._open_file(path)
 
     def _zoom(self, delta: int) -> None:
         global _OPINION_FONT_PT

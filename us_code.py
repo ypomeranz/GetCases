@@ -53,6 +53,97 @@ def spec_label(spec: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Enumerator-level inference (shared with ecfr.py)
+#
+# The OLRC's HTML indentation classes mirror the *print* layout, where a
+# paragraph opening "(a)(1)" sits flush left and the following "(2)" sits
+# flush too.  For on-screen reading we want logical depth instead — each
+# enumerator type at its own indent — so nesting is inferred from the
+# enumerators themselves.  Hierarchies differ: U.S.C. runs
+# (a) -> (1) -> (A) -> (i) -> (I); C.F.R. runs (a) -> (1) -> (i) -> (A).
+# The "(i) after (h)" ambiguity is resolved by preferring a successor at
+# an already-open level over starting a deeper one.
+# ---------------------------------------------------------------------------
+
+USC_HIERARCHY = ("a", "1", "A", "i", "I")
+CFR_HIERARCHY = ("a", "1", "i", "A")
+
+ENUM_LEAD_RE = re.compile(r"^((?:\((?:\d{1,3}|[a-zA-Z]{1,5})\)\s*)+)")
+
+_ROMAN_VALS = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500,
+               "m": 1000}
+
+
+def _roman_to_int(s: str) -> int:
+    total, prev = 0, 0
+    for ch in reversed(s.lower()):
+        v = _ROMAN_VALS.get(ch, 0)
+        total += v if v >= prev else -v
+        prev = max(prev, v)
+    return total
+
+
+def _enum_value(enum: str, kind: str) -> int:
+    """Ordinal of an enumerator interpreted as `kind` (one of "1", "a",
+    "A", "i", "I"), or 0 if it doesn't fit that kind."""
+    if kind == "1":
+        return int(enum) if enum.isdigit() else 0
+    if kind in ("a", "A"):
+        ok = enum.islower() if kind == "a" else enum.isupper()
+        # single letters a..z, then repeated letters (aa), (bb), ...
+        if ok and enum.isalpha() and len(set(enum.lower())) == 1:
+            return 26 * (len(enum) - 1) + ord(enum[0].lower()) - ord("a") + 1
+        return 0
+    if kind in ("i", "I"):
+        ok = enum.islower() if kind == "i" else enum.isupper()
+        if ok and enum and all(c in _ROMAN_VALS for c in enum.lower()):
+            return _roman_to_int(enum)
+        return 0
+    return 0
+
+
+def infer_enum_level(enums: list[str], stack: list[tuple[str, str]],
+                     hierarchy: tuple[str, ...]) -> int | None:
+    """Indent level for a paragraph opening with `enums`, updating `stack`
+    (open levels as (kind, enum) pairs) in place.  Returns None — leaving
+    the stack untouched — when the first token cannot be an enumerator at
+    all ("(See)"), so the caller can keep its fallback indent."""
+    e = enums[0]
+    if not any(_enum_value(e, k) for k in ("1", "a", "A", "i", "I")):
+        return None
+    level = kind = None
+    # 1) successor of an open level, deepest first — "(i)" after "(h)"
+    #    continues that level rather than starting romans
+    for lvl in range(len(stack) - 1, -1, -1):
+        k, prev = stack[lvl]
+        if _enum_value(prev, k) and \
+                _enum_value(e, k) == _enum_value(prev, k) + 1:
+            level, kind = lvl, k
+            break
+    # 2) the first value one level deeper
+    if level is None:
+        k = hierarchy[min(len(stack), len(hierarchy) - 1)]
+        if _enum_value(e, k) == 1:
+            level, kind = len(stack), k
+    # 3) the first value of some shallower level
+    if level is None:
+        for lvl in range(min(len(stack), len(hierarchy)) - 1, -1, -1):
+            if _enum_value(e, hierarchy[lvl]) == 1:
+                level, kind = lvl, hierarchy[lvl]
+                break
+    if level is None:  # give up gracefully: sibling of the deepest level
+        level = max(len(stack) - 1, 0)
+        kind = hierarchy[min(level, len(hierarchy) - 1)]
+    del stack[level:]
+    stack.append((kind, e))
+    # further enumerators in the same paragraph open deeper levels
+    for extra in enums[1:]:
+        k = hierarchy[min(len(stack), len(hierarchy) - 1)]
+        stack.append((k, extra))
+    return level
+
+
+# ---------------------------------------------------------------------------
 # Fetching
 # ---------------------------------------------------------------------------
 
@@ -99,6 +190,12 @@ class UscSection:
     @property
     def source_note(self) -> str:
         return "OLRC preliminary edition (current law)"
+
+    def bluebook_cite(self, subs: tuple = ()) -> str:
+        """Bluebook citation (rule 12.3); current official code, so no
+        edition year: '42 U.S.C. § 1983(b)(1)'."""
+        tail = "".join(f"({s})" for s in subs)
+        return f"{self.title} U.S.C. § {self.section}{tail}"
 
 
 _cache: dict[tuple[str, str], UscSection] = {}
@@ -231,7 +328,28 @@ def parse_section(page_html: str) -> list[tuple[str, int, str]]:
                           _INDENT_CLASSES.get(
                               cls, _SUB_HEAD_INDENT.get(cls, 0)),
                           text))
-    return paras
+    return _relevel_statute(paras)
+
+
+def _relevel_statute(
+    paras: list[tuple[str, int, str]]
+) -> list[tuple[str, int, str]]:
+    """Replace the print-derived indents of enumerated statute paragraphs
+    with logical depth per the U.S.C. hierarchy, so "(a)(1)" followed by
+    "(2)" indents "(2)" under "(a)".  Unenumerated paragraphs keep their
+    class-derived indent."""
+    stack: list[tuple[str, str]] = []
+    out: list[tuple[str, int, str]] = []
+    for kind, ind, text in paras:
+        if kind in ("body", "head"):
+            m = ENUM_LEAD_RE.match(text)
+            if m:
+                enums = re.findall(r"\(([^)]+)\)", m.group(1))
+                lvl = infer_enum_level(enums, stack, USC_HIERARCHY)
+                if lvl is not None:
+                    ind = min(lvl, 6)
+        out.append((kind, ind, text))
+    return out
 
 
 if __name__ == "__main__":
@@ -306,6 +424,27 @@ if __name__ == "__main__":
     body1 = next(t for k, i, t in paras if (k, i) == ("body", 1))
     check("resident" in body1 and "<em>" not in body1,
           "inline tags stripped")
+
+    # Logical releveling: OLRC's print layout puts "(a)(1)" and the
+    # following "(2)" both flush left; the reader should indent (2) under
+    # (a), and (A)/(i) one level deeper each (U.S.C. hierarchy).
+    quirk = """
+<!-- field-start:statute -->
+<p class="statutory-body">(a)(1) Combined opening paragraph.</p>
+<p class="statutory-body">(2) Print-flush sibling of (1).</p>
+<p class="statutory-body-1em">(A) A subparagraph.</p>
+<p class="statutory-body-2em">(i) A clause.</p>
+<p class="statutory-body-2em">(ii) Another clause.</p>
+<p class="statutory-body">(b) Next subsection.</p>
+<p class="statutory-body">(c) Then (h)-style:</p>
+<p class="statutory-body">(h) Skip ahead.</p>
+<p class="statutory-body">(i) Letter i, not roman.</p>
+<!-- field-end:statute -->"""
+    got_lvls = [(t.split()[0], i) for k, i, t in parse_section(quirk)]
+    want_lvls = [("(a)(1)", 0), ("(2)", 1), ("(A)", 2), ("(i)", 3),
+                 ("(ii)", 3), ("(b)", 0), ("(c)", 0), ("(h)", 0),
+                 ("(i)", 0)]
+    check(got_lvls == want_lvls, f"logical relevel: {got_lvls!r}")
 
     # Fallback: same page without field comments still classifies by class
     stripped = re.sub(r"<!--.*?-->", "", sample, flags=re.DOTALL)
