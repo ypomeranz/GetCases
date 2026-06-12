@@ -184,12 +184,21 @@ class UscSection:
         """Adjacent sections, from the container's table of sections
         (fetched lazily and cached).  Failures yield (None, None)."""
         if not self.container:
+            print(f"[usc-nav] no container breadcrumb found for "
+                  f"§ {self.section}")
             return None, None
         try:
             order = _container_sections(self.container)
+        except Exception as exc:
+            print(f"[usc-nav] section list fetch failed for "
+                  f"{self.container}: {exc}")
+            return None, None
+        try:
             i = next(idx for idx, s in enumerate(order)
                      if s.lower() == self.section.lower())
-        except Exception:
+        except StopIteration:
+            print(f"[usc-nav] § {self.section} not in {self.container} "
+                  f"list ({len(order)} sections: {order[:8]}…)")
             return None, None
         prev = (self.title, order[i - 1]) if i > 0 else None
         nxt = (self.title, order[i + 1]) if i + 1 < len(order) else None
@@ -286,16 +295,26 @@ def _find_container(page_html: str) -> str | None:
     return best
 
 
+# The closing comment is optional so a streamed buffer cut mid-comment
+# still parses; the cell classes only occur inside analyses, so falling
+# back to the whole buffer when the field markers are absent is safe.
 _ANALYSIS_REGION_RE = re.compile(
-    r"<!--\s*field-start:analysis\s*-->(.*?)<!--\s*field-end:analysis\s*-->",
+    r"<!--\s*field-start:analysis\s*-->(.*?)"
+    r"(?:<!--\s*field-end:analysis|\Z)",
     re.DOTALL,
 )
 _ANALYSIS_LEFT_RE = re.compile(
-    r'class="two-column-analysis-style-content-left"[^>]*>(.*?)</div>',
+    r'class="(?:two|three)-column-analysis-style-content-left"[^>]*>'
+    r"(.*?)</(?:div|td)>",
     re.DOTALL,
 )
 _ANALYSIS_SEC_RE = re.compile(
     r"\[?(\d+[A-Za-z0-9]*(?:[-–]\d+[A-Za-z0-9]*)?)"
+)
+# Fallback ordering: the section heads themselves, in document order
+_SECHEAD_NUM_RE = re.compile(
+    r'<h3\s+class="section-head"[^>]*>\s*(?:<[^>]+>\s*)*\[?§+\s*'
+    r"(\d+[A-Za-z0-9]*(?:[-–]\d+[A-Za-z0-9]*)?)",
 )
 
 
@@ -303,15 +322,21 @@ def _sections_from_analysis(page_html: str) -> list[str]:
     """Ordered section numbers from a container page's table of sections.
     A range entry ("5001 to 5011. Repealed.") contributes its first
     number; bracketed (repealed/omitted) entries are kept — the OLRC
-    serves a page for them too."""
+    serves a page for them too.  When no analysis cells are found, the
+    section heads in the buffer provide the order instead."""
     m = _ANALYSIS_REGION_RE.search(page_html)
-    region = m.group(1) if m else ""
+    region = m.group(1) if m else page_html
     out: list[str] = []
     for cell in _ANALYSIS_LEFT_RE.finditer(region):
         text = _clean(cell.group(1))
         sec = _ANALYSIS_SEC_RE.match(text)
         if sec:
             ident = sec.group(1).replace("–", "-")
+            if not out or out[-1] != ident:
+                out.append(ident)
+    if not out:
+        for head in _SECHEAD_NUM_RE.finditer(page_html):
+            ident = head.group(1).replace("–", "-")
             if not out or out[-1] != ident:
                 out.append(ident)
     return out
@@ -344,6 +369,8 @@ def _container_sections(container: str) -> list[str]:
     finally:
         resp.close()
     order = _sections_from_analysis(buf.decode("utf-8", "replace"))
+    print(f"[usc-nav] {container}: {len(order)} sections "
+          f"from {len(buf):,} bytes")
     if order:
         with _cache_lock:
             _order_cache[container] = order
@@ -594,6 +621,24 @@ if __name__ == "__main__":
     order = _sections_from_analysis(analysis)
     check(order == ["5000A", "5000B", "5001", "5012", "2000e-2"],
           f"analysis order: {order!r}")
+    # Streamed buffer cut off mid closing comment still parses
+    truncated = analysis.split("<!-- field-end:analysis")[0] \
+        + "<!-- field-end:analysis"
+    check(_sections_from_analysis(truncated)
+          == ["5000A", "5000B", "5001", "5012", "2000e-2"],
+          "truncated buffer parses")
+    # Fallback: no analysis cells -> order from section heads
+    heads = """
+<h3 class="section-head">§1981. Equal rights under the law</h3>
+<p class="statutory-body">text</p>
+<h3 class="section-head">§1981a. Damages in cases of intentional
+ discrimination</h3>
+<h3 class="section-head">[§1982. Repealed]</h3>
+<h3 class="section-head">§1983. Civil action for deprivation of rights</h3>
+"""
+    fb = _sections_from_analysis(heads)
+    check(fb == ["1981", "1981a", "1982", "1983"],
+          f"section-head fallback: {fb!r}")
     doc = UscSection(title="26", section="5000A", url="u",
                      container="title26-chapter48")
     _order_cache["title26-chapter48"] = order
