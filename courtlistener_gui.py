@@ -892,17 +892,38 @@ class CourtListenerGUI:
         entry.bind("<Return>", _submit)
         entry.bind("<Escape>", _dismiss)
 
-        def _grab_focus() -> None:
+        def _grab_focus(attempt: int = 0) -> None:
             try:
+                popup.deiconify()
                 popup.lift()
+                # Wait until the override-redirect window is actually
+                # viewable before trying to take input focus — on X11
+                # focus_force() is a no-op on an unmapped window.
+                if not popup.winfo_viewable():
+                    if attempt < 20:
+                        popup.after(20, lambda: _grab_focus(attempt + 1))
+                    return
+                # Direct all keyboard/mouse input to the popup so keys land
+                # in the entry even though the WM didn't manage this window.
+                try:
+                    popup.grab_set_global()
+                except tk.TclError:
+                    try:
+                        popup.grab_set()
+                    except tk.TclError:
+                        pass
                 popup.focus_force()
                 entry.focus_set()
                 entry.icursor(tk.END)
                 entry.selection_range(0, tk.END)
+                # The entry may still not hold keyboard focus on the first
+                # try (focus can land on the toplevel); retry until it does.
+                if popup.focus_get() is not entry and attempt < 20:
+                    popup.after(20, lambda: _grab_focus(attempt + 1))
             except tk.TclError:
                 pass
 
-        popup.after(50, _grab_focus)
+        popup.after(10, _grab_focus)
 
     # ------------------------------------------------------------------
     # Settings dialog
