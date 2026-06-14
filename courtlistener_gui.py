@@ -891,7 +891,18 @@ class CourtListenerGUI:
 
         entry.bind("<Return>", _submit)
         entry.bind("<Escape>", _dismiss)
-        popup.after(10, entry.focus_force)
+
+        def _grab_focus() -> None:
+            try:
+                popup.lift()
+                popup.focus_force()
+                entry.focus_set()
+                entry.icursor(tk.END)
+                entry.selection_range(0, tk.END)
+            except tk.TclError:
+                pass
+
+        popup.after(50, _grab_focus)
 
     # ------------------------------------------------------------------
     # Settings dialog
