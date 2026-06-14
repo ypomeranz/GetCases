@@ -50,6 +50,7 @@ def _ensure_dependencies() -> None:
             for module, pip_name in (
                 ("requests", "requests"),
                 ("bs4", "beautifulsoup4"),
+                ("pynput", "pynput"),
             )
             if importlib.util.find_spec(module) is None
         ]
@@ -562,6 +563,13 @@ except ImportError:
     def educate_quotes(text: str) -> str:  # graceful degradation
         return text
 
+try:
+    from pynput import keyboard as _pynput_keyboard
+
+    _HOTKEY_AVAILABLE = True
+except ImportError:
+    _HOTKEY_AVAILABLE = False
+
 
 class CourtListenerGUI:
     def __init__(self, root: tk.Tk) -> None:
@@ -584,7 +592,11 @@ class CourtListenerGUI:
         initial_token = os.environ.get("COURTLISTENER_TOKEN") or _load_saved_token()
         self._token_var = tk.StringVar(value=initial_token)
 
+        self._quick_popup: Optional[tk.Toplevel] = None
+        self._hotkey_listener = None
+
         self._build_ui()
+        self._setup_global_hotkey()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -803,6 +815,83 @@ class CourtListenerGUI:
             "<Double-1>", lambda _e: self._open_selected_scholar_result()
         )
 
+
+    # ------------------------------------------------------------------
+    # Global hotkey (Ctrl+Space / Cmd+Space) → quick search popup
+    # ------------------------------------------------------------------
+
+    def _setup_global_hotkey(self) -> None:
+        if not _HOTKEY_AVAILABLE:
+            return
+        hotkey = "<cmd>+<space>" if sys.platform == "darwin" else "<ctrl>+<space>"
+        try:
+            self._hotkey_listener = _pynput_keyboard.GlobalHotKeys(
+                {hotkey: self._on_global_hotkey}
+            )
+            self._hotkey_listener.daemon = True
+            self._hotkey_listener.start()
+        except Exception:
+            self._hotkey_listener = None
+
+    def _on_global_hotkey(self) -> None:
+        self.root.after(0, self._toggle_quick_search_popup)
+
+    def _toggle_quick_search_popup(self) -> None:
+        if self._quick_popup is not None:
+            try:
+                if self._quick_popup.winfo_exists():
+                    self._quick_popup.destroy()
+            except tk.TclError:
+                pass
+            self._quick_popup = None
+            return
+
+        popup = tk.Toplevel(self.root)
+        self._quick_popup = popup
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+
+        pw, ph = 520, 48
+        sx = popup.winfo_screenwidth()
+        sy = popup.winfo_screenheight()
+        popup.geometry(f"{pw}x{ph}+{(sx - pw) // 2}+{sy // 3}")
+
+        border = tk.Frame(popup, bg="#888888")
+        border.pack(fill="both", expand=True)
+        inner = tk.Frame(border, bg="#ffffff", padx=10, pady=6)
+        inner.pack(fill="both", expand=True, padx=2, pady=2)
+
+        tk.Label(
+            inner, text="Search CourtListener:", bg="#ffffff",
+            fg="#555555", font=("TkDefaultFont", 11),
+        ).pack(side="left", padx=(0, 6))
+
+        entry_var = tk.StringVar()
+        entry = tk.Entry(
+            inner, textvariable=entry_var, font=("TkDefaultFont", 13),
+            relief="flat", bg="#ffffff",
+        )
+        entry.pack(side="left", fill="x", expand=True)
+
+        def _submit(_e=None) -> None:
+            query = entry_var.get().strip()
+            popup.destroy()
+            self._quick_popup = None
+            if query:
+                self._query_var.set(query)
+                self.root.deiconify()
+                self.root.lift()
+                self.root.focus_force()
+                self._query_entry.focus_set()
+                self._do_search()
+
+        def _dismiss(_e=None) -> None:
+            popup.destroy()
+            self._quick_popup = None
+
+        entry.bind("<Return>", _submit)
+        entry.bind("<Escape>", _dismiss)
+        popup.after(10, entry.focus_force)
 
     # ------------------------------------------------------------------
     # Settings dialog
