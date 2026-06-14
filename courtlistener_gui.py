@@ -892,32 +892,41 @@ class CourtListenerGUI:
         entry.bind("<Return>", _submit)
         entry.bind("<Escape>", _dismiss)
 
+        def _force_foreground(hwnd: int) -> None:
+            """Use Win32 API to force-steal foreground on Windows."""
+            import ctypes
+            user32 = ctypes.windll.user32
+            cur_thread = user32.GetCurrentThreadId()
+            fg_win = user32.GetForegroundWindow()
+            fg_thread = user32.GetWindowThreadProcessId(fg_win, None)
+            if fg_thread != cur_thread:
+                user32.AttachThreadInput(fg_thread, cur_thread, True)
+            user32.SetForegroundWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
+            if fg_thread != cur_thread:
+                user32.AttachThreadInput(fg_thread, cur_thread, False)
+
         def _grab_focus(attempt: int = 0) -> None:
             try:
                 popup.deiconify()
                 popup.lift()
-                # Wait until the override-redirect window is actually
-                # viewable before trying to take input focus — on X11
-                # focus_force() is a no-op on an unmapped window.
                 if not popup.winfo_viewable():
                     if attempt < 20:
                         popup.after(20, lambda: _grab_focus(attempt + 1))
                     return
-                # Direct all keyboard/mouse input to the popup so keys land
-                # in the entry even though the WM didn't manage this window.
-                try:
-                    popup.grab_set_global()
-                except tk.TclError:
+                # On Windows, Tk's focus_force cannot steal foreground from
+                # another process. Use the Win32 API to attach to the
+                # foreground thread and force our window to the front.
+                if sys.platform == "win32":
                     try:
-                        popup.grab_set()
-                    except tk.TclError:
+                        hwnd = int(popup.wm_frame(), 16)
+                        _force_foreground(hwnd)
+                    except Exception:
                         pass
                 popup.focus_force()
                 entry.focus_set()
                 entry.icursor(tk.END)
                 entry.selection_range(0, tk.END)
-                # The entry may still not hold keyboard focus on the first
-                # try (focus can land on the toplevel); retry until it does.
                 if popup.focus_get() is not entry and attempt < 20:
                     popup.after(20, lambda: _grab_focus(attempt + 1))
             except tk.TclError:
