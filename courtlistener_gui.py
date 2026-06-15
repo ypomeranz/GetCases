@@ -1169,6 +1169,8 @@ class CourtListenerGUI:
                 self._query_var.set(query)
                 self.root.deiconify()
                 self.root.lift()
+                if sys.platform == "win32":
+                    self._win_force_foreground(self.root)
                 self.root.focus_force()
                 self._query_entry.focus_set()
                 self._do_search()
@@ -1180,47 +1182,132 @@ class CourtListenerGUI:
         entry.bind("<Return>", _submit)
         entry.bind("<Escape>", _dismiss)
 
-        def _force_foreground(hwnd: int) -> None:
-            """Use Win32 API to force-steal foreground on Windows."""
-            import ctypes
-            user32 = ctypes.windll.user32
-            cur_thread = user32.GetCurrentThreadId()
-            fg_win = user32.GetForegroundWindow()
-            fg_thread = user32.GetWindowThreadProcessId(fg_win, None)
-            if fg_thread != cur_thread:
-                user32.AttachThreadInput(fg_thread, cur_thread, True)
-            user32.SetForegroundWindow(hwnd)
-            user32.BringWindowToTop(hwnd)
-            if fg_thread != cur_thread:
-                user32.AttachThreadInput(fg_thread, cur_thread, False)
-
         def _grab_focus(attempt: int = 0) -> None:
             try:
                 popup.deiconify()
                 popup.lift()
                 if not popup.winfo_viewable():
-                    if attempt < 20:
+                    if attempt < 25:
                         popup.after(20, lambda: _grab_focus(attempt + 1))
                     return
-                # On Windows, Tk's focus_force cannot steal foreground from
-                # another process. Use the Win32 API to attach to the
-                # foreground thread and force our window to the front.
+                # On Windows, Tk's focus_force cannot steal the foreground
+                # from another process (the OS foreground-lock blocks it),
+                # so go through the Win32 API on the real top-level HWND.
                 if sys.platform == "win32":
-                    try:
-                        hwnd = int(popup.wm_frame(), 16)
-                        _force_foreground(hwnd)
-                    except Exception:
-                        pass
+                    self._win_force_foreground(popup)
                 popup.focus_force()
-                entry.focus_set()
+                entry.focus_force()
                 entry.icursor(tk.END)
                 entry.selection_range(0, tk.END)
-                if popup.focus_get() is not entry and attempt < 20:
+                # The entry may not hold keyboard focus on the first try;
+                # retry until it does (or we run out of attempts).
+                if popup.focus_get() is not entry and attempt < 25:
                     popup.after(20, lambda: _grab_focus(attempt + 1))
             except tk.TclError:
                 pass
 
         popup.after(10, _grab_focus)
+
+    @staticmethod
+    def _win_force_foreground(popup: tk.Misc) -> bool:
+        """Force *popup* to the foreground on Windows, defeating the
+        foreground-lock that stops a background process from stealing focus.
+
+        Returns True if the window became the foreground window.  Several
+        Win32 quirks are handled here that the naive approach gets wrong:
+
+          * 64-bit window handles must be passed through ``wintypes.HWND``
+            argtypes or ctypes truncates them to 32 bits, corrupting the
+            handle so ``SetForegroundWindow`` silently fails.
+          * the real OS top-level window is obtained with ``GetAncestor``
+            from ``winfo_id`` (``wm_frame`` is unreliable on Windows).
+          * the system foreground-lock timeout is temporarily set to 0 so
+            the call is honored even though we're not the active app.
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return False
+
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            # Signatures — critical so 64-bit HWNDs survive the call.
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            user32.GetWindowThreadProcessId.argtypes = [
+                wintypes.HWND, ctypes.POINTER(wintypes.DWORD)
+            ]
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            user32.AttachThreadInput.argtypes = [
+                wintypes.DWORD, wintypes.DWORD, wintypes.BOOL
+            ]
+            user32.AttachThreadInput.restype = wintypes.BOOL
+            user32.BringWindowToTop.argtypes = [wintypes.HWND]
+            user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            user32.SetForegroundWindow.restype = wintypes.BOOL
+            user32.SetActiveWindow.argtypes = [wintypes.HWND]
+            user32.SetActiveWindow.restype = wintypes.HWND
+            user32.SetFocus.argtypes = [wintypes.HWND]
+            user32.SetFocus.restype = wintypes.HWND
+            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.GetAncestor.restype = wintypes.HWND
+            user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.IsIconic.argtypes = [wintypes.HWND]
+            user32.SystemParametersInfoW.argtypes = [
+                wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT
+            ]
+            user32.SystemParametersInfoW.restype = wintypes.BOOL
+
+            GA_ROOT = 2
+            SW_SHOW, SW_RESTORE = 5, 9
+            SPI_GETFGLOCK, SPI_SETFGLOCK = 0x2000, 0x2001
+            SPIF_SENDCHANGE = 0x0002
+
+            # winfo_id() can be a child wrapper; GetAncestor gives the
+            # actual OS top-level window SetForegroundWindow expects.
+            hwnd = user32.GetAncestor(wintypes.HWND(popup.winfo_id()), GA_ROOT)
+            if not hwnd:
+                hwnd = popup.winfo_id()
+
+            user32.ShowWindow(
+                hwnd, SW_RESTORE if user32.IsIconic(hwnd) else SW_SHOW
+            )
+
+            # Clear the foreground-lock timeout for the duration of the call.
+            old_timeout = wintypes.DWORD(0)
+            user32.SystemParametersInfoW(
+                SPI_GETFGLOCK, 0, ctypes.byref(old_timeout), 0
+            )
+            user32.SystemParametersInfoW(
+                SPI_SETFGLOCK, 0, ctypes.c_void_p(0), SPIF_SENDCHANGE
+            )
+
+            fg_win = user32.GetForegroundWindow()
+            fg_thread = user32.GetWindowThreadProcessId(fg_win, None)
+            our_thread = kernel32.GetCurrentThreadId()
+
+            attached = False
+            if fg_thread and fg_thread != our_thread:
+                attached = bool(
+                    user32.AttachThreadInput(fg_thread, our_thread, True)
+                )
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            user32.SetActiveWindow(hwnd)
+            user32.SetFocus(hwnd)
+            if attached:
+                user32.AttachThreadInput(fg_thread, our_thread, False)
+
+            # Restore the user's original foreground-lock timeout.
+            user32.SystemParametersInfoW(
+                SPI_SETFGLOCK, 0,
+                ctypes.c_void_p(old_timeout.value), SPIF_SENDCHANGE,
+            )
+            return bool(user32.GetForegroundWindow() == hwnd)
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Settings dialog
