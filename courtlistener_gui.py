@@ -450,6 +450,294 @@ def _strip_html(html: str) -> str:
     return text.strip()
 
 
+# CL opinion-type codes → OpinionPart kind
+_CL_TYPE_KIND: dict[str, str] = {
+    "010combined": "majority",
+    "015unamimous": "majority",
+    "020lead": "majority",
+    "025plurality": "majority",
+    "030concurrence": "concurrence",
+    "035concurrenceinpart": "concurrence",
+    "040dissent": "dissent",
+    "050addendum": "majority",
+    "060remittitur": "majority",
+    "070rehearing": "majority",
+    "080onthemerits": "majority",
+    "090onmotiontoamend": "majority",
+}
+
+
+def _parse_cl_html(html: str) -> "list[Block]":
+    """Parse CourtListener opinion HTML into Block/Span objects.
+
+    Similar to ``parse_opinion_blocks`` in the Scholar module, but adapted
+    for CourtListener's HTML structure.  Requires beautifulsoup4; returns
+    an empty list if it's not installed.
+    """
+    try:
+        from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+        from google_scholar import Block, Span, educate_quotes
+    except ImportError:
+        return []
+
+    _WS = re.compile(r"\s+")
+    _FMT_KEYS = ("italic", "bold", "underline", "small", "sup")
+    _H_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+    _BLOCK_TAGS = _H_TAGS | {
+        "p", "div", "blockquote", "center", "pre", "table", "tbody",
+        "thead", "tr", "ul", "ol", "li", "dl", "dt", "dd",
+    }
+    # CourtListener citation links look like /opinion/12345/case-name/
+    _CL_OPINION_RE = re.compile(r"/opinion/\d+/")
+
+    soup = BeautifulSoup(html, "html.parser")
+    for bad in soup.find_all(["script", "style"]):
+        bad.decompose()
+
+    blocks: list[Block] = []
+    cur: list[Span] = []
+
+    def emit(text: str, fmt: dict, *, link: str = "") -> None:
+        text = _WS.sub(" ", text)
+        if not text:
+            return
+        if not cur:
+            text = text.lstrip()
+            if not text:
+                return
+        elif cur[-1].text.endswith((" ", "\n")) and text.startswith(" "):
+            text = text.lstrip(" ")
+            if not text:
+                return
+        last = cur[-1] if cur else None
+        if (
+            last is not None
+            and link == last.link
+            and all(getattr(last, k) == fmt.get(k, False) for k in _FMT_KEYS)
+        ):
+            last.text += text
+        else:
+            cur.append(Span(
+                text=text, link=link,
+                **{k: fmt.get(k, False) for k in _FMT_KEYS},
+            ))
+
+    def flush(kind: str) -> None:
+        nonlocal cur
+        while cur and not cur[-1].text.strip():
+            cur.pop()
+        if cur:
+            cur[-1].text = cur[-1].text.rstrip()
+            blocks.append(Block(kind=kind, spans=cur))
+        cur = []
+
+    def walk(node: Tag, fmt: dict, kind: str, link: str = "") -> None:
+        for child in node.children:
+            if isinstance(child, Comment):
+                continue
+            if isinstance(child, NavigableString):
+                emit(str(child), fmt, link=link)
+                continue
+            if not isinstance(child, Tag):
+                continue
+            name = (child.name or "").lower()
+            if name == "br":
+                if cur:
+                    cur.append(Span(text="\n"))
+                continue
+            if name == "hr":
+                flush(kind)
+                continue
+            if name == "a":
+                href = child.get("href") or ""
+                if _CL_OPINION_RE.search(href):
+                    # Citation link — store as a link span so _insert_span
+                    # makes it clickable the same way Scholar links work.
+                    if not href.startswith("http"):
+                        href = "https://www.courtlistener.com" + href
+                    walk(child, fmt, kind, link=href)
+                    continue
+                walk(child, fmt, kind, link=link)
+                continue
+            if name in _BLOCK_TAGS:
+                flush(kind)
+                child_fmt = fmt
+                if name == "center":
+                    child_kind = "center"
+                elif name == "blockquote":
+                    child_kind = "blockquote"
+                elif name in _H_TAGS:
+                    child_kind = kind if kind == "center" else "heading"
+                    child_fmt = {**fmt, "bold": True}
+                else:
+                    child_kind = kind
+                walk(child, child_fmt, child_kind, link=link)
+                flush(child_kind)
+                continue
+            if name in ("i", "em", "cite"):
+                walk(child, {**fmt, "italic": True}, kind, link=link)
+            elif name in ("b", "strong"):
+                walk(child, {**fmt, "bold": True}, kind, link=link)
+            elif name == "u":
+                walk(child, {**fmt, "underline": True}, kind, link=link)
+            elif name == "small":
+                walk(child, {**fmt, "small": True}, kind, link=link)
+            elif name in ("sup", "sub"):
+                walk(child, {**fmt, "sup": True}, kind, link=link)
+            else:
+                walk(child, fmt, kind, link=link)
+
+    walk(soup, {}, "para")
+    flush("para")
+    try:
+        from google_scholar import _educate_block_quotes
+        for block in blocks:
+            _educate_block_quotes(block)
+    except ImportError:
+        pass
+    return blocks
+
+
+def _assemble_case_parts(
+    client, item: dict
+) -> "tuple[list[OpinionPart], list[Block], str, dict]":
+    """Fetch a case from CourtListener and build structured OpinionParts.
+
+    Returns (parts, all_blocks, plain_text, cluster_metadata).
+    """
+    try:
+        from google_scholar import Block, OpinionPart, Span, blocks_to_text
+    except ImportError:
+        return [], [], "", {}
+
+    cluster_id = item.get("cluster_id") or item.get("id")
+    cluster = client.get_cluster(
+        int(cluster_id),
+        fields="case_name,citations,judges,attorneys,syllabus,headnotes,"
+               "sub_opinions,date_filed,docket",
+    )
+
+    # --- Build header part from metadata ---
+    header_blocks: list[Block] = []
+    case_name = re.sub(
+        r"<[^>]+>", "",
+        cluster.get("case_name") or item.get("caseName")
+        or item.get("case_name") or "",
+    ).strip()
+    if case_name:
+        header_blocks.append(Block(kind="center", spans=[
+            Span(text=case_name, bold=True),
+        ]))
+
+    citations = cluster.get("citations") or []
+    cite_parts: list[str] = []
+    for c in citations:
+        if isinstance(c, dict):
+            vol = c.get("volume", "")
+            reporter = c.get("reporter", "")
+            page = c.get("page", "")
+            if vol and reporter and page:
+                cite_parts.append(f"{vol} {reporter} {page}")
+        elif isinstance(c, str) and c.strip():
+            cite_parts.append(c.strip())
+    if cite_parts:
+        header_blocks.append(Block(kind="center", spans=[
+            Span(text=", ".join(cite_parts)),
+        ]))
+
+    for field_name, label in [
+        ("judges", "Judges"),
+        ("attorneys", "Attorneys"),
+    ]:
+        val = (cluster.get(field_name) or "").strip()
+        if val:
+            val = _strip_html(val)
+        if val:
+            header_blocks.append(Block(kind="para", spans=[
+                Span(text=f"{label}: ", bold=True),
+                Span(text=val),
+            ]))
+
+    for field_name, label in [("syllabus", "Syllabus"), ("headnotes", "Headnotes")]:
+        val = (cluster.get(field_name) or "").strip()
+        if val:
+            parsed = _parse_cl_html(val)
+            if parsed:
+                header_blocks.append(Block(kind="heading", spans=[
+                    Span(text=label, bold=True),
+                ]))
+                header_blocks.extend(parsed)
+
+    parts: list[OpinionPart] = []
+    if header_blocks:
+        parts.append(OpinionPart(label="Header", kind="header", blocks=header_blocks))
+
+    # --- Sub-opinions ---
+    sub_urls = cluster.get("sub_opinions") or []
+    opinions: list[dict] = []
+    for url in sub_urls:
+        try:
+            op = client._get_url(
+                url,
+                {"fields": "ordering_key,type,author_str,per_curiam,"
+                           "html_with_citations,html,plain_text"},
+            )
+            opinions.append(op)
+        except Exception as exc:
+            print(f"[cl-parts] failed to fetch sub-opinion {url}: {exc}")
+
+    opinions.sort(key=lambda o: (
+        o.get("ordering_key") is None, o.get("ordering_key") or 0,
+    ))
+
+    all_blocks: list[Block] = list(header_blocks)
+
+    for op in opinions:
+        type_code = op.get("type") or ""
+        label = _OPINION_TYPE_LABELS.get(type_code, type_code or "Opinion")
+        kind = _CL_TYPE_KIND.get(type_code, "majority")
+
+        # Add author info to label
+        author = (op.get("author_str") or "").strip()
+        if op.get("per_curiam") and not author:
+            author = "Per Curiam"
+        if author:
+            label = f"{label} ({author})"
+
+        html_text = (
+            op.get("html_with_citations")
+            or op.get("html")
+            or ""
+        )
+        if html_text:
+            op_blocks = _parse_cl_html(html_text)
+        else:
+            plain = (op.get("plain_text") or "").strip()
+            if plain:
+                try:
+                    from google_scholar import educate_quotes
+                    plain = educate_quotes(plain)
+                except ImportError:
+                    pass
+                op_blocks = [
+                    Block(kind="para", spans=[Span(text=para.strip())])
+                    for para in re.split(r"\n{2,}", plain) if para.strip()
+                ]
+            else:
+                op_blocks = []
+
+        if op_blocks:
+            parts.append(OpinionPart(label=label, kind=kind, blocks=op_blocks))
+            all_blocks.extend(op_blocks)
+
+    try:
+        plain_text = blocks_to_text(all_blocks)
+    except Exception:
+        plain_text = ""
+
+    return parts, all_blocks, plain_text, cluster
+
+
 def _assemble_case_text(client, item: dict) -> str:
     """
     Build a plain-text representation of a case from CourtListener.
@@ -1928,15 +2216,42 @@ class CourtListenerGUI:
     ) -> None:
         self._restore_buttons()
         if result is None:
-            self._status_var.set("Google Scholar text unavailable.")
-            messagebox.showwarning(
-                "Scholar Text Unavailable",
-                "Could not find a Google Scholar opinion matching this case.\n\n"
-                + (f"({note})\n\n" if note else "")
-                + "Google may have blocked the request, the case may not be "
-                "indexed, or every candidate differed too much from the "
-                "CourtListener text.",
+            target_item = dict(item) if item else {}
+            has_cluster = bool(
+                target_item.get("cluster_id") or target_item.get("id")
             )
+            if not has_cluster:
+                self._status_var.set("Google Scholar text unavailable.")
+                messagebox.showwarning(
+                    "Scholar Text Unavailable",
+                    "Could not find a Google Scholar opinion matching this case."
+                    + (f"\n\n({note})" if note else ""),
+                )
+                return
+            self._status_var.set(
+                "Scholar unavailable — loading CourtListener text…"
+            )
+            self._scholar_btn.config(state="disabled")
+            client = self._get_client()
+            if client is None:
+                self._status_var.set("Google Scholar text unavailable.")
+                return
+
+            def run() -> None:
+                try:
+                    parts, blocks, plain, cluster = _assemble_case_parts(
+                        client, target_item,
+                    )
+                except Exception as exc:
+                    import traceback
+                    traceback.print_exc()
+                    parts, blocks, plain, cluster = [], [], "", {}
+                self.root.after(
+                    0, self._on_cl_fallback_ready,
+                    parts, blocks, plain, target_item, cl_text, note,
+                )
+
+            threading.Thread(target=run, daemon=True).start()
             return
 
         url, html = result
@@ -1945,6 +2260,26 @@ class CourtListenerGUI:
         )
         _ScholarTextWindow(
             self.root, self, url, html, item=item, cl_text=cl_text, note=note
+        )
+
+    def _on_cl_fallback_ready(
+        self, parts, blocks, plain, item, cl_text, note,
+    ) -> None:
+        self._restore_buttons()
+        if not parts and not blocks:
+            self._status_var.set("Google Scholar text unavailable.")
+            messagebox.showwarning(
+                "Scholar Text Unavailable",
+                "Could not find a Google Scholar opinion matching this case,\n"
+                "and CourtListener text could not be loaded either.\n\n"
+                + (f"({note})" if note else ""),
+            )
+            return
+        self._status_var.set("Loaded CourtListener text (Scholar unavailable).")
+        _ScholarTextWindow(
+            self.root, self, "", "",
+            item=item, cl_text=cl_text or plain, note=note,
+            cl_parts=parts, cl_blocks=blocks,
         )
 
     def _restore_buttons(self) -> None:
@@ -2774,14 +3109,32 @@ class _ScholarTextWindow:
         item: Optional[dict] = None,
         cl_text: Optional[str] = None,
         note: str = "",
+        cl_parts: Optional[list] = None,
+        cl_blocks: Optional[list] = None,
     ) -> None:
         self._app = app
         self._item = item or {}
         self._scholar_url = url
         self._note = note
-        self._blocks = parse_opinion_blocks(opinion_html)
-        self._scholar_text = blocks_to_text(self._blocks) or _strip_html(opinion_html)
-        self._parts = segment_blocks(self._blocks)
+        self._cl_primary = cl_parts is not None and not opinion_html
+        if self._cl_primary:
+            # Opened as a CourtListener-primary window (Scholar failed).
+            self._blocks = cl_blocks or []
+            try:
+                self._scholar_text = blocks_to_text(self._blocks)
+            except Exception:
+                self._scholar_text = cl_text or ""
+            self._parts = cl_parts or []
+            self._cl_parts = cl_parts or []
+            self._cl_blocks = cl_blocks or []
+        else:
+            self._blocks = parse_opinion_blocks(opinion_html)
+            self._scholar_text = (
+                blocks_to_text(self._blocks) or _strip_html(opinion_html)
+            )
+            self._parts = segment_blocks(self._blocks)
+            self._cl_parts = None
+            self._cl_blocks = None
         self._current_part: Optional[int] = None  # None = full opinion
         # Page in effect at the start of each part, for pin cites when a
         # single part is displayed (no preceding star marker on screen).
@@ -2796,18 +3149,26 @@ class _ScholarTextWindow:
                         if m:
                             page = int(m.group(0))
         self._cl_text: Optional[str] = cl_text
-        self._mode = "scholar"
+        self._mode = "courtlistener" if self._cl_primary else "scholar"
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
         self._fonts: dict[str, tkfont.Font] = {}
         self._bb = self._compute_bluebook_parts()
 
         self._win = tk.Toplevel(parent)
-        self._win.title(self._bb["name"] or "Google Scholar Opinion Text")
+        self._win.title(
+            self._bb["name"] or (
+                "CourtListener Opinion Text" if self._cl_primary
+                else "Google Scholar Opinion Text"
+            )
+        )
         self._win.geometry("860x680")
         self._win.minsize(500, 300)
         self._build_ui()
-        self._render_scholar()
+        if self._cl_primary:
+            self._render_cl_blocks()
+        else:
+            self._render_scholar()
 
     # ------------------------------------------------------------------
     # UI
@@ -3181,9 +3542,82 @@ class _ScholarTextWindow:
     def _on_part_selected(self, _event=None) -> None:
         idx = self._part_combo.current()
         self._current_part = None if idx <= 0 else idx - 1
-        self._render_scholar()  # selecting a part always shows the Scholar text
+        if self._cl_primary or self._mode == "courtlistener":
+            self._render_cl_blocks()
+        else:
+            self._render_scholar()
+
+    def _render_cl_blocks(self) -> None:
+        """Render CourtListener opinion parts with full block formatting."""
+        parts = self._cl_parts or self._parts
+        # Update part selector to reflect CL parts
+        part_values = ["Full opinion"] + [
+            f"{i + 1}. {p.label}" for i, p in enumerate(parts)
+        ]
+        self._part_combo.config(values=part_values)
+        if self._current_part is None:
+            self._part_combo.current(0)
+        txt = self._text
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        self._link_actions.clear()
+        self._fnref_pages: dict[str, Optional[int]] = {}
+        self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
+        self._part_regions: list[tuple[str, str, int]] = []
+        self._fn_ref_pos: dict[str, str] = {}
+        self._fn_def_pos: dict[str, str] = {}
+        self._page_pos: dict[int, str] = {}
+        self._cur_page: Optional[int] = None
+        if not parts:
+            self._insert_plain_with_links(self._cl_text or "(no text)", ())
+        else:
+            if self._current_part is None:
+                shown = list(enumerate(parts))
+            else:
+                shown = [(self._current_part, parts[self._current_part])]
+            for pi, part in shown:
+                part_start = txt.index("end-1c")
+                part_tag = self._PART_COLOR_TAGS.get(part.kind)
+                for block in part.blocks:
+                    self._insert_block(block, part_tag)
+                if part.footnotes:
+                    fnhead_tags = ("fnhead",) + ((part_tag,) if part_tag else ())
+                    txt.insert("end", "Footnotes\n\n", fnhead_tags)
+                    self._render_footnotes(part.footnotes, part_tag)
+                self._part_regions.append((part_start, txt.index("end-1c"), pi))
+        txt.config(state="disabled")
+        self._mode = "courtlistener"
+        self._source_var.set("CourtListener (REST API)")
+        toggle_label = (
+            "Google Scholar Text" if self._scholar_url else "Scholar unavailable"
+        )
+        self._toggle_btn.config(
+            text=toggle_label,
+            state="normal" if self._scholar_url else "disabled",
+        )
+        if len(parts) > 1:
+            self._part_combo.config(state="readonly")
+        else:
+            self._part_combo.config(state="disabled")
+        if self._current_part is None:
+            self._view_label_var.set("Full opinion")
+            self._view_label.config(foreground="black")
+        else:
+            part = parts[self._current_part]
+            self._view_label_var.set(part.label)
+            self._view_label.config(
+                foreground=self._PART_LABEL_COLORS.get(part.kind, "black")
+            )
+        char_count = len(self._cl_text or self._scholar_text or "")
+        self._status_var.set(
+            f"{char_count:,} characters | CourtListener version"
+        )
+        self._finder.refresh()
 
     def _show_courtlistener(self) -> None:
+        if self._cl_parts or self._cl_blocks:
+            self._render_cl_blocks()
+            return
         txt = self._text
         txt.config(state="normal")
         txt.delete("1.0", "end")
@@ -3881,11 +4315,19 @@ class _ScholarTextWindow:
         if kind in ("usc", "cfr"):
             self._open_statute(kind, value)
             return
-        fetcher = self._app._get_scholar()
-        if fetcher is None:
+        # CourtListener opinion URL: fetch structured text from CL directly
+        if kind == "url" and "courtlistener.com/opinion/" in value:
+            self._follow_cl_link(value)
             return
+        fetcher = self._app._get_scholar()
         cite, _, pin = value.partition("@") if kind == "cite" else (value, "", "")
         label = cite if kind == "cite" else "cited case"
+        if fetcher is None:
+            if kind == "cite":
+                self._follow_cite_via_cl(cite, pin)
+            else:
+                self._status_var.set("Google Scholar is not available.")
+            return
         self._status_var.set(f"Fetching {label} from Google Scholar…")
 
         def run() -> None:
@@ -3897,10 +4339,83 @@ class _ScholarTextWindow:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _follow_cl_link(self, url: str) -> None:
+        """Open a CourtListener opinion URL with structured block rendering."""
+        client = self._app._get_client()
+        if client is None:
+            return
+        m = re.search(r"/opinion/(\d+)/", url)
+        if not m:
+            return
+        opinion_id = m.group(1)
+        self._status_var.set("Fetching opinion from CourtListener…")
+
+        def run() -> None:
+            try:
+                op = client.get_opinion(
+                    int(opinion_id),
+                    fields="cluster,html_with_citations,html,plain_text",
+                )
+                cluster_url = op.get("cluster") or ""
+                cm = re.search(r"/(\d+)/", cluster_url)
+                if cm:
+                    item = {"cluster_id": cm.group(1)}
+                    parts, blocks, plain, cluster = _assemble_case_parts(
+                        client, item,
+                    )
+                    self._post(self._on_cl_link_ready, parts, blocks, plain, item)
+                else:
+                    self._post(self._on_cl_link_error, "Could not resolve cluster.")
+            except Exception as exc:
+                self._post(self._on_cl_link_error, str(exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_cl_link_ready(self, parts, blocks, plain, item) -> None:
+        self._status_var.set("Cited case loaded from CourtListener.")
+        _ScholarTextWindow(
+            self._win, self._app, "", "",
+            item=item, cl_text=plain,
+            cl_parts=parts, cl_blocks=blocks,
+        )
+
+    def _on_cl_link_error(self, msg: str) -> None:
+        self._status_var.set(f"CourtListener: {msg}")
+
+    def _follow_cite_via_cl(self, cite: str, pin: str = "") -> None:
+        """Follow a citation link using CourtListener when Scholar is unavailable."""
+        client = self._app._get_client()
+        if client is None:
+            return
+        self._status_var.set(f"Fetching {cite} from CourtListener…")
+
+        def run() -> None:
+            try:
+                data = client.search(f'"{cite}"', type="o", page_size=1)
+                results = data.get("results") or []
+                if not results:
+                    self._post(self._on_cl_link_error, f"No match for {cite!r}.")
+                    return
+                target = results[0]
+                parts, blocks, plain, cluster = _assemble_case_parts(
+                    client, target,
+                )
+                self._post(self._on_cl_link_ready, parts, blocks, plain, target)
+            except Exception as exc:
+                self._post(self._on_cl_link_error, str(exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _on_link_ready(self, result: Optional[tuple[str, str]],
                        cite: str = "", pin: str = "") -> None:
         if not result:
-            self._status_var.set("Google Scholar: cited case not found (or blocked).")
+            # Scholar failed — try CourtListener as fallback
+            if cite:
+                self._follow_cite_via_cl(cite, pin)
+            else:
+                self._status_var.set(
+                    "Google Scholar: cited case not found (or blocked)."
+                )
             return
         url, html = result
         self._status_var.set("Cited case loaded.")
@@ -3941,7 +4456,12 @@ class _ScholarTextWindow:
 
     def _toggle_source(self) -> None:
         if self._mode == "courtlistener":
+            if self._cl_primary and not self._scholar_url:
+                return
             self._render_scholar()
+            return
+        if self._cl_parts:
+            self._render_cl_blocks()
             return
         if self._cl_text is not None:
             self._show_courtlistener()
@@ -3958,8 +4478,6 @@ class _ScholarTextWindow:
             try:
                 target = item
                 if not (target.get("cluster_id") or target.get("id")):
-                    # Opened from a citation link — locate the case on
-                    # CourtListener by its citation.
                     if not cite:
                         raise RuntimeError(
                             "No citation available to locate this case on CourtListener."
@@ -3972,16 +4490,24 @@ class _ScholarTextWindow:
                     if not results:
                         raise RuntimeError(f"No CourtListener match for {cite!r}.")
                     target = results[0]
-                text = _assemble_case_text(client, target)
-                self._post(self._on_cl_ready, text)
+                parts, blocks, plain, cluster = _assemble_case_parts(
+                    client, target,
+                )
+                text = _assemble_case_text(client, target) if not plain else plain
+                self._post(self._on_cl_ready, text, parts, blocks)
             except Exception as exc:
                 self._post(self._on_cl_error, str(exc))
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _on_cl_ready(self, text: str) -> None:
+    def _on_cl_ready(self, text: str, parts=None, blocks=None) -> None:
         self._cl_text = text
-        self._show_courtlistener()
+        if parts:
+            self._cl_parts = parts
+            self._cl_blocks = blocks
+            self._render_cl_blocks()
+        else:
+            self._show_courtlistener()
 
     def _on_cl_error(self, msg: str) -> None:
         self._toggle_btn.config(state="normal")
