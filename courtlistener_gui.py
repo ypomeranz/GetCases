@@ -1456,7 +1456,16 @@ class CourtListenerGUI:
                         if f is None:
                             return
                         def run():
-                            res = f.fetch_by_url(sr.url)
+                            try:
+                                res = f.fetch_by_url(sr.url)
+                            except Exception as exc:
+                                def fail(e=exc):
+                                    messagebox.showerror(
+                                        "Google Scholar Error",
+                                        f"Could not load “{sr.title}”.\n\n{e}",
+                                    )
+                                self._post_root(fail)
+                                return
                             if res:
                                 url, html = res
                                 def show():
@@ -1501,15 +1510,24 @@ class CourtListenerGUI:
                 date = item.get("dateFiled") or item.get("date_filed") or ""
                 year = date[:4] if len(date) >= 4 else ""
 
-                def make_opener(it=item):
+                def make_opener(it=item, nm=case_name):
                     def open_it():
                         c = self._get_client()
                         if c is None:
                             return
                         def run():
-                            parts, blocks, plain, cluster = (
-                                _assemble_case_parts(c, it)
-                            )
+                            try:
+                                parts, blocks, plain, cluster = (
+                                    _assemble_case_parts(c, it)
+                                )
+                            except Exception as exc:
+                                def fail(e=exc):
+                                    messagebox.showerror(
+                                        "CourtListener Error",
+                                        f"Could not load “{nm}”.\n\n{e}",
+                                    )
+                                self._post_root(fail)
+                                return
                             if parts or plain:
                                 def show():
                                     _ScholarTextWindow(
