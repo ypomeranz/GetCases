@@ -1462,7 +1462,7 @@ class CourtListenerGUI:
                                 def fail(e=exc):
                                     messagebox.showerror(
                                         "Google Scholar Error",
-                                        f"Could not load “{sr.title}”.\n\n{e}",
+                                        f'Could not load "{sr.title}".\n\n{e}',
                                     )
                                 self._post_root(fail)
                                 return
@@ -1530,10 +1530,71 @@ class CourtListenerGUI:
 
                 def make_opener(it=item, nm=case_name):
                     def open_it():
+                        fetcher = (
+                            self._get_scholar()
+                            if _SCHOLAR_AVAILABLE else None
+                        )
                         c = self._get_client()
-                        if c is None:
-                            return
+
                         def run():
+                            # Try Google Scholar first, same as the main window
+                            if fetcher is not None:
+                                primary = _pick_citation(
+                                    it.get("citation", [])
+                                )
+                                quick_result = None
+                                if primary:
+                                    try:
+                                        quick_result = fetcher.fetch_by_citation(
+                                            primary
+                                        )
+                                    except Exception:
+                                        pass
+                                if quick_result:
+                                    url, html = quick_result
+                                    def show_quick():
+                                        win = _ScholarTextWindow(
+                                            self.root, self, url, html,
+                                            item=it,
+                                            note="verifying against CourtListener…",
+                                        )
+                                        def verify():
+                                            self._spotlight_verify_scholar(
+                                                win, url, html, it,
+                                                fetcher, c,
+                                            )
+                                        threading.Thread(
+                                            target=verify, daemon=True,
+                                        ).start()
+                                    self._post_root(show_quick)
+                                    return
+                                # Quick fetch failed — try full search
+                                try:
+                                    result, cl_text, note = _find_scholar_for_item(
+                                        c, fetcher, it, lambda m: None,
+                                    )
+                                except Exception:
+                                    result, cl_text, note = None, None, ""
+                                if result:
+                                    s_url, s_html = result
+                                    def show_full():
+                                        _ScholarTextWindow(
+                                            self.root, self, s_url, s_html,
+                                            item=it, cl_text=cl_text,
+                                            note=note,
+                                        )
+                                    self._post_root(show_full)
+                                    return
+
+                            # Scholar unavailable or failed — fall back to CL
+                            if c is None:
+                                def fail_no():
+                                    messagebox.showerror(
+                                        "Error",
+                                        f'Could not load "{nm}".',
+                                    )
+                                self._post_root(fail_no)
+                                return
                             try:
                                 parts, blocks, plain, cluster = (
                                     _assemble_case_parts(c, it)
@@ -1542,7 +1603,7 @@ class CourtListenerGUI:
                                 def fail(e=exc):
                                     messagebox.showerror(
                                         "CourtListener Error",
-                                        f"Could not load “{nm}”.\n\n{e}",
+                                        f'Could not load "{nm}".\n\n{e}',
                                     )
                                 self._post_root(fail)
                                 return
@@ -2805,6 +2866,47 @@ class CourtListenerGUI:
                 f"The text is displayed but may be for a different case.",
                 parent=win._win,
             )
+
+    def _spotlight_verify_scholar(
+        self, win, url: str, html: str, item: dict, fetcher, client,
+    ) -> None:
+        """Background verification for Scholar text opened from the spotlight.
+
+        Same logic as ``_on_scholar_quick_show``'s verify thread, but
+        self-contained — doesn't touch the main window's status bar or
+        buttons.
+        """
+        cluster_id = item.get("cluster_id") or item.get("id")
+        vkey = f"verified:cluster:{cluster_id}" if cluster_id else ""
+        cl_text: Optional[str] = None
+        if client is not None and cluster_id:
+            try:
+                cl_text = _assemble_case_text(client, item)
+            except Exception:
+                pass
+        if cl_text is None:
+            self.root.after(0, self._on_verify_done, win, True,
+                            url, html, cl_text, None, vkey, fetcher)
+            return
+        sim = text_similarity(
+            blocks_to_text(parse_opinion_blocks(html)), cl_text,
+        )
+        if sim >= _SCHOLAR_MATCH_THRESHOLD:
+            if vkey:
+                fetcher.put_cached(vkey, url, html)
+            self.root.after(0, self._on_verify_done, win, True,
+                            url, html, cl_text, sim, vkey, fetcher)
+            return
+        try:
+            result, cl_text2, note = _find_scholar_for_item(
+                client, fetcher, item, lambda m: None,
+            )
+        except Exception:
+            result = None
+            cl_text2 = cl_text
+        self.root.after(0, self._on_verify_done, win, False,
+                        url, html, cl_text2 or cl_text, sim,
+                        vkey, fetcher, result)
 
     def _on_scholar_result(
         self,
