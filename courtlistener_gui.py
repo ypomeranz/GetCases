@@ -882,9 +882,11 @@ class CourtListenerGUI:
 
         self._quick_popup: Optional[tk.Toplevel] = None
         self._hotkey_listener = None
+        self._root_hidden = False
 
         self._build_ui()
         self._setup_global_hotkey()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1105,6 +1107,30 @@ class CourtListenerGUI:
 
 
     # ------------------------------------------------------------------
+    # Window lifecycle — hide on close, keep hotkey alive
+    # ------------------------------------------------------------------
+
+    def _on_close_window(self) -> None:
+        """Hide the main window instead of destroying it so the global
+        hotkey keeps working.  The process quits when the user presses
+        'q' in the terminal (handled by main())."""
+        self.root.withdraw()
+        self._root_hidden = True
+        if _HOTKEY_AVAILABLE and self._hotkey_listener is not None:
+            print(
+                "\nWindow closed — Ctrl+Space is still active.\n"
+                "Press 'q' + Enter in this terminal to quit."
+            )
+        else:
+            self.root.destroy()
+
+    def _ensure_root_exists(self) -> None:
+        """Make sure the root window is usable — show it if it was hidden."""
+        if self._root_hidden:
+            self.root.deiconify()
+            self._root_hidden = False
+
+    # ------------------------------------------------------------------
     # Global hotkey (Ctrl+Space / Cmd+Space) → quick search popup
     # ------------------------------------------------------------------
 
@@ -1163,17 +1189,49 @@ class CourtListenerGUI:
 
         def _submit(_e=None) -> None:
             query = entry_var.get().strip()
+            if not query:
+                return
             popup.destroy()
             self._quick_popup = None
-            if query:
-                self._query_var.set(query)
-                self.root.deiconify()
-                self.root.lift()
-                if sys.platform == "win32":
-                    self._win_force_foreground(self.root)
-                self.root.focus_force()
-                self._query_entry.focus_set()
-                self._do_search()
+
+            # 1. Statute / regulation: "42 USC 1983(b)", "29 CFR 1614.105"
+            statute = _parse_statute_query(query)
+            if statute:
+                _fetch_statute_window(
+                    self.root, statute[0], statute[1],
+                    lambda s: None,
+                )
+                return
+
+            # 2. Case citation: "365 U.S. 167" or "Monroe v. Pape, 365 U.S. 167, 171"
+            parsed = _parse_citation_line(query)
+            if parsed:
+                name, cite, pin = parsed
+                fetcher = (
+                    self._get_scholar() if _SCHOLAR_AVAILABLE else None
+                )
+                client = (
+                    self._get_client()
+                    if self._token_var.get().strip() else None
+                )
+                if fetcher is not None or client is not None:
+                    def run() -> None:
+                        self._try_open_citation(
+                            name, cite, pin, fetcher, client,
+                        )
+                    threading.Thread(target=run, daemon=True).start()
+                    return
+
+            # 3. Fallback: full-text search in the main window
+            self._ensure_root_exists()
+            self.root.deiconify()
+            self.root.lift()
+            if sys.platform == "win32":
+                self._win_force_foreground(self.root)
+            self.root.focus_force()
+            self._query_entry.focus_set()
+            self._query_var.set(query)
+            self._do_search()
 
         def _dismiss(_e=None) -> None:
             popup.destroy()
@@ -1360,17 +1418,17 @@ class CourtListenerGUI:
                     results = data.get("results") or []
                 if results:
                     target = results[0]
-                    text = _assemble_case_text(client, target)
-                    if text.strip():
-
+                    parts, blocks, plain, cluster = _assemble_case_parts(
+                        client, target,
+                    )
+                    if parts or plain:
                         def open_cl() -> None:
                             try:
-                                w = _ScholarTextWindow(
+                                _ScholarTextWindow(
                                     self.root, self, "", "",
-                                    item=target, cl_text=text)
-                                w._show_courtlistener()
-                                # nothing to toggle to — no Scholar text
-                                w._toggle_btn.config(state="disabled")
+                                    item=target, cl_text=plain,
+                                    cl_parts=parts, cl_blocks=blocks,
+                                )
                             except tk.TclError:
                                 pass
 
@@ -5774,7 +5832,25 @@ class _CitingOpinionsWindow:
 
 def main() -> None:
     root = tk.Tk()
-    CourtListenerGUI(root)
+    app = CourtListenerGUI(root)
+
+    if _HOTKEY_AVAILABLE and app._hotkey_listener is not None:
+        # A background thread watches stdin so the user can type 'q' to
+        # quit even after the main window has been closed (withdrawn).
+        def _watch_stdin() -> None:
+            try:
+                for line in sys.stdin:
+                    if line.strip().lower() == "q":
+                        try:
+                            root.after(0, root.destroy)
+                        except Exception:
+                            pass
+                        return
+            except Exception:
+                pass
+
+        threading.Thread(target=_watch_stdin, daemon=True).start()
+
     root.mainloop()
 
 
