@@ -1222,16 +1222,8 @@ class CourtListenerGUI:
                     threading.Thread(target=run, daemon=True).start()
                     return
 
-            # 3. Fallback: full-text search in the main window
-            self._ensure_root_exists()
-            self.root.deiconify()
-            self.root.lift()
-            if sys.platform == "win32":
-                self._win_force_foreground(self.root)
-            self.root.focus_force()
-            self._query_entry.focus_set()
-            self._query_var.set(query)
-            self._do_search()
+            # 3. Fallback: show spotlight dropdown with search results
+            self._show_spotlight_dropdown(popup, border, entry, query)
 
         def _dismiss(_e=None) -> None:
             popup.destroy()
@@ -1265,6 +1257,275 @@ class CourtListenerGUI:
                 pass
 
         popup.after(10, _grab_focus)
+
+    def _show_spotlight_dropdown(
+        self, popup: tk.Toplevel, border: tk.Frame,
+        entry: tk.Entry, query: str,
+    ) -> None:
+        """Expand the popup into a spotlight-style dropdown with streaming
+        search results from Google Scholar and CourtListener."""
+
+        # Resize popup to accommodate results
+        pw = 580
+        row_h = 52
+        max_rows = 6
+        header_h = 48
+        dropdown_h = row_h * max_rows + 28  # extra for status label
+        sx = popup.winfo_screenwidth()
+        sy = popup.winfo_screenheight()
+        popup.geometry(
+            f"{pw}x{header_h + dropdown_h}"
+            f"+{(sx - pw) // 2}+{sy // 3}"
+        )
+
+        # Results frame below the search bar
+        results_frame = tk.Frame(border, bg="#f0f0f0")
+        results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
+
+        # Tracking state
+        result_rows: list[dict] = []
+        selected_idx = [-1]  # mutable via closure
+
+        def _add_result(court_id: str, name: str, cite: str, year: str,
+                        source_label: str, open_fn) -> None:
+            try:
+                if not popup.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+
+            idx = len(result_rows)
+            if idx >= max_rows:
+                return
+
+            row = tk.Frame(results_frame, bg="#ffffff", padx=6, pady=4,
+                           cursor="hand2")
+            row.pack(fill="x", padx=4, pady=(2, 0))
+
+            court_abbr = _COURT_BLUEBOOK.get(
+                court_id, court_id.upper() if court_id else "?"
+            )
+            if court_id == "scotus":
+                court_abbr = "SCOTUS"
+
+            # Court badge on the left
+            badge = tk.Label(
+                row, text=court_abbr, bg="#3a5a8c", fg="#ffffff",
+                font=("TkDefaultFont", 10, "bold"),
+                padx=6, pady=2, anchor="center", width=8,
+            )
+            badge.pack(side="left", padx=(0, 8))
+
+            # Text on the right
+            text_frame = tk.Frame(row, bg="#ffffff")
+            text_frame.pack(side="left", fill="x", expand=True)
+
+            # Truncate name for display
+            display_name = name[:80] + ("…" if len(name) > 80 else "")
+            tk.Label(
+                text_frame, text=display_name, bg="#ffffff", fg="#222222",
+                font=("TkDefaultFont", 10), anchor="w",
+            ).pack(fill="x")
+
+            detail = f"{cite}" if cite else ""
+            if year:
+                detail = f"{detail} ({year})" if detail else f"({year})"
+            detail_suffix = f"  — {source_label}" if source_label else ""
+            tk.Label(
+                text_frame, text=detail + detail_suffix, bg="#ffffff",
+                fg="#888888", font=("TkDefaultFont", 8), anchor="w",
+            ).pack(fill="x")
+
+            entry_data = {
+                "row": row, "open_fn": open_fn, "badge": badge,
+                "text_frame": text_frame,
+            }
+            result_rows.append(entry_data)
+
+            def on_click(_e=None) -> None:
+                popup.destroy()
+                self._quick_popup = None
+                open_fn()
+
+            for widget in (row, badge, text_frame):
+                widget.bind("<Button-1>", on_click)
+            for child in text_frame.winfo_children():
+                child.bind("<Button-1>", on_click)
+
+        def _highlight(idx: int) -> None:
+            for i, r in enumerate(result_rows):
+                bg = "#d0e0f0" if i == idx else "#ffffff"
+                r["row"].config(bg=bg)
+                r["text_frame"].config(bg=bg)
+                for child in r["text_frame"].winfo_children():
+                    try:
+                        child.config(bg=bg)
+                    except tk.TclError:
+                        pass
+
+        def _on_key(event) -> None:
+            if not result_rows:
+                return
+            if event.keysym == "Down":
+                selected_idx[0] = min(selected_idx[0] + 1,
+                                      len(result_rows) - 1)
+                _highlight(selected_idx[0])
+            elif event.keysym == "Up":
+                selected_idx[0] = max(selected_idx[0] - 1, 0)
+                _highlight(selected_idx[0])
+            elif event.keysym == "Return":
+                if 0 <= selected_idx[0] < len(result_rows):
+                    popup.destroy()
+                    self._quick_popup = None
+                    result_rows[selected_idx[0]]["open_fn"]()
+
+        entry.bind("<Down>", _on_key)
+        entry.bind("<Up>", _on_key)
+        # Override Return to select from dropdown once results exist
+        def _entry_return(_e=None) -> None:
+            if result_rows and selected_idx[0] >= 0:
+                _on_key(type("E", (), {"keysym": "Return"})())
+            else:
+                # If Enter is pressed again with no selection, go to main window
+                popup.destroy()
+                self._quick_popup = None
+                self._ensure_root_exists()
+                self.root.deiconify()
+                self.root.lift()
+                if sys.platform == "win32":
+                    self._win_force_foreground(self.root)
+                self.root.focus_force()
+                self._query_entry.focus_set()
+                self._query_var.set(query)
+                self._do_search()
+        entry.bind("<Return>", _entry_return)
+
+        # Status label
+        status_lbl = tk.Label(
+            results_frame, text="Searching…", bg="#f0f0f0", fg="#999999",
+            font=("TkDefaultFont", 8), anchor="w",
+        )
+        status_lbl.pack(fill="x", padx=8, pady=(4, 4))
+        search_done = [0]  # track how many searches completed
+
+        def _update_status() -> None:
+            try:
+                if not popup.winfo_exists():
+                    return
+                n = len(result_rows)
+                if search_done[0] >= 2:
+                    status_lbl.config(
+                        text=f"{n} results" if n else "No results found"
+                    )
+                else:
+                    status_lbl.config(text=f"{n} results so far…")
+            except tk.TclError:
+                pass
+
+        # Launch Scholar and CL searches in parallel
+        def scholar_search() -> None:
+            if not _SCHOLAR_AVAILABLE:
+                search_done[0] += 1
+                self.root.after(0, _update_status)
+                return
+            fetcher = self._get_scholar()
+            if fetcher is None:
+                search_done[0] += 1
+                self.root.after(0, _update_status)
+                return
+            try:
+                results = fetcher.search_cases(query, limit=3)
+            except Exception:
+                results = []
+            for r in results[:3]:
+                court_id = _scholar_source_to_court_id(r.source)
+                year = _scholar_source_year(r.source)
+                # Extract citation from snippet if possible
+                cite = ""
+                m = _TEXT_CITE_RE.search(r.title + " " + r.snippet)
+                if m:
+                    cite = re.sub(r"\s+", " ", m.group(0))
+
+                def make_opener(sr=r):
+                    def open_it():
+                        f = self._get_scholar()
+                        if f is None:
+                            return
+                        def run():
+                            res = f.fetch_by_url(sr.url)
+                            if res:
+                                url, html = res
+                                def show():
+                                    _ScholarTextWindow(
+                                        self.root, self, url, html,
+                                        item=None,
+                                    )
+                                self._post_root(show)
+                        threading.Thread(target=run, daemon=True).start()
+                    return open_it
+
+                self.root.after(
+                    0, _add_result, court_id, r.title, cite, year,
+                    "Scholar", make_opener(),
+                )
+            search_done[0] += 1
+            self.root.after(0, _update_status)
+
+        def cl_search() -> None:
+            client = (
+                self._get_client()
+                if self._token_var.get().strip() else None
+            )
+            if client is None:
+                search_done[0] += 1
+                self.root.after(0, _update_status)
+                return
+            try:
+                data = client.search(query, type="o", page_size=3)
+                results = data.get("results") or []
+            except Exception:
+                results = []
+            for item in results[:3]:
+                case_name = re.sub(
+                    r"<[^>]+>", "",
+                    item.get("caseName") or item.get("case_name") or "",
+                ).strip()
+                court_id = str(
+                    item.get("court_id") or item.get("court") or ""
+                ).strip().lower()
+                cite_str = _pick_citation(item.get("citation", []))
+                date = item.get("dateFiled") or item.get("date_filed") or ""
+                year = date[:4] if len(date) >= 4 else ""
+
+                def make_opener(it=item):
+                    def open_it():
+                        c = self._get_client()
+                        if c is None:
+                            return
+                        def run():
+                            parts, blocks, plain, cluster = (
+                                _assemble_case_parts(c, it)
+                            )
+                            if parts or plain:
+                                def show():
+                                    _ScholarTextWindow(
+                                        self.root, self, "", "",
+                                        item=it, cl_text=plain,
+                                        cl_parts=parts, cl_blocks=blocks,
+                                    )
+                                self._post_root(show)
+                        threading.Thread(target=run, daemon=True).start()
+                    return open_it
+
+                self.root.after(
+                    0, _add_result, court_id, case_name, cite_str, year,
+                    "CourtListener", make_opener(),
+                )
+            search_done[0] += 1
+            self.root.after(0, _update_status)
+
+        threading.Thread(target=scholar_search, daemon=True).start()
+        threading.Thread(target=cl_search, daemon=True).start()
 
     @staticmethod
     def _win_force_foreground(popup: tk.Misc) -> bool:
@@ -2336,21 +2597,174 @@ class CourtListenerGUI:
         self._search_btn.config(state="disabled")
         self._status_var.set("Searching Google Scholar…")
 
+        cluster_id = item.get("cluster_id") or item.get("id")
+        vkey = f"verified:cluster:{cluster_id}" if cluster_id else ""
+
+        # Check verified cache first — if found, open immediately
+        if vkey:
+            cached = fetcher.get_cached(vkey)
+            if cached:
+                self._restore_buttons()
+                self._status_var.set("Scholar text loaded (cached).")
+                _ScholarTextWindow(
+                    self.root, self, cached[0], cached[1],
+                    item=item, note="verified match (cached)",
+                )
+                return
+
         def status_cb(msg: str) -> None:
             self.root.after(0, self._status_var.set, msg)
 
         def run() -> None:
-            try:
-                result, cl_text, note = _find_scholar_for_item(
-                    client, fetcher, item, status_cb
+            # Step 1: Quick fetch — get the first Scholar result fast
+            primary = _pick_citation(item.get("citation", []))
+            quick_result = None
+            if primary:
+                try:
+                    quick_result = fetcher.fetch_by_citation(primary)
+                except Exception:
+                    pass
+
+            if quick_result:
+                # Show the result immediately (unverified)
+                url, html = quick_result
+                self.root.after(
+                    0, self._on_scholar_quick_show,
+                    url, html, item, fetcher, client,
                 )
-            except Exception as exc:
-                import traceback
-                traceback.print_exc()
-                result, cl_text, note = None, None, str(exc)
-            self.root.after(0, self._on_scholar_result, result, item, cl_text, note)
+            else:
+                # No quick result — fall through to the full search
+                try:
+                    result, cl_text, note = _find_scholar_for_item(
+                        client, fetcher, item, status_cb,
+                    )
+                except Exception as exc:
+                    import traceback
+                    traceback.print_exc()
+                    result, cl_text, note = None, None, str(exc)
+                self.root.after(
+                    0, self._on_scholar_result, result, item, cl_text, note,
+                )
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _on_scholar_quick_show(
+        self, url: str, html: str, item: dict,
+        fetcher, client,
+    ) -> None:
+        """Open the Scholar text immediately, then verify in background."""
+        self._restore_buttons()
+        self._status_var.set("Scholar text loaded — verifying…")
+        win = _ScholarTextWindow(
+            self.root, self, url, html, item=item,
+            note="verifying against CourtListener…",
+        )
+
+        def verify() -> None:
+            cluster_id = item.get("cluster_id") or item.get("id")
+            vkey = f"verified:cluster:{cluster_id}" if cluster_id else ""
+            cl_text: Optional[str] = None
+            if client is not None and cluster_id:
+                try:
+                    cl_text = _assemble_case_text(client, item)
+                except Exception:
+                    pass
+            if cl_text is None:
+                # Can't verify — accept what we have
+                self.root.after(0, self._on_verify_done, win, True,
+                                url, html, cl_text, None, vkey, fetcher)
+                return
+            sim = text_similarity(
+                blocks_to_text(parse_opinion_blocks(html)), cl_text,
+            )
+            if sim >= _SCHOLAR_MATCH_THRESHOLD:
+                if vkey:
+                    fetcher.put_cached(vkey, url, html)
+                self.root.after(0, self._on_verify_done, win, True,
+                                url, html, cl_text, sim, vkey, fetcher)
+                return
+            # First result didn't match — run full search for better match
+            def status_cb(msg: str) -> None:
+                self.root.after(0, self._status_var.set, msg)
+            try:
+                result, cl_text2, note = _find_scholar_for_item(
+                    client, fetcher, item, status_cb,
+                )
+            except Exception:
+                result = None
+                cl_text2 = cl_text
+            self.root.after(0, self._on_verify_done, win, False,
+                            url, html, cl_text2 or cl_text, sim,
+                            vkey, fetcher, result)
+
+        threading.Thread(target=verify, daemon=True).start()
+
+    def _on_verify_done(
+        self, win, matched: bool, orig_url: str, orig_html: str,
+        cl_text: Optional[str], sim: Optional[float],
+        vkey: str, fetcher, better_result=None,
+    ) -> None:
+        try:
+            if not win._win.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        if matched:
+            note = "verified against CourtListener"
+            if sim is None:
+                note = "unverified (no CourtListener text)"
+            win._note = note
+            if cl_text is not None:
+                win._cl_text = cl_text
+            win._status_var.set(
+                f"{len(win._scholar_text):,} characters | "
+                f"Google Scholar version | {note}"
+            )
+            return
+
+        # Verification failed
+        if better_result is not None:
+            url2, html2 = better_result
+            # Replace the window contents with the verified match
+            win._scholar_url = url2
+            win._source_var.set(url2)
+            win._blocks = parse_opinion_blocks(html2)
+            win._scholar_text = (
+                blocks_to_text(win._blocks) or _strip_html(html2)
+            )
+            win._parts = segment_blocks(win._blocks)
+            win._note = "verified against CourtListener (replaced)"
+            if cl_text is not None:
+                win._cl_text = cl_text
+            # Rebuild part selector
+            part_values = ["Full opinion"] + [
+                f"{i + 1}. {p.label}" for i, p in enumerate(win._parts)
+            ]
+            win._part_combo.config(values=part_values)
+            win._current_part = None
+            win._part_combo.current(0)
+            win._render_scholar()
+            self._status_var.set(
+                "Scholar text replaced — initial result didn't match."
+            )
+        else:
+            # No better match found — warn the user
+            sim_pct = f"{sim:.0%}" if sim is not None else "unknown"
+            win._note = f"unverified (similarity {sim_pct})"
+            win._status_var.set(
+                f"{len(win._scholar_text):,} characters | "
+                f"Google Scholar version | WARNING: may be wrong case "
+                f"(similarity {sim_pct})"
+            )
+            messagebox.showwarning(
+                "Possible Mismatch",
+                f"The Google Scholar text shown may not match this case.\n\n"
+                f"Best similarity score: {sim_pct}\n"
+                f"Threshold: {_SCHOLAR_MATCH_THRESHOLD:.0%}\n\n"
+                f"The text is displayed but may be for a different case.",
+                parent=win._win,
+            )
 
     def _on_scholar_result(
         self,
@@ -2750,6 +3164,42 @@ def _scholar_caption_name(blocks) -> str:
         if re.match(r"(?:IN\s+RE|EX\s+PARTE|(?:IN\s+THE\s+)?MATTER\s+OF)\b", t, re.IGNORECASE):
             return _titlecase_caps(t.split(",")[0].strip())
     return ""
+
+
+def _scholar_source_to_court_id(source: str) -> str:
+    """Parse a Scholar result's source byline (e.g. 'Supreme Court, 1973'
+    or 'Court of Appeals for the Ninth Circuit, 2015') into a CourtListener
+    court ID."""
+    t = re.sub(r"\s+", " ", source).strip().rstrip(".").lower()
+    if not t:
+        return ""
+    if "supreme court" in t and ("united states" in t or t.startswith("supreme court")):
+        return "scotus"
+    m = re.search(
+        r"court of appeals,? (?:for the )?(\w+(?: of columbia)?) circuit", t
+    )
+    if m:
+        word = m.group(1)
+        if word == "federal":
+            return "cafc"
+        if "columbia" in word:
+            return "cadc"
+        return _CIRCUIT_ORDINALS.get(word, "")
+    for state, courts in _STATE_COURTS:
+        if state.lower() not in t:
+            continue
+        high = courts[0][0]
+        inter = courts[1][0] if len(courts) > 1 else ""
+        if "court of appeal" in t:
+            return inter or high
+        return high
+    return ""
+
+
+def _scholar_source_year(source: str) -> str:
+    """Extract the year from a Scholar source byline."""
+    m = re.search(r"\b(1[6-9]\d{2}|20\d{2})\b", source or "")
+    return m.group(1) if m else ""
 
 
 def _rtf_escape(s: str) -> str:
