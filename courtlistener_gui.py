@@ -1494,10 +1494,28 @@ class CourtListenerGUI:
                 self.root.after(0, _update_status)
                 return
             try:
-                data = client.search(query, type="o", page_size=3)
+                # Over-fetch so we can still fill 3 rows after dropping
+                # SCOTUS "order" entries (≤ 2 outbound citations), the same
+                # ones the main search routes out of the primary results.
+                data = client.search(query, type="o", page_size=10)
                 results = data.get("results") or []
             except Exception:
                 results = []
+
+            def _is_scotus_order(it: dict) -> bool:
+                court_val = str(it.get("court_id") or it.get("court") or "")
+                if "scotus" not in court_val.lower():
+                    return False
+                opinions = it.get("opinions") or []
+                main_op = max(
+                    opinions,
+                    key=lambda o: len(o.get("cites") or []),
+                    default=None,
+                )
+                cites_count = len(main_op.get("cites") or []) if main_op else 0
+                return cites_count <= 2
+
+            results = [it for it in results if not _is_scotus_order(it)]
             for item in results[:3]:
                 case_name = re.sub(
                     r"<[^>]+>", "",
