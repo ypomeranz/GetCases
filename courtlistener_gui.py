@@ -1191,12 +1191,12 @@ class CourtListenerGUI:
             query = entry_var.get().strip()
             if not query:
                 return
-            popup.destroy()
-            self._quick_popup = None
 
             # 1. Statute / regulation: "42 USC 1983(b)", "29 CFR 1614.105"
             statute = _parse_statute_query(query)
             if statute:
+                popup.destroy()
+                self._quick_popup = None
                 _fetch_statute_window(
                     self.root, statute[0], statute[1],
                     lambda s: None,
@@ -1215,6 +1215,9 @@ class CourtListenerGUI:
                     if self._token_var.get().strip() else None
                 )
                 if fetcher is not None or client is not None:
+                    popup.destroy()
+                    self._quick_popup = None
+
                     def run() -> None:
                         self._try_open_citation(
                             name, cite, pin, fetcher, client,
@@ -1223,6 +1226,7 @@ class CourtListenerGUI:
                     return
 
             # 3. Fallback: show spotlight dropdown with search results
+            # (keep the popup alive — it expands into the dropdown)
             self._show_spotlight_dropdown(popup, border, entry, query)
 
         def _dismiss(_e=None) -> None:
