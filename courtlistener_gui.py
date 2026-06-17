@@ -195,6 +195,50 @@ def _cluster_citations_to_strings(citations) -> list[str]:
     return result
 
 
+# Bluebook rule 6.1(a): close up adjacent single capitals, but set a single
+# capital off from a longer abbreviation with a space.  Ordinal series
+# designators ("2d", "3d", "4th") count as single capitals for this purpose.
+# Sources such as Google Scholar emit reporters closed up ("S.Ct.",
+# "L.Ed.2d", "F.Supp.2d"); these helpers re-space them to the proper
+# Bluebook form ("S. Ct.", "L. Ed. 2d", "F. Supp. 2d") while leaving cites
+# that are already correct — including all-single-capital reporters like
+# "U.S." and "N.Y.S.2d" — untouched.
+_REPORTER_UNIT_RE = re.compile(
+    r"[A-Z]\.|"                     # single capital + period: F. S. N. Y.
+    r"\d+(?:st|nd|rd|th|d)|"        # ordinal series designator: 2d 3d 4th
+    r"[A-Za-z][A-Za-z'’]*\.?"       # longer word, optional period: Supp. Ct. So. App'x
+)
+_SINGLE_CAP_RE = re.compile(r"[A-Z]\.")
+
+
+def _reporter_unit_is_tight(unit: str) -> bool:
+    """A single capital ("F.") or an ordinal ("2d") closes up with its
+    neighbour; longer abbreviations ("Supp.", "Ct.") take a space."""
+    return bool(_SINGLE_CAP_RE.fullmatch(unit)) or unit[:1].isdigit()
+
+
+def _respace_reporter(reporter: str) -> str:
+    """Re-space a reporter abbreviation per Bluebook rule 6.1(a)."""
+    units = _REPORTER_UNIT_RE.findall(reporter)
+    if not units:
+        return reporter.strip()
+    out = units[0]
+    for prev, cur in zip(units, units[1:]):
+        tight = _reporter_unit_is_tight(prev) and _reporter_unit_is_tight(cur)
+        out += ("" if tight else " ") + cur
+    return out
+
+
+def _respace_reporter_in_cite(cite: str) -> str:
+    """Re-space the reporter inside a "volume reporter page" citation,
+    leaving the string unchanged if it isn't a standard reporter cite."""
+    m = _CITE_PARSE_RE.match(cite or "")
+    if not m:
+        return cite
+    vol, reporter, page = m.group(1), m.group(2).strip(), m.group(3)
+    return f"{vol} {_respace_reporter(reporter)} {page}"
+
+
 # Priority-ordered patterns for picking the best citation for display,
 # filenames, and Google Scholar searches.
 # Order: U.S. Reports > S.Ct. > Federal Reporter (newest first) >
@@ -4460,6 +4504,7 @@ class _ScholarTextWindow:
             fallback = str(item.get("court") or court_id).strip() if court_id else ""
             court_abbr = _court_for_paren(cite, court_id, fallback)
         name = abbreviate_case_name(name)
+        cite = _respace_reporter_in_cite(cite)
         return {"name": name, "cite": cite, "court": court_abbr, "year": year}
 
     def _writer_parenthetical(self, part) -> str:
@@ -5286,6 +5331,7 @@ def _parse_citation_line(line: str) -> Optional[tuple[str, str, str]]:
     cite = re.sub(r"\s+", " ",
                   f"{m.group(1)} {m.group(2)} {m.group(3)}")
     cite = cite.replace("U. S.", "U.S.").replace("’", "'")
+    cite = _respace_reporter_in_cite(cite)
     name = line[: m.start()].strip().rstrip(",;–—- ").strip()
     pin_m = _PINCITE_AFTER_RE.match(line, m.end())
     pin = pin_m.group(1) if pin_m else ""
