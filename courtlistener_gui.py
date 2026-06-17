@@ -3934,6 +3934,8 @@ class _ScholarTextWindow:
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
         self._fonts: dict[str, tkfont.Font] = {}
+        self._fn_text: dict[str, str] = {}  # footnote id → body text (for hover tips)
+        self._fn_tip: Optional[tk.Toplevel] = None
         self._bb = self._compute_bluebook_parts()
 
         self._win = tk.Toplevel(parent)
@@ -4137,7 +4139,46 @@ class _ScholarTextWindow:
         self._text.tag_bind(
             tag, "<Button-1>", lambda _e, t=tag: self._follow_link(t)
         )
+        if action[0] == "fnref":
+            # Hovering an in-text footnote marker previews the note's text.
+            fid = action[1]
+            self._text.tag_bind(
+                tag, "<Enter>", lambda e, i=fid: self._show_fn_tip(e, i), add="+"
+            )
+            self._text.tag_bind(
+                tag, "<Leave>", lambda _e: self._hide_fn_tip(), add="+"
+            )
         return tag
+
+    # ------------------------------------------------------------------
+    # Footnote hover tooltip
+    # ------------------------------------------------------------------
+    def _show_fn_tip(self, event, fid: str) -> None:
+        """Pop up the footnote's text next to the hovered marker."""
+        text = self._fn_text.get(fid)
+        if not text:
+            return
+        self._hide_fn_tip()
+        tip = tk.Toplevel(self._text)
+        tip.wm_overrideredirect(True)
+        try:
+            tip.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tk.Label(
+            tip, text=text, justify="left", wraplength=460,
+            background="#fffbe6", foreground="#000000",
+            relief="solid", borderwidth=1,
+            font=(self._family, max(self._base_size - 2, 8)),
+            padx=8, pady=5,
+        ).pack()
+        tip.wm_geometry(f"+{event.x_root + 14}+{event.y_root + 18}")
+        self._fn_tip = tip
+
+    def _hide_fn_tip(self) -> None:
+        if self._fn_tip is not None:
+            self._fn_tip.destroy()
+            self._fn_tip = None
 
     def _insert_span(self, span, block_tags: tuple) -> None:
         txt = self._text
@@ -4233,6 +4274,7 @@ class _ScholarTextWindow:
                 )
                 open_region = None
 
+        last_fid: Optional[str] = None
         for block in footnotes:
             first = block.spans[0] if block.spans else None
             num = ""
@@ -4247,6 +4289,16 @@ class _ScholarTextWindow:
                 m = _FN_BODY_MARK_RE.match(body_text)
                 if m:
                     num = (m.group(1) or m.group(2) or "").strip()
+            # Record the note's text, keyed by its anchor id, for hover tips.
+            body = re.sub(
+                r"\s+", " ",
+                "".join(s.text for s in block.spans if not s.pagenum),
+            ).strip()
+            if first is not None and first.fndef:
+                last_fid = first.fndef
+                self._fn_text[last_fid] = body
+            elif last_fid is not None and body:
+                self._fn_text[last_fid] += " " + body
             if num:
                 close_region()
                 open_region = [txt.index("end-1c"), num, page]
@@ -4272,7 +4324,9 @@ class _ScholarTextWindow:
         txt = self._text
         txt.config(state="normal")
         txt.delete("1.0", "end")
+        self._hide_fn_tip()
         self._link_actions.clear()
+        self._fn_text.clear()
         self._fnref_pages: dict[str, Optional[int]] = {}
         self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
         self._part_regions: list[tuple[str, str, int]] = []
@@ -4341,7 +4395,9 @@ class _ScholarTextWindow:
         txt = self._text
         txt.config(state="normal")
         txt.delete("1.0", "end")
+        self._hide_fn_tip()
         self._link_actions.clear()
+        self._fn_text.clear()
         self._fnref_pages: dict[str, Optional[int]] = {}
         self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
         self._part_regions: list[tuple[str, str, int]] = []
