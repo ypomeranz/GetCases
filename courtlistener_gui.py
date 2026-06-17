@@ -4829,7 +4829,9 @@ class _ScholarTextWindow:
 
     def _majority_author(self, part) -> str:
         """Running-head label for the lead opinion: 'Blackmun, J.',
-        'Sykes, C.J.', 'per curiam', or '' when no author is identified."""
+        'Sykes, C.J.', 'per curiam', or '' when no author is identified.
+        Case-insensitive: Google Scholar renders many opinions' attribution
+        lines in mixed case ('Justice Barrett delivered the opinion…')."""
         for b in part.blocks[:3]:
             t = re.sub(r"\s+", " ", b.text()).strip()
             t = re.sub(r"^(?:\*\d+\s+)+", "", t)
@@ -4838,7 +4840,7 @@ class _ScholarTextWindow:
             m = re.match(
                 r"(?:(?:MR\.|MRS\.|MS\.)\s+)?(CHIEF\s+)?JUSTICE\s+([A-Z][\w.'’-]+)\s+"
                 r"(?:delivered|announced)",
-                t,
+                t, re.IGNORECASE,
             )
             if m:
                 title = "C.J." if m.group(1) else "J."
@@ -4846,10 +4848,11 @@ class _ScholarTextWindow:
             m = re.match(
                 r"([A-Z][\w.'’ -]{0,40}?),\s*((?:Chief\s+)?(?:Senior\s+)?"
                 r"(?:Circuit\s+|District\s+)?Judge)\s*[.:;]?\s*$",
-                t,
+                t, re.IGNORECASE,
             )
             if m:
-                title = "C.J." if re.search(r"\bChief\b", m.group(2)) else "J."
+                title = ("C.J." if re.search(r"\bChief\b", m.group(2), re.IGNORECASE)
+                         else "J.")
                 return f"{_fix_name_case(m.group(1).split(',')[0])}, {title}"
         return ""
 
