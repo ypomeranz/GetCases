@@ -903,6 +903,15 @@ except ImportError:
     _HOTKEY_AVAILABLE = False
 
 
+def _stdin_is_tty() -> bool:
+    """True when an interactive terminal is attached, so we can read the
+    's' (show window) and 'q' (quit) commands the background process offers."""
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 class CourtListenerGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -1154,17 +1163,23 @@ class CourtListenerGUI:
     # Window lifecycle — hide on close, keep hotkey alive
     # ------------------------------------------------------------------
 
+    def _can_run_headless(self) -> bool:
+        """True when the process can keep running without a visible window:
+        either the global hotkey is live (Ctrl+Space opens search) or there's
+        a terminal to read 's'/'q' from."""
+        if _stdin_is_tty():
+            return True
+        return _HOTKEY_AVAILABLE and self._hotkey_listener is not None
+
     def _on_close_window(self) -> None:
-        """Hide the main window instead of destroying it so the global
-        hotkey keeps working.  The process quits when the user presses
-        'q' in the terminal (handled by main())."""
-        self.root.withdraw()
-        self._root_hidden = True
-        if _HOTKEY_AVAILABLE and self._hotkey_listener is not None:
-            print(
-                "\nWindow closed — Ctrl+Space is still active.\n"
-                "Press 'q' + Enter in this terminal to quit."
-            )
+        """Hide the main window instead of destroying it so the process keeps
+        running in the background — the global hotkey stays live and the
+        window can be reopened with 's' in the terminal.  Only quit outright
+        when there's no way to bring it back."""
+        if self._can_run_headless():
+            self.root.withdraw()
+            self._root_hidden = True
+            self._print_background_help(closed=True)
         else:
             self.root.destroy()
 
@@ -1173,6 +1188,40 @@ class CourtListenerGUI:
         if self._root_hidden:
             self.root.deiconify()
             self._root_hidden = False
+
+    def _show_main_window(self) -> None:
+        """Bring the full search window to the front (the 's' command and the
+        quick-search 'open the main window' path both land here)."""
+        try:
+            self._ensure_root_exists()
+            self.root.deiconify()
+            self.root.lift()
+            if sys.platform == "win32":
+                self._win_force_foreground(self.root)
+            self.root.focus_force()
+            self._query_entry.focus_set()
+        except tk.TclError:
+            pass
+
+    def _print_background_help(self, closed: bool = False) -> None:
+        """Tell the user how to drive the background process — Ctrl+Space to
+        search, 's' to open the full window, 'q' to quit."""
+        hotkey = "Cmd+Space" if sys.platform == "darwin" else "Ctrl+Space"
+        intro = (
+            "Window closed — GetCases is still running in the background."
+            if closed
+            else "GetCases is running in the background."
+        )
+        tips = []
+        if _HOTKEY_AVAILABLE and self._hotkey_listener is not None:
+            tips.append(f"Press {hotkey} anywhere to search.")
+        if _stdin_is_tty():
+            tips.append(
+                "Type 's' + Enter to open the full search window, "
+                "'q' + Enter to quit."
+            )
+        if tips:
+            print("\n" + intro + "\n  " + "\n  ".join(tips))
 
     # ------------------------------------------------------------------
     # Global hotkey (Ctrl+Space / Cmd+Space) → quick search popup
@@ -2880,6 +2929,7 @@ class CourtListenerGUI:
                 blocks_to_text(win._blocks) or _strip_html(html2)
             )
             win._parts = segment_blocks(win._blocks)
+            win._refine_part_labels(win._parts)
             win._note = "verified against CourtListener (replaced)"
             if cl_text is not None:
                 win._cl_text = cl_text
@@ -4050,6 +4100,8 @@ class _ScholarTextWindow:
         self._fn_tip: Optional[tk.Toplevel] = None
         self._is_scotus = False  # set by _compute_bluebook_parts
         self._bb = self._compute_bluebook_parts()
+        if not self._cl_primary:
+            self._refine_part_labels(self._parts)
 
         self._win = tk.Toplevel(parent)
         self._win.title(
@@ -4801,6 +4853,31 @@ class _ScholarTextWindow:
                 return f"{_fix_name_case(m.group(1).split(',')[0])}, {title}"
         return ""
 
+    def _refine_part_labels(self, parts: list) -> None:
+        """Sharpen the lead opinion's label.  ``segment_blocks`` calls every
+        lead opinion "Majority Opinion", but a lead opinion that stands alone
+        — no concurrences and no dissents — is simply the "Opinion" (as it is
+        for a one-judge district court).  A Supreme Court lead opinion that
+        only announces the judgment is a "Plurality Opinion"; otherwise it is
+        the "Majority Opinion".  Each type is then followed by its author, the
+        way the concurrence and dissent headers already name theirs."""
+        maj = next((p for p in parts if p.kind == "majority"), None)
+        if maj is None:
+            return
+        has_dissent = any(p.kind == "dissent" for p in parts)
+        has_concurrence = any(p.kind == "concurrence" for p in parts)
+        signal = self._writer_parenthetical(maj)  # "" | per curiam | plurality
+        if signal == "plurality opinion" and self._is_scotus:
+            base = "Plurality Opinion"
+        elif not has_dissent and not has_concurrence:
+            base = "Opinion"
+        else:
+            base = "Majority Opinion"
+        author = self._majority_author(maj)  # "Name, J." | "per curiam" | ""
+        if signal == "per curiam" or author == "per curiam":
+            author = "Per Curiam"
+        maj.label = f"{base} ({author})" if author else base
+
     def _bluebook_citation(
         self, pin: Optional[str], writer: str = ""
     ) -> tuple[str, str]:
@@ -5258,10 +5335,8 @@ class _ScholarTextWindow:
         for part in self._parts:
             if part.kind == "header":
                 continue
-            writer = self._writer_parenthetical(part)
             if part.kind == "majority":
-                lines.append(("h", "Per Curiam" if writer == "per curiam"
-                              else "Majority / Lead Opinion"))
+                lines.append(("h", part.label or "Opinion"))
                 for b in part.blocks[:3]:
                     t = clean(b.text())
                     if len(t) <= 200 and re.search(
@@ -6688,18 +6763,33 @@ def main() -> None:
     root = tk.Tk()
     app = CourtListenerGUI(root)
 
-    if _HOTKEY_AVAILABLE and app._hotkey_listener is not None:
-        # A background thread watches stdin so the user can type 'q' to
-        # quit even after the main window has been closed (withdrawn).
+    # Run in the background by default: rather than greeting the user with the
+    # full search window, GetCases starts hidden and waits.  Ctrl+Space opens
+    # the quick-search popup; 's' + Enter opens the full window; 'q' + Enter
+    # quits.  When there's no terminal to drive it, fall back to showing the
+    # window so the app stays discoverable.
+    if _stdin_is_tty():
+        root.withdraw()
+        app._root_hidden = True
+        app._print_background_help()
+
+        # A background thread watches stdin so the user can open the window
+        # ('s') or quit ('q') even while it is hidden.
         def _watch_stdin() -> None:
             try:
                 for line in sys.stdin:
-                    if line.strip().lower() == "q":
+                    cmd = line.strip().lower()
+                    if cmd == "q":
                         try:
                             root.after(0, root.destroy)
                         except Exception:
                             pass
                         return
+                    if cmd == "s":
+                        try:
+                            root.after(0, app._show_main_window)
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
