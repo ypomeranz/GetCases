@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
@@ -385,6 +385,76 @@ _SEP_HEADER_RE = re.compile(
 # headers but are not.
 _NOT_SEP_RE = re.compile(r"\b(?:filed|delivered|announced)\b", re.IGNORECASE)
 
+# The byline shared with the body of _SEP_HEADER_RE — a justice/judge name
+# followed (within a clause) by "concurring"/"dissenting".
+_SEP_BYLINE = (
+    r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?"
+    r"(?:(?:CHIEF\s+)?JUSTICE\s+\S+|"
+    r"[A-Z][\w.'’-]*(?:\s+[A-Z][\w.'’-]*){0,3}\s*,\s*"
+    r"(?:C\.\s*J\.|JJ?\.|(?:Chief\s+|Senior\s+|Presiding\s+)?"
+    r"(?:Circuit\s+|District\s+|Bankruptcy\s+)?Judge))"
+    r".{0,200}?\b(?:concurring|dissenting)\b[^.:]*[.:]"
+)
+# Scholar sometimes tucks a separate opinion's byline onto the end of the
+# disposition blockquote instead of giving it its own paragraph, e.g.
+#   "Affirmed.  Justice Thomas, concurring."
+# Anchored to a standalone disposition sentence and requiring the byline to
+# end the block, so it never fires on a mid-sentence parenthetical such as
+# "(Kennedy, J., dissenting)".  Group 1 is the byline to split onto its own
+# block/line.
+_INLINE_SEP_HEADER_RE = re.compile(
+    r"(?:^|\.\s+)"                                  # disposition starts block/sentence
+    r"(?:it\s+is\s+so\s+ordered"
+    r"|(?:the\s+(?:judgments?|orders?)\s+(?:is|are)\s+)?"
+    r"(?:affirmed|reversed|vacated|remanded|dismissed|modified|reinstated)"
+    r"[^.]{0,60})\.\s+"                             # ...a short disposition sentence
+    r"(" + _SEP_BYLINE + r")\s*$",                  # ...then the inlined byline
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_block_at(block: Block, offset: int) -> tuple[Block, Block]:
+    """Split *block* into two at character *offset* in its concatenated
+    text, dividing the span that straddles the cut and preserving each
+    span's formatting."""
+    head: list[Span] = []
+    tail: list[Span] = []
+    pos = 0
+    for s in block.spans:
+        end = pos + len(s.text)
+        if end <= offset:
+            head.append(s)
+        elif pos >= offset:
+            tail.append(s)
+        else:
+            cut = offset - pos
+            head.append(replace(s, text=s.text[:cut]))
+            tail.append(replace(s, text=s.text[cut:]))
+        pos = end
+    return Block(block.kind, head), Block(block.kind, tail)
+
+
+def _split_inline_sep_headers(blocks: list[Block]) -> list[Block]:
+    """Give a separate-opinion byline its own block when Scholar appended it
+    to the disposition block (e.g. "Affirmed.  Justice Thomas, concurring.")
+    so segmentation — and the rendered opinion — start it on a new line."""
+    out: list[Block] = []
+    for b in blocks:
+        m = _INLINE_SEP_HEADER_RE.search(b.text())
+        if (
+            m
+            and not _SEP_HEADER_RE.match(_content_text(b))  # not already its own header
+            and not _NOT_SEP_RE.search(m.group(1))          # not a syllabus disposition
+        ):
+            head, tail = _split_block_at(b, m.start(1))
+            if head.text().strip():
+                out.append(head)
+                tail.kind = "para"
+                out.append(tail)
+                continue
+        out.append(b)
+    return out
+
 # The majority opinion starts at an attribution block such as
 # "MR. JUSTICE BLACKMUN delivered the opinion of the Court." or "PER CURIAM."
 _MAJ_PHRASE_RE = re.compile(
@@ -534,6 +604,7 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     blocks, fn_run = _split_footnote_run(blocks)
     if not blocks:
         return []
+    blocks = _split_inline_sep_headers(blocks)
     boundaries: list[tuple[int, str, str]] = []  # (block index, kind, label)
     maj_phrase_idx: Optional[int] = None
     maj_author_idx: Optional[int] = None

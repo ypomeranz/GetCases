@@ -195,6 +195,50 @@ def _cluster_citations_to_strings(citations) -> list[str]:
     return result
 
 
+# Bluebook rule 6.1(a): close up adjacent single capitals, but set a single
+# capital off from a longer abbreviation with a space.  Ordinal series
+# designators ("2d", "3d", "4th") count as single capitals for this purpose.
+# Sources such as Google Scholar emit reporters closed up ("S.Ct.",
+# "L.Ed.2d", "F.Supp.2d"); these helpers re-space them to the proper
+# Bluebook form ("S. Ct.", "L. Ed. 2d", "F. Supp. 2d") while leaving cites
+# that are already correct — including all-single-capital reporters like
+# "U.S." and "N.Y.S.2d" — untouched.
+_REPORTER_UNIT_RE = re.compile(
+    r"[A-Z]\.|"                     # single capital + period: F. S. N. Y.
+    r"\d+(?:st|nd|rd|th|d)|"        # ordinal series designator: 2d 3d 4th
+    r"[A-Za-z][A-Za-z'’]*\.?"       # longer word, optional period: Supp. Ct. So. App'x
+)
+_SINGLE_CAP_RE = re.compile(r"[A-Z]\.")
+
+
+def _reporter_unit_is_tight(unit: str) -> bool:
+    """A single capital ("F.") or an ordinal ("2d") closes up with its
+    neighbour; longer abbreviations ("Supp.", "Ct.") take a space."""
+    return bool(_SINGLE_CAP_RE.fullmatch(unit)) or unit[:1].isdigit()
+
+
+def _respace_reporter(reporter: str) -> str:
+    """Re-space a reporter abbreviation per Bluebook rule 6.1(a)."""
+    units = _REPORTER_UNIT_RE.findall(reporter)
+    if not units:
+        return reporter.strip()
+    out = units[0]
+    for prev, cur in zip(units, units[1:]):
+        tight = _reporter_unit_is_tight(prev) and _reporter_unit_is_tight(cur)
+        out += ("" if tight else " ") + cur
+    return out
+
+
+def _respace_reporter_in_cite(cite: str) -> str:
+    """Re-space the reporter inside a "volume reporter page" citation,
+    leaving the string unchanged if it isn't a standard reporter cite."""
+    m = _CITE_PARSE_RE.match(cite or "")
+    if not m:
+        return cite
+    vol, reporter, page = m.group(1), m.group(2).strip(), m.group(3)
+    return f"{vol} {_respace_reporter(reporter)} {page}"
+
+
 # Priority-ordered patterns for picking the best citation for display,
 # filenames, and Google Scholar searches.
 # Order: U.S. Reports > S.Ct. > Federal Reporter (newest first) >
@@ -1444,11 +1488,12 @@ class CourtListenerGUI:
             for r in results[:3]:
                 court_id = _scholar_source_to_court_id(r.source)
                 year = _scholar_source_year(r.source)
-                # Extract citation from snippet if possible
-                cite = ""
-                m = _TEXT_CITE_RE.search(r.title + " " + r.snippet)
-                if m:
-                    cite = re.sub(r"\s+", " ", m.group(0))
+                # The case's own reporter citation sits in the source byline.
+                cite = _scholar_source_cite(r.source)
+                if not cite:
+                    m = _TEXT_CITE_RE.search(r.title + " " + r.snippet)
+                    if m:
+                        cite = re.sub(r"\s+", " ", m.group(0))
 
                 def make_opener(sr=r):
                     def open_it():
@@ -3180,6 +3225,12 @@ _HEADER_CITE_RE = re.compile(
     r"^\s*(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})\s*(?:\(|$)"
 )
 
+# A line that is *only* a reporter citation (optionally with a year), e.g.
+# "512 U.S. 477 (1994)" — the running reference at the top of an opinion.
+_CITE_ONLY_LINE_RE = re.compile(
+    r"^\d{1,4}\s+[A-Z][A-Za-z0-9.'’ ]{0,30}?\s+\d{1,5}(?:\s*\(\d{4}\))?$"
+)
+
 # Marker opening a footnote body, e.g. "[4] …" or "* …" (fallback when the
 # parser found no footnote anchor ids)
 _FN_BODY_MARK_RE = re.compile(r"^\s*(?:\[([^\]\s]{1,6})\]|(\*{1,3}|†|‡))(?=\s|$)")
@@ -3242,10 +3293,67 @@ def _caption_party(s: str) -> str:
 
 
 _CIRCUIT_ORDINALS = {
+    # Spelled-out (opinion headers) and digit ordinals (results bylines).
     "first": "ca1", "second": "ca2", "third": "ca3", "fourth": "ca4",
     "fifth": "ca5", "sixth": "ca6", "seventh": "ca7", "eighth": "ca8",
     "ninth": "ca9", "tenth": "ca10", "eleventh": "ca11",
+    "1st": "ca1", "2nd": "ca2", "3rd": "ca3", "4th": "ca4", "5th": "ca5",
+    "6th": "ca6", "7th": "ca7", "8th": "ca8", "9th": "ca9", "10th": "ca10",
+    "11th": "ca11",
 }
+
+# Google Scholar prefixes a state result's court with the state's Bluebook
+# abbreviation minus periods/spaces ("N.D." → "ND", "Cal." → "Cal").  Map
+# that key to the state's court list (court of last resort first) so the
+# prefix selects the right CourtListener court ids.
+_SCHOLAR_STATE_PREFIX: dict[str, list[tuple[str, str, str]]] = {}
+for _state_name, _state_courts in _STATE_COURTS:
+    _pref_key = _state_courts[0][1].replace(".", "").replace(" ", "").lower()
+    _SCHOLAR_STATE_PREFIX.setdefault(_pref_key, _state_courts)
+
+
+def _classify_state_court(text: str, courts: list[tuple[str, str, str]]) -> str:
+    """Pick a state's CourtListener court id from a court description,
+    matching against the catalog's court labels (rule of last resort first)."""
+    t = re.sub(r"\s+", " ", text or "").strip().lower()
+    high = courts[0][0]
+    inter = courts[1][0] if len(courts) > 1 else ""
+
+    def by_label(*keywords: str) -> str:
+        for cid, _abbr, label in courts:
+            ll = label.lower()
+            if any(k in ll for k in keywords):
+                return cid
+        return ""
+
+    # Most specific named courts first, matched to the catalog's labels.
+    if "criminal" in t:
+        hit = by_label("criminal")
+        if hit:
+            return hit
+    if "civil" in t:
+        hit = by_label("civil")
+        if hit:
+            return hit
+    if "appellate division" in t:
+        return "nyappdiv" if high == "ny" else (by_label("appellate division")
+                                                or inter or high)
+    if "special appeals" in t:
+        return by_label("special") or inter or high
+    if "commonwealth" in t:
+        return by_label("commonwealth") or inter or high
+    if "superior" in t:
+        return by_label("superior") or inter or high
+    # Generic intermediate appellate court (its name varies by state:
+    # "Court of Appeal(s)", "Appeals Court", "Appellate Court", "District
+    # Court of Appeal").  Maryland, New York, and D.C. name their highest
+    # court this way instead.
+    if (re.search(r"courts? of appeal", t) or "appeals court" in t
+            or "appellate court" in t):
+        return high if high in ("md", "ny", "dc") else (inter or high)
+    if "supreme" in t:
+        return high
+    return high
 
 
 def _scholar_court_id(blocks) -> str:
@@ -3272,21 +3380,7 @@ def _scholar_court_id(blocks) -> str:
         for state, courts in _STATE_COURTS:
             if state.lower() not in t:
                 continue
-            high = courts[0][0]
-            inter = courts[1][0] if len(courts) > 1 else ""
-            if "appellate division" in t:
-                return "nyappdiv" if high == "ny" else (inter or high)
-            if "court of criminal appeals" in t:
-                crim = next((cid for cid, _a, _l in courts if "crim" in cid), "")
-                return crim or inter or high
-            if "court of appeals" in t:
-                # the court of last resort in Maryland, New York, and D.C.
-                return high if high in ("md", "ny", "dc") else (inter or high)
-            if "supreme" in t:
-                return high
-            if "court of appeal" in t:  # California style
-                return inter or high
-            return high
+            return _classify_state_court(t, courts)
     return ""
 
 
@@ -3308,40 +3402,102 @@ def _scholar_caption_name(blocks) -> str:
     return ""
 
 
-def _scholar_source_to_court_id(source: str) -> str:
-    """Parse a Scholar result's source byline (e.g. 'Supreme Court, 1973'
-    or 'Court of Appeals for the Ninth Circuit, 2015') into a CourtListener
-    court ID."""
-    t = re.sub(r"\s+", " ", source).strip().rstrip(".").lower()
-    if not t:
+def _scholar_source_segments(source: str) -> list[str]:
+    """A Scholar result byline reads "<citations> - <court>, <year> -
+    Google Scholar"; split it on the dashes and drop the publisher tail."""
+    segs = [s.strip() for s in re.split(r"\s+-\s+", source or "") if s.strip()]
+    while segs and segs[-1].lower() == "google scholar":
+        segs.pop()
+    return segs
+
+
+def _scholar_court_desc_to_id(desc: str) -> str:
+    """Map a Scholar court description to a CourtListener court id.  Handles
+    state-prefixed bylines ("Cal: Court of Appeal", "La: Court of Appeals,
+    4th Circuit") and federal ones ("Supreme Court", "Court of Appeals, 9th
+    Circuit"), keeping a state's own appellate circuits out of the federal
+    circuits."""
+    desc = re.sub(r"\s+", " ", desc or "").strip().rstrip(".")
+    if not desc:
         return ""
-    if "supreme court" in t and ("united states" in t or t.startswith("supreme court")):
+    # State-prefixed: a Bluebook state abbreviation, then a colon.
+    m = re.match(r"([A-Za-z][A-Za-z.]{0,5}):\s*(.+)$", desc)
+    if m:
+        key = m.group(1).replace(".", "").lower()
+        courts = _SCHOLAR_STATE_PREFIX.get(key)
+        if courts:
+            return _classify_state_court(m.group(2), courts)
+        desc = m.group(2)  # unknown prefix — classify the remainder generically
+    low = desc.lower()
+    if low in ("supreme court", "us supreme court", "u.s. supreme court",
+               "united states supreme court") or (
+            "supreme court" in low and "united states" in low):
         return "scotus"
     m = re.search(
-        r"court of appeals,? (?:for the )?(\w+(?: of columbia)?) circuit", t
+        r"court of appeals,?\s*(?:for the\s+)?(\w+(?: of columbia)?)\s+circuit", low
     )
     if m:
         word = m.group(1)
         if word == "federal":
             return "cafc"
-        if "columbia" in word:
+        if "columbia" in word or word == "dc":
             return "cadc"
         return _CIRCUIT_ORDINALS.get(word, "")
-    for state, courts in _STATE_COURTS:
-        if state.lower() not in t:
-            continue
-        high = courts[0][0]
-        inter = courts[1][0] if len(courts) > 1 else ""
-        if "court of appeal" in t:
-            return inter or high
-        return high
     return ""
 
 
+def _scholar_source_to_court_id(source: str) -> str:
+    """Parse a Scholar result's source byline into a CourtListener court id."""
+    segs = _scholar_source_segments(source)
+    if not segs:
+        return ""
+    court_year = re.sub(r",?\s*(1[6-9]\d{2}|20\d{2})\s*$", "", segs[-1])
+    return _scholar_court_desc_to_id(court_year)
+
+
 def _scholar_source_year(source: str) -> str:
-    """Extract the year from a Scholar source byline."""
+    """Extract the decision year from a Scholar source byline (preferring the
+    year trailing the court segment over any stray year in the citations)."""
+    segs = _scholar_source_segments(source)
+    if segs:
+        m = re.search(r"(1[6-9]\d{2}|20\d{2})\s*$", segs[-1])
+        if m:
+            return m.group(1)
     m = re.search(r"\b(1[6-9]\d{2}|20\d{2})\b", source or "")
     return m.group(1) if m else ""
+
+
+def _normalize_scholar_cite(cite: str) -> str:
+    """Normalize a Scholar-style reporter citation to Bluebook form: restore
+    the periods Scholar drops from multi-capital reporters ("US" → "U.S.",
+    "NW" → "N.W.") and fix reporter spacing ("F. 3d" → "F.3d")."""
+    cite = re.sub(r"\s+", " ", cite or "").strip().strip(",")
+    m = re.match(r"^(\d+)\s+(.+?)\s+(\d+)$", cite)
+    if not m:
+        return cite
+    vol, rep, page = m.group(1), m.group(2), m.group(3)
+    rep = re.sub(r"\b([A-Z]{2,})\b",
+                 lambda mm: ".".join(mm.group(1)) + ".", rep)
+    rep = _respace_reporter(rep)
+    return f"{vol} {rep} {page}"
+
+
+def _scholar_source_cite(source: str) -> str:
+    """Pick the best reporter citation from a Scholar byline's leading
+    citation segment ("529 NW 2d 155" / "512 US 477, 114 S. Ct. 2364 …"),
+    normalized to Bluebook form."""
+    segs = _scholar_source_segments(source)
+    if len(segs) < 2:
+        return ""  # only a court/year segment, no citations
+    cites = []
+    for part in segs[0].split(","):
+        part = part.strip()
+        if not part or "…" in part or "..." in part:
+            continue  # skip truncated parallel cites
+        norm = _normalize_scholar_cite(part)
+        if re.match(r"^\d+\s+.+\s+\d+$", norm):
+            cites.append(norm)
+    return _pick_citation(cites) if cites else ""
 
 
 def _rtf_escape(s: str) -> str:
@@ -3890,6 +4046,9 @@ class _ScholarTextWindow:
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
         self._fonts: dict[str, tkfont.Font] = {}
+        self._fn_text: dict[str, str] = {}  # footnote id → body text (for hover tips)
+        self._fn_tip: Optional[tk.Toplevel] = None
+        self._is_scotus = False  # set by _compute_bluebook_parts
         self._bb = self._compute_bluebook_parts()
 
         self._win = tk.Toplevel(parent)
@@ -3947,7 +4106,7 @@ class _ScholarTextWindow:
 
         text_frame = ttk.Frame(win)
         text_frame.pack(fill="both", expand=True, padx=8, pady=4)
-        base = tkfont.Font(family="Georgia", size=_OPINION_FONT_PT)
+        base = tkfont.Font(family=self._opinion_font_family(), size=_OPINION_FONT_PT)
         self._fonts["base"] = base
         self._family = base.actual("family")
         self._base_size = base.actual("size")
@@ -3976,8 +4135,12 @@ class _ScholarTextWindow:
         txt.tag_configure(
             "fnhead", font=fnhead_font, foreground="#666666", spacing1=10
         )
+        # Star-pagination markers are reporter page references the app
+        # interleaves into the text, not the Court's prose, so they stay in
+        # the default serif even when a SCOTUS body switches to Century
+        # Schoolbook.
         pagenum_font = tkfont.Font(
-            family=self._family, size=max(self._base_size - 1, 8), weight="bold"
+            family="Georgia", size=max(self._base_size - 1, 8), weight="bold"
         )
         self._fonts["pagenum"] = pagenum_font
         txt.tag_configure(
@@ -4072,12 +4235,15 @@ class _ScholarTextWindow:
     # Rendering
     # ------------------------------------------------------------------
 
-    def _font_tag(self, italic: bool, bold: bool, small: bool, sup: bool) -> str:
-        name = "fnt_" + "".join("1" if f else "0" for f in (italic, bold, small, sup))
+    def _font_tag(self, italic: bool, bold: bool, small: bool, sup: bool,
+                  family: Optional[str] = None) -> str:
+        fam = family or self._family
+        prefix = "fnt_" if fam == self._family else "fna_"
+        name = prefix + "".join("1" if f else "0" for f in (italic, bold, small, sup))
         if name not in self._fonts:
             size = self._base_size - (3 if sup else 2 if small else 0)
             f = tkfont.Font(
-                family=self._family,
+                family=fam,
                 size=max(size, 7),
                 slant="italic" if italic else "roman",
                 weight="bold" if bold else "normal",
@@ -4086,6 +4252,28 @@ class _ScholarTextWindow:
             self._text.tag_configure(name, font=f, offset=4 if sup else 0)
         return name
 
+    # Century Schoolbook is the Supreme Court's house typeface; prefer the
+    # first installed variant for SCOTUS opinions.  Names vary by platform
+    # (URW "Century Schoolbook L" on Linux, the TeX Gyre Schola clone, etc.).
+    _SCOTUS_FONT_FAMILIES = (
+        "Century Schoolbook",
+        "New Century Schoolbook",
+        "Century Schoolbook L",
+        "Century Schoolbook Std",
+        "TeX Gyre Schola",
+        "Century",
+    )
+
+    def _opinion_font_family(self) -> str:
+        """Body font for the opinion: Century Schoolbook for Supreme Court
+        decisions (its house typeface), the default serif otherwise."""
+        if self._is_scotus:
+            available = {f.lower() for f in tkfont.families(self._win)}
+            for fam in self._SCOTUS_FONT_FAMILIES:
+                if fam.lower() in available:
+                    return fam
+        return "Georgia"
+
     def _new_link(self, action: tuple[str, str]) -> str:
         self._link_n += 1
         tag = f"lnk{self._link_n}"
@@ -4093,9 +4281,48 @@ class _ScholarTextWindow:
         self._text.tag_bind(
             tag, "<Button-1>", lambda _e, t=tag: self._follow_link(t)
         )
+        if action[0] == "fnref":
+            # Hovering an in-text footnote marker previews the note's text.
+            fid = action[1]
+            self._text.tag_bind(
+                tag, "<Enter>", lambda e, i=fid: self._show_fn_tip(e, i), add="+"
+            )
+            self._text.tag_bind(
+                tag, "<Leave>", lambda _e: self._hide_fn_tip(), add="+"
+            )
         return tag
 
-    def _insert_span(self, span, block_tags: tuple) -> None:
+    # ------------------------------------------------------------------
+    # Footnote hover tooltip
+    # ------------------------------------------------------------------
+    def _show_fn_tip(self, event, fid: str) -> None:
+        """Pop up the footnote's text next to the hovered marker."""
+        text = self._fn_text.get(fid)
+        if not text:
+            return
+        self._hide_fn_tip()
+        tip = tk.Toplevel(self._text)
+        tip.wm_overrideredirect(True)
+        try:
+            tip.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tk.Label(
+            tip, text=text, justify="left", wraplength=460,
+            background="#fffbe6", foreground="#000000",
+            relief="solid", borderwidth=1,
+            font=(self._family, max(self._base_size - 2, 8)),
+            padx=8, pady=5,
+        ).pack()
+        tip.wm_geometry(f"+{event.x_root + 14}+{event.y_root + 18}")
+        self._fn_tip = tip
+
+    def _hide_fn_tip(self) -> None:
+        if self._fn_tip is not None:
+            self._fn_tip.destroy()
+            self._fn_tip = None
+
+    def _insert_span(self, span, block_tags: tuple, neutral: bool = False) -> None:
         txt = self._text
         tags = list(block_tags)
         if span.pagenum:
@@ -4112,7 +4339,10 @@ class _ScholarTextWindow:
             # Page in effect where the footnote is referenced — that's the
             # page a Bluebook "n.N" pin cite uses.
             self._fnref_pages[span.fnref] = self._cur_page
-        tags.append(self._font_tag(span.italic, span.bold, span.small, span.sup))
+        tags.append(self._font_tag(
+            span.italic, span.bold, span.small, span.sup,
+            family="Georgia" if neutral else None,
+        ))
         if span.underline:
             tags.append("underline")
         if span.fnref:
@@ -4189,6 +4419,7 @@ class _ScholarTextWindow:
                 )
                 open_region = None
 
+        last_fid: Optional[str] = None
         for block in footnotes:
             first = block.spans[0] if block.spans else None
             num = ""
@@ -4203,6 +4434,16 @@ class _ScholarTextWindow:
                 m = _FN_BODY_MARK_RE.match(body_text)
                 if m:
                     num = (m.group(1) or m.group(2) or "").strip()
+            # Record the note's text, keyed by its anchor id, for hover tips.
+            body = re.sub(
+                r"\s+", " ",
+                "".join(s.text for s in block.spans if not s.pagenum),
+            ).strip()
+            if first is not None and first.fndef:
+                last_fid = first.fndef
+                self._fn_text[last_fid] = body
+            elif last_fid is not None and body:
+                self._fn_text[last_fid] += " " + body
             if num:
                 close_region()
                 open_region = [txt.index("end-1c"), num, page]
@@ -4220,15 +4461,26 @@ class _ScholarTextWindow:
             block_tags = ()
         if part_tag:
             block_tags = block_tags + (part_tag,)
+        # The reporter citation lines at the top of a SCOTUS opinion ("512
+        # U.S. 477 (1994)") are reference scaffolding, not the Court's prose,
+        # so keep them out of the Century Schoolbook body face.
+        neutral = self._is_scotus and block.kind in ("center", "heading") and bool(
+            _CITE_ONLY_LINE_RE.match(
+                re.sub(r"\s+", " ",
+                       "".join(s.text for s in block.spans if not s.pagenum)).strip()
+            )
+        )
         for span in block.spans:
-            self._insert_span(span, block_tags)
+            self._insert_span(span, block_tags, neutral=neutral)
         self._text.insert("end", "\n\n", block_tags)
 
     def _render_scholar(self) -> None:
         txt = self._text
         txt.config(state="normal")
         txt.delete("1.0", "end")
+        self._hide_fn_tip()
         self._link_actions.clear()
+        self._fn_text.clear()
         self._fnref_pages: dict[str, Optional[int]] = {}
         self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
         self._part_regions: list[tuple[str, str, int]] = []
@@ -4297,7 +4549,9 @@ class _ScholarTextWindow:
         txt = self._text
         txt.config(state="normal")
         txt.delete("1.0", "end")
+        self._hide_fn_tip()
         self._link_actions.clear()
+        self._fn_text.clear()
         self._fnref_pages: dict[str, Optional[int]] = {}
         self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
         self._part_regions: list[tuple[str, str, int]] = []
@@ -4455,11 +4709,13 @@ class _ScholarTextWindow:
         is_scotus = "scotus" in court_id or bool(
             re.match(r"\d+\s+(U\.S\.|S\.\s?Ct\.|L\.\s?Ed\.)", cite)
         )
+        self._is_scotus = is_scotus
         court_abbr = ""
         if not is_scotus:
             fallback = str(item.get("court") or court_id).strip() if court_id else ""
             court_abbr = _court_for_paren(cite, court_id, fallback)
         name = abbreviate_case_name(name)
+        cite = _respace_reporter_in_cite(cite)
         return {"name": name, "cite": cite, "court": court_abbr, "year": year}
 
     def _writer_parenthetical(self, part) -> str:
@@ -4564,6 +4820,11 @@ class _ScholarTextWindow:
         if writer:
             rest += f" ({writer})"
         rest += "."
+        # Bluebook abbreviations ("Ass'n", "Int'l", "Dep't", "F. App'x"),
+        # possessives, and names like O'Connor take a typographic apostrophe
+        # (right single quotation mark) when copied or exported.
+        name = name.replace("'", "’")
+        rest = rest.replace("'", "’")
         if name:
             plain = f"{name}{rest}"
             rtf = (
@@ -5286,6 +5547,7 @@ def _parse_citation_line(line: str) -> Optional[tuple[str, str, str]]:
     cite = re.sub(r"\s+", " ",
                   f"{m.group(1)} {m.group(2)} {m.group(3)}")
     cite = cite.replace("U. S.", "U.S.").replace("’", "'")
+    cite = _respace_reporter_in_cite(cite)
     name = line[: m.start()].strip().rstrip(",;–—- ").strip()
     pin_m = _PINCITE_AFTER_RE.match(line, m.end())
     pin = pin_m.group(1) if pin_m else ""
