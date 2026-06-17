@@ -3224,6 +3224,12 @@ _HEADER_CITE_RE = re.compile(
     r"^\s*(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})\s*(?:\(|$)"
 )
 
+# A line that is *only* a reporter citation (optionally with a year), e.g.
+# "512 U.S. 477 (1994)" — the running reference at the top of an opinion.
+_CITE_ONLY_LINE_RE = re.compile(
+    r"^\d{1,4}\s+[A-Z][A-Za-z0-9.'’ ]{0,30}?\s+\d{1,5}(?:\s*\(\d{4}\))?$"
+)
+
 # Marker opening a footnote body, e.g. "[4] …" or "* …" (fallback when the
 # parser found no footnote anchor ids)
 _FN_BODY_MARK_RE = re.compile(r"^\s*(?:\[([^\]\s]{1,6})\]|(\*{1,3}|†|‡))(?=\s|$)")
@@ -3936,6 +3942,7 @@ class _ScholarTextWindow:
         self._fonts: dict[str, tkfont.Font] = {}
         self._fn_text: dict[str, str] = {}  # footnote id → body text (for hover tips)
         self._fn_tip: Optional[tk.Toplevel] = None
+        self._is_scotus = False  # set by _compute_bluebook_parts
         self._bb = self._compute_bluebook_parts()
 
         self._win = tk.Toplevel(parent)
@@ -3993,7 +4000,7 @@ class _ScholarTextWindow:
 
         text_frame = ttk.Frame(win)
         text_frame.pack(fill="both", expand=True, padx=8, pady=4)
-        base = tkfont.Font(family="Georgia", size=_OPINION_FONT_PT)
+        base = tkfont.Font(family=self._opinion_font_family(), size=_OPINION_FONT_PT)
         self._fonts["base"] = base
         self._family = base.actual("family")
         self._base_size = base.actual("size")
@@ -4022,8 +4029,12 @@ class _ScholarTextWindow:
         txt.tag_configure(
             "fnhead", font=fnhead_font, foreground="#666666", spacing1=10
         )
+        # Star-pagination markers are reporter page references the app
+        # interleaves into the text, not the Court's prose, so they stay in
+        # the default serif even when a SCOTUS body switches to Century
+        # Schoolbook.
         pagenum_font = tkfont.Font(
-            family=self._family, size=max(self._base_size - 1, 8), weight="bold"
+            family="Georgia", size=max(self._base_size - 1, 8), weight="bold"
         )
         self._fonts["pagenum"] = pagenum_font
         txt.tag_configure(
@@ -4118,12 +4129,15 @@ class _ScholarTextWindow:
     # Rendering
     # ------------------------------------------------------------------
 
-    def _font_tag(self, italic: bool, bold: bool, small: bool, sup: bool) -> str:
-        name = "fnt_" + "".join("1" if f else "0" for f in (italic, bold, small, sup))
+    def _font_tag(self, italic: bool, bold: bool, small: bool, sup: bool,
+                  family: Optional[str] = None) -> str:
+        fam = family or self._family
+        prefix = "fnt_" if fam == self._family else "fna_"
+        name = prefix + "".join("1" if f else "0" for f in (italic, bold, small, sup))
         if name not in self._fonts:
             size = self._base_size - (3 if sup else 2 if small else 0)
             f = tkfont.Font(
-                family=self._family,
+                family=fam,
                 size=max(size, 7),
                 slant="italic" if italic else "roman",
                 weight="bold" if bold else "normal",
@@ -4131,6 +4145,28 @@ class _ScholarTextWindow:
             self._fonts[name] = f
             self._text.tag_configure(name, font=f, offset=4 if sup else 0)
         return name
+
+    # Century Schoolbook is the Supreme Court's house typeface; prefer the
+    # first installed variant for SCOTUS opinions.  Names vary by platform
+    # (URW "Century Schoolbook L" on Linux, the TeX Gyre Schola clone, etc.).
+    _SCOTUS_FONT_FAMILIES = (
+        "Century Schoolbook",
+        "New Century Schoolbook",
+        "Century Schoolbook L",
+        "Century Schoolbook Std",
+        "TeX Gyre Schola",
+        "Century",
+    )
+
+    def _opinion_font_family(self) -> str:
+        """Body font for the opinion: Century Schoolbook for Supreme Court
+        decisions (its house typeface), the default serif otherwise."""
+        if self._is_scotus:
+            available = {f.lower() for f in tkfont.families(self._win)}
+            for fam in self._SCOTUS_FONT_FAMILIES:
+                if fam.lower() in available:
+                    return fam
+        return "Georgia"
 
     def _new_link(self, action: tuple[str, str]) -> str:
         self._link_n += 1
@@ -4180,7 +4216,7 @@ class _ScholarTextWindow:
             self._fn_tip.destroy()
             self._fn_tip = None
 
-    def _insert_span(self, span, block_tags: tuple) -> None:
+    def _insert_span(self, span, block_tags: tuple, neutral: bool = False) -> None:
         txt = self._text
         tags = list(block_tags)
         if span.pagenum:
@@ -4197,7 +4233,10 @@ class _ScholarTextWindow:
             # Page in effect where the footnote is referenced — that's the
             # page a Bluebook "n.N" pin cite uses.
             self._fnref_pages[span.fnref] = self._cur_page
-        tags.append(self._font_tag(span.italic, span.bold, span.small, span.sup))
+        tags.append(self._font_tag(
+            span.italic, span.bold, span.small, span.sup,
+            family="Georgia" if neutral else None,
+        ))
         if span.underline:
             tags.append("underline")
         if span.fnref:
@@ -4316,8 +4355,17 @@ class _ScholarTextWindow:
             block_tags = ()
         if part_tag:
             block_tags = block_tags + (part_tag,)
+        # The reporter citation lines at the top of a SCOTUS opinion ("512
+        # U.S. 477 (1994)") are reference scaffolding, not the Court's prose,
+        # so keep them out of the Century Schoolbook body face.
+        neutral = self._is_scotus and block.kind in ("center", "heading") and bool(
+            _CITE_ONLY_LINE_RE.match(
+                re.sub(r"\s+", " ",
+                       "".join(s.text for s in block.spans if not s.pagenum)).strip()
+            )
+        )
         for span in block.spans:
-            self._insert_span(span, block_tags)
+            self._insert_span(span, block_tags, neutral=neutral)
         self._text.insert("end", "\n\n", block_tags)
 
     def _render_scholar(self) -> None:
@@ -4555,6 +4603,7 @@ class _ScholarTextWindow:
         is_scotus = "scotus" in court_id or bool(
             re.match(r"\d+\s+(U\.S\.|S\.\s?Ct\.|L\.\s?Ed\.)", cite)
         )
+        self._is_scotus = is_scotus
         court_abbr = ""
         if not is_scotus:
             fallback = str(item.get("court") or court_id).strip() if court_id else ""
