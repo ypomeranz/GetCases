@@ -4820,6 +4820,11 @@ class _ScholarTextWindow:
         if writer:
             rest += f" ({writer})"
         rest += "."
+        # Bluebook abbreviations ("Ass'n", "Int'l", "Dep't", "F. App'x"),
+        # possessives, and names like O'Connor take a typographic apostrophe
+        # (right single quotation mark) when copied or exported.
+        name = name.replace("'", "’")
+        rest = rest.replace("'", "’")
         if name:
             plain = f"{name}{rest}"
             rtf = (
