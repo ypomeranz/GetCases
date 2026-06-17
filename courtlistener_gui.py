@@ -3442,7 +3442,16 @@ def _scholar_caption_name(blocks) -> str:
         t = re.sub(r"\s+", " ", b.text()).strip().rstrip(".")
         if not t or _HEADER_CITE_RE.match(t) or t.startswith(("No.", "Nos.")):
             continue
-        sides = re.split(r"\s+[vV]s?\.\s+", t, maxsplit=1)
+        # Google Scholar renders the party separator in lowercase ("… v. …")
+        # even for ALL-CAPS captions ("MERCY HOSPITAL, INC. v. JACKSON"), so
+        # a lowercase "v."/"vs." is the reliable separator and never collides
+        # with an uppercase middle initial like the "V." in "Francis V.
+        # Lorenzo".  Only fall back to a case-insensitive split (for a caption
+        # that happens to capitalize the separator) when no lowercase one is
+        # found.
+        sides = re.split(r"\s+vs?\.\s+", t, maxsplit=1)
+        if len(sides) != 2:
+            sides = re.split(r"\s+[vV]s?\.\s+", t, maxsplit=1)
         if len(sides) == 2:
             left, right = _caption_party(sides[0]), _caption_party(sides[1])
             if left and right:
