@@ -642,16 +642,17 @@ def _recognized_initialism(party: str) -> str:
     return ""
 
 
-def _abbreviate_party(party: str) -> str:
+def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     p = re.sub(r"\s+", " ", party).strip()
     p = _ET_AL_RE.sub("", p)
     p = re.sub(r"^the\s+", "", p, flags=re.IGNORECASE)  # rule 10.2.1(d)
     p = re.sub(r"\bUnited States of America\b", "United States", p,
                flags=re.IGNORECASE)
     p = _STATE_OF_RE.sub("", p)  # "State of Washington" -> "Washington"
-    initials = _recognized_initialism(p)  # rule 10.2.1(c): SEC, NLRB, FCC…
-    if initials:
-        return initials
+    if recognize_initials:  # rule 10.2.1(c): SEC, NLRB, FCC…
+        initials = _recognized_initialism(p)
+        if initials:
+            return initials
     if p.strip(" ,.").lower() in _GEO_PARTIES:
         return p
 
@@ -689,6 +690,17 @@ def _abbreviate_party(party: str) -> str:
                              m.group(0))
 
     return _TOKEN_RE.sub(_sub, p)
+
+
+# Also recognize each institution's *abbreviated* form — "Sec. & Exch. Comm'n",
+# "Nat'l Lab. Rels. Bd." — not just the spelled-out name.  Generate those keys
+# by running the long form through the ordinary abbreviator (with the
+# initials lookup itself disabled), so the variants always track table T6
+# instead of being hand-maintained.
+for _acr, _names in _WIDELY_RECOGNIZED_INITIALS_RAW.items():
+    for _name in _names:
+        _abbr = _abbreviate_party(_name, recognize_initials=False)
+        _WIDELY_RECOGNIZED_INITIALS.setdefault(_initials_key(_abbr), _acr)
 
 
 def abbreviate_case_name(name: str) -> str:
@@ -731,7 +743,7 @@ if __name__ == "__main__":
          "West Virginia v. EPA"),
         ("The Florida Star v. B. J. F.", "Fla. Star v. B. J. F."),
         ("Nat'l Lab. Rels. Bd. v. Jones & Laughlin Steel Corp.",
-         "Nat'l Lab. Rels. Bd. v. Jones & Laughlin Steel Corp."),
+         "NLRB v. Jones & Laughlin Steel Corp."),
         # Given names (rule 10.2.1(g))
         ("Mercy Hospital, Inc. v. Ernestine Jackson",
          "Mercy Hosp., Inc. v. Jackson"),
@@ -770,6 +782,11 @@ if __name__ == "__main__":
         ("The Equal Employment Opportunity Commission v. Abercrombie",
          "EEOC v. Abercrombie"),
         ("SEC v. Edwards", "SEC v. Edwards"),  # already-initialed: unchanged
+        # Already-abbreviated long forms also fold to the initials
+        ("Sec. & Exch. Comm'n v. Edwards", "SEC v. Edwards"),
+        ("Nat'l Lab. Rels. Bd. v. Acme Corp.", "NLRB v. Acme Corp."),
+        ("U.S. Env't Prot. Agency v. Smith", "EPA v. Smith"),
+        ("Fed. Commc'ns Comm'n v. Smith", "FCC v. Smith"),
     ]
     failed = 0
     for raw, want in _CASES:
