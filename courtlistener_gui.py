@@ -1488,11 +1488,12 @@ class CourtListenerGUI:
             for r in results[:3]:
                 court_id = _scholar_source_to_court_id(r.source)
                 year = _scholar_source_year(r.source)
-                # Extract citation from snippet if possible
-                cite = ""
-                m = _TEXT_CITE_RE.search(r.title + " " + r.snippet)
-                if m:
-                    cite = re.sub(r"\s+", " ", m.group(0))
+                # The case's own reporter citation sits in the source byline.
+                cite = _scholar_source_cite(r.source)
+                if not cite:
+                    m = _TEXT_CITE_RE.search(r.title + " " + r.snippet)
+                    if m:
+                        cite = re.sub(r"\s+", " ", m.group(0))
 
                 def make_opener(sr=r):
                     def open_it():
@@ -3292,10 +3293,67 @@ def _caption_party(s: str) -> str:
 
 
 _CIRCUIT_ORDINALS = {
+    # Spelled-out (opinion headers) and digit ordinals (results bylines).
     "first": "ca1", "second": "ca2", "third": "ca3", "fourth": "ca4",
     "fifth": "ca5", "sixth": "ca6", "seventh": "ca7", "eighth": "ca8",
     "ninth": "ca9", "tenth": "ca10", "eleventh": "ca11",
+    "1st": "ca1", "2nd": "ca2", "3rd": "ca3", "4th": "ca4", "5th": "ca5",
+    "6th": "ca6", "7th": "ca7", "8th": "ca8", "9th": "ca9", "10th": "ca10",
+    "11th": "ca11",
 }
+
+# Google Scholar prefixes a state result's court with the state's Bluebook
+# abbreviation minus periods/spaces ("N.D." → "ND", "Cal." → "Cal").  Map
+# that key to the state's court list (court of last resort first) so the
+# prefix selects the right CourtListener court ids.
+_SCHOLAR_STATE_PREFIX: dict[str, list[tuple[str, str, str]]] = {}
+for _state_name, _state_courts in _STATE_COURTS:
+    _pref_key = _state_courts[0][1].replace(".", "").replace(" ", "").lower()
+    _SCHOLAR_STATE_PREFIX.setdefault(_pref_key, _state_courts)
+
+
+def _classify_state_court(text: str, courts: list[tuple[str, str, str]]) -> str:
+    """Pick a state's CourtListener court id from a court description,
+    matching against the catalog's court labels (rule of last resort first)."""
+    t = re.sub(r"\s+", " ", text or "").strip().lower()
+    high = courts[0][0]
+    inter = courts[1][0] if len(courts) > 1 else ""
+
+    def by_label(*keywords: str) -> str:
+        for cid, _abbr, label in courts:
+            ll = label.lower()
+            if any(k in ll for k in keywords):
+                return cid
+        return ""
+
+    # Most specific named courts first, matched to the catalog's labels.
+    if "criminal" in t:
+        hit = by_label("criminal")
+        if hit:
+            return hit
+    if "civil" in t:
+        hit = by_label("civil")
+        if hit:
+            return hit
+    if "appellate division" in t:
+        return "nyappdiv" if high == "ny" else (by_label("appellate division")
+                                                or inter or high)
+    if "special appeals" in t:
+        return by_label("special") or inter or high
+    if "commonwealth" in t:
+        return by_label("commonwealth") or inter or high
+    if "superior" in t:
+        return by_label("superior") or inter or high
+    # Generic intermediate appellate court (its name varies by state:
+    # "Court of Appeal(s)", "Appeals Court", "Appellate Court", "District
+    # Court of Appeal").  Maryland, New York, and D.C. name their highest
+    # court this way instead.
+    if (re.search(r"courts? of appeal", t) or "appeals court" in t
+            or "appellate court" in t):
+        return high if high in ("md", "ny", "dc") else (inter or high)
+    if "supreme" in t:
+        return high
+    return high
 
 
 def _scholar_court_id(blocks) -> str:
@@ -3322,21 +3380,7 @@ def _scholar_court_id(blocks) -> str:
         for state, courts in _STATE_COURTS:
             if state.lower() not in t:
                 continue
-            high = courts[0][0]
-            inter = courts[1][0] if len(courts) > 1 else ""
-            if "appellate division" in t:
-                return "nyappdiv" if high == "ny" else (inter or high)
-            if "court of criminal appeals" in t:
-                crim = next((cid for cid, _a, _l in courts if "crim" in cid), "")
-                return crim or inter or high
-            if "court of appeals" in t:
-                # the court of last resort in Maryland, New York, and D.C.
-                return high if high in ("md", "ny", "dc") else (inter or high)
-            if "supreme" in t:
-                return high
-            if "court of appeal" in t:  # California style
-                return inter or high
-            return high
+            return _classify_state_court(t, courts)
     return ""
 
 
@@ -3358,40 +3402,102 @@ def _scholar_caption_name(blocks) -> str:
     return ""
 
 
-def _scholar_source_to_court_id(source: str) -> str:
-    """Parse a Scholar result's source byline (e.g. 'Supreme Court, 1973'
-    or 'Court of Appeals for the Ninth Circuit, 2015') into a CourtListener
-    court ID."""
-    t = re.sub(r"\s+", " ", source).strip().rstrip(".").lower()
-    if not t:
+def _scholar_source_segments(source: str) -> list[str]:
+    """A Scholar result byline reads "<citations> - <court>, <year> -
+    Google Scholar"; split it on the dashes and drop the publisher tail."""
+    segs = [s.strip() for s in re.split(r"\s+-\s+", source or "") if s.strip()]
+    while segs and segs[-1].lower() == "google scholar":
+        segs.pop()
+    return segs
+
+
+def _scholar_court_desc_to_id(desc: str) -> str:
+    """Map a Scholar court description to a CourtListener court id.  Handles
+    state-prefixed bylines ("Cal: Court of Appeal", "La: Court of Appeals,
+    4th Circuit") and federal ones ("Supreme Court", "Court of Appeals, 9th
+    Circuit"), keeping a state's own appellate circuits out of the federal
+    circuits."""
+    desc = re.sub(r"\s+", " ", desc or "").strip().rstrip(".")
+    if not desc:
         return ""
-    if "supreme court" in t and ("united states" in t or t.startswith("supreme court")):
+    # State-prefixed: a Bluebook state abbreviation, then a colon.
+    m = re.match(r"([A-Za-z][A-Za-z.]{0,5}):\s*(.+)$", desc)
+    if m:
+        key = m.group(1).replace(".", "").lower()
+        courts = _SCHOLAR_STATE_PREFIX.get(key)
+        if courts:
+            return _classify_state_court(m.group(2), courts)
+        desc = m.group(2)  # unknown prefix — classify the remainder generically
+    low = desc.lower()
+    if low in ("supreme court", "us supreme court", "u.s. supreme court",
+               "united states supreme court") or (
+            "supreme court" in low and "united states" in low):
         return "scotus"
     m = re.search(
-        r"court of appeals,? (?:for the )?(\w+(?: of columbia)?) circuit", t
+        r"court of appeals,?\s*(?:for the\s+)?(\w+(?: of columbia)?)\s+circuit", low
     )
     if m:
         word = m.group(1)
         if word == "federal":
             return "cafc"
-        if "columbia" in word:
+        if "columbia" in word or word == "dc":
             return "cadc"
         return _CIRCUIT_ORDINALS.get(word, "")
-    for state, courts in _STATE_COURTS:
-        if state.lower() not in t:
-            continue
-        high = courts[0][0]
-        inter = courts[1][0] if len(courts) > 1 else ""
-        if "court of appeal" in t:
-            return inter or high
-        return high
     return ""
 
 
+def _scholar_source_to_court_id(source: str) -> str:
+    """Parse a Scholar result's source byline into a CourtListener court id."""
+    segs = _scholar_source_segments(source)
+    if not segs:
+        return ""
+    court_year = re.sub(r",?\s*(1[6-9]\d{2}|20\d{2})\s*$", "", segs[-1])
+    return _scholar_court_desc_to_id(court_year)
+
+
 def _scholar_source_year(source: str) -> str:
-    """Extract the year from a Scholar source byline."""
+    """Extract the decision year from a Scholar source byline (preferring the
+    year trailing the court segment over any stray year in the citations)."""
+    segs = _scholar_source_segments(source)
+    if segs:
+        m = re.search(r"(1[6-9]\d{2}|20\d{2})\s*$", segs[-1])
+        if m:
+            return m.group(1)
     m = re.search(r"\b(1[6-9]\d{2}|20\d{2})\b", source or "")
     return m.group(1) if m else ""
+
+
+def _normalize_scholar_cite(cite: str) -> str:
+    """Normalize a Scholar-style reporter citation to Bluebook form: restore
+    the periods Scholar drops from multi-capital reporters ("US" → "U.S.",
+    "NW" → "N.W.") and fix reporter spacing ("F. 3d" → "F.3d")."""
+    cite = re.sub(r"\s+", " ", cite or "").strip().strip(",")
+    m = re.match(r"^(\d+)\s+(.+?)\s+(\d+)$", cite)
+    if not m:
+        return cite
+    vol, rep, page = m.group(1), m.group(2), m.group(3)
+    rep = re.sub(r"\b([A-Z]{2,})\b",
+                 lambda mm: ".".join(mm.group(1)) + ".", rep)
+    rep = _respace_reporter(rep)
+    return f"{vol} {rep} {page}"
+
+
+def _scholar_source_cite(source: str) -> str:
+    """Pick the best reporter citation from a Scholar byline's leading
+    citation segment ("529 NW 2d 155" / "512 US 477, 114 S. Ct. 2364 …"),
+    normalized to Bluebook form."""
+    segs = _scholar_source_segments(source)
+    if len(segs) < 2:
+        return ""  # only a court/year segment, no citations
+    cites = []
+    for part in segs[0].split(","):
+        part = part.strip()
+        if not part or "…" in part or "..." in part:
+            continue  # skip truncated parallel cites
+        norm = _normalize_scholar_cite(part)
+        if re.match(r"^\d+\s+.+\s+\d+$", norm):
+            cites.append(norm)
+    return _pick_citation(cites) if cites else ""
 
 
 def _rtf_escape(s: str) -> str:
