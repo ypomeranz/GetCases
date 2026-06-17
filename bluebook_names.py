@@ -566,6 +566,82 @@ def _strip_given_names(p: str) -> str | None:
     return " ".join(tokens[i:])
 
 
+# Bluebook rule 10.2.1(c): the name of a widely recognized institution is
+# abbreviated to its initials.  Google Scholar prints the full name, so map
+# the formal long form back to the initials practitioners actually use.  Keyed
+# on the full party name (matched exactly) to avoid clobbering longer names
+# that merely contain one of these phrases; cabinet departments are left to
+# the ordinary "Dep't of …" abbreviation per the Bluebook's own practice.
+_WIDELY_RECOGNIZED_INITIALS_RAW: dict[str, tuple[str, ...]] = {
+    "SEC": ("Securities and Exchange Commission",),
+    "NLRB": ("National Labor Relations Board",),
+    "FCC": ("Federal Communications Commission",),
+    "FTC": ("Federal Trade Commission",),
+    "FEC": ("Federal Election Commission",),
+    "FERC": ("Federal Energy Regulatory Commission",),
+    "FMC": ("Federal Maritime Commission",),
+    "FPC": ("Federal Power Commission",),
+    "ICC": ("Interstate Commerce Commission",),
+    "CFTC": ("Commodity Futures Trading Commission",),
+    "CPSC": ("Consumer Product Safety Commission",),
+    "EEOC": ("Equal Employment Opportunity Commission",),
+    "NRC": ("Nuclear Regulatory Commission",),
+    "NMB": ("National Mediation Board",),
+    "NTSB": ("National Transportation Safety Board",),
+    "STB": ("Surface Transportation Board",),
+    "CFPB": ("Consumer Financial Protection Bureau",),
+    "FDIC": ("Federal Deposit Insurance Corporation",),
+    "EPA": ("Environmental Protection Agency",),
+    "NASA": ("National Aeronautics and Space Administration",),
+    "TVA": ("Tennessee Valley Authority",),
+    "OPM": ("Office of Personnel Management",),
+    "MSPB": ("Merit Systems Protection Board",),
+    "FBI": ("Federal Bureau of Investigation",),
+    "IRS": ("Internal Revenue Service",),
+    "INS": ("Immigration and Naturalization Service",),
+    "DEA": ("Drug Enforcement Administration",),
+    "FDA": ("Food and Drug Administration",),
+    "FAA": ("Federal Aviation Administration",),
+    "OSHA": ("Occupational Safety and Health Administration",),
+    "CIA": ("Central Intelligence Agency",),
+    "SSA": ("Social Security Administration",),
+    "USPS": ("Postal Service",),
+    "NAACP": ("National Association for the Advancement of Colored People",),
+    "ACLU": ("American Civil Liberties Union",),
+    "NCAA": ("National Collegiate Athletic Association",),
+}
+
+
+def _initials_key(s: str) -> str:
+    """Normalize a party name for the recognized-initials lookup: drop
+    punctuation, fold '&' to 'and', and lowercase."""
+    s = s.replace("&", " and ")
+    s = re.sub(r"[.,'’]", "", s)
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+_WIDELY_RECOGNIZED_INITIALS: dict[str, str] = {
+    _initials_key(_name): _acr
+    for _acr, _names in _WIDELY_RECOGNIZED_INITIALS_RAW.items()
+    for _name in _names
+}
+
+
+def _recognized_initialism(party: str) -> str:
+    """Rule 10.2.1(c) initials for a widely recognized institution (SEC,
+    NLRB, FCC, EPA…), or '' if the party isn't one.  A leading 'United
+    States'/'U.S.' is ignored so 'United States Environmental Protection
+    Agency' resolves to EPA the same as the bare name."""
+    key = _initials_key(party)
+    acr = _WIDELY_RECOGNIZED_INITIALS.get(key)
+    if acr:
+        return acr
+    stripped = re.sub(r"^(?:united states|us)\s+", "", key)
+    if stripped != key:
+        return _WIDELY_RECOGNIZED_INITIALS.get(stripped, "")
+    return ""
+
+
 def _abbreviate_party(party: str) -> str:
     p = re.sub(r"\s+", " ", party).strip()
     p = _ET_AL_RE.sub("", p)
@@ -573,6 +649,9 @@ def _abbreviate_party(party: str) -> str:
     p = re.sub(r"\bUnited States of America\b", "United States", p,
                flags=re.IGNORECASE)
     p = _STATE_OF_RE.sub("", p)  # "State of Washington" -> "Washington"
+    initials = _recognized_initialism(p)  # rule 10.2.1(c): SEC, NLRB, FCC…
+    if initials:
+        return initials
     if p.strip(" ,.").lower() in _GEO_PARTIES:
         return p
 
@@ -633,12 +712,12 @@ if __name__ == "__main__":
          "N.Y. Times Co. v. Sullivan"),
         ("National Labor Relations Board v. "
          "Jones and Laughlin Steel Corporation",
-         "Nat'l Lab. Rels. Bd. v. Jones & Laughlin Steel Corp."),
+         "NLRB v. Jones & Laughlin Steel Corp."),
         ("United States v. Carolene Products Company",
          "United States v. Carolene Prods. Co."),
         ("Natural Resources Defense Council, Inc. v. "
          "United States Environmental Protection Agency",
-         "Nat. Res. Def. Council, Inc. v. U.S. Env't Prot. Agency"),
+         "Nat. Res. Def. Council, Inc. v. EPA"),
         ("Department of Homeland Security v. "
          "Regents of the University of California",
          "Dep't of Homeland Sec. v. Regents of the Univ. of Cal."),
@@ -649,7 +728,7 @@ if __name__ == "__main__":
         ("Doctor's Associates, Inc. v. Casarotto",
          "Doctor's Assocs., Inc. v. Casarotto"),
         ("West Virginia v. Environmental Protection Agency",
-         "West Virginia v. Env't Prot. Agency"),
+         "West Virginia v. EPA"),
         ("The Florida Star v. B. J. F.", "Fla. Star v. B. J. F."),
         ("Nat'l Lab. Rels. Bd. v. Jones & Laughlin Steel Corp.",
          "Nat'l Lab. Rels. Bd. v. Jones & Laughlin Steel Corp."),
@@ -679,6 +758,18 @@ if __name__ == "__main__":
         ("Town of Greece v. Susan Galloway", "Town of Greece v. Galloway"),
         ("City of New York Department of Parks v. Doe",
          "City of N.Y. Dep't of Parks v. Doe"),
+        # Widely recognized initials (rule 10.2.1(c))
+        ("Lorenzo v. Securities and Exchange Commission", "Lorenzo v. SEC"),
+        ("Securities & Exchange Commission v. Edwards", "SEC v. Edwards"),
+        ("Smith v. Federal Communications Commission", "Smith v. FCC"),
+        ("Doe v. Federal Bureau of Investigation", "Doe v. FBI"),
+        ("National Labor Relations Board v. Acme Corporation",
+         "NLRB v. Acme Corp."),
+        ("United States Environmental Protection Agency v. Smith",
+         "EPA v. Smith"),
+        ("The Equal Employment Opportunity Commission v. Abercrombie",
+         "EEOC v. Abercrombie"),
+        ("SEC v. Edwards", "SEC v. Edwards"),  # already-initialed: unchanged
     ]
     failed = 0
     for raw, want in _CASES:
