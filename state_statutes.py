@@ -39,6 +39,8 @@ import re
 import urllib.parse
 from dataclasses import dataclass, field
 
+import state_ca  # California: canonical code table + in-app fetch/parse
+
 # ---------------------------------------------------------------------------
 # Shared sub-patterns
 # ---------------------------------------------------------------------------
@@ -214,9 +216,24 @@ def _subject_build(key_prefix, name, label_state, code_word):
 
 
 # California: "Cal. Penal Code § 187", "Cal. Health & Safety Code § 11350".
+# CA has a fixed set of 29 named codes, so the captured subject is canonicalized
+# to an official lawCode (key "ca-pen", label "Cal. Penal Code") — which both
+# normalizes spelling variants and makes the citation renderable in-app.
+def _ca_build(m: re.Match) -> Cite:
+    subj = _norm(m.group("subj"))
+    sec = m.group("sec")
+    code = state_ca.code_for_subject(subj)
+    if code:
+        key, abbr = state_ca.spec_key(code), state_ca.label_for_code(code)
+    else:  # not one of the 29 CA codes — keep generic and link-out
+        key, abbr = f"ca-{_subj_slug(subj)}", f"Cal. {subj} Code"
+    _register(key, "California", abbr)
+    return Cite(m.start(), m.end(), key, sec, f"{abbr} § {sec}",
+                m.group(0), _subs_of(m))
+
+
 _add(rf"\bCal\.?\s+(?P<subj>{_SUBJ})Code\s*(?:Ann\.?)?\s*{_SS}"
-     rf"(?P<sec>{_SEC})(?P<subs>{_SUBS})",
-     _subject_build("ca", "California", "Cal.", "Code"))
+     rf"(?P<sec>{_SEC})(?P<subs>{_SUBS})", _ca_build)
 
 # Texas: "Tex. Penal Code Ann. § 19.02" — but NOT "Tex. Admin. Code" (regs).
 # Texas codes are cited *with* "Ann." (unlike Cal./N.Y.), so normalize to it.
@@ -386,13 +403,29 @@ def spec_label(spec: str) -> str:
     return f"{abbr} § {section}{tail}"
 
 
-# States with a full in-app parser (load_section); others link-out.  Filled in
-# as per-state parsers land.  A key like "ca-pen" belongs to state "ca".
-IN_APP: set[str] = set()
+# Spec keys we can render in-app (everything else link-outs).  Populated from
+# the per-state modules as parsers land.  California: all 29 codes.
+_RENDERABLE_KEYS: set[str] = set()
+
+for _code in state_ca.SUBJECT:                       # noqa: SIM118
+    _k = state_ca.spec_key(_code)
+    KEY_ABBR.setdefault(_k, state_ca.label_for_code(_code))
+    KEY_NAME.setdefault(_k, "California")
+    _RENDERABLE_KEYS.add(_k)
 
 
-def _state_of(key: str) -> str:
-    return key.split("-", 1)[0]
+def _renderable(key: str) -> bool:
+    return key in _RENDERABLE_KEYS
+
+
+def load_section(key: str, section: str):
+    """Fetch & parse one section for an in-app state (dispatched by the spec
+    key's state prefix).  Matches the source-module contract used by the GUI's
+    _fetch_statute_window / _STATUTE_SOURCES registry."""
+    state = key.split("-", 1)[0]
+    if state == "ca":
+        return state_ca.load(key, section)
+    raise RuntimeError(f"no in-app source for {KEY_NAME.get(key, key)}")
 
 
 def link_url(c: Cite) -> str:
@@ -406,8 +439,8 @@ def link_url(c: Cite) -> str:
 
 def action_for(c: Cite) -> tuple[str, str]:
     """The (kind, value) link action for a detected citation: an in-app view
-    for priority states, else a browser link-out."""
-    if _state_of(c.key) in IN_APP:
+    for renderable (priority-state) cites, else a browser link-out."""
+    if _renderable(c.key):
         return ("statestat", cite_spec(c))
     return ("browse", link_url(c))
 
@@ -429,7 +462,7 @@ def parse_query(query: str) -> tuple[str, str] | None:
     # citation buried in prose).
     if c.start > 0 or c.end < len(q.rstrip(". ")):
         return None
-    if _state_of(c.key) not in IN_APP:
+    if not _renderable(c.key):
         return None
     return ("statestat", cite_spec(c))
 
@@ -453,7 +486,7 @@ if __name__ == "__main__":
     # (citation text, expected key, expected section, expected label)
     cases = [
         ("N.Y. Penal Law § 125.25", "ny-penal", "125.25", "N.Y. Penal Law § 125.25"),
-        ("Cal. Penal Code § 187", "ca-penal", "187", "Cal. Penal Code § 187"),
+        ("Cal. Penal Code § 187", "ca-pen", "187", "Cal. Penal Code § 187"),
         ("Tex. Penal Code Ann. § 19.02", "tx-penal", "19.02", "Tex. Penal Code Ann. § 19.02"),
         ("Md. Code Ann., Crim. Law § 2-201", "md-crimlaw", "2-201", "Md. Code Ann., Crim. Law § 2-201"),
         ("Fla. Stat. § 776.012", "fl", "776.012", "Fla. Stat. § 776.012"),
@@ -474,7 +507,7 @@ if __name__ == "__main__":
         ("M.G.L. c. 265, § 1", "ma", "265/1", "Mass. Gen. Laws ch. 265, § 1"),
         ("42 Pa.C.S. § 9711", "pa", "42-9711", "42 Pa. Cons. Stat. § 9711"),
         ("O.C.G.A. § 16-5-1", "ga", "16-5-1", "Ga. Code Ann. § 16-5-1"),
-        ("Cal. Health & Safety Code § 11350", "ca-healthsafety", "11350", "Cal. Health & Safety Code § 11350"),
+        ("Cal. Health & Safety Code § 11350", "ca-hsc", "11350", "Cal. Health & Safety Code § 11350"),
         ("N.Y. Veh. & Traf. Law § 1192", "ny-vehtraf", "1192", "N.Y. Veh. & Traf. Law § 1192"),
         ("Tex. Civ. Prac. & Rem. Code § 16.003", "tx-civpracrem", "16.003", "Tex. Civ. Prac. & Rem. Code Ann. § 16.003"),
         ("fla. stat. ann. § 776.012", "fl", "776.012", "Fla. Stat. § 776.012"),
@@ -484,10 +517,11 @@ if __name__ == "__main__":
         got = (c.key, c.section, c.label) if c else None
         check(got == (key, section, label), f"{text!r} -> {got!r}")
 
-    # subject-code keys are collision-resistant: Civil Code vs Civil Procedure
+    # California subjects canonicalize to official lawCodes (distinct keys for
+    # Civil Code vs Code of Civil Procedure).
     check(first("Cal. Civ. Code § 1714").key == "ca-civ"
-          and first("Cal. Civ. Proc. Code § 425.16").key == "ca-civproc",
-          "Cal. Civ. Code and Civ. Proc. Code get distinct keys")
+          and first("Cal. Civ. Proc. Code § 425.16").key == "ca-ccp",
+          "Cal. Civ. Code -> ca-civ, Civ. Proc. Code -> ca-ccp")
 
     # subdivisions captured, year not swallowed
     c = first("Cal. Penal Code § 187(a)")
@@ -503,11 +537,19 @@ if __name__ == "__main__":
     check(spec_label("de:11-636:") == "Del. Code Ann. tit. 11, § 636", "spec de")
     check(spec_label("pa:42-9711:") == "42 Pa. Cons. Stat. § 9711", "spec pa")
 
-    # everything link-outs while IN_APP is empty
-    c = first("Fla. Stat. § 776.012")
-    kind, val = action_for(c)
+    # California cites render in-app; non-priority states link-out.
+    kind, val = action_for(first("Cal. Penal Code § 187"))
+    check(kind == "statestat" and val == "ca-pen:187:",
+          f"CA in-app action: {(kind, val)}")
+    kind, val = action_for(first("Fla. Stat. § 776.012"))
     check(kind == "browse" and val.startswith("https://www.google.com/search?"),
           f"link-out action: {(kind, val[:40])}")
+    check(parse_query("Cal. Penal Code § 187") == ("statestat", "ca-pen:187:"),
+          "parse_query CA -> in-app spec")
+    check(parse_query("Fla. Stat. § 776.012") is None,
+          "parse_query non-priority -> None (link-out handled elsewhere)")
+    check(spec_label("ca-pen:187:") == "Cal. Penal Code § 187",
+          "spec_label CA works cold (eager registration)")
 
     # things that must NOT be detected as state statutes
     negatives = [
@@ -528,6 +570,6 @@ if __name__ == "__main__":
     prose = ("The court applied Fla. Stat. § 776.012 and also cited "
              "Cal. Penal Code § 187 before turning to Ga. Code Ann. § 16-5-1.")
     keys = [c.key for c in iter_cites(prose)]
-    check(keys == ["fl", "ca-penal", "ga"], f"prose scan: {keys}")
+    check(keys == ["fl", "ca-pen", "ga"], f"prose scan: {keys}")
 
     raise SystemExit(1 if failed else 0)

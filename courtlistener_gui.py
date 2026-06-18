@@ -5727,13 +5727,16 @@ _STATUTE_QUERY_RE = re.compile(
 
 
 def _parse_statute_query(query: str) -> Optional[tuple[str, str]]:
-    """Parse a typed citation into ("usc"|"cfr"|"rule", spec), or None.
-    Federal-rule queries ("fre 404(b)", "Fed. R. Civ. P. 56") never start
-    with a volume number, so they can't collide with the U.S.C./C.F.R.
-    form and are tried first."""
+    """Parse a typed citation into ("usc"|"cfr"|"rule"|"statestat", spec), or
+    None.  Federal-rule queries ("fre 404(b)", "Fed. R. Civ. P. 56") and state
+    statute queries ("Cal. Penal Code § 187") never start with a volume number,
+    so they can't collide with the U.S.C./C.F.R. form and are tried first."""
     rule = fed_rules.parse_query(query)
     if rule:
         return rule
+    statestat = state_statutes.parse_query(query)
+    if statestat:
+        return statestat
     m = _STATUTE_QUERY_RE.match(query or "")
     if not m:
         return None
@@ -5755,11 +5758,13 @@ _STATUTE_SOURCES: dict[str, object] = {
     "usc": us_code,
     "cfr": ecfr,
     "rule": fed_rules,
+    "statestat": state_statutes,  # in-app state statutes (CA; more to follow)
 }
 _SOURCE_HOST: dict[str, str] = {
     "usc": "uscode.house.gov",
     "cfr": "ecfr.gov",
     "rule": "law.cornell.edu",
+    "statestat": "the official source",
 }
 
 
