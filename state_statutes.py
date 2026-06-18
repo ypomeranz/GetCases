@@ -40,6 +40,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 
 import state_ca  # California: canonical code table + in-app fetch/parse
+import state_fl  # Florida: in-app fetch/parse (single compilation)
 
 # ---------------------------------------------------------------------------
 # Shared sub-patterns
@@ -412,6 +413,7 @@ for _code in state_ca.SUBJECT:                       # noqa: SIM118
     KEY_ABBR.setdefault(_k, state_ca.label_for_code(_code))
     KEY_NAME.setdefault(_k, "California")
     _RENDERABLE_KEYS.add(_k)
+_RENDERABLE_KEYS.add("fl")          # Florida: single compilation, in-app
 
 
 def _renderable(key: str) -> bool:
@@ -425,6 +427,8 @@ def load_section(key: str, section: str):
     state = key.split("-", 1)[0]
     if state == "ca":
         return state_ca.load(key, section)
+    if state == "fl":
+        return state_fl.load(key, section)
     raise RuntimeError(f"no in-app source for {KEY_NAME.get(key, key)}")
 
 
@@ -537,16 +541,21 @@ if __name__ == "__main__":
     check(spec_label("de:11-636:") == "Del. Code Ann. tit. 11, § 636", "spec de")
     check(spec_label("pa:42-9711:") == "42 Pa. Cons. Stat. § 9711", "spec pa")
 
-    # California cites render in-app; non-priority states link-out.
+    # Priority states (CA, FL) render in-app; non-priority states link-out.
     kind, val = action_for(first("Cal. Penal Code § 187"))
     check(kind == "statestat" and val == "ca-pen:187:",
           f"CA in-app action: {(kind, val)}")
     kind, val = action_for(first("Fla. Stat. § 776.012"))
+    check(kind == "statestat" and val == "fl:776.012:",
+          f"FL in-app action: {(kind, val)}")
+    kind, val = action_for(first("Ga. Code Ann. § 16-5-1"))
     check(kind == "browse" and val.startswith("https://www.google.com/search?"),
           f"link-out action: {(kind, val[:40])}")
     check(parse_query("Cal. Penal Code § 187") == ("statestat", "ca-pen:187:"),
           "parse_query CA -> in-app spec")
-    check(parse_query("Fla. Stat. § 776.012") is None,
+    check(parse_query("Fla. Stat. § 776.012") == ("statestat", "fl:776.012:"),
+          "parse_query FL -> in-app spec")
+    check(parse_query("Ga. Code Ann. § 16-5-1") is None,
           "parse_query non-priority -> None (link-out handled elsewhere)")
     check(spec_label("ca-pen:187:") == "Cal. Penal Code § 187",
           "spec_label CA works cold (eager registration)")
