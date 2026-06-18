@@ -32,18 +32,40 @@ From an `AskUserQuestion` round:
 
 ## 2. Status
 
+**Egress is now OPEN** (law.cornell.edu, uscode.house.gov, ecfr.gov, and the
+official state sites all reachable) — the §3 blocker is resolved.
+
 | Piece | State |
 |---|---|
-| Federal rules — detection | ✅ Done, tested offline (`fed_rules.py`) |
-| Federal rules — GUI wiring (links in opinions + viewer + Quick Look Up) | ✅ Done |
-| Federal rules — Cornell HTML→paragraph parser | ⚠️ Written to the LII template, **NOT verified against a live page** (egress blocked here) |
-| State regulations (Cornell, all 50, in-app) | ⬜ Not started — needs live recon of URL/HTML |
-| State statutes — all-50 detection table | ⬜ Not started (HTML-independent; can build now) |
-| State statutes — in-app for select states | ⬜ Not started — needs the user's state list + sources |
+| Federal rules — detection + GUI wiring | ✅ Done (`fed_rules.py`) |
+| Federal rules — Cornell HTML→paragraph parser | ✅ **Verified live** & fixed (article region, page-title head, `<p>` credit/note detection) |
+| State statutes — all-50 + D.C. detection | ✅ Done (`state_statutes.py`, offline-tested) |
+| State statutes — GUI wiring (opinion + viewer links; link-out) | ✅ Done (`browse` action → `webbrowser`) |
+| State statutes — in-app **California** | ✅ Done (`state_ca.py`, verified live; Quick Look Up wired) |
+| State statutes — in-app **Florida** | ⬜ Next — flsenate.gov reachable (single compilation) |
+| State statutes — in-app **Texas** | ⬜ Next — statutes.capitol.texas.gov reachable (chapter pages) |
+| State statutes — in-app **New York** | ⚠️ nysenate.gov is **Cloudflare-blocked** to automated fetch → link-out only (a real browser passes); see resumption note |
+| State regulations (Cornell, all 50, in-app) | ⬜ Recon done for CA (§6a); build deferred — statutes first per user |
 
-Commits live on branch **`claude/friendly-goodall-0faz93`** (confirm your task's
-branch instructions still point here). The federal-rules work is one commit:
-"Add federal rules (Cornell LII) as a citation source."
+User decisions (2026-06-18): priority states **CA, NY, TX, FL** full in-app;
+other states **detect + link-out**; **statutes before regulations**.
+
+Commits live on branch **`claude/friendly-goodall-0faz93`**. Recent slices:
+verify federal-rules parser; state-statute detection; GUI wiring; CA in-app.
+
+### Decisions / patterns worth keeping
+- **In-app state statutes are per-state** (no uniform source): each priority
+  state gets a `state_<xx>.py` implementing the source contract, dispatched by
+  `state_statutes.load_section(key, section)` on the spec-key prefix, and its
+  keys added to `_RENDERABLE_KEYS`. `state_ca.py` is the reference.
+- **Subject-code states** (CA/NY/TX) canonicalize the captured subject to an
+  official code (CA: 29-code table in `state_ca.CA_CODES`) so keys/labels are
+  stable and renderable; non-priority subject states (MD) stay free-text +
+  link-out. **Section numbers with colons** (N.J. `2C:11-3`, La. `14:30`) are
+  link-out only, so they never hit `_fetch_statute_window`'s `split(":",2)`.
+- **Link-out** default is a web search of the citation (`state_statutes.link_url`);
+  override per-state with a deep official URL where worthwhile (do this for NY:
+  nysenate.gov deep link, which works in a browser despite Cloudflare).
 
 ---
 
