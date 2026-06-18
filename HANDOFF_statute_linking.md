@@ -42,10 +42,17 @@ official state sites all reachable) — the §3 blocker is resolved.
 | State statutes — all-50 + D.C. detection | ✅ Done (`state_statutes.py`, offline-tested) |
 | State statutes — GUI wiring (opinion + viewer links; link-out) | ✅ Done (`browse` action → `webbrowser`) |
 | State statutes — in-app **California** | ✅ Done (`state_ca.py`, verified live; Quick Look Up wired) |
-| State statutes — in-app **Florida** | ⬜ Next — flsenate.gov reachable (single compilation) |
-| State statutes — in-app **Texas** | ⬜ Next — statutes.capitol.texas.gov reachable (chapter pages) |
-| State statutes — in-app **New York** | ⚠️ nysenate.gov is **Cloudflare-blocked** to automated fetch → link-out only (a real browser passes); see resumption note |
+| State statutes — in-app **Florida** | ✅ Done (`state_fl.py`, verified live; nested-class indent via stdlib HTML parser) |
+| State statutes — **Texas** | ⚠️ In-app infeasible (site is a JS **SPA**, no text in HTML) → **deep link-out** to official chapter page |
+| State statutes — **New York** | ⚠️ In-app infeasible (nysenate.gov **Cloudflare**) → **deep link-out** to nysenate.gov section |
 | State regulations (Cornell, all 50, in-app) | ⬜ Recon done for CA (§6a); build deferred — statutes first per user |
+
+**All four priority states handled.** CA & FL render in-app; NY & TX cannot be
+fetched with the app's requests+regex model (Cloudflare / Angular SPA) so they
+deep-link to the exact provision on the official site (a browser handles both).
+The only path to NY/TX *in-app* is a headless browser — ask the user before
+taking that on. NY LAWID and TX code maps live in `state_statutes` (`_NY_LAW`,
+`_TX_CODE`).
 
 User decisions (2026-06-18): priority states **CA, NY, TX, FL** full in-app;
 other states **detect + link-out**; **statutes before regulations**.
