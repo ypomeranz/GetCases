@@ -101,6 +101,7 @@ from bluebook_names import abbreviate_case_name
 from courtlistener import CourtListenerClient, CourtListenerError
 import ecfr
 import fed_rules
+import state_statutes
 import us_code
 from court_catalog import (
     CATALOG as _COURT_CATALOG,
@@ -4495,6 +4496,8 @@ class _ScholarTextWindow:
             matches.append((m.start(), m.end(), "cfr", m))
         for m in fed_rules.RULE_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "rule", m))
+        for c in state_statutes.iter_cites(text):
+            matches.append((c.start, c.end, "statestat", c))
         matches.sort(key=lambda t: (t[0], -t[1]))
         pos = 0
         for start, end, kind, m in matches:
@@ -4517,6 +4520,10 @@ class _ScholarTextWindow:
                 action = ("usc", us_code.cite_spec(m))
             elif kind == "rule":
                 action = ("rule", fed_rules.cite_spec(m))
+            elif kind == "statestat":
+                # In-app for priority states (once a parser exists), else a
+                # browser link-out.  `m` here is a state_statutes.Cite record.
+                action = state_statutes.action_for(m)
             else:
                 action = ("cfr", ecfr.cite_spec(m))
             ltags = tags + ("citelink", self._new_link(action))
@@ -5460,6 +5467,12 @@ class _ScholarTextWindow:
         if kind in _STATUTE_SOURCES:
             self._open_statute(kind, value)
             return
+        if kind == "browse":
+            # Link-out to an external source (e.g. a state statute we don't
+            # render in-app); open it in the user's browser.
+            webbrowser.open(value)
+            self._status_var.set("Opened in your browser.")
+            return
         # CourtListener opinion URL: fetch structured text from CL directly
         if kind == "url" and "courtlistener.com/opinion/" in value:
             self._follow_cl_link(value)
@@ -6051,6 +6064,9 @@ class _StatuteWindow:
             refs.append((m.start(), m.end(), "cfr", ecfr.cite_spec(m)))
         for m in fed_rules.RULE_CITE_RE.finditer(text):
             refs.append((m.start(), m.end(), "rule", fed_rules.cite_spec(m)))
+        for c in state_statutes.iter_cites(text):
+            kind, value = state_statutes.action_for(c)
+            refs.append((c.start, c.end, kind, value))
         if self._doc.kind == "usc":
             for m in _USC_XREF_RE.finditer(text):
                 title = m.group(3) or self._doc.title
@@ -6089,9 +6105,16 @@ class _StatuteWindow:
 
     def _follow_link(self, tag: str) -> None:
         action = self._link_actions.get(tag)
-        if action:
-            _fetch_statute_window(self._win, action[0], action[1],
-                                  self._status_var.set)
+        if not action:
+            return
+        kind, value = action
+        if kind == "browse":
+            # Cross-reference to a source we don't render in-app (e.g. a state
+            # statute) — open it in the user's browser.
+            webbrowser.open(value)
+            self._status_var.set("Opened in your browser.")
+            return
+        _fetch_statute_window(self._win, kind, value, self._status_var.set)
 
     # ------------------------------------------------------------------
     # Previous/next provision
