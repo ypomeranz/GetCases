@@ -315,10 +315,37 @@ def _set_order(set_key: str) -> list[str]:
 
 RULES_HIERARCHY = ("a", "1", "A", "i", "I")
 
-# Heading text that begins the (collapsible) notes that follow a rule.
+# Heading *element* text that begins the notes that follow a rule (some LII
+# pages wrap the committee notes under an <h2>Notes</h2> / similar heading).
 _NOTE_HEAD_RE = re.compile(
     r"(advisory\s+committee|committee\s+note|notes?\s+of\s+decisions|"
     r"\bnotes\b|amendment|effective\s+date)",
+    re.IGNORECASE,
+)
+
+# On most LII rule pages the committee notes are NOT wrapped in heading
+# elements — the boundary and the per-era dividers are plain <p> paragraphs.
+# These two patterns are anchored to the start of a paragraph so they detect
+# the notes without misfiring on operative rule text.
+
+# The amendment-history credit line that trails the operative text, e.g.
+# "(As amended Dec. 27, 1946, eff. ...)", "(As added Apr. 12, 2006, ...)",
+# "(Pub. L. 93-595, ... 88 Stat. 1932; ...)".  Its appearance both yields a
+# "credit" paragraph and marks the start of the trailing notes.
+# (No trailing \b: "Pub. L." ends in a period, so a word boundary there fails;
+# the alternatives are distinctive enough at the head of a parenthetical.)
+_CREDIT_RE = re.compile(
+    r"^\(\s*(?:As\s+(?:amended|added)|Amended|Added|Pub\.\s*L\.)",
+    re.IGNORECASE,
+)
+
+# A per-era committee-note divider rendered as a <p>, e.g. "Notes of Advisory
+# Committee on Rules—1937", "Committee Notes on Rules—2010 Amendment", "Notes
+# of Committee on the Judiciary, House Report No. 93-650".
+_NOTE_SECTION_RE = re.compile(
+    r"^(?:Notes?\s+of\s+(?:the\s+)?(?:Advisory\s+)?Committee\b"
+    r"|Committee\s+Notes?\s+on\s+Rules?\b"
+    r"|Advisory\s+Committee\s+Notes?\b)",
     re.IGNORECASE,
 )
 
@@ -329,13 +356,26 @@ _BLOCK_RE = re.compile(
 )
 _ENUM_LEAD_RE = re.compile(r"^((?:\((?:\d{1,3}|[a-zA-Z]{1,5})\)\s*)+)")
 
-# Common LII / Drupal content containers, tried in order before the body.
+# Common LII / Drupal content containers, tried in order.  The rule node is
+# rendered as a single self-closing <article> that holds the rule body AND the
+# trailing committee notes, with the "Toolbox" <aside> and the site <footer>
+# OUTSIDE it — so the bounded <article> match is both the cleanest and the
+# safest (verified across frcp/frcrmp/fre/frap/frbp).  The remaining patterns
+# are fallbacks for any page that lacks the node article.
 _CONTENT_RE = (
-    re.compile(r'<div[^>]+id="?content[^>]*>(.*)', re.IGNORECASE | re.DOTALL),
     re.compile(r'<article\b[^>]*>(.*?)</article>', re.IGNORECASE | re.DOTALL),
-    re.compile(r'<main\b[^>]*>(.*?)</main>', re.IGNORECASE | re.DOTALL),
-    re.compile(r'<div[^>]+id="?main-content[^>]*>(.*)',
+    re.compile(r'<div[^>]+id="?main-content"?[^>]*>(.*)',
                re.IGNORECASE | re.DOTALL),
+    re.compile(r'<main\b[^>]*>(.*?)</main>', re.IGNORECASE | re.DOTALL),
+    re.compile(r'<div[^>]+id="?content"?[^>]*>(.*)', re.IGNORECASE | re.DOTALL),
+)
+
+# The rule's descriptive heading ("Rule 404. Character Evidence ...") is
+# rendered in the page <h1 id="page-title">, which sits OUTSIDE the node
+# <article> used as the content region — so it is pulled from the whole page.
+_PAGE_TITLE_RE = re.compile(
+    r'<h1\b[^>]*\bid="?page-title"?[^>]*>(.*?)</h1>',
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -354,17 +394,33 @@ def _content_region(page_html: str) -> str:
     return page_html
 
 
+def _page_title(page_html: str) -> str:
+    """The rule's descriptive heading from <h1 id="page-title">, e.g.
+    'Rule 404. Character Evidence; Other Crimes, Wrongs, or Acts'."""
+    m = _PAGE_TITLE_RE.search(page_html)
+    return _clean(m.group(1)) if m else ""
+
+
 def parse_rule_html(page_html: str) -> list[tuple[str, int, str]]:
     """Parse an LII rule page into the (kind, indent, text) stream used by
     the statute viewer (same contract as us_code.parse_section)."""
     region = _content_region(page_html)
-    # Drop obvious chrome that can sit inside the content region.
-    region = re.sub(r"(?is)<(script|style|nav|form|figure)\b.*?</\1>", "",
-                    region)
+    # Drop obvious chrome that can sit inside (or, on fallback paths, after)
+    # the content region: scripts/styles, the prev/up/next pager <nav> that
+    # trails the rule body, the "Toolbox" <aside>, and the site <footer>.
+    region = re.sub(
+        r"(?is)<(script|style|nav|aside|footer|form|figure)\b.*?</\1>", "",
+        region)
     paras: list[tuple[str, int, str]] = []
     stack: list[tuple[str, str]] = []
     in_notes = False
-    seen_head = False
+    # Seed the stream with the rule's descriptive heading (it lives in the
+    # page <h1>, outside the article region); fall back to deriving the head
+    # from the first in-article heading when that <h1> is absent.
+    title = _page_title(page_html)
+    seen_head = bool(title)
+    if title:
+        paras.append(("sechead", 0, title))
     for em in _BLOCK_RE.finditer(region):
         tag = em.group(1).lower()
         text = _clean(em.group(2))
@@ -384,9 +440,24 @@ def parse_rule_html(page_html: str) -> list[tuple[str, int, str]]:
             paras.append(("note-head" if in_notes else "head", 0, text))
             continue
         if not seen_head:
-            # Body text before any heading: synthesize the section head from
-            # the citation label is the caller's job; treat as body.
+            # Body text before any heading: the section head is seeded from
+            # the page <h1> above, so treat this as body.
             seen_head = True
+        # The amendment-history credit line ends the operative rule text and
+        # opens the trailing committee notes (LII renders it as a bare <p>).
+        if _CREDIT_RE.match(text):
+            in_notes = True
+            stack.clear()
+            paras.append(("credit", 0, text))
+            continue
+        # Per-era note dividers are <p> paragraphs (not headings) on most LII
+        # pages; promote them to note heads, flipping into note mode when the
+        # credit line happens to be absent.
+        if _NOTE_SECTION_RE.match(text):
+            in_notes = True
+            stack.clear()
+            paras.append(("note-head", 0, text))
+            continue
         if in_notes:
             paras.append(("note-body", 0, text))
             continue
@@ -458,36 +529,98 @@ if __name__ == "__main__":
     check(parse_query("42 USC 1983") is None, "query rejects usc")
     check(parse_query("hello") is None, "query rejects prose")
 
-    # --- parser on a synthetic LII-shaped page (VERIFY vs. live HTML) ---
-    sample = """<html><head><title>x</title></head><body>
-    <nav><a href="/rules/fre">FRE</a></nav>
-    <div id="content">
-      <h1>Rule 404. Character Evidence; Other Crimes, Wrongs, or Acts</h1>
-      <p>(a) <b>Character Evidence.</b></p>
-      <p>(1) <i>Prohibited Uses.</i> Evidence of a person&rsquo;s character
-         is not admissible to prove conduct.</p>
-      <p>(2) <i>Exceptions for a Defendant or Victim.</i> The following
-         exceptions apply in a criminal case:</p>
-      <p>(A) a defendant may offer evidence of the defendant&rsquo;s
-         pertinent trait;</p>
-      <p>(b) <b>Other Crimes, Wrongs, or Acts.</b></p>
-      <p>(1) <i>Prohibited Uses.</i> Evidence of any other crime is not
-         admissible to prove character.</p>
-      <h2>Notes of Advisory Committee on Proposed Rules</h2>
-      <p>Subdivision (a). This is a note and should be collapsible.</p>
-    </div>
-    <footer>junk nav material</footer></body></html>"""
+    # --- boundary patterns: credit line + <p> note dividers ---
+    # (Confirmed against live LII markup for frcp/frcrmp/fre/frap/frbp.)
+    check(bool(_CREDIT_RE.match("(As amended Dec. 27, 1946, eff. Mar. 19, "
+                                "1948; Jan. 21, 1963.)")), "credit: As amended")
+    check(bool(_CREDIT_RE.match("(As added Apr. 12, 2006, eff. Dec. 1, 2006.)")),
+          "credit: As added")
+    # "Pub. L." ends in a period — the pattern must not require a \b there.
+    check(bool(_CREDIT_RE.match("(Pub. L. 93–595, §1, Jan. 2, 1975, "
+                                "88 Stat. 1932.)")), "credit: Pub. L.")
+    check(not _CREDIT_RE.match("(a) Motion for Summary Judgment."),
+          "credit: not an operative subdivision")
+    check(not _CREDIT_RE.match("(2) the complaint may be amended."),
+          "credit: not a body para that mentions amendment")
+    check(bool(_NOTE_SECTION_RE.match(
+        "Notes of Advisory Committee on Rules—1937")), "note div: advisory")
+    check(bool(_NOTE_SECTION_RE.match("Committee Notes on Rules—2010 "
+                                      "Amendment")), "note div: committee notes")
+    check(bool(_NOTE_SECTION_RE.match("Notes of Committee on the Judiciary, "
+                                      "House Report No. 93–650")),
+          "note div: judiciary")
+    check(not _NOTE_SECTION_RE.match("The committee notes that this rule..."),
+          "note div: not prose mentioning the committee")
+
+    # --- parser on a page that mirrors real LII structure ---
+    # The descriptive title lives in <h1 id="page-title"> OUTSIDE the node
+    # <article>; the rule body, the "(As amended ...)" credit, and the per-era
+    # note dividers are <p> elements INSIDE it; a prev/next pager <nav> trails
+    # the body; the "Toolbox" <aside> and the site <footer> (with <li>/<a>
+    # link text that would otherwise be scraped) sit AFTER the article.
+    sample = """<html><head>
+    <title>Rule 404. Character Evidence | Federal Rules of Evidence | LII</title>
+    </head><body>
+    <nav id="sitenav"><a href="/rules/fre">FRE</a></nav>
+    <main id="main"><div id="content" class="col-sm-8"><div id="main-content">
+      <h1 class="title" id="page-title">Rule 404. Character Evidence; Other
+         Crimes, Wrongs, or Acts</h1>
+      <article data-history-node-id="42"><div><div>
+        <p>(a) <b>Character Evidence.</b></p>
+        <p>(1) <i>Prohibited Uses.</i> Evidence of a person&rsquo;s character
+           is not admissible to prove conduct.</p>
+        <p>(2) <i>Exceptions for a Defendant or Victim.</i> The following
+           exceptions apply in a criminal case:</p>
+        <p>(A) a defendant may offer evidence of the defendant&rsquo;s
+           pertinent trait;</p>
+        <p>(b) <b>Other Crimes, Wrongs, or Acts.</b></p>
+        <p>(1) <i>Prohibited Uses.</i> Evidence of any other crime is not
+           admissible to prove character.</p>
+        <p>(As amended Pub. L. 93&ndash;595, &sect;1, Jan. 2, 1975; Apr. 26,
+           2011, eff. Dec. 1, 2011.)</p>
+        <p>Notes of Advisory Committee on Proposed Rules</p>
+        <p>Subdivision (a). This is a note and should be collapsible.</p>
+        <p>Committee Notes on Rules&mdash;2011 Amendment</p>
+        <p>The language of Rule 404 has been amended as part of restyling.</p>
+        <nav class="pager"><a rel="prev">Rule 403. Excluding Evidence</a>
+           <a rel="next">Rule 405. Methods of Proving Character</a></nav>
+      </div></div></article>
+    </div></div>
+    <aside><h2>Federal Rules of Evidence Toolbox</h2>
+      <ul><li><a href="/wex">Wex: Evidence: Overview</a></li></ul></aside>
+    </main>
+    <footer id="liifooter"><ul>
+      <li><a href="/about">About LII</a></li>
+      <li><a href="/privacy">Privacy</a></li></ul></footer></body></html>"""
     paras = parse_rule_html(sample)
     kinds = [(k, i) for k, i, _t in paras]
-    check(paras[0][0] == "sechead" and "Rule 404" in paras[0][2],
-          f"section head: {paras[0]!r}")
+    texts = [t for _k, _i, t in paras]
+    # Title comes from <h1 id="page-title"> even though it sits outside <article>.
+    check(paras[0][0] == "sechead" and "Rule 404" in paras[0][2]
+          and "Character Evidence" in paras[0][2],
+          f"section head from page <h1>: {paras[0]!r}")
     check(("body", 0) in kinds and ("body", 1) in kinds
           and ("body", 2) in kinds, f"body indents: {kinds!r}")
-    check(any(k == "note-head" for k, _i in kinds), "note head captured")
-    check(paras[-1][0] == "note-body",
-          f"advisory note becomes note-body: {paras[-1]!r}")
-    check(not any("junk nav" in t for _k, _i, t in paras),
-          "footer chrome dropped")
+    # The "(As amended ...)" line is a credit and the operative/notes boundary.
+    credits = [t for k, _i, t in paras if k == "credit"]
+    check(len(credits) == 1 and credits[0].startswith("(As amended"),
+          f"credit line captured: {credits!r}")
+    # Both <p> note dividers become note heads (no heading element present).
+    note_heads = [t for k, _i, t in paras if k == "note-head"]
+    check(any("Advisory Committee on Proposed Rules" in t for t in note_heads)
+          and any("Committee Notes on Rules" in t for t in note_heads),
+          f"<p> note dividers -> note-head: {note_heads!r}")
+    # The narrative under a divider is note-body; nothing after the credit is body.
+    check(any(k == "note-body" and t.startswith("Subdivision (a)")
+              for k, _i, t in paras), "advisory narrative -> note-body")
+    check(not any(k == "body" and i == 0
+                  and (t.startswith("(As ") or "Advisory Committee" in t)
+                  for k, i, t in paras), "no notes mislabeled as body")
+    # Chrome: the prev/next pager, the Toolbox <aside>, and the <footer> links
+    # must not leak into the paragraph stream.
+    for junk in ("Rule 403", "Rule 405", "Toolbox", "Wex:", "About LII",
+                 "Privacy"):
+        check(not any(junk in t for t in texts), f"chrome dropped: {junk!r}")
     body_a1 = next(t for k, i, t in paras if (k, i) == ("body", 1))
     check("<i>" not in body_a1 and "Prohibited" in body_a1,
           "inline tags stripped")
