@@ -1298,15 +1298,14 @@ class CourtListenerGUI:
                 return
             self._spotlight_empty_returns = 0
 
-            # 1. Statute / regulation: "42 USC 1983(b)", "29 CFR 1614.105"
+            # 1. Statute / regulation / federal rule: "42 USC 1983(b)",
+            # "29 CFR 1614.105", "Fed. R. Civ. P. 56", "Cal. Penal Code 187".
+            # The section sign is optional — it can't be typed on a keyboard.
             statute = _parse_statute_query(query)
             if statute:
                 popup.destroy()
                 self._quick_popup = None
-                _fetch_statute_window(
-                    self.root, statute[0], statute[1],
-                    lambda s: None,
-                )
+                _open_statute_action(self.root, statute)
                 return
 
             # 2. Case citation: "365 U.S. 167" or "Monroe v. Pape, 365 U.S. 167, 171"
@@ -2098,8 +2097,7 @@ class CourtListenerGUI:
             # read as volume 42, reporter "USC", page 1983
             statute = _parse_statute_query(q)
             if statute:
-                _fetch_statute_window(self.root, statute[0], statute[1],
-                                      set_status)
+                _open_statute_action(self.root, statute, set_status)
                 return
             parsed = _parse_citation_line(q)
             if not parsed:
@@ -2153,8 +2151,8 @@ class CourtListenerGUI:
         entry.grid(row=0, column=1, padx=6, sticky="we")
         entry.focus_set()
         status_var = tk.StringVar(
-            value="e.g.  42 USC 1983(b)   ·   29 CFR 1614.105(a)   ·   "
-                  "Fed. R. Evid. 404(b)"
+            value="e.g.  42 USC 1983(b)   ·   Fed. R. Evid. 404(b)   ·   "
+                  "Cal. Penal Code 187   ·   Fla. Stat. 776.012"
         )
         ttk.Label(frame, textvariable=status_var, foreground="gray").grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(8, 0)
@@ -2165,12 +2163,13 @@ class CourtListenerGUI:
             if not parsed:
                 status_var.set(
                     "Couldn't read that — try '42 USC 1983', "
-                    "'29 CFR 1614.105(a)' or 'Fed. R. Evid. 404(b)'."
+                    "'29 CFR 1614.105(a)', 'Fed. R. Evid. 404(b)' or "
+                    "'Cal. Penal Code 187'."
                 )
                 return
-            kind, spec = parsed
-            # Parent on the root so the statute window outlives the dialog
-            _fetch_statute_window(self.root, kind, spec, status_var.set)
+            # Parent on the root so the statute window outlives the dialog.
+            # (A state we only link out to opens in the browser instead.)
+            _open_statute_action(self.root, parsed, status_var.set)
 
         ttk.Button(frame, text="Look Up", command=go).grid(row=0, column=2)
         entry.bind("<Return>", go)
@@ -5806,6 +5805,19 @@ def _fetch_statute_window(parent: tk.Misc, kind: str, spec: str,
         post(show)
 
     threading.Thread(target=run, daemon=True).start()
+
+
+def _open_statute_action(parent: tk.Misc, action: tuple[str, str],
+                         status=lambda _s: None) -> None:
+    """Carry out a parsed statute-lookup action: open the in-app viewer, or —
+    for a state we only link out to (N.Y., Tex., other states) — open the
+    official source in the browser."""
+    kind, value = action
+    if kind == "browse":
+        webbrowser.open(value)
+        status("Opened in your browser.")
+        return
+    _fetch_statute_window(parent, kind, value, status)
 
 
 def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:

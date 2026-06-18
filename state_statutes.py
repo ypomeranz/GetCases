@@ -85,9 +85,11 @@ class Cite:
 # ---------------------------------------------------------------------------
 
 _PATTERNS: list[tuple[re.Pattern, "callable"]] = []
+_PATTERN_SRC: list[tuple[str, "callable"]] = []
 
 
 def _add(rx: str, build) -> None:
+    _PATTERN_SRC.append((rx, build))
     _PATTERNS.append((re.compile(rx, re.IGNORECASE), build))
 
 
@@ -354,21 +356,47 @@ _add(rf"\bN\.?\s*J\.?\s*(?:Stat\.?\s*Ann\.?|Rev\.?\s*Stat\.?|S\.?A\.?)\s*"
 # Detection
 # ---------------------------------------------------------------------------
 
-def iter_cites(text: str):
-    """Yield non-overlapping Cite records found in `text`, left to right.
-    Overlaps are resolved first-start / longest-match (as the GUI also does
-    across sources)."""
+# Relaxed patterns make the section sign optional, for the hand-typed lookup
+# path — you can't type "§" on a keyboard, so "Cal. Penal Code 187" must
+# resolve just like "Cal. Penal Code § 187".  Built lazily by making the _SS
+# group optional in each strict pattern's source.
+_SS_OPTIONAL = _SS.replace(r")\s*", r")?\s*")
+_relaxed_compiled: list | None = None
+
+
+def _relaxed_patterns():
+    global _relaxed_compiled
+    if _relaxed_compiled is None:
+        _relaxed_compiled = [
+            (re.compile(src.replace(_SS, _SS_OPTIONAL), re.IGNORECASE), build)
+            for src, build in _PATTERN_SRC
+        ]
+    return _relaxed_compiled
+
+
+def _scan(patterns, text: str) -> list[Cite]:
+    """Run `patterns` over `text`, returning non-overlapping Cite records
+    left to right (overlaps resolved first-start / longest-match, as the GUI
+    also does across sources)."""
     found: list[Cite] = []
-    for rx, build in _PATTERNS:
+    for rx, build in patterns:
         for m in rx.finditer(text):
             if m.group(0).strip():
                 found.append(build(m))
     found.sort(key=lambda c: (c.start, -(c.end - c.start)))
+    out: list[Cite] = []
     pos = -1
     for c in found:
         if c.start >= pos:
-            yield c
+            out.append(c)
             pos = c.end
+    return out
+
+
+def iter_cites(text: str) -> list[Cite]:
+    """Detected state-statute citations in `text` (strict: a section sign or
+    'sec.'/'section' is required, to avoid false positives in running prose)."""
+    return _scan(_PATTERNS, text)
 
 
 # ---------------------------------------------------------------------------
@@ -528,11 +556,15 @@ def action_for(c: Cite) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def parse_query(query: str) -> tuple[str, str] | None:
-    """Parse a whole hand-typed citation into ("statestat", spec), or None.
-    Only resolves to an in-app spec for states with a parser; otherwise the
-    GUI should fall back to opening the link-out."""
+    """Parse a whole hand-typed citation into a link action, or None.
+    Forgiving: the section sign is optional (you can't type "§"), so
+    "Cal. Penal Code 187" works as well as "Cal. Penal Code § 187".  Returns
+    ("statestat", spec) for an in-app state (CA, FL) or ("browse", url) for a
+    recognized state whose text we open in the browser (NY, TX, others)."""
     q = (query or "").strip()
-    cites = [c for c in iter_cites(q)]
+    if not q:
+        return None
+    cites = _scan(_relaxed_patterns(), q)
     if not cites:
         return None
     c = cites[0]
@@ -540,9 +572,7 @@ def parse_query(query: str) -> tuple[str, str] | None:
     # citation buried in prose).
     if c.start > 0 or c.end < len(q.rstrip(". ")):
         return None
-    if not _renderable(c.key):
-        return None
-    return ("statestat", cite_spec(c))
+    return action_for(c)
 
 
 # ---------------------------------------------------------------------------
@@ -629,8 +659,18 @@ if __name__ == "__main__":
           "parse_query CA -> in-app spec")
     check(parse_query("Fla. Stat. § 776.012") == ("statestat", "fl:776.012:"),
           "parse_query FL -> in-app spec")
-    check(parse_query("Ga. Code Ann. § 16-5-1") is None,
-          "parse_query non-priority -> None (link-out handled elsewhere)")
+    # Forgiving: no section sign needed (can't type "§" on a keyboard).
+    check(parse_query("Cal. Penal Code 187") == ("statestat", "ca-pen:187:"),
+          "parse_query CA without § ")
+    check(parse_query("cal penal code 187") == ("statestat", "ca-pen:187:"),
+          "parse_query CA lowercase / no periods / no §")
+    check(parse_query("Fla. Stat. 776.012") == ("statestat", "fl:776.012:"),
+          "parse_query FL without §")
+    # Link-out states resolve too (Spotlight opens them in the browser).
+    check(parse_query("N.Y. Penal Law 125.25")
+          == ("browse", "https://www.nysenate.gov/legislation/laws/PEN/125.25"),
+          "parse_query NY without § -> deep link-out")
+    check(parse_query("hello world") is None, "parse_query rejects prose")
     check(spec_label("ca-pen:187:") == "Cal. Penal Code § 187",
           "spec_label CA works cold (eager registration)")
 
