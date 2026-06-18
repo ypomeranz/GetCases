@@ -198,12 +198,47 @@ Grep these symbols (line numbers drift):
 ## 6. Plan for state law
 
 ### 6a. State regulations — Cornell hosts all 50 (in-app) — `state_regs.py`
-- Cornell publishes state regs for all 50 states under `/regulations`
-  (confirmed via search; **per-state URL scheme NOT yet verified** — needs
-  egress). Recon: fetch `https://www.law.cornell.edu/regulations`, pick one
-  state (e.g. California Code of Regulations), and learn the deep-link pattern +
-  HTML structure. Then implement the standard contract (§4a). Likely very close
-  to `fed_rules.py`.
+- Cornell publishes state regs for all 50 states under
+  `/regulations/<state-slug>` (all 50 slugs confirmed live; slugs are the
+  lower-case state name, hyphenated, e.g. `california`, `new-york`,
+  `north-carolina`). Each state landing page is a TOC of titles
+  (`/regulations/<slug>/title-N`) that nests deeply
+  (title → division → subdivision → part → chapter → article …).
+
+- **RECON DONE for California (2026-06; egress open):**
+  - A **leaf section** has a flat, citation-derived URL:
+    `/regulations/california/<title>-CCR-<section>` where the section's dots
+    become dashes, e.g. `22-CCR-51303` and `22-CCR-125-1` (= § 125.1). This is
+    a **direct map from the citation** — no TOC traversal needed.
+  - Section-page HTML (clean, structured — *easier* than the rule pages):
+    - Title: `<h1 class="title" id="page_title">` — note the **underscore**
+      `page_title` (rule pages use hyphen `page-title`). Text is the Bluebook
+      cite + name, e.g. "Cal. Code Regs. Tit. 22, § 51303 - General Provisions".
+    - Body: `<div class="statereg-text">` containing
+      `<div class="subsect indentN">` blocks — **indent is explicit in the
+      class** (`indent0..`), no enumerator inference needed; each has
+      `<span class="designator">(a)</span>` + text.
+    - Internal cross-refs already `<a>`-linked as `<span class="codecitation">`.
+    - Notes: `<h2 class="statereg-notes-heading">Notes</h2>` + amendment history.
+  - **Soft-404 warning:** missing/section-less URLs return **HTTP 200** with the
+    state *landing* page (CA landing len ≈ 27622; h1 text "California Code of
+    Regulations"). Detect a bad section by absence of `statereg-text` /
+    `id="page_title"`, not by status code.
+
+- **NOT uniform across states:** the `{title}-CCR-{section}` guess does **not**
+  transfer — NY's `10-NYCRR-3.2` soft-404s to the NY landing page, so NY's real
+  section URL scheme differs (code token is `NYCRR`, but section formatting /
+  path differs). TX & FL didn't surface a section link via a shallow BFS. So
+  per state we need: (1) the URL **code token** (CCR/NYCRR/TAC/…), (2) the
+  section-number → URL-slug formatting, (3) the citation signature, all
+  verified live. The `statereg-*` class template *looks* shared (CA confirmed),
+  but verify per state. **This per-state work is best scoped to the user's
+  priority jurisdictions** — hence the question below.
+
+- Implementation shape once a state is verified: same contract as §4a; kind
+  `statereg`, spec `"<slug>:<title>-<section>"`; parser keys off
+  `statereg-text` / `subsect indentN` / `page_title` / `statereg-notes`
+  (so it can be ONE parser for all template-conforming states).
 
 ### 6b. State statutes — detection table (all 50 + DC + territories)
 Cornell does **not** host uniform full-text state statutes (it mostly links out
