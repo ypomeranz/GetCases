@@ -9,24 +9,52 @@ federal rules** (Civ. P., Crim. P., Evid., App. P., etc.) — tolerant of
 Bluebook spacing/period/capitalization quirks — turn them into clickable links,
 and show the cited provision *inside* the app's statute viewer (the same window
 that already serves U.S. Code and C.F.R.). Source of choice: **Cornell LII**
-(`www.law.cornell.edu`).
+(`www.law.cornell.edu`); state statutes come from each state's official site.
+
+---
+
+## 0. ⏸️ PAUSED — 2026-06-18 (read this first)
+
+The user asked to **pause the state-statute project after the priority "big
+states" were handled**, and move on to other features. We are at that planned
+break. **Nothing here is broken or half-finished** — it's a clean stopping
+point. What shipped before the break:
+
+- **Federal rules** — done & verified live (`fed_rules.py`).
+- **State-statute detection** — all 50 states + D.C., wired into the opinion
+  reader, the statute viewer, and the Ctrl-Space spotlight / Look Up dialog
+  (`state_statutes.py`).
+- **Priority states (CA, NY, TX, FL):** **CA & FL render in-app**
+  (`state_ca.py`, `state_fl.py`); **NY & TX deep-link out** to the official
+  source because they can't be fetched headlessly (NY = Cloudflare, TX = JS
+  SPA — see §2 / the `[[ny-statutes-cloudflare-blocked]]` memory).
+- **Spotlight / Look Up** — typing a federal rule or an accessible statute
+  (e.g. `Cal. Penal Code 187`, `Fed. R. Civ. P. 56`) opens it; the section
+  sign is optional (can't type `§`).
+
+**When you resume this project (only if the user asks),** the open backlog is
+in §8. The biggest remaining pieces: state **regulations** (Cornell, all 50 —
+CA recon done, §6a) and, if wanted, a **headless-browser** path to make NY/TX
+render in-app. Everything else (other states' statutes) is intentionally
+detect-and-link-out, not in-app.
 
 ---
 
 ## 1. Decisions the user already made (do not re-litigate)
 
-From an `AskUserQuestion` round:
+From two `AskUserQuestion` rounds:
 
-- **State statutes:** "Full in-app for select states." → Build full in-app
-  statute parsing for a chosen set of priority states; for the rest, detect the
-  citation and open the source in the browser (link-out). The user has **not
-  yet named the select states** — ask which jurisdictions they practice in
-  before building per-state in-app parsers. (Detection of all states can proceed
-  without that list.)
+- **Priority states for full in-app:** **California, New York, Texas, Florida**
+  (named 2026-06-18). Status: CA & FL in-app; NY & TX deep link-out (can't be
+  fetched headlessly). See §0 / §2.
+- **Other states:** "Detect all + link out" — every state's citation is
+  clickable; opens the source (in-app where we can, else the browser).
+- **Build order:** **statutes before regulations.** (Statutes done for the
+  break; regulations are the main remaining backlog — §6a.)
 - **Jurisdiction coverage for detection:** Federal rules (all sets) **+ all 50
-  states + specific states + DC/territories** — i.e. detect broadly.
-- **Unblocking network:** "Add hosts to egress allowlist." (See §3 — still
-  pending as of this writing.)
+  states + DC** — detect broadly. (Done.)
+- **Unblocking network:** the egress allowlist was opened; the §3 blocker is
+  **resolved** (all sources reachable).
 
 ---
 
@@ -269,15 +297,12 @@ Grep these symbols (line numbers drift):
   `statereg-text` / `subsect indentN` / `page_title` / `statereg-notes`
   (so it can be ONE parser for all template-conforming states).
 
-### 6b. State statutes — detection table (all 50 + DC + territories)
-Cornell does **not** host uniform full-text state statutes (it mostly links out
-to official sources). So: **detect everywhere; full in-app parse only for the
-user's select states; link-out (browser) for the rest.**
-
-Build a data-driven table (Bluebook **Table T1**) mapping each jurisdiction's
-citation signature(s) → (normalized spec, link target / parser). The formats
-vary a lot — design for it. Representative forms (tolerate `Ann.`, spacing,
-periods, case):
+### 6b. State statutes — detection table (all 50 + DC) — ✅ DONE (`state_statutes.py`)
+Cornell does **not** host uniform full-text state statutes, so: **detect
+everywhere; in-app parse only for priority states; link-out for the rest.** The
+Bluebook **Table T1** detection table is built and offline-tested. Representative
+forms it handles (tolerant of `Ann.`, spacing, periods, case, and — in the
+`parse_query` lookup path — a missing section sign):
 
 ```
 N.Y. Penal Law § 125.25            Cal. Penal Code § 187            (subject-matter codes)
@@ -296,19 +321,22 @@ Approach: per-jurisdiction compiled regex fragments (like each source has its
 own `CITE_RE`), assembled so `_insert_plain_with_links` can scan them. Keep the
 state abbreviation/name table aligned with `court_catalog.py`'s `STATE_COURTS`.
 
-### 6c. Link-out target (design decision for non-select states)
-Default to opening the **official state source** or the Cornell `/states/<state>`
-landing page in the browser (`("browse", url)`). Deep per-statute links need
-per-state URL schemes (egress-dependent research). Recommend: ship link-out to a
-reliable target first, deepen later. Confirm the preference with the user.
+### 6c. Link-out target — ✅ DONE (`state_statutes.link_url`)
+Default: a web search of the citation (reliable for any state, no per-state URL
+scheme needed). **NY and TX override with deep official URLs** (they can't be
+in-app): NY → `nysenate.gov/legislation/laws/<LAWID>/<section>` (`_NY_LAW`
+map); TX → `statutes.capitol.texas.gov/Docs/<CODE>/htm/<CODE>.<chapter>.htm`
+(`_TX_CODE` map). Add deep URLs for more states here as wanted.
 
 ---
 
 ## 7. Testing & conventions
 
-- Per-module offline tests: `python3 fed_rules.py` (and `us_code.py`,
-  `ecfr.py`) — exit 0 = pass. Add the same for new modules.
-- GUI syntax: `python3 -m py_compile courtlistener_gui.py`.
+- Per-module offline tests: `python <module>.py` — exit 0 = pass. Modules with
+  test blocks: `fed_rules`, `state_statutes`, `state_ca`, `state_fl`, `us_code`,
+  `ecfr`. Add the same for new modules. (On Windows use `python -X utf8` so the
+  console can print `§`/curly quotes.)
+- GUI syntax: `python -m py_compile courtlistener_gui.py`.
 - **`tkinter` is NOT installed in the sandbox**, so you can't import
   `courtlistener_gui` here; rely on `py_compile` + isolated logic tests. Example
   integration check (no tkinter): run all `*_CITE_RE` over a mixed sentence and
@@ -323,30 +351,54 @@ reliable target first, deepen later. Confirm the preference with the user.
 
 ---
 
-## 8. Suggested order for the new session
+## 8. Backlog — when this project resumes (only if the user asks)
 
-1. Re-test egress (§3). If still blocked, tell the user exactly what to add and
-   offer the paste-HTML fallback; you can still do step 4 meanwhile.
-2. If open: verify & fix `fed_rules.parse_rule_html` against the live FRE 404
-   page; add real-HTML assertions.
-3. Recon + build `state_regs.py` (Cornell, all 50) to the §4a contract; wire
-   into `_STATUTE_SOURCES` as `statereg`.
-4. Build the state-statute **detection** table (all 50 + DC + territories) —
-   HTML-independent, do anytime. Wire detection into both scan points.
-5. Ask the user for the **select states**; build in-app statute parsing for
-   those; add `("browse", url)` link-out for the rest (new `_follow_link` kind).
-6. Keep every step covered by offline tests; commit per coherent slice.
+Steps 1–5 of the original plan (egress, federal-rules verification, all-state
+detection, GUI wiring, priority-state in-app/link-out) are **done**. What's left,
+roughly in value order:
+
+1. **State regulations — `state_regs.py` (Cornell, all 50).** The main unbuilt
+   piece. CA recon is done (§6a): flat URL `…/regulations/california/<title>-CCR-<section>`,
+   clean `statereg-text` / `subsect indentN` template; soft-404 to the landing
+   page. The `statereg-*` template *looks* shared across states but the URL
+   **code token differs per state** (CA=CCR, NY=NYCRR, …) and isn't a uniform
+   guess (NY's `10-NYCRR-3.2` soft-404'd). Verify per state; scope to the user's
+   priority states first. Wire as kind `statereg` in `_STATUTE_SOURCES`.
+2. **NY / TX in-app (optional, needs headless browser).** Both block plain
+   fetches (NY Cloudflare, TX Angular SPA). Only a headless browser
+   (e.g. Playwright) could render them for in-app parsing — a real dependency/
+   architecture change. **Ask the user before taking this on**; today they
+   deep-link out, which is a fine experience.
+3. **More states in-app (low priority).** Other states are detect-and-link-out
+   by the user's choice. Promote one to in-app only on request: add a
+   `state_<xx>.py` (copy `state_ca.py` / `state_fl.py`), add its key(s) to
+   `_RENDERABLE_KEYS`, and dispatch it in `state_statutes.load_section`.
+4. **Polish:** per-state link-out deep URLs for more states (see `_NY_LAW` /
+   `_TX_CODE` patterns in `state_statutes`); prev/next neighbors for CA/FL
+   (currently `(None, None)`); territories (PR/GU/VI) in detection.
+
+Keep every step covered by offline tests (`python <module>.py`, exit 0); commit
+per coherent slice; don't open a PR unless asked.
 
 ---
 
 ## 9. File map
 
 - `courtlistener_gui.py` — the Tk app (large). Citation detection + statute
-  viewer live here; integration points in §4b.
+  viewer live here; integration points in §4b. Lookup entry points
+  (`_parse_statute_query`, spotlight `_submit`, `_show_statute_lookup`) route
+  through `_open_statute_action` (in-app viewer or browser link-out).
 - `us_code.py` — U.S. Code from OLRC (uscode.house.gov). Owns `infer_enum_level`.
 - `ecfr.py` — C.F.R. from eCFR (ecfr.gov).
-- `fed_rules.py` — **NEW** Federal Rules from Cornell LII (this work).
-- `court_catalog.py` — court IDs + Bluebook abbrs + `STATE_COURTS` (reuse the
-  state list for the statute table).
+- `fed_rules.py` — Federal Rules from Cornell LII (verified live).
+- `state_statutes.py` — **state-statute detection (all 50 + DC)** + link
+  actions: `iter_cites` (strict), `parse_query` (relaxed, § optional),
+  `action_for`, `link_url` (NY/TX deep links via `_NY_LAW`/`_TX_CODE`),
+  `load_section` dispatcher, `_RENDERABLE_KEYS`. Owns the citation T1 table.
+- `state_ca.py` — in-app California statutes (leginfo.legislature.ca.gov);
+  29-code canonical table; reference per-state implementation.
+- `state_fl.py` — in-app Florida statutes (flsenate.gov); stdlib HTML-parser
+  walk for nested subdivisions; runtime latest-year discovery.
+- `court_catalog.py` — court IDs + Bluebook abbrs + `STATE_COURTS`.
 - `bluebook_names.py`, `courtlistener.py`, `google_scholar.py` — case-name
   abbreviation, CL API client, Scholar fetcher (not central to this task).
