@@ -100,6 +100,7 @@ import requests as _requests
 from bluebook_names import abbreviate_case_name
 from courtlistener import CourtListenerClient, CourtListenerError
 import ecfr
+import fed_rules
 import us_code
 from court_catalog import (
     CATALOG as _COURT_CATALOG,
@@ -2137,10 +2138,11 @@ class CourtListenerGUI:
         entry.bind("<Return>", go)
 
     def _show_statute_lookup(self) -> None:
-        """Small dialog that opens a statute/regulation by typed citation
-        ("42 USC 1983(b)", "29 CFR 1614.105(a)") in the statute viewer."""
+        """Small dialog that opens a statute, regulation or federal rule by
+        typed citation ("42 USC 1983(b)", "29 CFR 1614.105(a)",
+        "Fed. R. Evid. 404(b)") in the statute viewer."""
         dlg = tk.Toplevel(self.root)
-        dlg.title("Look Up Statute / Regulation")
+        dlg.title("Look Up Statute / Regulation / Rule")
         dlg.resizable(False, False)
         frame = ttk.Frame(dlg, padding=12)
         frame.pack(fill="both", expand=True)
@@ -2150,7 +2152,8 @@ class CourtListenerGUI:
         entry.grid(row=0, column=1, padx=6, sticky="we")
         entry.focus_set()
         status_var = tk.StringVar(
-            value="e.g.  42 USC 1983(b)   or   29 CFR 1614.105(a)"
+            value="e.g.  42 USC 1983(b)   ·   29 CFR 1614.105(a)   ·   "
+                  "Fed. R. Evid. 404(b)"
         )
         ttk.Label(frame, textvariable=status_var, foreground="gray").grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(8, 0)
@@ -2160,8 +2163,8 @@ class CourtListenerGUI:
             parsed = _parse_statute_query(query_var.get())
             if not parsed:
                 status_var.set(
-                    "Couldn't read that — try '42 USC 1983' or "
-                    "'29 CFR 1614.105(a)'."
+                    "Couldn't read that — try '42 USC 1983', "
+                    "'29 CFR 1614.105(a)' or 'Fed. R. Evid. 404(b)'."
                 )
                 return
             kind, spec = parsed
@@ -4490,6 +4493,8 @@ class _ScholarTextWindow:
             matches.append((m.start(), m.end(), "usc", m))
         for m in ecfr.CFR_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "cfr", m))
+        for m in fed_rules.RULE_CITE_RE.finditer(text):
+            matches.append((m.start(), m.end(), "rule", m))
         matches.sort(key=lambda t: (t[0], -t[1]))
         pos = 0
         for start, end, kind, m in matches:
@@ -4510,6 +4515,8 @@ class _ScholarTextWindow:
                 action = ("cite", cite)
             elif kind == "usc":
                 action = ("usc", us_code.cite_spec(m))
+            elif kind == "rule":
+                action = ("rule", fed_rules.cite_spec(m))
             else:
                 action = ("cfr", ecfr.cite_spec(m))
             ltags = tags + ("citelink", self._new_link(action))
@@ -5450,7 +5457,7 @@ class _ScholarTextWindow:
             if pos:
                 self._jump_to(pos)
             return
-        if kind in ("usc", "cfr"):
+        if kind in _STATUTE_SOURCES:
             self._open_statute(kind, value)
             return
         # CourtListener opinion URL: fetch structured text from CL directly
@@ -5707,7 +5714,13 @@ _STATUTE_QUERY_RE = re.compile(
 
 
 def _parse_statute_query(query: str) -> Optional[tuple[str, str]]:
-    """Parse a typed citation into ("usc"|"cfr", spec), or None."""
+    """Parse a typed citation into ("usc"|"cfr"|"rule", spec), or None.
+    Federal-rule queries ("fre 404(b)", "Fed. R. Civ. P. 56") never start
+    with a volume number, so they can't collide with the U.S.C./C.F.R.
+    form and are tried first."""
+    rule = fed_rules.parse_query(query)
+    if rule:
+        return rule
     m = _STATUTE_QUERY_RE.match(query or "")
     if not m:
         return None
@@ -5719,12 +5732,30 @@ def _parse_statute_query(query: str) -> Optional[tuple[str, str]]:
     return kind, f"{m.group(1)}:{section}:{','.join(subs)}"
 
 
+# Registry of statute/rule sources, keyed by the action `kind` carried on a
+# citation link.  Each module exposes the same contract (a CITE_RE,
+# cite_spec/spec_label, load_section(title, section), and a Doc with
+# paras/label/source_name/source_note/url/kind/bluebook_cite/neighbors), so
+# one viewer serves them all.  ``_SOURCE_HOST`` is only the name shown in the
+# "Fetching … from <host>" status line.
+_STATUTE_SOURCES: dict[str, object] = {
+    "usc": us_code,
+    "cfr": ecfr,
+    "rule": fed_rules,
+}
+_SOURCE_HOST: dict[str, str] = {
+    "usc": "uscode.house.gov",
+    "cfr": "ecfr.gov",
+    "rule": "law.cornell.edu",
+}
+
+
 def _fetch_statute_window(parent: tk.Misc, kind: str, spec: str,
                           status=lambda _s: None) -> None:
-    """Fetch a U.S. Code (OLRC) or C.F.R. (eCFR) section in a background
+    """Fetch a statute, regulation or federal rule section in a background
     thread and open a _StatuteWindow over `parent` when it arrives."""
-    mod = us_code if kind == "usc" else ecfr
-    host = "uscode.house.gov" if kind == "usc" else "ecfr.gov"
+    mod = _STATUTE_SOURCES[kind]
+    host = _SOURCE_HOST.get(kind, "the source")
     title, section, subs = spec.split(":", 2)
     label = mod.spec_label(spec)
 
@@ -6018,6 +6049,8 @@ class _StatuteWindow:
             refs.append((m.start(), m.end(), "usc", us_code.cite_spec(m)))
         for m in ecfr.CFR_CITE_RE.finditer(text):
             refs.append((m.start(), m.end(), "cfr", ecfr.cite_spec(m)))
+        for m in fed_rules.RULE_CITE_RE.finditer(text):
+            refs.append((m.start(), m.end(), "rule", fed_rules.cite_spec(m)))
         if self._doc.kind == "usc":
             for m in _USC_XREF_RE.finditer(text):
                 title = m.group(3) or self._doc.title
@@ -6095,7 +6128,7 @@ class _StatuteWindow:
         target = self._neighbors[which]
         if not target:
             return
-        mod = us_code if self._doc.kind == "usc" else ecfr
+        mod = _STATUTE_SOURCES[self._doc.kind]
         self._prev_btn.config(state="disabled")
         self._next_btn.config(state="disabled")
         self._status_var.set(
