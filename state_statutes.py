@@ -72,6 +72,7 @@ class Cite:
     label: str          # Bluebook label ("Fla. Stat. § 776.012")
     text: str           # the matched source text
     subs: tuple = field(default_factory=tuple)
+    subject: str = ""   # captured subject for subject-code states ("Penal")
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +213,7 @@ def _subject_build(key_prefix, name, label_state, code_word):
         abbr = f"{label_state} {subj} {code_word}"
         _register(key, name, abbr)
         return Cite(m.start(), m.end(), key, sec,
-                    f"{abbr} § {sec}", m.group(0), _subs_of(m))
+                    f"{abbr} § {sec}", m.group(0), _subs_of(m), subject=subj)
     return build
 
 
@@ -230,7 +231,7 @@ def _ca_build(m: re.Match) -> Cite:
         key, abbr = f"ca-{_subj_slug(subj)}", f"Cal. {subj} Code"
     _register(key, "California", abbr)
     return Cite(m.start(), m.end(), key, sec, f"{abbr} § {sec}",
-                m.group(0), _subs_of(m))
+                m.group(0), _subs_of(m), subject=subj)
 
 
 _add(rf"\bCal\.?\s+(?P<subj>{_SUBJ})Code\s*(?:Ann\.?)?\s*{_SS}"
@@ -259,7 +260,7 @@ def _md_build(m: re.Match) -> Cite:
     abbr = f"Md. Code Ann., {subj}"
     _register(key, "Maryland", abbr)
     return Cite(m.start(), m.end(), key, sec, f"{abbr} § {sec}",
-                m.group(0), _subs_of(m))
+                m.group(0), _subs_of(m), subject=subj)
 
 
 _add(rf"\bMd\.?\s*Code\s*(?:Ann\.?)?\s*,\s*(?P<subj>{_SUBJ})"
@@ -432,11 +433,84 @@ def load_section(key: str, section: str):
     raise RuntimeError(f"no in-app source for {KEY_NAME.get(key, key)}")
 
 
+# --- per-state deep link-out (official source) for priority states that can't
+#     be rendered in-app: New York (Cloudflare) and Texas (JS SPA).  A real
+#     browser handles both; we still link to the exact provision. ------------
+
+def _link_canon(subject: str) -> str:
+    s = re.sub(r"\band\b", " ", subject.lower())
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+# New York: subject -> nysenate.gov LAWID.  URL:
+# https://www.nysenate.gov/legislation/laws/<LAWID>/<section>
+_NY_LAW: dict[str, str] = {
+    "penal": "PEN", "criminalprocedure": "CPL", "crimproc": "CPL",
+    "vehicletraffic": "VAT", "vehtraf": "VAT", "generalbusiness": "GBS",
+    "genbus": "GBS", "generalobligations": "GOB", "genoblig": "GOB",
+    "domesticrelations": "DOM", "domrel": "DOM", "realproperty": "RPP",
+    "realprop": "RPP", "labor": "LAB", "lab": "LAB", "insurance": "ISC",
+    "ins": "ISC", "education": "EDN", "educ": "EDN", "tax": "TAX",
+    "publichealth": "PBH", "pubhealth": "PBH", "executive": "EXC",
+    "exec": "EXC", "judiciary": "JUD", "jud": "JUD",
+    "businesscorporation": "BSC", "buscorp": "BSC",
+    "estatespowerstrusts": "EPT", "estpowerstrusts": "EPT",
+    "mentalhygiene": "MHY", "menthyg": "MHY", "socialservices": "SOS",
+    "socservs": "SOS", "civilrights": "CVR", "civrights": "CVR",
+    "generalmunicipal": "GMU", "genmun": "GMU", "correction": "COR",
+    "environmentalconservation": "ENV", "envtlconserv": "ENV",
+}
+
+# Texas: subject -> capitol.texas.gov code (from /assets/StatuteCodes.json).
+# URL: https://statutes.capitol.texas.gov/Docs/<CODE>/htm/<CODE>.<chapter>.htm
+_TX_CODE: dict[str, str] = {
+    "penal": "PE", "civilpracticeremedies": "CP", "civpracrem": "CP",
+    "family": "FA", "fam": "FA", "healthsafety": "HS",
+    "government": "GV", "govt": "GV", "gov": "GV",
+    "businesscommerce": "BC", "buscom": "BC", "property": "PR", "prop": "PR",
+    "transportation": "TN", "transp": "TN", "education": "ED", "educ": "ED",
+    "labor": "LA", "lab": "LA", "tax": "TX", "estates": "ES", "est": "ES",
+    "insurance": "IN", "ins": "IN", "occupations": "OC", "occ": "OC",
+    "localgovernment": "LG", "locgovt": "LG", "water": "WA",
+    "naturalresources": "NR", "natres": "NR", "agriculture": "AG",
+    "agric": "AG", "election": "EL", "elec": "EL", "finance": "FI",
+    "fin": "FI", "humanresources": "HR", "humres": "HR",
+    "parkswildlife": "PW", "utilities": "UT", "util": "UT",
+    "alcoholicbeverage": "AL", "alcobev": "AL", "businessorganizations": "BO",
+    "busorgs": "BO",
+}
+
+
+def _ny_link(c: Cite) -> str | None:
+    lawid = _NY_LAW.get(_link_canon(c.subject))
+    if not lawid:
+        return None
+    return (f"https://www.nysenate.gov/legislation/laws/{lawid}/"
+            f"{c.section}")
+
+
+def _tx_link(c: Cite) -> str | None:
+    code = _TX_CODE.get(_link_canon(c.subject))
+    chapter = c.section.split(".")[0]
+    if not code or not chapter.isdigit():
+        return None
+    return (f"https://statutes.capitol.texas.gov/Docs/{code}/htm/"
+            f"{code}.{chapter}.htm")
+
+
 def link_url(c: Cite) -> str:
-    """Browser link-out target for a detected citation.  Defaults to a web
-    search for the (normalized) citation, which reliably surfaces the official
-    text for any jurisdiction without per-state URL schemes.  Per-state deep
-    links can override this as they are added."""
+    """Browser link-out target for a detected citation.  Priority states that
+    can't be rendered in-app (N.Y. — Cloudflare; Tex. — JS SPA) deep-link to
+    the official source; everything else falls back to a web search for the
+    citation, which reliably surfaces the official text without per-state URL
+    schemes."""
+    deep = None
+    if c.key.startswith("ny-"):
+        deep = _ny_link(c)
+    elif c.key.startswith("tx-"):
+        deep = _tx_link(c)
+    if deep:
+        return deep
     q = urllib.parse.quote_plus(_norm(c.text))
     return f"https://www.google.com/search?q={q}"
 
@@ -559,6 +633,25 @@ if __name__ == "__main__":
           "parse_query non-priority -> None (link-out handled elsewhere)")
     check(spec_label("ca-pen:187:") == "Cal. Penal Code § 187",
           "spec_label CA works cold (eager registration)")
+
+    # N.Y. and Tex. can't be rendered in-app (Cloudflare / JS SPA) but deep
+    # link-out to the official source instead of a generic search.
+    _, ny = action_for(first("N.Y. Penal Law § 125.25"))
+    check(ny == "https://www.nysenate.gov/legislation/laws/PEN/125.25",
+          f"NY deep link-out: {ny}")
+    _, nyv = action_for(first("N.Y. Veh. & Traf. Law § 1192"))
+    check(nyv == "https://www.nysenate.gov/legislation/laws/VAT/1192",
+          f"NY Veh&Traf deep link-out: {nyv}")
+    _, tx = action_for(first("Tex. Penal Code Ann. § 19.02"))
+    check(tx == "https://statutes.capitol.texas.gov/Docs/PE/htm/PE.19.htm",
+          f"TX deep link-out (chapter page): {tx}")
+    _, txc = action_for(first("Tex. Civ. Prac. & Rem. Code § 16.003"))
+    check(txc == "https://statutes.capitol.texas.gov/Docs/CP/htm/CP.16.htm",
+          f"TX CPRC deep link-out: {txc}")
+    # An unmapped subject-state subject falls back to a search.
+    _, mdfb = action_for(first("Md. Code Ann., Crim. Law § 2-201"))
+    check(mdfb.startswith("https://www.google.com/search?"),
+          f"unmapped subject -> search fallback: {mdfb[:40]}")
 
     # things that must NOT be detected as state statutes
     negatives = [
