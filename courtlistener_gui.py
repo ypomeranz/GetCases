@@ -6058,7 +6058,7 @@ class _StatuteWindow:
                 subs = re.findall(r"\(([^)]+)\)", m.group(2) or "")
                 refs.append((m.start(), m.end(), "usc",
                              f"{title}:{section}:{','.join(subs)}"))
-        else:
+        elif self._doc.kind == "cfr":
             for m in _CFR_SECREF_RE.finditer(text):
                 subs = re.findall(r"\(([^)]+)\)", m.group(2) or "")
                 refs.append((m.start(), m.end(), "cfr",
