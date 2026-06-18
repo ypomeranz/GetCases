@@ -1255,6 +1255,11 @@ class CourtListenerGUI:
 
         popup = tk.Toplevel(self.root)
         self._quick_popup = popup
+        # Reset the consecutive-empty-Return counter and dropdown generation
+        # each time a fresh popup opens.
+        self._spotlight_empty_returns = 0
+        self._spotlight_generation = 0
+        self._spotlight_results_frame = None
         popup.overrideredirect(True)
         popup.attributes("-topmost", True)
 
@@ -1283,7 +1288,13 @@ class CourtListenerGUI:
         def _submit(_e=None) -> None:
             query = entry_var.get().strip()
             if not query:
+                # Empty search bar: open the main window only on the second
+                # consecutive Return (a deliberate "show me everything").
+                self._spotlight_empty_returns += 1
+                if self._spotlight_empty_returns >= 2:
+                    self._open_main_from_spotlight(popup)
                 return
+            self._spotlight_empty_returns = 0
 
             # 1. Statute / regulation: "42 USC 1983(b)", "29 CFR 1614.105"
             statute = _parse_statute_query(query)
@@ -1355,12 +1366,45 @@ class CourtListenerGUI:
 
         popup.after(10, _grab_focus)
 
+    def _open_main_from_spotlight(
+        self, popup: tk.Toplevel, query: str = "",
+    ) -> None:
+        """Close the spotlight popup and bring up the full search window,
+        optionally seeding and running *query*."""
+        try:
+            popup.destroy()
+        except tk.TclError:
+            pass
+        self._quick_popup = None
+        self._ensure_root_exists()
+        self.root.deiconify()
+        self.root.lift()
+        if sys.platform == "win32":
+            self._win_force_foreground(self.root)
+        self.root.focus_force()
+        self._query_entry.focus_set()
+        if query:
+            self._query_var.set(query)
+            self._do_search()
+
     def _show_spotlight_dropdown(
         self, popup: tk.Toplevel, border: tk.Frame,
         entry: tk.Entry, query: str,
     ) -> None:
         """Expand the popup into a spotlight-style dropdown with streaming
         search results from Google Scholar and CourtListener."""
+
+        # A fresh search retracts any dropdown still showing from the previous
+        # query: bump the generation token so stale background callbacks are
+        # ignored, and tear down the old results frame.
+        self._spotlight_generation += 1
+        my_gen = self._spotlight_generation
+        old_frame = getattr(self, "_spotlight_results_frame", None)
+        if old_frame is not None:
+            try:
+                old_frame.destroy()
+            except tk.TclError:
+                pass
 
         # Resize popup to accommodate results
         pw = 580
@@ -1378,6 +1422,7 @@ class CourtListenerGUI:
         # Results frame below the search bar
         results_frame = tk.Frame(border, bg="#f0f0f0")
         results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
+        self._spotlight_results_frame = results_frame
 
         # Tracking state
         result_rows: list[dict] = []
@@ -1385,6 +1430,9 @@ class CourtListenerGUI:
 
         def _add_result(court_id: str, name: str, cite: str, year: str,
                         source_label: str, open_fn) -> None:
+            # Ignore results streaming in from a superseded search.
+            if my_gen != self._spotlight_generation:
+                return
             try:
                 if not popup.winfo_exists():
                     return
@@ -1481,20 +1529,23 @@ class CourtListenerGUI:
         # Override Return to select from dropdown once results exist
         def _entry_return(_e=None) -> None:
             if result_rows and selected_idx[0] >= 0:
+                # A result is highlighted — open it.
+                self._spotlight_empty_returns = 0
                 _on_key(type("E", (), {"keysym": "Return"})())
-            else:
-                # If Enter is pressed again with no selection, go to main window
-                popup.destroy()
-                self._quick_popup = None
-                self._ensure_root_exists()
-                self.root.deiconify()
-                self.root.lift()
-                if sys.platform == "win32":
-                    self._win_force_foreground(self.root)
-                self.root.focus_force()
-                self._query_entry.focus_set()
-                self._query_var.set(query)
-                self._do_search()
+                return
+            current = entry.get().strip()
+            if current:
+                # New (or re-typed) query with no selection: retract the
+                # current dropdown and run a fresh search in the spotlight
+                # interface rather than jumping to the main window.
+                self._spotlight_empty_returns = 0
+                self._show_spotlight_dropdown(popup, border, entry, current)
+                return
+            # Empty search bar: open the main window only on the second
+            # consecutive Return.
+            self._spotlight_empty_returns += 1
+            if self._spotlight_empty_returns >= 2:
+                self._open_main_from_spotlight(popup)
         entry.bind("<Return>", _entry_return)
 
         # Status label
@@ -1506,6 +1557,8 @@ class CourtListenerGUI:
         search_done = [0]  # track how many searches completed
 
         def _update_status() -> None:
+            if my_gen != self._spotlight_generation:
+                return
             try:
                 if not popup.winfo_exists():
                     return
