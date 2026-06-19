@@ -410,6 +410,23 @@ def _page_title(page_html: str) -> str:
     return _clean(m.group(1)) if m else ""
 
 
+def _sync_enum_stack(stack: list[tuple[str, str]], level: int,
+                     enums: list[str], hierarchy: tuple[str, ...]) -> None:
+    """Force the open-levels `stack` to reflect a paragraph whose depth came
+    from its CSS class rather than from enumerator inference, so a following
+    *plain* enumerated paragraph (one LII left unclassed) infers its level
+    correctly.  Mirrors infer_enum_level's stack bookkeeping."""
+    del stack[level:]
+    while len(stack) < level:  # pad if the class skipped an intermediate level
+        k = hierarchy[min(len(stack), len(hierarchy) - 1)]
+        stack.append((k, ""))
+    k = hierarchy[min(level, len(hierarchy) - 1)]
+    stack.append((k, enums[0] if enums else ""))
+    for extra in enums[1:]:
+        k = hierarchy[min(len(stack), len(hierarchy) - 1)]
+        stack.append((k, extra))
+
+
 def parse_rule_html(page_html: str) -> list[tuple[str, int, str]]:
     """Parse an LII rule page into the (kind, indent, text) stream used by
     the statute viewer (same contract as us_code.parse_section)."""
@@ -474,17 +491,28 @@ def parse_rule_html(page_html: str) -> list[tuple[str, int, str]]:
             paras.append(("note-body", 0, text))
             continue
         # Rule body: when LII's CSS indent classes are present they are
-        # authoritative (a numbered "statutory-body-Nem" class means depth N;
-        # a plain paragraph is a top-level subdivision).  Otherwise infer the
-        # indent from a leading enumerator, else continue the open item's depth.
+        # authoritative for depth.  But LII is not fully consistent — it
+        # sometimes drops the class on a sub-item (e.g. a "(ii)" right after a
+        # classed "(i)" renders as a plain <p>).  So keep the enumerator stack
+        # in sync with the class-derived depths and, for a *plain* enumerated
+        # paragraph, infer its depth from that stack: that nests the stray
+        # "(ii)" under its "(i)" while still letting a genuine top-level
+        # subsection "(i)" sit flush left.
+        lead = _ENUM_LEAD_RE.match(text)
+        enums = re.findall(r"\(([^)]+)\)", lead.group(1)) if lead else []
         if uses_em:
             mlvl = _STAT_BODY_LEVEL_RE.search(attrs)
-            level = int(mlvl.group(1)) if mlvl else 0
+            if mlvl:
+                level = min(int(mlvl.group(1)), 6)
+                _sync_enum_stack(stack, level, enums, RULES_HIERARCHY)
+            elif enums:
+                lvl = infer_enum_level(enums, stack, RULES_HIERARCHY)
+                level = lvl if lvl is not None else 0
+            else:  # plain continuation paragraph
+                level = max(len(stack) - 1, 0)
         else:
             level = max(len(stack) - 1, 0)
-            lead = _ENUM_LEAD_RE.match(text)
-            if lead:
-                enums = re.findall(r"\(([^)]+)\)", lead.group(1))
+            if enums:
                 lvl = infer_enum_level(enums, stack, RULES_HIERARCHY)
                 if lvl is not None:
                     level = lvl
