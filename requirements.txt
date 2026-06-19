@@ -1,0 +1,10 @@
+# GetCases runtime dependencies.
+#
+# Core (case search, opinion text, statute/regulation viewer):
+requests
+beautifulsoup4
+
+# In-app PDF viewer (View PDF button in the opinion window).  Optional —
+# without these the app still runs and offers to open the PDF in a browser.
+pypdfium2
+Pillow

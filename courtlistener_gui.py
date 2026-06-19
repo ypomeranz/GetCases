@@ -3961,6 +3961,112 @@ class _TextFinder:
         self._count_var.set(f"{i + 1} of {len(self._matches)}")
 
 
+class _PdfPane(ttk.Frame):
+    """A scrollable, lazily-rendered view of a PDF, embedded in the opinion
+    window (pypdfium2 + Pillow).
+
+    Pages are rendered to images only as they scroll near the viewport, and
+    pages that scroll far away are released again, so even a long opinion stays
+    light on memory.  Construction raises ImportError when pypdfium2/Pillow are
+    not installed — the caller then offers to open the PDF in a browser.
+    """
+
+    _PAD = 12        # vertical gap between pages (px)
+    _SCROLL_PX = 60  # wheel-notch scroll distance (px); canvas uses 1px units
+
+    def __init__(self, parent: tk.Misc, pdf_bytes: bytes, width: int = 800) -> None:
+        super().__init__(parent)
+        import pypdfium2 as pdfium
+        from PIL import ImageTk  # noqa: F401  (availability check at construct)
+
+        self._doc = pdfium.PdfDocument(pdf_bytes)
+        self._target_w = max(240, int(width))
+        self._photos: dict[int, object] = {}   # page → PhotoImage (kept alive)
+        self._img_ids: dict[int, int] = {}      # page → canvas image id
+
+        canvas = tk.Canvas(self, bg="#d9d9d9", highlightthickness=0,
+                           yscrollincrement=1)
+        vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=self._on_yview)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self._canvas, self._vsb = canvas, vsb
+
+        # Lay out one slot per page from its size — no rendering yet, just a
+        # white placeholder so the scrollbar/extent are correct immediately.
+        self._slots: list[tuple[int, int, int, float]] = []  # (y, w, h, scale)
+        y = self._PAD
+        for i in range(len(self._doc)):
+            page = self._doc[i]
+            try:
+                w_pt, h_pt = page.get_size()
+            finally:
+                page.close()
+            scale = (self._target_w / w_pt) if w_pt else 1.0
+            w, h = int(w_pt * scale), int(h_pt * scale)
+            x0 = self._PAD + max(0, (self._target_w - w) // 2)
+            canvas.create_rectangle(x0, y, x0 + w, y + h,
+                                    fill="white", outline="#b8b8b8")
+            self._slots.append((y, w, h, scale))
+            y += h + self._PAD
+        canvas.configure(
+            scrollregion=(0, 0, self._target_w + 2 * self._PAD, y))
+
+        canvas.bind("<Configure>", lambda _e: self._render_visible())
+        canvas.bind("<MouseWheel>", self._on_wheel)            # Windows / macOS
+        canvas.bind("<Button-4>", lambda _e: self._wheel(-1))  # X11 wheel up
+        canvas.bind("<Button-5>", lambda _e: self._wheel(1))   # X11 wheel down
+        canvas.bind("<Enter>", lambda _e: canvas.focus_set())
+        self.after(60, self._render_visible)
+
+    def _on_yview(self, first: str, last: str) -> None:
+        self._vsb.set(first, last)
+        self._render_visible()
+
+    def _on_wheel(self, e) -> None:
+        self._wheel(-1 if e.delta > 0 else 1)
+
+    def _wheel(self, direction: int) -> None:
+        self._canvas.yview_scroll(direction * self._SCROLL_PX, "units")
+
+    def _render_visible(self) -> None:
+        c = self._canvas
+        try:
+            top = c.canvasy(0)
+            view_h = c.winfo_height()
+        except tk.TclError:
+            return
+        lo, hi = top - view_h, top + 2 * view_h   # ~one screen of buffer
+        for i, (y, _w, h, _s) in enumerate(self._slots):
+            near = (y + h) >= lo and y <= hi
+            if near and i not in self._img_ids:
+                self._render_page(i)
+            elif not near and i in self._img_ids:
+                c.delete(self._img_ids.pop(i))
+                self._photos.pop(i, None)
+
+    def _render_page(self, i: int) -> None:
+        from PIL import ImageTk
+        y, w, _h, scale = self._slots[i]
+        page = self._doc[i]
+        try:
+            pil = page.render(scale=scale).to_pil()
+        finally:
+            page.close()
+        photo = ImageTk.PhotoImage(pil)
+        self._photos[i] = photo
+        x0 = self._PAD + max(0, (self._target_w - w) // 2)
+        self._img_ids[i] = self._canvas.create_image(
+            x0, y, anchor="nw", image=photo)
+
+    def destroy(self) -> None:
+        try:
+            self._doc.close()
+        except Exception:
+            pass
+        super().destroy()
+
+
 class _ScholarTextWindow:
     """
     Rich viewer for a Google Scholar opinion.
@@ -4038,6 +4144,8 @@ class _ScholarTextWindow:
                             page = int(m.group(0))
         self._cl_text: Optional[str] = cl_text
         self._mode = "courtlistener" if self._cl_primary else "scholar"
+        self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
+        self._pdf_url: Optional[str] = None
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
         self._fonts: dict[str, tkfont.Font] = {}
@@ -4155,6 +4263,7 @@ class _ScholarTextWindow:
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill="x", padx=8, pady=(0, 8))
+        self._btn_frame = btn_frame  # PDF/text panes pack just above this
         ttk.Button(btn_frame, text="Copy + Cite", command=self._copy_formatted).pack(
             side="right", padx=(4, 0)
         )
@@ -4526,7 +4635,10 @@ class _ScholarTextWindow:
         txt.config(state="disabled")
         self._mode = "scholar"
         self._source_var.set(self._scholar_url)
-        self._toggle_btn.config(text="CourtListener Text", state="normal")
+        # From the Scholar view, offer the official PDF (the CourtListener text
+        # is invariably worse, so it's no longer offered here).
+        self._toggle_btn.config(text="View PDF", command=self._view_pdf,
+                                state="normal")
         if len(self._parts) > 1:
             self._part_combo.config(state="readonly")
         if self._current_part is None:
@@ -4644,7 +4756,7 @@ class _ScholarTextWindow:
             "Google Scholar Text" if self._scholar_url else "Scholar unavailable"
         )
         self._toggle_btn.config(
-            text=toggle_label,
+            text=toggle_label, command=self._toggle_source,
             state="normal" if self._scholar_url else "disabled",
         )
         if len(parts) > 1:
@@ -4677,7 +4789,8 @@ class _ScholarTextWindow:
         txt.config(state="disabled")
         self._mode = "courtlistener"
         self._source_var.set("CourtListener (assembled from the REST API)")
-        self._toggle_btn.config(text="Google Scholar Text", state="normal")
+        self._toggle_btn.config(text="Google Scholar Text",
+                                command=self._toggle_source, state="normal")
         self._part_combo.config(state="disabled")
         self._view_label_var.set("CourtListener text")
         self._view_label.config(foreground="black")
@@ -5613,6 +5726,130 @@ class _ScholarTextWindow:
         self._toggle_btn.config(state="normal")
         self._status_var.set(f"CourtListener: {msg}")
         messagebox.showerror("CourtListener", msg, parent=self._win)
+
+    # ------------------------------------------------------------------
+    # PDF view (official opinion PDF, shown in-app)
+    # ------------------------------------------------------------------
+
+    def _pdf_item(self) -> dict:
+        """The search-result-shaped dict used to resolve a PDF URL.  Falls back
+        to the Bluebook citation when this window wasn't opened from a result."""
+        item = dict(self._item) if self._item else {}
+        if not item.get("citation") and self._bb.get("cite"):
+            item["citation"] = [self._bb["cite"]]
+        return item
+
+    def _view_pdf(self) -> None:
+        """Resolve and show the official PDF of the opinion inside the window."""
+        try:
+            import pypdfium2  # noqa: F401
+            from PIL import ImageTk  # noqa: F401
+        except ImportError:
+            if messagebox.askyesno(
+                "PDF viewer not installed",
+                "Viewing PDFs inside the app needs two Python packages:\n\n"
+                "    pip install pypdfium2 Pillow\n\n"
+                "Open the PDF in your web browser instead?",
+                parent=self._win,
+            ):
+                self._open_pdf_in_browser()
+            return
+        client = self._app._get_client()
+        self._pdf_url = None
+        self._toggle_btn.config(state="disabled")
+        self._status_var.set("Locating a PDF of the opinion…")
+        item = self._pdf_item()
+
+        def run() -> None:
+            try:
+                url = (self._app._resolve_pdf_url(client, item)
+                       if client is not None else None)
+                if not url:
+                    self._post(self._on_pdf_error,
+                               "No PDF is available for this opinion.")
+                    return
+                self._pdf_url = url  # so a fetch failure can offer the browser
+                resp = _anon_session.get(url, timeout=30)
+                resp.raise_for_status()
+                data = resp.content
+                if not data.startswith(b"%PDF"):
+                    self._post(self._on_pdf_error,
+                               "The source returned something that isn't a PDF.")
+                    return
+                self._post(self._show_pdf, data, url)
+            except Exception as exc:
+                self._post(self._on_pdf_error, str(exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_pdf(self, data: bytes, url: str) -> None:
+        width = max(self._text.winfo_width() - 24, 520)
+        try:
+            pane = _PdfPane(self._win, data, width=width)
+        except Exception as exc:  # pragma: no cover - render/lib failure
+            self._on_pdf_error(str(exc))
+            return
+        # Swap the text view for the PDF pane (kept above the button row).
+        self._text_frame.pack_forget()
+        pane.pack(fill="both", expand=True, padx=8, pady=4,
+                  before=self._btn_frame)
+        self._pdf_pane = pane
+        self._pdf_url = url
+        self._mode = "pdf"
+        self._part_combo.config(state="disabled")
+        self._view_label_var.set("PDF of opinion")
+        self._view_label.config(foreground="black")
+        self._source_var.set(url)
+        self._toggle_btn.config(text="Google Scholar Text",
+                                command=self._back_from_pdf, state="normal")
+        self._status_var.set("Showing the official PDF of the opinion.")
+
+    def _back_from_pdf(self) -> None:
+        """Return from the PDF to the Google Scholar text view."""
+        if self._pdf_pane is not None:
+            self._pdf_pane.destroy()
+            self._pdf_pane = None
+        self._text_frame.pack(fill="both", expand=True, padx=8, pady=4,
+                              before=self._btn_frame)
+        self._render_scholar()  # restores the label, combo and "View PDF" button
+
+    def _on_pdf_error(self, msg: str) -> None:
+        self._toggle_btn.config(text="View PDF", command=self._view_pdf,
+                                state="normal")
+        self._status_var.set(f"PDF: {msg}")
+        if self._pdf_url and messagebox.askyesno(
+            "PDF", f"{msg}\n\nOpen the PDF in your web browser instead?",
+            parent=self._win,
+        ):
+            webbrowser.open(self._pdf_url)
+        elif not self._pdf_url:
+            messagebox.showinfo("PDF", msg, parent=self._win)
+
+    def _open_pdf_in_browser(self) -> None:
+        """Resolve the PDF URL in the background and open it in the browser."""
+        client = self._app._get_client()
+        if client is None:
+            return
+        self._status_var.set("Locating a PDF of the opinion…")
+        item = self._pdf_item()
+
+        def run() -> None:
+            try:
+                url = self._app._resolve_pdf_url(client, item)
+            except Exception:
+                url = None
+            self._post(self._after_resolve_for_browser, url)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _after_resolve_for_browser(self, url: Optional[str]) -> None:
+        if url:
+            webbrowser.open(url)
+            self._status_var.set("Opened the PDF in your browser.")
+        else:
+            self._status_var.set("No PDF is available for this opinion.")
+            messagebox.showinfo(
+                "PDF", "No PDF is available for this opinion.", parent=self._win)
 
 
 # Cross-references in the U.S. Code's own style: "section 3142(f) of
