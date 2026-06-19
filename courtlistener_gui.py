@@ -4349,6 +4349,8 @@ class _ScholarTextWindow:
     # part is named, in color, at the top of the window.
     _PART_BOX_TAGS = {"dissent": "box-dissent", "concurrence": "box-concurrence"}
     _PART_LABEL_COLORS = {"dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR}
+    _PAGECOL_W = 48     # left gutter: reporter page numbers (px)
+    _PARTMAP_W = 138    # right strip: map of concurrences/dissents (px)
 
     def __init__(
         self,
@@ -4483,8 +4485,27 @@ class _ScholarTextWindow:
         self._text = txt
         vsb = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=self._on_yscroll)
+        # Left gutter: reporter page numbers in bold black, scrolling with the
+        # text — a separate Canvas, so it can't be selected/copied (the page is
+        # already marked inline in purple).  Right strip: a colour-coded map of
+        # where each concurrence/dissent begins (full-opinion view only).
+        self._pagecol_font = tkfont.Font(
+            family="Georgia", size=max(self._base_size - 2, 7), weight="bold")
+        self._partmap_font = tkfont.Font(
+            family="TkDefaultFont", size=max(self._base_size - 3, 7))
+        self._pagecol = tk.Canvas(text_frame, width=self._PAGECOL_W, bg="white",
+                                  highlightthickness=0, takefocus=0)
+        self._partmap = tk.Canvas(text_frame, width=0, bg="white",
+                                  highlightthickness=0, takefocus=0)
+        self._partmap_rows: list[tuple[float, float, int]] = []
+        self._pagecol.pack(side="left", fill="y")
         vsb.pack(side="right", fill="y")
+        self._partmap.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
+        txt.bind("<Configure>", lambda _e: self._schedule_gutter_redraw())
+        self._partmap.bind("<Button-1>", self._on_partmap_click)
+        self._partmap.bind("<Enter>", lambda _e: self._partmap.config(cursor="hand2"))
+        self._partmap.bind("<Leave>", lambda _e: self._partmap.config(cursor=""))
         self._text_frame, self._vsb = text_frame, vsb
         self._details_frame: Optional[ttk.Frame] = None
         self._details_loaded = False
@@ -4608,6 +4629,11 @@ class _ScholarTextWindow:
                 f.configure(
                     size=max(new - (3 if sup else 2 if small else 0), 7)
                 )
+        # Keep the side gutters in step with the body text.
+        if getattr(self, "_pagecol_font", None) is not None:
+            self._pagecol_font.configure(size=max(new - 2, 7))
+            self._partmap_font.configure(size=max(new - 3, 7))
+        self._schedule_gutter_redraw()
         self._status_var.set(f"Text size: {new} pt")
 
     # ------------------------------------------------------------------
@@ -4893,7 +4919,15 @@ class _ScholarTextWindow:
                 shown = list(enumerate(self._parts))
             else:
                 shown = [(self._current_part, self._parts[self._current_part])]
+            prev_kind: Optional[str] = None
             for pi, part in shown:
+                # A white separator line between two adjacent same-kind tinted
+                # parts (two dissents, or two concurrences) so they read as
+                # separate opinions rather than one big coloured block.
+                if (self._current_part is None
+                        and part.kind in self._PART_BOX_TAGS
+                        and part.kind == prev_kind):
+                    txt.insert("end", "\n")
                 part_start = txt.index("end-1c")
                 if self._part_start_pages:
                     self._cur_page = self._part_start_pages[pi] or self._cur_page
@@ -4908,6 +4942,7 @@ class _ScholarTextWindow:
                     box = self._PART_BOX_TAGS.get(part.kind)
                     if box:  # light tint behind concurrences/dissents
                         txt.tag_add(box, part_start, part_end)
+                prev_kind = part.kind
         txt.config(state="disabled")
         self._mode = "scholar"
         self._source_var.set(self._scholar_url)
@@ -4934,6 +4969,7 @@ class _ScholarTextWindow:
             f"{len(self._scholar_text):,} characters | Google Scholar version{extra}"
         )
         self._finder.refresh()
+        self._schedule_gutter_redraw()
 
     def _on_part_selected(self, _event=None) -> None:
         idx = self._part_combo.current()
@@ -4950,6 +4986,7 @@ class _ScholarTextWindow:
         if vsb is not None:
             vsb.set(first, last)
         self._update_scroll_part()
+        self._draw_page_column()
 
     def _update_scroll_part(self) -> None:
         """In the full-opinion view, name+colour the part at the top of the
@@ -4983,6 +5020,145 @@ class _ScholarTextWindow:
             self._view_label_var.set("Full opinion")
             self._view_label.config(foreground="black")
 
+    # ------------------------------------------------------------------
+    # Side gutters: left page-number column and right concurrence/dissent map
+    # ------------------------------------------------------------------
+
+    def _ypixels(self, index: str) -> int:
+        """Vertical offset (px) of `index` from the top of the document.
+        Tolerates Tk's `count` returning either an int or a 1-tuple."""
+        try:
+            r = self._text.count("1.0", index, "ypixels")
+        except tk.TclError:
+            return 0
+        if r is None:
+            return 0
+        return r[0] if isinstance(r, (tuple, list)) else int(r)
+
+    def _schedule_gutter_redraw(self) -> None:
+        """Redraw both gutters once the text has settled (after a resize, font
+        change, or fresh render)."""
+        if getattr(self, "_gutter_redraw_pending", False):
+            return
+        self._gutter_redraw_pending = True
+
+        def run() -> None:
+            self._gutter_redraw_pending = False
+            self._draw_page_column()
+            self._draw_part_map()
+
+        try:
+            self._win.after_idle(run)
+        except tk.TclError:
+            self._gutter_redraw_pending = False
+
+    def _draw_page_column(self) -> None:
+        """Draw the reporter page numbers (bold black) in the left gutter, each
+        aligned to the screen line where its star-pagination marker sits.  Only
+        the currently visible pages are drawn (it scrolls with the text)."""
+        canvas = getattr(self, "_pagecol", None)
+        if canvas is None:
+            return
+        page_pos = getattr(self, "_page_pos", None) or {}
+        if self._mode == "pdf" or not page_pos:
+            canvas.delete("all")
+            canvas.config(width=1)
+            return
+        canvas.config(width=self._PAGECOL_W)
+        canvas.delete("all")
+        txt = self._text
+        w = self._PAGECOL_W
+        seen_y: set[int] = set()
+        for page, idx in page_pos.items():
+            try:
+                di = txt.dlineinfo(idx)
+            except tk.TclError:
+                di = None
+            if not di:  # page not on screen right now
+                continue
+            y = di[1] + di[3] // 2  # vertical centre of that display line
+            if y in seen_y:
+                continue
+            seen_y.add(y)
+            canvas.create_text(w - 5, y, anchor="e", text=str(page),
+                               fill="black", font=self._pagecol_font)
+
+    def _draw_part_map(self) -> None:
+        """Draw a colour-coded strip on the right marking where each
+        concurrence/dissent begins, with its label.  Shown only in the
+        full-opinion text view; clicking a marker jumps to that part."""
+        canvas = getattr(self, "_partmap", None)
+        if canvas is None:
+            return
+        self._partmap_rows = []
+        canvas.delete("all")
+        parts = getattr(self, "_rendered_parts", None)
+        regions = getattr(self, "_part_regions", None)
+        if (self._mode == "pdf" or getattr(self, "_current_part", None) is not None
+                or not parts or not regions):
+            canvas.config(width=0)
+            return
+        marks = [
+            (rs, parts[p].kind, parts[p].label)
+            for rs, _re, p in regions
+            if parts[p].kind in ("concurrence", "dissent")
+        ]
+        if not marks:
+            canvas.config(width=0)
+            return
+        txt = self._text
+        total = self._ypixels("end-1c")
+        if not total:
+            canvas.config(width=0)
+            return
+        canvas.config(width=self._PARTMAP_W)
+        try:
+            h = canvas.winfo_height() or txt.winfo_height()
+        except tk.TclError:
+            h = txt.winfo_height()
+        w = self._PARTMAP_W
+        for rs, kind, label in marks:
+            off = self._ypixels(rs)
+            y = max(6, min(h - 6, int(off / total * h)))
+            color = self._PART_LABEL_COLORS.get(kind, "black")
+            canvas.create_line(2, y, w - 2, y, fill=color, width=2)
+            canvas.create_rectangle(2, y, 8, y + 10, fill=color, outline=color)
+            short = self._partmap_short_label(label, kind)
+            tid = canvas.create_text(11, y + 1, anchor="nw", text=short,
+                                     fill=color, font=self._partmap_font,
+                                     width=w - 13)
+            bbox = canvas.bbox(tid)
+            y2 = bbox[3] if bbox else y + 14
+            self._partmap_rows.append((y, y2, rs))
+
+    @staticmethod
+    def _partmap_short_label(label: str, kind: str) -> str:
+        """A compact label for the narrow part-map strip: the author's surname
+        plus the opinion role, e.g. 'Thomas, dissenting'."""
+        text = re.sub(r"\s+", " ", label or "").strip()
+        role = "dissenting" if kind == "dissent" else "concurring"
+        m = (re.search(r"\b(?:[Cc]hief\s+)?(?:JUSTICE|Justice)\s+"
+                       r"([A-Z][A-Za-z'’.]+)", text)
+             or re.search(r"\b([A-Z][A-Za-z'’]{2,}),\s*(?:C\.\s*)?J\.", text)
+             or re.search(r"\b([A-Z][A-Za-z'’]{2,})\b", text))
+        if not m:
+            return role.capitalize()
+        name = m.group(1).rstrip(".")
+        if name.isupper():  # THOMAS → Thomas
+            name = name[:1] + name[1:].lower()
+        return f"{name}, {role}"
+
+    def _on_partmap_click(self, event) -> None:
+        for y1, y2, rs in getattr(self, "_partmap_rows", []):
+            if y1 - 4 <= event.y <= y2 + 4:
+                try:
+                    self._text.see(rs)
+                    self._text.yview(rs)
+                except tk.TclError:
+                    pass
+                self._draw_page_column()
+                return
+
     def _render_cl_blocks(self) -> None:
         """Render CourtListener opinion parts with full block formatting."""
         parts = self._cl_parts or self._parts
@@ -5015,7 +5191,13 @@ class _ScholarTextWindow:
                 shown = list(enumerate(parts))
             else:
                 shown = [(self._current_part, parts[self._current_part])]
+            prev_kind: Optional[str] = None
             for pi, part in shown:
+                # White separator between two adjacent same-kind tinted parts.
+                if (self._current_part is None
+                        and part.kind in self._PART_BOX_TAGS
+                        and part.kind == prev_kind):
+                    txt.insert("end", "\n")
                 part_start = txt.index("end-1c")
                 for block in part.blocks:
                     self._insert_block(block, None)  # body text stays black
@@ -5028,6 +5210,7 @@ class _ScholarTextWindow:
                     box = self._PART_BOX_TAGS.get(part.kind)
                     if box:  # light tint behind concurrences/dissents
                         txt.tag_add(box, part_start, part_end)
+                prev_kind = part.kind
         txt.config(state="disabled")
         self._mode = "courtlistener"
         self._source_var.set("CourtListener (REST API)")
@@ -5056,6 +5239,7 @@ class _ScholarTextWindow:
             f"{char_count:,} characters | CourtListener version"
         )
         self._finder.refresh()
+        self._schedule_gutter_redraw()
 
     def _show_courtlistener(self) -> None:
         if self._cl_parts or self._cl_blocks:
