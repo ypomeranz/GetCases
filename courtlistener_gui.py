@@ -452,7 +452,18 @@ def _slugify_reporter(reporter: str) -> str:
     s = s.replace(" ", "-")
     s = re.sub(r"[^a-z0-9-]", "", s)
     s = re.sub(r"-+", "-", s)
-    return s.strip("-")
+    s = s.strip("-")
+    # Old reporter names → the slug static.case.law actually uses.  The Federal
+    # Reporter is "F." today, so an old "Fed. Rep." cite must look there.
+    return _CASE_LAW_REPORTER_ALIASES.get(s, s)
+
+
+# Old/long reporter names → the slug static.case.law uses for the modern form.
+_CASE_LAW_REPORTER_ALIASES = {
+    "fed-rep": "f",        # Federal Reporter (old "Fed. Rep." → "F.")
+    "fed-rep-2d": "f2d",
+    "fed-rep-3d": "f3d",
+}
 
 
 def _static_case_law_url(citation: str) -> Optional[str]:
@@ -472,6 +483,43 @@ def _static_case_law_url(citation: str) -> Optional[str]:
     if not slug:
         return None
     return f"https://static.case.law/{slug}/{vol}/case-pdfs/{int(page):04d}-01.pdf"
+
+
+def _gather_all_citations(client, item: dict) -> list[str]:
+    """Every citation known for a case: the search-result cite(s) plus the
+    cluster record's parallel cites (de-duplicated, HTML-stripped).
+
+    Early Supreme Court results frequently carry only a nominative-reporter
+    cite (e.g. "19 How. 393"); the parallel "U.S." cite that locates the
+    official PDF lives on the cluster.  Likewise Federal Reporter cases may
+    expose only one of several parallel cites.  Trying them all — rather than
+    just the first — is what lets the PDF resolver succeed for these."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(c) -> None:
+        c = re.sub(r"<[^>]+>", "", str(c)).strip()
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+
+    raw = item.get("citation", [])
+    for c in (raw if isinstance(raw, list) else [raw] if raw else []):
+        add(c)
+    cluster_id = item.get("cluster_id") or item.get("id")
+    if cluster_id:
+        try:
+            cr = client.get_cluster(int(cluster_id), fields="citations")
+            for c in (cr.get("citations") or []):
+                if isinstance(c, str):
+                    add(c)
+                elif isinstance(c, dict):
+                    v, r, p = c.get("volume"), c.get("reporter"), c.get("page")
+                    if v and r and p:
+                        add(f"{v} {r} {p}")
+        except Exception as exc:
+            print(f"[resolve] cluster citation fetch failed: {exc}")
+    return out
 
 
 _OPINION_TYPE_LABELS: dict[str, str] = {
@@ -2505,24 +2553,24 @@ class CourtListenerGUI:
                 print(f"[resolve] {label} check failed ({exc}): {url}")
             return False
 
-        # 0. Official US Reports PDF.
-        #    vols 1-542  → LOC CDN (exact per-opinion PDF); if LOC fails,
-        #                  GovInfo is tried next (available from vol 2 onward).
-        #    vols 543+   → GovInfo link service only (redirects to per-opinion PDF)
-        citations = item.get("citation", [])
-        if isinstance(citations, list):
-            us_cite = next((c for c in citations if " U.S. " in c), None)
-        else:
-            us_cite = str(citations) if citations and " U.S. " in str(citations) else None
-        if us_cite:
-            loc_url = _us_reports_loc_url(us_cite)
-            if loc_url:
-                if _head_ok(loc_url, "LOC US Reports"):
-                    print(f"[resolve] using LOC US Reports PDF: {loc_url}")
-                    return loc_url
-            govinfo_urls = _us_reports_govinfo_url(us_cite)
-            if govinfo_urls:
-                link_url, direct_url = govinfo_urls
+        # Gather EVERY citation we know — the search result often exposes only
+        # one (frequently a nominative reporter like "19 How. 393"), while the
+        # parallel U.S./F. cite that finds a PDF lives on the cluster record.
+        all_cites = _gather_all_citations(client, item)
+        print(f"[resolve] citations to try: {all_cites}")
+
+        # 0. Official US Reports PDF — try every U.S.-Reports cite among them.
+        #    vols 1-542 → LOC CDN; otherwise GovInfo (link service + direct PDF).
+        for cite in all_cites:
+            loc_url = _us_reports_loc_url(cite)
+            gov = _us_reports_govinfo_url(cite)
+            if not loc_url and not gov:
+                continue
+            if loc_url and _head_ok(loc_url, "LOC US Reports"):
+                print(f"[resolve] using LOC US Reports PDF: {loc_url}")
+                return loc_url
+            if gov:
+                link_url, direct_url = gov
                 if _head_ok(link_url, "GovInfo link"):
                     print(f"[resolve] using GovInfo link URL: {link_url}")
                     return link_url
@@ -2530,64 +2578,25 @@ class CourtListenerGUI:
                     print(f"[resolve] using GovInfo direct PDF URL: {direct_url}")
                     return direct_url
 
-        # 0.5. For non-SCOTUS cases try the Harvard CAP static.case.law copy
-        #      first.  A HEAD request confirms availability before committing.
-        #      If the cites from the search result all fail, also try alternate
-        #      cites from the cluster record before giving up on static.case.law.
+        # 0.5. Non-SCOTUS: the Harvard CAP static.case.law copy.  Try every
+        #      parallel cite before giving up.
         if not is_scotus:
-            cites = citations if isinstance(citations, list) else (
-                [str(citations)] if citations else []
-            )
-            tried_cites: set[str] = set()
-
-            def _try_static_case_law(cite_list: list[str]) -> Optional[str]:
-                for cite in cite_list:
-                    tried_cites.add(cite)
-                    if "lexis" in cite.lower():
-                        continue
-                    scl_url = _static_case_law_url(cite)
-                    if not scl_url:
-                        continue
-                    print(f"[resolve] checking static.case.law: {scl_url}")
-                    try:
-                        head = _anon_session.head(scl_url, timeout=10, allow_redirects=True)
-                        if head.status_code == 200:
-                            print(f"[resolve] using static.case.law PDF: {scl_url}")
-                            return scl_url
-                        print(f"[resolve] static.case.law returned {head.status_code} for {cite!r}")
-                    except Exception as exc:
-                        print(f"[resolve] static.case.law check failed: {exc}")
-                return None
-
-            result = _try_static_case_law(cites)
-            if result:
-                return result
-
-            # The search result may only expose a subset of citations.
-            # Fetch the cluster record to get any alternate cites not already tried.
-            cluster_id_for_cites = item.get("cluster_id") or item.get("id")
-            if cluster_id_for_cites:
+            for cite in all_cites:
+                if "lexis" in cite.lower():
+                    continue
+                scl_url = _static_case_law_url(cite)
+                if not scl_url:
+                    continue
+                print(f"[resolve] checking static.case.law: {scl_url}")
                 try:
-                    print(f"[resolve] fetching cluster {cluster_id_for_cites} for alternate citations")
-                    cites_resp = client.get_cluster(int(cluster_id_for_cites), fields="citations")
-                    alt_cites: list[str] = []
-                    for c in (cites_resp.get("citations") or []):
-                        if isinstance(c, str):
-                            alt_cites.append(re.sub(r"<[^>]+>", "", c).strip())
-                        elif isinstance(c, dict):
-                            vol = c.get("volume") or ""
-                            rep = c.get("reporter") or ""
-                            page = c.get("page") or ""
-                            if vol and rep and page:
-                                alt_cites.append(f"{vol} {rep} {page}")
-                    new_cites = [c for c in alt_cites if c not in tried_cites]
-                    if new_cites:
-                        print(f"[resolve] trying {len(new_cites)} alternate cite(s) from cluster")
-                        result = _try_static_case_law(new_cites)
-                        if result:
-                            return result
+                    head = _anon_session.head(scl_url, timeout=10,
+                                              allow_redirects=True)
+                    if head.status_code == 200:
+                        print(f"[resolve] using static.case.law PDF: {scl_url}")
+                        return scl_url
+                    print(f"[resolve] static.case.law {head.status_code} for {cite!r}")
                 except Exception as exc:
-                    print(f"[resolve] cluster cite fetch failed: {exc}")
+                    print(f"[resolve] static.case.law check failed: {exc}")
 
         # 1. local_path already present on the search result
         local = item.get("local_path") or item.get("localPath") or ""
@@ -3977,6 +3986,11 @@ class _PdfPane(ttk.Frame):
 
     _PAD = 12        # vertical gap between pages (px)
     _SCROLL_PX = 60  # wheel-notch scroll distance (px); canvas uses 1px units
+    _MARGIN = 18     # small even margin drawn around the cropped page (px)
+    _BBOX_SCALE = 0.6   # low-res render scale used to detect the content box
+    _INK_THRESH = 185   # grayscale < this counts as "ink" (ignores scan bg)
+    _PROFILE_MIN = 2    # min avg ink (0-255) for a row/col to count as content
+    _PAD_FRAC = 0.006   # tiny expansion of the detected box so glyphs aren't clipped
 
     def __init__(self, parent: tk.Misc, pdf_bytes: bytes, width: int = 800) -> None:
         super().__init__(parent)
@@ -3985,6 +3999,7 @@ class _PdfPane(ttk.Frame):
 
         self._doc = pdfium.PdfDocument(pdf_bytes)
         self._target_w = max(240, int(width))
+        self._inner_w = max(1, self._target_w - 2 * self._MARGIN)
         self._photos: dict[int, object] = {}   # page → PhotoImage (kept alive)
         self._img_ids: dict[int, int] = {}      # page → canvas image id
 
@@ -3996,23 +4011,33 @@ class _PdfPane(ttk.Frame):
         canvas.pack(side="left", fill="both", expand=True)
         self._canvas, self._vsb = canvas, vsb
 
-        # Lay out one slot per page from its size — no rendering yet, just a
-        # white placeholder so the scrollbar/extent are correct immediately.
-        self._slots: list[tuple[int, int, int, float]] = []  # (y, w, h, scale)
+        # Lay out one slot per page.  A quick low-resolution render detects each
+        # page's content box, so the wide blank margins of court PDFs are
+        # cropped down to a small, even margin; the slot is sized from the
+        # cropped content (full rendering still happens lazily, on scroll).
+        self._slots: list[tuple] = []  # (y, slot_h, frac_box, render_scale)
         y = self._PAD
         for i in range(len(self._doc)):
             page = self._doc[i]
             try:
                 w_pt, h_pt = page.get_size()
+                try:
+                    lo = page.render(scale=self._BBOX_SCALE).to_pil()
+                    frac = self._content_frac(lo)
+                except Exception:
+                    frac = (0.0, 0.0, 1.0, 1.0)
             finally:
                 page.close()
-            scale = (self._target_w / w_pt) if w_pt else 1.0
-            w, h = int(w_pt * scale), int(h_pt * scale)
-            x0 = self._PAD + max(0, (self._target_w - w) // 2)
-            canvas.create_rectangle(x0, y, x0 + w, y + h,
-                                    fill="white", outline="#b8b8b8")
-            self._slots.append((y, w, h, scale))
-            y += h + self._PAD
+            fl, ft, fr, fb = frac
+            cw_pt = max(1.0, (fr - fl) * w_pt)
+            ch_pt = max(1.0, (fb - ft) * h_pt)
+            render_scale = self._inner_w / cw_pt
+            slot_h = int(round(ch_pt * render_scale)) + 2 * self._MARGIN
+            canvas.create_rectangle(
+                self._PAD, y, self._PAD + self._target_w, y + slot_h,
+                fill="white", outline="#b8b8b8")
+            self._slots.append((y, slot_h, frac, render_scale))
+            y += slot_h + self._PAD
         canvas.configure(
             scrollregion=(0, 0, self._target_w + 2 * self._PAD, y))
 
@@ -4022,6 +4047,36 @@ class _PdfPane(ttk.Frame):
         canvas.bind("<Button-5>", lambda _e: self._wheel(1))   # X11 wheel down
         canvas.bind("<Enter>", lambda _e: canvas.focus_set())
         self.after(60, self._render_visible)
+
+    def _content_frac(self, img) -> tuple:
+        """Fractional content box (l, t, r, b in 0..1) of `img` — the area
+        holding actual text/figures, found from row/column ink projections so
+        scanner speckle in the margins doesn't defeat the crop.  Returns the
+        full page when nothing plausible is found."""
+        from PIL import Image
+        full = (0.0, 0.0, 1.0, 1.0)
+        W, H = img.size
+        if W < 8 or H < 8:
+            return full
+        mask = img.convert("L").point(
+            lambda p: 255 if p < self._INK_THRESH else 0)
+        cols = mask.resize((W, 1), Image.BOX).getdata()  # avg ink per column
+        rows = mask.resize((1, H), Image.BOX).getdata()  # avg ink per row
+
+        def span(profile, n):
+            idx = [k for k, v in enumerate(profile) if v > self._PROFILE_MIN]
+            return (idx[0], idx[-1] + 1) if idx else (0, n)
+
+        l, r = span(cols, W)
+        t, b = span(rows, H)
+        fl, ft = l / W - self._PAD_FRAC, t / H - self._PAD_FRAC
+        fr, fb = r / W + self._PAD_FRAC, b / H + self._PAD_FRAC
+        fl, ft = max(0.0, fl), max(0.0, ft)
+        fr, fb = min(1.0, fr), min(1.0, fb)
+        # Ignore implausible crops (blank page, or so tight it's likely noise).
+        if (fr - fl) < 0.15 or (fb - ft) < 0.15:
+            return full
+        return (fl, ft, fr, fb)
 
     def _on_yview(self, first: str, last: str) -> None:
         self._vsb.set(first, last)
@@ -4041,8 +4096,8 @@ class _PdfPane(ttk.Frame):
         except tk.TclError:
             return
         lo, hi = top - view_h, top + 2 * view_h   # ~one screen of buffer
-        for i, (y, _w, h, _s) in enumerate(self._slots):
-            near = (y + h) >= lo and y <= hi
+        for i, (y, slot_h, _frac, _scale) in enumerate(self._slots):
+            near = (y + slot_h) >= lo and y <= hi
             if near and i not in self._img_ids:
                 self._render_page(i)
             elif not near and i in self._img_ids:
@@ -4050,18 +4105,28 @@ class _PdfPane(ttk.Frame):
                 self._photos.pop(i, None)
 
     def _render_page(self, i: int) -> None:
-        from PIL import ImageTk
-        y, w, _h, scale = self._slots[i]
+        from PIL import Image, ImageTk
+        y, slot_h, frac, scale = self._slots[i]
         page = self._doc[i]
         try:
-            pil = page.render(scale=scale).to_pil()
+            full = page.render(scale=scale).to_pil()
         finally:
             page.close()
-        photo = ImageTk.PhotoImage(pil)
+        fl, ft, fr, fb = frac
+        W, H = full.size
+        content = full.crop((int(fl * W), int(ft * H),
+                             int(round(fr * W)), int(round(fb * H))))
+        # Snap to the exact content box so every page lines up with a uniform
+        # margin, then mount it on a white page of the slot's size.
+        inner_h = max(1, slot_h - 2 * self._MARGIN)
+        if content.size != (self._inner_w, inner_h):
+            content = content.resize((self._inner_w, inner_h), Image.LANCZOS)
+        canvas_img = Image.new("RGB", (self._target_w, slot_h), "white")
+        canvas_img.paste(content, (self._MARGIN, self._MARGIN))
+        photo = ImageTk.PhotoImage(canvas_img)
         self._photos[i] = photo
-        x0 = self._PAD + max(0, (self._target_w - w) // 2)
         self._img_ids[i] = self._canvas.create_image(
-            x0, y, anchor="nw", image=photo)
+            self._PAD, y, anchor="nw", image=photo)
 
     def destroy(self) -> None:
         try:
@@ -4082,7 +4147,7 @@ class _ScholarTextWindow:
       • Copy + Cite — copies selection (or all) with formatting and appends
         a Bluebook citation pin-cited from the star pagination,
       • Export RTF — two-column RTF named after the Bluebook caption,
-      • Save as .txt,
+      • View PDF — the official opinion PDF, shown in-app (Download PDF there),
       • a toggle to the CourtListener version of the text.
     """
 
@@ -4150,6 +4215,7 @@ class _ScholarTextWindow:
         self._mode = "courtlistener" if self._cl_primary else "scholar"
         self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
         self._pdf_url: Optional[str] = None
+        self._pdf_bytes: Optional[bytes] = None
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
         self._fonts: dict[str, tkfont.Font] = {}
@@ -4271,12 +4337,11 @@ class _ScholarTextWindow:
         ttk.Button(btn_frame, text="Copy + Cite", command=self._copy_formatted).pack(
             side="right", padx=(4, 0)
         )
-        ttk.Button(btn_frame, text="Export RTF…", command=self._export_rtf).pack(
-            side="right", padx=4
+        # In text view this exports RTF; in PDF view it becomes "Download PDF".
+        self._export_btn = ttk.Button(
+            btn_frame, text="Export RTF…", command=self._export_rtf
         )
-        ttk.Button(btn_frame, text="Save as .txt…", command=self._save_txt).pack(
-            side="right", padx=4
-        )
+        self._export_btn.pack(side="right", padx=4)
         self._toggle_btn = ttk.Button(
             btn_frame, text="CourtListener Text", command=self._toggle_source
         )
@@ -4643,6 +4708,7 @@ class _ScholarTextWindow:
         # is invariably worse, so it's no longer offered here).
         self._toggle_btn.config(text="View PDF", command=self._view_pdf,
                                 state="normal")
+        self._export_btn.config(text="Export RTF…", command=self._export_rtf)
         if len(self._parts) > 1:
             self._part_combo.config(state="readonly")
         if self._current_part is None:
@@ -5298,25 +5364,6 @@ class _ScholarTextWindow:
         ):
             CourtListenerGUI._open_file(path)
 
-    def _current_text(self) -> str:
-        if self._mode == "courtlistener":
-            return self._cl_text or ""
-        return self._scholar_text
-
-    def _save_txt(self) -> None:
-        default = _build_default_filename(self._filename_item())
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            initialfile=f"{default}.txt",
-            title="Save Opinion Text",
-            parent=self._win,
-        )
-        if path:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(self._current_text())
-            messagebox.showinfo("Saved", f"Text saved to:\n{path}", parent=self._win)
-
     # ------------------------------------------------------------------
     # Case details side panel (authors and joins per opinion)
     # ------------------------------------------------------------------
@@ -5799,6 +5846,7 @@ class _ScholarTextWindow:
                   before=self._btn_frame)
         self._pdf_pane = pane
         self._pdf_url = url
+        self._pdf_bytes = data
         self._mode = "pdf"
         self._part_combo.config(state="disabled")
         self._view_label_var.set("PDF of opinion")
@@ -5806,7 +5854,32 @@ class _ScholarTextWindow:
         self._source_var.set(url)
         self._toggle_btn.config(text="Google Scholar Text",
                                 command=self._back_from_pdf, state="normal")
+        # In PDF view, the RTF export becomes a "Download PDF" action.
+        self._export_btn.config(text="Download PDF", command=self._download_pdf)
         self._status_var.set("Showing the official PDF of the opinion.")
+
+    def _download_pdf(self) -> None:
+        """Save the PDF currently being viewed to a file the user chooses."""
+        data = getattr(self, "_pdf_bytes", None)
+        if not data:
+            return
+        default = _build_default_filename(self._filename_item())
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            initialfile=f"{default}.pdf",
+            title="Download Opinion PDF",
+            parent=self._win,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "wb") as fh:
+                fh.write(data)
+        except Exception as exc:
+            messagebox.showerror("Download PDF", str(exc), parent=self._win)
+            return
+        self._status_var.set(f"Saved PDF to {path}")
 
     def _back_from_pdf(self) -> None:
         """Return from the PDF to the Google Scholar text view."""
