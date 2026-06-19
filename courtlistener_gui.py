@@ -3272,13 +3272,39 @@ def _titlecase_caps(s: str) -> str:
     return " ".join(out)
 
 
+# Entity abbreviations that legitimately end a party name with a period, so the
+# period must be kept ("Acme Co.", "Foo Corp.", "Bar Inc.").  Initialisms with
+# internal periods (L.L.C., N.A., S.A.) are recognized separately.
+_PARTY_ABBR_SUFFIXES = {
+    "co", "cos", "corp", "corps", "inc", "ltd", "llc", "llp", "lp", "lllp",
+    "plc", "pc", "pa", "pllc", "na", "sa", "ag", "nv", "bros",
+}
+
+
+def _party_ends_in_abbrev(s: str) -> bool:
+    """True if the party name ends in an abbreviation whose trailing period is
+    part of the name (an entity suffix like 'Co.' or an initialism like
+    'L.L.C.'), as opposed to a stray sentence period."""
+    parts = s.split()
+    if not parts:
+        return False
+    last = parts[-1]
+    if "." in last[:-1]:  # an internal period → initialism (L.L.C., N.A.)
+        return True
+    return last.rstrip(".").replace("’", "'").lower() in _PARTY_ABBR_SUFFIXES
+
+
 def _caption_party(s: str) -> str:
     """One side of a Scholar caption → its Bluebook party name.  Drops the
     procedural designation and 'et al.'; when Scholar mixes cases, the
     all-caps run is the operative name ('Brent BREWBAKER' → 'Brewbaker',
     'UNITED STATES of America' → 'United States')."""
-    s = s.split(",")[0].strip().strip(".;")
+    s = s.split(",")[0].strip().lstrip(".;").rstrip(";").strip()
     s = re.sub(r"\s+et\s+al\.?$", "", s, flags=re.IGNORECASE).strip()
+    # Drop a stray trailing period, but keep an entity abbreviation's period
+    # ("Acme Co.", "Foo Corp.", "Bar Inc.").
+    if s.endswith(".") and not _party_ends_in_abbrev(s):
+        s = s[:-1].rstrip()
     tokens = s.split()
     caps = [w for w in tokens if w.isupper() and len(w.strip(".,'")) > 1]
     if caps and len(caps) < len(tokens):
@@ -3383,7 +3409,10 @@ def _scholar_caption_name(blocks) -> str:
     for b in blocks[:8]:
         if b.kind != "center":
             continue
-        t = re.sub(r"\s+", " ", b.text()).strip().rstrip(".")
+        # Keep a trailing period here — it may belong to an entity abbreviation
+        # ending the caption ("… v. Acme Co."); _caption_party drops only a
+        # stray one.
+        t = re.sub(r"\s+", " ", b.text()).strip()
         if not t or _HEADER_CITE_RE.match(t) or t.startswith(("No.", "Nos.")):
             continue
         # Google Scholar renders the party separator in lowercase ("… v. …")
