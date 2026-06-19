@@ -3508,8 +3508,9 @@ def _rtf_escape(s: str) -> str:
 
 # Color table: 1 = star-pagination marker (purple), 2 = dissent (dark red),
 # 3 = concurrence (dark green).  Citation links stay black in copied and
-# exported text; the blue is only an on-screen affordance.  Part colors are
-# applied only in exports, not clipboard copies.
+# exported text; the blue is only an on-screen affordance.  The dissent/
+# concurrence colors are used only on the running heading of a section in the
+# RTF export — opinion body text is always black.
 _RTF_HEADER = (
     "{\\rtf1\\ansi\\deff0"
     "{\\fonttbl{\\f0\\froman Times New Roman;}}"
@@ -3977,9 +3978,14 @@ class _ScholarTextWindow:
 
     _PAGENUM_COLOR = "#8e44ad"   # muted purple — visible but not loud
     _LINK_COLOR = "#1a56b0"
-    _DISSENT_COLOR = "#a31515"   # dark red
+    _DISSENT_COLOR = "#a31515"   # dark red — top-of-window label & RTF headings
     _CONCUR_COLOR = "#1a7a3c"    # dark green
-    _PART_COLOR_TAGS = {"dissent": "part-dissent", "concurrence": "part-concurrence"}
+    _DISSENT_BG = "#fbeeee"      # very light red — full-view box behind a dissent
+    _CONCUR_BG = "#eef7f0"       # very light green — box behind a concurrence
+    # In the full-opinion view the region behind a concurrence/dissent gets a
+    # light background tint; the body text itself stays black and the active
+    # part is named, in color, at the top of the window.
+    _PART_BOX_TAGS = {"dissent": "box-dissent", "concurrence": "box-concurrence"}
     _PART_LABEL_COLORS = {"dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR}
 
     def __init__(
@@ -4104,7 +4110,7 @@ class _ScholarTextWindow:
         txt = tk.Text(text_frame, wrap="word", font=base, padx=14, pady=10)
         self._text = txt
         vsb = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=vsb.set)
+        txt.configure(yscrollcommand=self._on_yscroll)
         vsb.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
         self._text_frame, self._vsb = text_frame, vsb
@@ -4115,10 +4121,14 @@ class _ScholarTextWindow:
         txt.tag_configure("blockquote", lmargin1=36, lmargin2=36, rmargin=36)
         txt.tag_configure("heading", spacing1=6, spacing3=4)
         txt.tag_configure("underline", underline=True)
-        # Part colors (configured before pagenum/citelink so those keep
-        # priority and stay purple/blue inside colored parts)
-        txt.tag_configure("part-dissent", foreground=self._DISSENT_COLOR)
-        txt.tag_configure("part-concurrence", foreground=self._CONCUR_COLOR)
+        # Full-view part boxes: a light background tint, kept at the bottom of
+        # the tag stack so the selection highlight, citation links and page
+        # markers all show above it.  Part text is no longer colored — only
+        # this subtle box and the top-of-window label distinguish the parts.
+        txt.tag_configure("box-dissent", background=self._DISSENT_BG)
+        txt.tag_configure("box-concurrence", background=self._CONCUR_BG)
+        txt.tag_lower("box-dissent")
+        txt.tag_lower("box-concurrence")
         fnhead_font = tkfont.Font(
             family=self._family, size=max(self._base_size - 2, 8), weight="bold"
         )
@@ -4485,6 +4495,8 @@ class _ScholarTextWindow:
         self._fnref_pages: dict[str, Optional[int]] = {}
         self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
         self._part_regions: list[tuple[str, str, int]] = []
+        self._rendered_parts = self._parts  # parts list _part_regions indexes
+        self._scroll_part: Optional[int] = None
         self._fn_ref_pos: dict[str, str] = {}  # footnote id → in-text marker index
         self._fn_def_pos: dict[str, str] = {}  # footnote id → body marker index
         self._page_pos: dict[int, str] = {}    # star page → start index
@@ -4500,14 +4512,17 @@ class _ScholarTextWindow:
                 part_start = txt.index("end-1c")
                 if self._part_start_pages:
                     self._cur_page = self._part_start_pages[pi] or self._cur_page
-                part_tag = self._PART_COLOR_TAGS.get(part.kind)
                 for block in part.blocks:
-                    self._insert_block(block, part_tag)
+                    self._insert_block(block, None)  # body text stays black
                 if part.footnotes:
-                    fnhead_tags = ("fnhead",) + ((part_tag,) if part_tag else ())
-                    txt.insert("end", "Footnotes\n\n", fnhead_tags)
-                    self._render_footnotes(part.footnotes, part_tag)
-                self._part_regions.append((part_start, txt.index("end-1c"), pi))
+                    txt.insert("end", "Footnotes\n\n", ("fnhead",))
+                    self._render_footnotes(part.footnotes, None)
+                part_end = txt.index("end-1c")
+                self._part_regions.append((part_start, part_end, pi))
+                if self._current_part is None:
+                    box = self._PART_BOX_TAGS.get(part.kind)
+                    if box:  # light tint behind concurrences/dissents
+                        txt.tag_add(box, part_start, part_end)
         txt.config(state="disabled")
         self._mode = "scholar"
         self._source_var.set(self._scholar_url)
@@ -4537,6 +4552,46 @@ class _ScholarTextWindow:
         else:
             self._render_scholar()
 
+    def _on_yscroll(self, first: str, last: str) -> None:
+        """Keep the scrollbar in sync and, in the full-opinion view, colour the
+        top-of-window label to name the part now at the top of the page."""
+        vsb = getattr(self, "_vsb", None)
+        if vsb is not None:
+            vsb.set(first, last)
+        self._update_scroll_part()
+
+    def _update_scroll_part(self) -> None:
+        """In the full-opinion view, name+colour the part at the top of the
+        viewport (so scrolling into a concurrence/dissent colours the header).
+        A single selected part keeps its fixed label, so this no-ops there."""
+        if getattr(self, "_current_part", None) is not None:
+            return
+        parts = getattr(self, "_rendered_parts", None)
+        regions = getattr(self, "_part_regions", None)
+        if not parts or not regions:
+            return
+        txt = self._text
+        try:
+            top = txt.index("@0,0")
+        except tk.TclError:
+            return
+        pi = None
+        for rs, rend, p in regions:
+            if txt.compare(top, ">=", rs) and txt.compare(top, "<", rend):
+                pi = p
+                break
+        if pi is None or pi == getattr(self, "_scroll_part", None):
+            return
+        self._scroll_part = pi
+        kind = parts[pi].kind
+        if kind in ("concurrence", "dissent"):
+            self._view_label_var.set(parts[pi].label)
+            self._view_label.config(
+                foreground=self._PART_LABEL_COLORS.get(kind, "black"))
+        else:
+            self._view_label_var.set("Full opinion")
+            self._view_label.config(foreground="black")
+
     def _render_cl_blocks(self) -> None:
         """Render CourtListener opinion parts with full block formatting."""
         parts = self._cl_parts or self._parts
@@ -4556,6 +4611,8 @@ class _ScholarTextWindow:
         self._fnref_pages: dict[str, Optional[int]] = {}
         self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
         self._part_regions: list[tuple[str, str, int]] = []
+        self._rendered_parts = parts  # parts list _part_regions indexes
+        self._scroll_part: Optional[int] = None
         self._fn_ref_pos: dict[str, str] = {}
         self._fn_def_pos: dict[str, str] = {}
         self._page_pos: dict[int, str] = {}
@@ -4569,14 +4626,17 @@ class _ScholarTextWindow:
                 shown = [(self._current_part, parts[self._current_part])]
             for pi, part in shown:
                 part_start = txt.index("end-1c")
-                part_tag = self._PART_COLOR_TAGS.get(part.kind)
                 for block in part.blocks:
-                    self._insert_block(block, part_tag)
+                    self._insert_block(block, None)  # body text stays black
                 if part.footnotes:
-                    fnhead_tags = ("fnhead",) + ((part_tag,) if part_tag else ())
-                    txt.insert("end", "Footnotes\n\n", fnhead_tags)
-                    self._render_footnotes(part.footnotes, part_tag)
-                self._part_regions.append((part_start, txt.index("end-1c"), pi))
+                    txt.insert("end", "Footnotes\n\n", ("fnhead",))
+                    self._render_footnotes(part.footnotes, None)
+                part_end = txt.index("end-1c")
+                self._part_regions.append((part_start, part_end, pi))
+                if self._current_part is None:
+                    box = self._PART_BOX_TAGS.get(part.kind)
+                    if box:  # light tint behind concurrences/dissents
+                        txt.tag_add(box, part_start, part_end)
         txt.config(state="disabled")
         self._mode = "courtlistener"
         self._source_var.set("CourtListener (REST API)")
@@ -5035,7 +5095,9 @@ class _ScholarTextWindow:
         opinion: the header and majority share the first section, and each
         concurrence/dissent starts a new page (numbering continues).  Every
         section carries a running head with the Bluebook citation and the
-        opinion's author, and a page-number footer.  Part colors are kept.
+        opinion's author, and a page-number footer.  The running head is
+        coloured by opinion kind (dissent red, concurrence green); the body
+        text is black.
         """
         txt = self._text
         case_line = self._bluebook_citation(None)[0].rstrip(".")
@@ -5049,7 +5111,8 @@ class _ScholarTextWindow:
         main_regions = self._part_regions[: main_end + 1]
         rest_regions = self._part_regions[main_end + 1:]
 
-        sections: list[tuple[str, str, str]] = []  # (author label, start, end)
+        # (author label, start, end, kind)
+        sections: list[tuple[str, str, str, str]] = []
         if main_regions:
             maj = next(
                 (self._parts[pi] for _rs, _re, pi in main_regions
@@ -5057,12 +5120,17 @@ class _ScholarTextWindow:
                 None,
             )
             label = self._majority_author(maj) if maj is not None else ""
-            sections.append((label, main_regions[0][0], main_regions[-1][1]))
+            sections.append((label, main_regions[0][0], main_regions[-1][1],
+                             "majority"))
         for rs, rend, pi in rest_regions:
-            sections.append((self._writer_parenthetical(self._parts[pi]), rs, rend))
+            sections.append((self._writer_parenthetical(self._parts[pi]), rs,
+                             rend, self._parts[pi].kind))
 
+        # Colour only the running heading by opinion kind (dissent red,
+        # concurrence green); the body text of every opinion stays black.
+        head_cf = {"dissent": "\\cf2 ", "concurrence": "\\cf3 "}
         out: list[str] = []
-        for i, (label, rs, rend) in enumerate(sections):
+        for i, (label, rs, rend, kind) in enumerate(sections):
             out.append(
                 "\\sectd\\sbknone\\cols2\\colsx432\n"
                 if i == 0
@@ -5070,10 +5138,11 @@ class _ScholarTextWindow:
             )
             head = f"{case_line} — {label}" if label else case_line
             out.append(
-                "{\\header\\pard\\qc\\fs18\\i " + _rtf_escape(head) + "\\par}\n"
+                "{\\header\\pard\\qc\\fs18\\i " + head_cf.get(kind, "")
+                + _rtf_escape(head) + "\\par}\n"
             )
             out.append("{\\footer\\pard\\qc\\fs18\\chpgn\\par}\n")
-            out.append(_dump_to_rtf(txt, rs, rend, part_colors=True,
+            out.append(_dump_to_rtf(txt, rs, rend, part_colors=False,
                                     fn_links=self._fn_link_map()))
         return _RTF_HEADER + "".join(out) + "}"
 
