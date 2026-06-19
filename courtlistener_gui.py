@@ -107,6 +107,7 @@ from courtlistener import CourtListenerClient, CourtListenerError
 import ecfr
 import fed_rules
 import state_statutes
+import statutes_at_large
 import us_code
 from court_catalog import (
     CATALOG as _COURT_CATALOG,
@@ -4559,6 +4560,9 @@ class _ScholarTextWindow:
             matches.append((m.start(), m.end(), "rule", m))
         for c in state_statutes.iter_cites(text):
             matches.append((c.start, c.end, "statestat", c))
+        for m in statutes_at_large.STAT_CITE_RE.finditer(text):
+            if statutes_at_large.url_for(m):  # only link volumes GovInfo has
+                matches.append((m.start(), m.end(), "stat", m))
         matches.sort(key=lambda t: (t[0], -t[1]))
         pos = 0
         for start, end, kind, m in matches:
@@ -4585,6 +4589,9 @@ class _ScholarTextWindow:
                 # In-app for priority states (once a parser exists), else a
                 # browser link-out.  `m` here is a state_statutes.Cite record.
                 action = state_statutes.action_for(m)
+            elif kind == "stat":
+                # Statutes at Large → free GovInfo scan, opened in the browser.
+                action = ("browse", statutes_at_large.url_for(m))
             else:
                 action = ("cfr", ecfr.cite_spec(m))
             ltags = tags + ("citelink", self._new_link(action))
@@ -6341,6 +6348,10 @@ class _StatuteWindow:
         for c in state_statutes.iter_cites(text):
             kind, value = state_statutes.action_for(c)
             refs.append((c.start, c.end, kind, value))
+        for m in statutes_at_large.STAT_CITE_RE.finditer(text):
+            url = statutes_at_large.url_for(m)
+            if url:  # Statutes at Large → free GovInfo scan (browser)
+                refs.append((m.start(), m.end(), "browse", url))
         if self._doc.kind == "usc":
             for m in _USC_XREF_RE.finditer(text):
                 title = m.group(3) or self._doc.title
