@@ -703,6 +703,43 @@ for _acr, _names in _WIDELY_RECOGNIZED_INITIALS_RAW.items():
         _WIDELY_RECOGNIZED_INITIALS.setdefault(_initials_key(_abbr), _acr)
 
 
+# Rule 10.2.1(h): omit "Inc.", "Ltd.", "L.L.C.", "L.L.P.", "N.A.", "F.S.B.",
+# and similar business-entity terms when the name *also* contains a word like
+# "Ass'n", "Bros.", "Co.", or "Corp." that already marks it as a business firm.
+_FIRM_MARKERS = {"ass'n", "assn", "bros", "co", "cos", "corp", "corps"}
+_REDUNDANT_ENTITY_TERMS = {
+    "inc", "ltd", "llc", "l.l.c", "llp", "l.l.p", "lllp", "pllc", "p.l.l.c",
+    "plc", "pc", "p.c", "pa", "p.a", "na", "n.a", "f.s.b", "fsb", "lp", "l.p",
+}
+
+
+def _norm_entity_token(tok: str) -> str:
+    """A token's comparison key: lowercase, no surrounding punctuation, with
+    a trailing entity period removed ('Inc.,' → 'inc', 'L.L.C.' → 'l.l.c')."""
+    t = tok.replace("’", "'").strip().lower().strip(",")
+    if t.endswith("."):
+        t = t[:-1]
+    return t
+
+
+def _drop_redundant_entity(name: str) -> str:
+    """Apply rule 10.2.1(h): if the party name contains a firm marker
+    ('Co.', 'Corp.', 'Ass'n', 'Bros.'), drop any redundant entity suffix
+    ('Inc.', 'LLC', 'Ltd.', …) and tidy the comma it left behind."""
+    words = name.split()
+    norm = [_norm_entity_token(w) for w in words]
+    if not any(n in _FIRM_MARKERS for n in norm):
+        return name
+    kept: list[str] = []
+    for w, n in zip(words, norm):
+        if n in _REDUNDANT_ENTITY_TERMS:
+            if kept and kept[-1].endswith(","):
+                kept[-1] = kept[-1][:-1]
+            continue
+        kept.append(w)
+    return " ".join(kept).strip().rstrip(",")
+
+
 def abbreviate_case_name(name: str) -> str:
     """Abbreviate a case name for use in a citation or filename per
     Bluebook rule 10.2.2 (= Indigo Book R8.3), dropping given names of
@@ -712,7 +749,9 @@ def abbreviate_case_name(name: str) -> str:
     if not name:
         return name
     parts = _V_SPLIT_RE.split(name, maxsplit=1)
-    return " v. ".join(_abbreviate_party(p) for p in parts)
+    return " v. ".join(
+        _drop_redundant_entity(_abbreviate_party(p)) for p in parts
+    )
 
 
 if __name__ == "__main__":

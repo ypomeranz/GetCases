@@ -3251,15 +3251,27 @@ _CAPTION_SMALL_WORDS = {
     "of", "the", "and", "on", "in", "for", "a", "an", "ex", "rel", "re", "et", "al",
 }
 
+# Entity initialisms that stay all-caps in a normal-cased caption — title-casing
+# would otherwise turn "SEILA LAW LLC" into "Seila Law Llc".  (Unlike "Co.",
+# "Inc.", "Corp.", which are abbreviated words and *do* take title case.)
+_ENTITY_INITIALISMS = {
+    "llc", "llp", "lllp", "pllc", "plc", "pc", "pa", "lp", "na", "sa",
+    "ag", "nv", "bv",
+}
+
 
 def _titlecase_caps(s: str) -> str:
     """Normal-case an all-caps caption fragment: 'MERCY HOSPITAL' →
     'Mercy Hospital', 'UNITED STATES' → 'United States', 'IN RE GAULT' →
-    'In re Gault'.  Mixed-case words and abbreviations pass through."""
+    'In re Gault'.  Mixed-case words, abbreviations, and entity initialisms
+    ('LLC', 'LLP') pass through unchanged."""
     out: list[str] = []
     for i, w in enumerate(s.split()):
         if not w.isupper() or re.fullmatch(r"(?:[A-Z]\.)+,?", w):
             out.append(w)
+            continue
+        if w.replace("’", "'").rstrip(".,'").lower() in _ENTITY_INITIALISMS:
+            out.append(w)  # keep 'LLC', 'LLP', 'PLLC', … uppercase
             continue
         core = w.lower()
         if i > 0 and core.strip(".,'") in _CAPTION_SMALL_WORDS:
@@ -4025,12 +4037,16 @@ class _PdfPane(ttk.Frame):
     _ZOOM_MIN_W = 240   # narrowest page render width (px)
     _ZOOM_MAX_W = 3200  # widest page render width (px)
 
-    def __init__(self, parent: tk.Misc, pdf_bytes: bytes, width: int = 800) -> None:
+    def __init__(self, parent: tk.Misc, pdf_bytes: bytes, width: int = 800,
+                 margin: Optional[int] = None) -> None:
         super().__init__(parent)
         import pypdfium2 as pdfium
         from PIL import ImageTk  # noqa: F401  (availability check at construct)
 
         self._doc = pdfium.PdfDocument(pdf_bytes)
+        # White margin drawn around each cropped page; US Reports scans get a
+        # roomier margin (their official typography sits in a small block).
+        self._margin = self._MARGIN if margin is None else max(0, int(margin))
         self._base_w = max(240, int(width))    # the fit-to-window width (zoom 1.0)
         self._target_w = self._base_w          # current render width (zoom applied)
         self._page_x = self._PAD               # left x of each page; centered later
@@ -4142,7 +4158,7 @@ class _PdfPane(ttk.Frame):
         self._slots = []
         self._photos.clear()
         self._img_ids.clear()
-        self._inner_w = max(1, self._target_w - 2 * self._MARGIN)
+        self._inner_w = max(1, self._target_w - 2 * self._margin)
         self._page_x = self._page_left()
         y = self._PAD
         for (w_pt, h_pt, frac) in self._meta:
@@ -4150,7 +4166,7 @@ class _PdfPane(ttk.Frame):
             cw_pt = max(1.0, (fr - fl) * w_pt)
             ch_pt = max(1.0, (fb - ft) * h_pt)
             render_scale = self._inner_w / cw_pt
-            slot_h = int(round(ch_pt * render_scale)) + 2 * self._MARGIN
+            slot_h = int(round(ch_pt * render_scale)) + 2 * self._margin
             rid = c.create_rectangle(
                 self._page_x, y, self._page_x + self._target_w, y + slot_h,
                 fill="white", outline="#b8b8b8")
@@ -4243,15 +4259,53 @@ class _PdfPane(ttk.Frame):
                              int(round(fr * W)), int(round(fb * H))))
         # Snap to the exact content box so every page lines up with a uniform
         # margin, then mount it on a white page of the slot's size.
-        inner_h = max(1, slot_h - 2 * self._MARGIN)
+        inner_h = max(1, slot_h - 2 * self._margin)
         if content.size != (self._inner_w, inner_h):
             content = content.resize((self._inner_w, inner_h), Image.LANCZOS)
         canvas_img = Image.new("RGB", (self._target_w, slot_h), "white")
-        canvas_img.paste(content, (self._MARGIN, self._MARGIN))
+        canvas_img.paste(content, (self._margin, self._margin))
         photo = ImageTk.PhotoImage(canvas_img)
         self._photos[i] = photo
         self._img_ids[i] = self._canvas.create_image(
             self._page_x, y, anchor="nw", image=photo)
+
+    def export_pdf(self, path: str, dpi: int = 150) -> None:
+        """Write a PDF that matches what's shown — each page cropped to its
+        content box and re-centered on a clean white page with the viewer's
+        uniform margin — rather than the original scan with its wide, uneven
+        borders.  Rendered as images at `dpi` (text becomes raster)."""
+        from PIL import Image
+        scale = dpi / 72.0
+        # Keep the same margin-to-content proportion the viewer displays.
+        margin_ratio = self._margin / max(1, self._inner_w)
+        pages: list = []
+        try:
+            for i, (w_pt, h_pt, frac) in enumerate(self._meta):
+                page = self._doc[i]
+                try:
+                    full = page.render(scale=scale).to_pil().convert("RGB")
+                finally:
+                    page.close()
+                fl, ft, fr, fb = frac
+                W, H = full.size
+                content = full.crop((int(fl * W), int(ft * H),
+                                     int(round(fr * W)), int(round(fb * H))))
+                m = max(1, int(round(content.width * margin_ratio)))
+                sheet = Image.new(
+                    "RGB", (content.width + 2 * m, content.height + 2 * m),
+                    "white")
+                sheet.paste(content, (m, m))
+                pages.append(sheet)
+            if not pages:
+                raise ValueError("the PDF has no pages")
+            pages[0].save(path, "PDF", resolution=float(dpi),
+                          save_all=True, append_images=pages[1:])
+        finally:
+            for p in pages:
+                try:
+                    p.close()
+                except Exception:
+                    pass
 
     def destroy(self) -> None:
         try:
@@ -4259,6 +4313,14 @@ class _PdfPane(ttk.Frame):
         except Exception:
             pass
         super().destroy()
+
+
+# US Reports scans (LOC CDN "usrepNNN…" and GovInfo "USREPORTS-…") have a small
+# type block centred on a large page; a roomier margin reads better than the
+# default.  Detected from the resolved PDF URL.
+def _is_us_reports_pdf(url: str) -> bool:
+    u = (url or "").lower()
+    return "usrep" in u or "usreports-" in u
 
 
 class _ScholarTextWindow:
@@ -4304,6 +4366,7 @@ class _ScholarTextWindow:
         self._item = item or {}
         self._scholar_url = url
         self._note = note
+        self._header_cites: list[str] = []  # parallel reporter cites (PDF resolve)
         self._cl_primary = cl_parts is not None and not opinion_html
         if self._cl_primary:
             # Opened as a CourtListener-primary window (Scholar failed).
@@ -4341,6 +4404,10 @@ class _ScholarTextWindow:
         self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
         self._pdf_url: Optional[str] = None
         self._pdf_bytes: Optional[bytes] = None
+        # Background-prefetched PDF (data, url) so "View PDF" is instant; set by
+        # _prefetch_pdf, consumed by _view_pdf.
+        self._pdf_prefetch: Optional[tuple[bytes, str]] = None
+        self._pdf_prefetch_started = False
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
         self._fonts: dict[str, tkfont.Font] = {}
@@ -4365,6 +4432,8 @@ class _ScholarTextWindow:
             self._render_cl_blocks()
         else:
             self._render_scholar()
+            # Warm the official PDF in the background so "View PDF" is instant.
+            self._prefetch_pdf()
 
     # ------------------------------------------------------------------
     # UI
@@ -4720,8 +4789,9 @@ class _ScholarTextWindow:
                 # browser link-out.  `m` here is a state_statutes.Cite record.
                 action = state_statutes.action_for(m)
             elif kind == "stat":
-                # Statutes at Large → free GovInfo scan, opened in the browser.
-                action = ("browse", statutes_at_large.url_for(m))
+                # Statutes at Large → free GovInfo scan, shown in the in-app
+                # PDF viewer (with a Download option).
+                action = ("statpdf", statutes_at_large.url_for(m))
             else:
                 action = ("cfr", ecfr.cite_spec(m))
             ltags = tags + ("citelink", self._new_link(action))
@@ -5037,6 +5107,11 @@ class _ScholarTextWindow:
             if m:
                 vol, rep, page = m.group(1), m.group(2).strip(" ,"), m.group(3)
                 cands.append((f"{vol} {rep} {page}", int(page)))
+        # Every parallel reporter cite printed above the case name — Scholar
+        # often lists two or three (U.S., S. Ct., L. Ed.).  Kept so the PDF
+        # resolver can try them all before giving up (not just the one chosen
+        # for the Bluebook citation below).
+        self._header_cites = [c for c, _p in cands]
         cite = ""
         if cands:
             first_star: Optional[int] = None
@@ -5718,6 +5793,9 @@ class _ScholarTextWindow:
             webbrowser.open(value)
             self._status_var.set("Opened in your browser.")
             return
+        if kind == "statpdf":
+            _open_statute_pdf(self._win, value, self._status_var.set)
+            return
         # CourtListener opinion URL: fetch structured text from CL directly
         if kind == "url" and "courtlistener.com/opinion/" in value:
             self._follow_cl_link(value)
@@ -5925,12 +6003,56 @@ class _ScholarTextWindow:
         """The search-result-shaped dict used to resolve a PDF URL.  Falls back
         to the Bluebook citation when this window wasn't opened from a result."""
         item = dict(self._item) if self._item else {}
-        if not item.get("citation") and self._bb.get("cite"):
-            item["citation"] = [self._bb["cite"]]
+        cites: list[str] = []
+        raw = item.get("citation")
+        if raw:
+            cites = list(raw) if isinstance(raw, list) else [raw]
+        # Add every parallel reporter cite from the header and the chosen
+        # Bluebook cite, so the resolver tries them all (point: Scholar cases
+        # list several reporters above the case name).
+        for c in list(self._header_cites) + [self._bb.get("cite", "")]:
+            if c and c not in cites:
+                cites.append(c)
+        if cites:
+            item["citation"] = cites
         return item
 
+    def _prefetch_pdf(self) -> None:
+        """Resolve and fetch the official PDF in the background right after the
+        Scholar view opens, caching the bytes so a later 'View PDF' is instant.
+        Best-effort: any failure is swallowed and the on-demand path still runs.
+        Skipped when the PDF libraries aren't installed."""
+        if self._pdf_prefetch_started:
+            return
+        self._pdf_prefetch_started = True
+        try:
+            import pypdfium2  # noqa: F401
+            from PIL import ImageTk  # noqa: F401
+        except ImportError:
+            return
+        client = self._app._get_client()
+        if client is None:
+            return
+        item = self._pdf_item()
+
+        def run() -> None:
+            try:
+                url = self._app._resolve_pdf_url(client, item)
+                if not url:
+                    return
+                resp = _anon_session.get(url, timeout=30)
+                resp.raise_for_status()
+                data = resp.content
+                if data.startswith(b"%PDF"):
+                    self._pdf_prefetch = (data, url)
+            except Exception as exc:
+                print(f"[prefetch] PDF prefetch failed: {exc}")
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _view_pdf(self) -> None:
-        """Resolve and show the official PDF of the opinion inside the window."""
+        """Show the official PDF of the opinion inside the window — using the
+        background-prefetched copy when it's ready, else resolving on demand."""
         try:
             import pypdfium2  # noqa: F401
             from PIL import ImageTk  # noqa: F401
@@ -5943,6 +6065,11 @@ class _ScholarTextWindow:
                 parent=self._win,
             ):
                 self._open_pdf_in_browser()
+            return
+        if self._pdf_prefetch is not None:  # warmed in the background already
+            data, url = self._pdf_prefetch
+            self._pdf_url = url
+            self._show_pdf(data, url)
             return
         client = self._app._get_client()
         self._pdf_url = None
@@ -5974,8 +6101,10 @@ class _ScholarTextWindow:
 
     def _show_pdf(self, data: bytes, url: str) -> None:
         width = max(self._text.winfo_width() - 24, 520)
+        # US Reports scans get a roughly 3× margin (see _is_us_reports_pdf).
+        margin = _PdfPane._MARGIN * 3 if _is_us_reports_pdf(url) else None
         try:
-            pane = _PdfPane(self._win, data, width=width)
+            pane = _PdfPane(self._win, data, width=width, margin=margin)
         except Exception as exc:  # pragma: no cover - render/lib failure
             self._on_pdf_error(str(exc))
             return
@@ -6001,7 +6130,9 @@ class _ScholarTextWindow:
         self._status_var.set("Showing the official PDF of the opinion.")
 
     def _download_pdf(self) -> None:
-        """Save the PDF currently being viewed to a file the user chooses."""
+        """Save the PDF currently being viewed to a file the user chooses —
+        re-spaced and centered the way the viewer shows it, falling back to the
+        original bytes if that rendering fails."""
         data = getattr(self, "_pdf_bytes", None)
         if not data:
             return
@@ -6016,11 +6147,18 @@ class _ScholarTextWindow:
         if not path:
             return
         try:
-            with open(path, "wb") as fh:
-                fh.write(data)
+            if self._pdf_pane is not None:
+                self._pdf_pane.export_pdf(path)
+            else:
+                with open(path, "wb") as fh:
+                    fh.write(data)
         except Exception as exc:
-            messagebox.showerror("Download PDF", str(exc), parent=self._win)
-            return
+            try:  # re-spacing failed → save the original scan instead
+                with open(path, "wb") as fh:
+                    fh.write(data)
+            except Exception:
+                messagebox.showerror("Download PDF", str(exc), parent=self._win)
+                return
         self._status_var.set(f"Saved PDF to {path}")
 
     def _back_from_pdf(self) -> None:
@@ -6216,7 +6354,164 @@ def _open_statute_action(parent: tk.Misc, action: tuple[str, str],
         webbrowser.open(value)
         status("Opened in your browser.")
         return
+    if kind == "statpdf":
+        _open_statute_pdf(parent, value, status)
+        return
     _fetch_statute_window(parent, kind, value, status)
+
+
+def _stat_cite_from_url(url: str) -> str:
+    """'… /link/statute/88/1932' → '88 Stat. 1932' (the Statutes at Large
+    citation), falling back to a generic label."""
+    m = re.search(r"/statute/(\d+)/(\d+)", url or "")
+    return f"{m.group(1)} Stat. {m.group(2)}" if m else "Statutes at Large"
+
+
+class _PdfWindow:
+    """A standalone in-app PDF viewer (e.g. a Statutes at Large scan).  Reuses
+    the centered, zoomable pane from the opinion window and adds a Download
+    button; the citation is shown at the top.  Falls back to opening the PDF in
+    the browser when the PDF libraries are missing or the fetch fails."""
+
+    def __init__(self, parent: tk.Misc, url: str, title: str,
+                 status=lambda _s: None) -> None:
+        self._url = url
+        self._title = title
+        self._ext_status = status
+        self._bytes: Optional[bytes] = None
+        self._pane: Optional[_PdfPane] = None
+
+        self._win = tk.Toplevel(parent)
+        self._win.title(title)
+        self._win.geometry("820x900")
+        self._win.minsize(500, 320)
+
+        top = ttk.Frame(self._win)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(top, text=title,
+                  font=("TkDefaultFont", 12, "bold")).pack(side="left")
+
+        btns = ttk.Frame(self._win)
+        btns.pack(fill="x", side="bottom", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="Download PDF",
+                   command=self._download).pack(side="right")
+        ttk.Button(btns, text="−", width=3,
+                   command=lambda: self._zoom(-1)).pack(side="left")
+        ttk.Button(btns, text="+", width=3,
+                   command=lambda: self._zoom(+1)).pack(side="left", padx=(2, 8))
+        self._status_var = tk.StringVar(value="Loading PDF…")
+        ttk.Label(btns, textvariable=self._status_var,
+                  foreground="gray").pack(side="left", fill="x", expand=True)
+
+        self._body = ttk.Frame(self._win)
+        self._body.pack(fill="both", expand=True)
+
+        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            self._win.bind(seq, lambda _e: self._zoom(+1))
+        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
+            self._win.bind(seq, lambda _e: self._zoom(-1))
+        self._win.bind("<Control-0>", lambda _e: self._zoom(0))
+
+        self._fetch()
+
+    def _post(self, fn, *args) -> None:
+        try:
+            self._win.after(0, fn, *args)
+        except tk.TclError:
+            pass
+
+    def _zoom(self, delta: int) -> None:
+        if self._pane is not None:
+            self._pane.zoom(delta)
+            self._status_var.set(f"Zoom: {self._pane.zoom_percent()}%")
+
+    def _fetch(self) -> None:
+        try:
+            import pypdfium2  # noqa: F401
+            from PIL import ImageTk  # noqa: F401
+        except ImportError:
+            if messagebox.askyesno(
+                "PDF viewer not installed",
+                "Viewing PDFs inside the app needs two Python packages:\n\n"
+                "    pip install pypdfium2 Pillow\n\n"
+                "Open the PDF in your web browser instead?",
+                parent=self._win,
+            ):
+                webbrowser.open(self._url)
+            self._win.destroy()
+            return
+
+        def run() -> None:
+            try:
+                resp = _anon_session.get(self._url, timeout=30,
+                                         allow_redirects=True)
+                resp.raise_for_status()
+                data = resp.content
+                if not data.startswith(b"%PDF"):
+                    raise ValueError("the source returned something that "
+                                     "isn't a PDF")
+                self._post(self._show, data)
+            except Exception as exc:
+                self._post(self._error, str(exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show(self, data: bytes) -> None:
+        try:
+            pane = _PdfPane(self._body, data, width=760)
+        except Exception as exc:  # pragma: no cover - render/lib failure
+            self._error(str(exc))
+            return
+        pane.pack(fill="both", expand=True, padx=8, pady=4)
+        self._pane = pane
+        self._bytes = data
+        self._status_var.set(self._title)
+
+    def _error(self, msg: str) -> None:
+        self._status_var.set(f"PDF: {msg}")
+        if messagebox.askyesno(
+            "PDF", f"{msg}\n\nOpen the PDF in your web browser instead?",
+            parent=self._win,
+        ):
+            webbrowser.open(self._url)
+        self._win.destroy()
+
+    def _download(self) -> None:
+        data = self._bytes
+        if not data:
+            return
+        safe = re.sub(r"[^\w.-]+", "_", self._title).strip("_") or "statute"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            initialfile=f"{safe}.pdf",
+            title="Download PDF",
+            parent=self._win,
+        )
+        if not path:
+            return
+        try:
+            if self._pane is not None:
+                self._pane.export_pdf(path)
+            else:
+                with open(path, "wb") as fh:
+                    fh.write(data)
+        except Exception:
+            try:  # re-spacing failed → save the original scan
+                with open(path, "wb") as fh:
+                    fh.write(data)
+            except Exception as exc:
+                messagebox.showerror("Download PDF", str(exc), parent=self._win)
+                return
+        self._status_var.set(f"Saved PDF to {path}")
+
+
+def _open_statute_pdf(parent: tk.Misc, url: str,
+                      status=lambda _s: None) -> None:
+    """Open a Statutes at Large GovInfo scan in the in-app PDF viewer."""
+    cite = _stat_cite_from_url(url)
+    status(f"Opening {cite}…")
+    _PdfWindow(parent, url, cite, status)
 
 
 def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:
@@ -6485,8 +6780,8 @@ class _StatuteWindow:
             refs.append((c.start, c.end, kind, value))
         for m in statutes_at_large.STAT_CITE_RE.finditer(text):
             url = statutes_at_large.url_for(m)
-            if url:  # Statutes at Large → free GovInfo scan (browser)
-                refs.append((m.start(), m.end(), "browse", url))
+            if url:  # Statutes at Large → free GovInfo scan (in-app PDF viewer)
+                refs.append((m.start(), m.end(), "statpdf", url))
         if self._doc.kind == "usc":
             for m in _USC_XREF_RE.finditer(text):
                 title = m.group(3) or self._doc.title
@@ -6533,6 +6828,9 @@ class _StatuteWindow:
             # statute) — open it in the user's browser.
             webbrowser.open(value)
             self._status_var.set("Opened in your browser.")
+            return
+        if kind == "statpdf":
+            _open_statute_pdf(self._win, value, self._status_var.set)
             return
         _fetch_statute_window(self._win, kind, value, self._status_var.set)
 

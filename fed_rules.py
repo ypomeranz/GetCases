@@ -351,10 +351,19 @@ _NOTE_SECTION_RE = re.compile(
 
 # Block elements carrying rule/note text, in document order.
 _BLOCK_RE = re.compile(
-    r"<(h[1-6]|p|li)\b[^>]*>(.*?)</\1>",
+    r"<(h[1-6]|p|li)\b([^>]*)>(.*?)</\1>",
     re.IGNORECASE | re.DOTALL,
 )
 _ENUM_LEAD_RE = re.compile(r"^((?:\((?:\d{1,3}|[a-zA-Z]{1,5})\)\s*)+)")
+
+# LII encodes each subdivision's nesting purely in CSS: a paragraph's depth is
+# carried by its class ("statutory-body-2em", "statutory-body-block-3em"),
+# while top-level subdivisions are plain <p> elements (no such class).  When a
+# page uses these classes they are authoritative — they disambiguate cases the
+# leading enumerator alone cannot, e.g. a nested "(i)" (roman numeral, 3em)
+# vs. a top-level subsection "(i)" (plain), which otherwise both look like the
+# letter after "(h)".
+_STAT_BODY_LEVEL_RE = re.compile(r"statutory-body(?:-block)?-(\d+)em")
 
 # Common LII / Drupal content containers, tried in order.  The rule node is
 # rendered as a single self-closing <article> that holds the rule body AND the
@@ -414,6 +423,8 @@ def parse_rule_html(page_html: str) -> list[tuple[str, int, str]]:
     paras: list[tuple[str, int, str]] = []
     stack: list[tuple[str, str]] = []
     in_notes = False
+    # Trust LII's CSS indent classes when the page carries them (see above).
+    uses_em = bool(_STAT_BODY_LEVEL_RE.search(region))
     # Seed the stream with the rule's descriptive heading (it lives in the
     # page <h1>, outside the article region); fall back to deriving the head
     # from the first in-article heading when that <h1> is absent.
@@ -423,7 +434,8 @@ def parse_rule_html(page_html: str) -> list[tuple[str, int, str]]:
         paras.append(("sechead", 0, title))
     for em in _BLOCK_RE.finditer(region):
         tag = em.group(1).lower()
-        text = _clean(em.group(2))
+        attrs = em.group(2)
+        text = _clean(em.group(3))
         if not text:
             continue
         is_heading = tag in ("h1", "h2", "h3", "h4", "h5", "h6")
@@ -461,15 +473,21 @@ def parse_rule_html(page_html: str) -> list[tuple[str, int, str]]:
         if in_notes:
             paras.append(("note-body", 0, text))
             continue
-        # Rule body: infer indent from a leading enumerator, else continue
-        # the open item's depth.
-        level = max(len(stack) - 1, 0)
-        lead = _ENUM_LEAD_RE.match(text)
-        if lead:
-            enums = re.findall(r"\(([^)]+)\)", lead.group(1))
-            lvl = infer_enum_level(enums, stack, RULES_HIERARCHY)
-            if lvl is not None:
-                level = lvl
+        # Rule body: when LII's CSS indent classes are present they are
+        # authoritative (a numbered "statutory-body-Nem" class means depth N;
+        # a plain paragraph is a top-level subdivision).  Otherwise infer the
+        # indent from a leading enumerator, else continue the open item's depth.
+        if uses_em:
+            mlvl = _STAT_BODY_LEVEL_RE.search(attrs)
+            level = int(mlvl.group(1)) if mlvl else 0
+        else:
+            level = max(len(stack) - 1, 0)
+            lead = _ENUM_LEAD_RE.match(text)
+            if lead:
+                enums = re.findall(r"\(([^)]+)\)", lead.group(1))
+                lvl = infer_enum_level(enums, stack, RULES_HIERARCHY)
+                if lvl is not None:
+                    level = lvl
         paras.append(("body", min(level, 6), text))
     return paras
 
