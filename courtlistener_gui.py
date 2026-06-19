@@ -4021,6 +4021,9 @@ class _PdfPane(ttk.Frame):
     _INK_THRESH = 185   # grayscale < this counts as "ink" (ignores scan bg)
     _PROFILE_MIN = 2    # min avg ink (0-255) for a row/col to count as content
     _PAD_FRAC = 0.006   # tiny expansion of the detected box so glyphs aren't clipped
+    _ZOOM_STEP = 1.25   # render-width multiplier per zoom notch
+    _ZOOM_MIN_W = 240   # narrowest page render width (px)
+    _ZOOM_MAX_W = 3200  # widest page render width (px)
 
     def __init__(self, parent: tk.Misc, pdf_bytes: bytes, width: int = 800) -> None:
         super().__init__(parent)
@@ -4028,8 +4031,9 @@ class _PdfPane(ttk.Frame):
         from PIL import ImageTk  # noqa: F401  (availability check at construct)
 
         self._doc = pdfium.PdfDocument(pdf_bytes)
-        self._target_w = max(240, int(width))
-        self._inner_w = max(1, self._target_w - 2 * self._MARGIN)
+        self._base_w = max(240, int(width))    # the fit-to-window width (zoom 1.0)
+        self._target_w = self._base_w          # current render width (zoom applied)
+        self._page_x = self._PAD               # left x of each page; centered later
         self._photos: dict[int, object] = {}   # page → PhotoImage (kept alive)
         self._img_ids: dict[int, int] = {}      # page → canvas image id
 
@@ -4041,12 +4045,11 @@ class _PdfPane(ttk.Frame):
         canvas.pack(side="left", fill="both", expand=True)
         self._canvas, self._vsb = canvas, vsb
 
-        # Lay out one slot per page.  A quick low-resolution render detects each
-        # page's content box, so the wide blank margins of court PDFs are
-        # cropped down to a small, even margin; the slot is sized from the
-        # cropped content (full rendering still happens lazily, on scroll).
-        self._slots: list[tuple] = []  # (y, slot_h, frac_box, render_scale)
-        y = self._PAD
+        # Detect each page's content box once with a quick low-resolution render
+        # (independent of zoom), so the wide blank margins of court PDFs are
+        # cropped to a small, even margin.  The layout is (re)built from this
+        # cached metadata whenever the window resizes or the zoom changes.
+        self._meta: list[tuple] = []  # (w_pt, h_pt, frac_box)
         for i in range(len(self._doc)):
             page = self._doc[i]
             try:
@@ -4058,25 +4061,117 @@ class _PdfPane(ttk.Frame):
                     frac = (0.0, 0.0, 1.0, 1.0)
             finally:
                 page.close()
+            self._meta.append((w_pt, h_pt, frac))
+
+        self._rect_ids: list[int] = []
+        self._slots: list[tuple] = []  # (y, slot_h, frac_box, render_scale)
+        self._content_h = self._PAD
+        self._layout()
+
+        canvas.bind("<Configure>", lambda _e: self._on_configure())
+        canvas.bind("<MouseWheel>", self._on_wheel)            # Windows / macOS
+        canvas.bind("<Button-4>", lambda _e: self._wheel(-1))  # X11 wheel up
+        canvas.bind("<Button-5>", lambda _e: self._wheel(1))   # X11 wheel down
+        # Ctrl + wheel zooms the page (matches the reader's Ctrl-wheel binding).
+        canvas.bind("<Control-MouseWheel>",
+                    lambda e: self.zoom(1 if e.delta > 0 else -1) or "break")
+        canvas.bind("<Control-Button-4>", lambda _e: self.zoom(1) or "break")
+        canvas.bind("<Control-Button-5>", lambda _e: self.zoom(-1) or "break")
+        canvas.bind("<Enter>", lambda _e: canvas.focus_set())
+        self.after(60, self._render_visible)
+
+    # ------------------------------------------------------------------
+    # Layout / zoom
+    # ------------------------------------------------------------------
+
+    def zoom_percent(self) -> int:
+        """Current zoom level as a whole-number percentage of fit-to-window."""
+        return int(round(100 * self._target_w / self._base_w))
+
+    def zoom(self, delta: int) -> None:
+        """Zoom in (delta > 0), out (delta < 0), or reset to fit (delta == 0).
+        Re-lays out from cached page metadata, so only the render width changes
+        — the (expensive) content-box detection is not repeated."""
+        if delta == 0:
+            new_w = self._base_w
+        else:
+            factor = self._ZOOM_STEP if delta > 0 else 1 / self._ZOOM_STEP
+            new_w = int(round(self._target_w * factor))
+        new_w = max(self._ZOOM_MIN_W, min(self._ZOOM_MAX_W, new_w))
+        if new_w == self._target_w:
+            return
+        try:
+            top_frac = self._canvas.yview()[0]
+        except tk.TclError:
+            top_frac = 0.0
+        self._target_w = new_w
+        self._layout()
+        try:
+            self._canvas.yview_moveto(top_frac)  # keep the same place in the doc
+        except tk.TclError:
+            pass
+        self._render_visible()
+
+    def _page_left(self) -> int:
+        """Left x for each page so it's centred when the canvas is wider than
+        the page, and flush at the gutter otherwise."""
+        try:
+            view_w = self._canvas.winfo_width()
+        except tk.TclError:
+            view_w = 0
+        full_w = self._target_w + 2 * self._PAD
+        if view_w > full_w:
+            return (view_w - self._target_w) // 2
+        return self._PAD
+
+    def _update_scrollregion(self) -> None:
+        try:
+            view_w = self._canvas.winfo_width()
+        except tk.TclError:
+            view_w = 0
+        # Span the viewport when the page is narrower than it, so the centred
+        # page stays put with no spurious horizontal scrolling.
+        width = max(view_w, self._target_w + 2 * self._PAD)
+        self._canvas.configure(scrollregion=(0, 0, width, self._content_h))
+
+    def _layout(self) -> None:
+        """(Re)build one white slot per page at the current zoom, centred."""
+        c = self._canvas
+        c.delete("all")
+        self._rect_ids = []
+        self._slots = []
+        self._photos.clear()
+        self._img_ids.clear()
+        self._inner_w = max(1, self._target_w - 2 * self._MARGIN)
+        self._page_x = self._page_left()
+        y = self._PAD
+        for (w_pt, h_pt, frac) in self._meta:
             fl, ft, fr, fb = frac
             cw_pt = max(1.0, (fr - fl) * w_pt)
             ch_pt = max(1.0, (fb - ft) * h_pt)
             render_scale = self._inner_w / cw_pt
             slot_h = int(round(ch_pt * render_scale)) + 2 * self._MARGIN
-            canvas.create_rectangle(
-                self._PAD, y, self._PAD + self._target_w, y + slot_h,
+            rid = c.create_rectangle(
+                self._page_x, y, self._page_x + self._target_w, y + slot_h,
                 fill="white", outline="#b8b8b8")
+            self._rect_ids.append(rid)
             self._slots.append((y, slot_h, frac, render_scale))
             y += slot_h + self._PAD
-        canvas.configure(
-            scrollregion=(0, 0, self._target_w + 2 * self._PAD, y))
+        self._content_h = y
+        self._update_scrollregion()
 
-        canvas.bind("<Configure>", lambda _e: self._render_visible())
-        canvas.bind("<MouseWheel>", self._on_wheel)            # Windows / macOS
-        canvas.bind("<Button-4>", lambda _e: self._wheel(-1))  # X11 wheel up
-        canvas.bind("<Button-5>", lambda _e: self._wheel(1))   # X11 wheel down
-        canvas.bind("<Enter>", lambda _e: canvas.focus_set())
-        self.after(60, self._render_visible)
+    def _on_configure(self) -> None:
+        """Recentre on resize without a full re-render when the zoom is steady."""
+        new_x = self._page_left()
+        if new_x != self._page_x:
+            dx = new_x - self._page_x
+            self._page_x = new_x
+            for rid in self._rect_ids:
+                self._canvas.move(rid, dx, 0)
+            for iid in self._img_ids.values():
+                self._canvas.move(iid, dx, 0)
+        self._update_scrollregion()
+        self._render_visible()
 
     def _content_frac(self, img) -> tuple:
         """Fractional content box (l, t, r, b in 0..1) of `img` — the area
@@ -4156,7 +4251,7 @@ class _PdfPane(ttk.Frame):
         photo = ImageTk.PhotoImage(canvas_img)
         self._photos[i] = photo
         self._img_ids[i] = self._canvas.create_image(
-            self._PAD, y, anchor="nw", image=photo)
+            self._page_x, y, anchor="nw", image=photo)
 
     def destroy(self) -> None:
         try:
@@ -4364,9 +4459,7 @@ class _ScholarTextWindow:
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill="x", padx=8, pady=(0, 8))
         self._btn_frame = btn_frame  # PDF/text panes pack just above this
-        ttk.Button(btn_frame, text="Copy + Cite", command=self._copy_formatted).pack(
-            side="right", padx=(4, 0)
-        )
+        # (Copy-with-citation lives on Ctrl-C / Cmd-C; no button needed.)
         # In text view this exports RTF; in PDF view it becomes "Download PDF".
         self._export_btn = ttk.Button(
             btn_frame, text="Export RTF…", command=self._export_rtf
@@ -4377,13 +4470,16 @@ class _ScholarTextWindow:
         )
         self._toggle_btn.pack(side="right", padx=4)
 
-        # Text-size controls (also Ctrl +/−/0 and Ctrl+mouse wheel)
-        ttk.Button(
+        # Size controls: text size in the reader, PDF zoom in the PDF view
+        # (also Ctrl +/−/0 and Ctrl+mouse wheel).
+        self._zoom_out_btn = ttk.Button(
             btn_frame, text="A−", width=3, command=lambda: self._zoom(-1)
-        ).pack(side="left")
-        ttk.Button(
+        )
+        self._zoom_out_btn.pack(side="left")
+        self._zoom_in_btn = ttk.Button(
             btn_frame, text="A+", width=3, command=lambda: self._zoom(+1)
-        ).pack(side="left", padx=(2, 8))
+        )
+        self._zoom_in_btn.pack(side="left", padx=(2, 8))
         self._details_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             btn_frame, text="Case details", variable=self._details_var,
@@ -4415,9 +4511,14 @@ class _ScholarTextWindow:
         )
 
     def _zoom(self, delta: int) -> None:
-        """Grow/shrink every font in the window; delta 0 resets to default.
+        """In the reader, grow/shrink every font (delta 0 resets to default);
         Tk re-renders widgets when a named Font object is reconfigured, so
-        resizing the shared Font instances restyles all existing text."""
+        resizing the shared Font instances restyles all existing text.  In the
+        PDF view the same controls zoom the rendered page instead."""
+        if self._mode == "pdf" and self._pdf_pane is not None:
+            self._pdf_pane.zoom(delta)
+            self._status_var.set(f"PDF zoom: {self._pdf_pane.zoom_percent()}%")
+            return
         global _OPINION_FONT_PT
         new = 11 if delta == 0 else max(
             _OPINION_FONT_MIN, min(_OPINION_FONT_MAX, self._base_size + delta)
@@ -4745,6 +4846,8 @@ class _ScholarTextWindow:
         self._toggle_btn.config(text="View PDF", command=self._view_pdf,
                                 state="normal")
         self._export_btn.config(text="Export RTF…", command=self._export_rtf)
+        self._zoom_out_btn.config(text="A−")
+        self._zoom_in_btn.config(text="A+")
         if len(self._parts) > 1:
             self._part_combo.config(state="readonly")
         if self._current_part is None:
@@ -5890,8 +5993,11 @@ class _ScholarTextWindow:
         self._source_var.set(url)
         self._toggle_btn.config(text="Google Scholar Text",
                                 command=self._back_from_pdf, state="normal")
-        # In PDF view, the RTF export becomes a "Download PDF" action.
+        # In PDF view, the RTF export becomes a "Download PDF" action and the
+        # text-size buttons zoom the page.
         self._export_btn.config(text="Download PDF", command=self._download_pdf)
+        self._zoom_out_btn.config(text="−")
+        self._zoom_in_btn.config(text="+")
         self._status_var.set("Showing the official PDF of the opinion.")
 
     def _download_pdf(self) -> None:
