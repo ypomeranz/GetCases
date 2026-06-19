@@ -38,8 +38,10 @@ def _ensure_dependencies() -> None:
     Check for the third-party packages this GUI needs and offer to
     pip-install any that are missing before the imports below run.
 
-    ``requests`` is required; ``beautifulsoup4`` enables the Google
-    Scholar features (declining just disables them).
+    ``requests`` is required; the rest enable features and declining just
+    disables them: ``beautifulsoup4`` (Google Scholar / opinion parsing),
+    ``pynput`` (global hotkey), and ``pypdfium2`` + ``Pillow`` (the in-app
+    PDF viewer).
     """
     import importlib
     import importlib.util
@@ -51,6 +53,8 @@ def _ensure_dependencies() -> None:
                 ("requests", "requests"),
                 ("bs4", "beautifulsoup4"),
                 ("pynput", "pynput"),
+                ("pypdfium2", "pypdfium2"),  # in-app PDF viewer
+                ("PIL", "Pillow"),           # in-app PDF viewer (imports as PIL)
             )
             if importlib.util.find_spec(module) is None
         ]
