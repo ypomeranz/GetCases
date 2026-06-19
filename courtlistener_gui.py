@@ -98,6 +98,7 @@ _ensure_dependencies()
 import requests as _requests
 
 from bluebook_names import abbreviate_case_name
+from cl_parse import parse_cl_html as _parse_cl_html
 from courtlistener import CourtListenerClient, CourtListenerError
 import ecfr
 import fed_rules
@@ -513,137 +514,6 @@ _CL_TYPE_KIND: dict[str, str] = {
 }
 
 
-def _parse_cl_html(html: str) -> "list[Block]":
-    """Parse CourtListener opinion HTML into Block/Span objects.
-
-    Similar to ``parse_opinion_blocks`` in the Scholar module, but adapted
-    for CourtListener's HTML structure.  Requires beautifulsoup4; returns
-    an empty list if it's not installed.
-    """
-    try:
-        from bs4 import BeautifulSoup, Comment, NavigableString, Tag
-        from google_scholar import Block, Span, educate_quotes
-    except ImportError:
-        return []
-
-    _WS = re.compile(r"\s+")
-    _FMT_KEYS = ("italic", "bold", "underline", "small", "sup")
-    _H_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
-    _BLOCK_TAGS = _H_TAGS | {
-        "p", "div", "blockquote", "center", "pre", "table", "tbody",
-        "thead", "tr", "ul", "ol", "li", "dl", "dt", "dd",
-    }
-    # CourtListener citation links look like /opinion/12345/case-name/
-    _CL_OPINION_RE = re.compile(r"/opinion/\d+/")
-
-    soup = BeautifulSoup(html, "html.parser")
-    for bad in soup.find_all(["script", "style"]):
-        bad.decompose()
-
-    blocks: list[Block] = []
-    cur: list[Span] = []
-
-    def emit(text: str, fmt: dict, *, link: str = "") -> None:
-        text = _WS.sub(" ", text)
-        if not text:
-            return
-        if not cur:
-            text = text.lstrip()
-            if not text:
-                return
-        elif cur[-1].text.endswith((" ", "\n")) and text.startswith(" "):
-            text = text.lstrip(" ")
-            if not text:
-                return
-        last = cur[-1] if cur else None
-        if (
-            last is not None
-            and link == last.link
-            and all(getattr(last, k) == fmt.get(k, False) for k in _FMT_KEYS)
-        ):
-            last.text += text
-        else:
-            cur.append(Span(
-                text=text, link=link,
-                **{k: fmt.get(k, False) for k in _FMT_KEYS},
-            ))
-
-    def flush(kind: str) -> None:
-        nonlocal cur
-        while cur and not cur[-1].text.strip():
-            cur.pop()
-        if cur:
-            cur[-1].text = cur[-1].text.rstrip()
-            blocks.append(Block(kind=kind, spans=cur))
-        cur = []
-
-    def walk(node: Tag, fmt: dict, kind: str, link: str = "") -> None:
-        for child in node.children:
-            if isinstance(child, Comment):
-                continue
-            if isinstance(child, NavigableString):
-                emit(str(child), fmt, link=link)
-                continue
-            if not isinstance(child, Tag):
-                continue
-            name = (child.name or "").lower()
-            if name == "br":
-                if cur:
-                    cur.append(Span(text="\n"))
-                continue
-            if name == "hr":
-                flush(kind)
-                continue
-            if name == "a":
-                href = child.get("href") or ""
-                if _CL_OPINION_RE.search(href):
-                    # Citation link — store as a link span so _insert_span
-                    # makes it clickable the same way Scholar links work.
-                    if not href.startswith("http"):
-                        href = "https://www.courtlistener.com" + href
-                    walk(child, fmt, kind, link=href)
-                    continue
-                walk(child, fmt, kind, link=link)
-                continue
-            if name in _BLOCK_TAGS:
-                flush(kind)
-                child_fmt = fmt
-                if name == "center":
-                    child_kind = "center"
-                elif name == "blockquote":
-                    child_kind = "blockquote"
-                elif name in _H_TAGS:
-                    child_kind = kind if kind == "center" else "heading"
-                    child_fmt = {**fmt, "bold": True}
-                else:
-                    child_kind = kind
-                walk(child, child_fmt, child_kind, link=link)
-                flush(child_kind)
-                continue
-            if name in ("i", "em", "cite"):
-                walk(child, {**fmt, "italic": True}, kind, link=link)
-            elif name in ("b", "strong"):
-                walk(child, {**fmt, "bold": True}, kind, link=link)
-            elif name == "u":
-                walk(child, {**fmt, "underline": True}, kind, link=link)
-            elif name == "small":
-                walk(child, {**fmt, "small": True}, kind, link=link)
-            elif name in ("sup", "sub"):
-                walk(child, {**fmt, "sup": True}, kind, link=link)
-            else:
-                walk(child, fmt, kind, link=link)
-
-    walk(soup, {}, "para")
-    flush("para")
-    try:
-        from google_scholar import _educate_block_quotes
-        for block in blocks:
-            _educate_block_quotes(block)
-    except ImportError:
-        pass
-    return blocks
-
-
 def _assemble_case_parts(
     client, item: dict
 ) -> "tuple[list[OpinionPart], list[Block], str, dict]":
@@ -707,7 +577,7 @@ def _assemble_case_parts(
     for field_name, label in [("syllabus", "Syllabus"), ("headnotes", "Headnotes")]:
         val = (cluster.get(field_name) or "").strip()
         if val:
-            parsed = _parse_cl_html(val)
+            parsed, _fn = _parse_cl_html(val)  # syllabus/headnotes have no footnotes
             if parsed:
                 header_blocks.append(Block(kind="heading", spans=[
                     Span(text=label, bold=True),
@@ -738,7 +608,7 @@ def _assemble_case_parts(
 
     all_blocks: list[Block] = list(header_blocks)
 
-    for op in opinions:
+    for idx, op in enumerate(opinions):
         type_code = op.get("type") or ""
         label = _OPINION_TYPE_LABELS.get(type_code, type_code or "Opinion")
         kind = _CL_TYPE_KIND.get(type_code, "majority")
@@ -755,8 +625,11 @@ def _assemble_case_parts(
             or op.get("html")
             or ""
         )
+        op_footnotes: list[Block] = []
         if html_text:
-            op_blocks = _parse_cl_html(html_text)
+            # Namespace footnote ids per opinion so a case's several opinions
+            # (each numbering from 1) don't collide in the viewer.
+            op_blocks, op_footnotes = _parse_cl_html(html_text, fn_prefix=f"op{idx}_")
         else:
             plain = (op.get("plain_text") or "").strip()
             if plain:
@@ -773,7 +646,8 @@ def _assemble_case_parts(
                 op_blocks = []
 
         if op_blocks:
-            parts.append(OpinionPart(label=label, kind=kind, blocks=op_blocks))
+            parts.append(OpinionPart(label=label, kind=kind, blocks=op_blocks,
+                                     footnotes=op_footnotes))
             all_blocks.extend(op_blocks)
 
     try:
