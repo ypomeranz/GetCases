@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 import urllib.parse
@@ -4696,6 +4697,11 @@ class _ScholarTextWindow:
             btn_frame, text="Export RTF…", command=self._export_rtf
         )
         self._export_btn.pack(side="right", padx=4)
+        # Print: only meaningful in the PDF view, so it's packed there and
+        # hidden again in the text view.
+        self._print_btn = ttk.Button(
+            btn_frame, text="Print…", command=self._print_pdf
+        )
         self._toggle_btn = ttk.Button(
             btn_frame, text="CourtListener Text", command=self._toggle_source
         )
@@ -5096,6 +5102,7 @@ class _ScholarTextWindow:
         self._toggle_btn.config(text="View PDF", command=self._view_pdf,
                                 state="normal")
         self._export_btn.config(text="Export RTF…", command=self._export_rtf)
+        self._print_btn.pack_forget()  # text view: no Print button
         self._zoom_out_btn.config(text="A−")
         self._zoom_in_btn.config(text="A+")
         if len(self._parts) > 1:
@@ -6483,9 +6490,10 @@ class _ScholarTextWindow:
         self._toggle_btn.config(
             text="Google Scholar Text", command=self._back_from_pdf,
             state=toggle_state)
-        # In PDF view, the RTF export becomes a "Download PDF" action and the
-        # text-size buttons zoom the page.
+        # In PDF view, the RTF export becomes a "Download PDF" action, a Print
+        # button appears, and the text-size buttons zoom the page.
         self._export_btn.config(text="Download PDF", command=self._download_pdf)
+        self._print_btn.pack(side="right", padx=4)
         self._zoom_out_btn.config(text="−")
         self._zoom_in_btn.config(text="+")
         self._status_var.set("Showing the official PDF of the opinion.")
@@ -6521,6 +6529,25 @@ class _ScholarTextWindow:
                 messagebox.showerror("Download PDF", str(exc), parent=self._win)
                 return
         self._status_var.set(f"Saved PDF to {path}")
+
+    def _print_pdf(self) -> None:
+        """Print the PDF currently being viewed — the re-spaced/centered
+        rendering shown on screen, falling back to the original scan."""
+        data = getattr(self, "_pdf_bytes", None)
+        if not data:
+            return
+        fd, path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        try:
+            if self._pdf_pane is not None:
+                self._pdf_pane.export_pdf(path)
+            else:
+                with open(path, "wb") as fh:
+                    fh.write(data)
+        except Exception:
+            with open(path, "wb") as fh:
+                fh.write(data)
+        _print_pdf_file(self._win, path, self._status_var.set)
 
     def _back_from_pdf(self) -> None:
         """Return from the PDF to the Google Scholar text view."""
@@ -6761,6 +6788,8 @@ class _PdfWindow:
         btns.pack(fill="x", side="bottom", padx=8, pady=(0, 8))
         ttk.Button(btns, text="Download PDF",
                    command=self._download).pack(side="right")
+        ttk.Button(btns, text="Print…",
+                   command=self._print).pack(side="right", padx=4)
         ttk.Button(btns, text="−", width=3,
                    command=lambda: self._zoom(-1)).pack(side="left")
         ttk.Button(btns, text="+", width=3,
@@ -6842,6 +6871,23 @@ class _PdfWindow:
             webbrowser.open(self._url)
         self._win.destroy()
 
+    def _print(self) -> None:
+        data = self._bytes
+        if not data:
+            return
+        fd, path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        try:
+            if self._pane is not None:
+                self._pane.export_pdf(path)
+            else:
+                with open(path, "wb") as fh:
+                    fh.write(data)
+        except Exception:
+            with open(path, "wb") as fh:
+                fh.write(data)
+        _print_pdf_file(self._win, path, self._status_var.set)
+
     def _download(self) -> None:
         data = self._bytes
         if not data:
@@ -6870,6 +6916,36 @@ class _PdfWindow:
                 messagebox.showerror("Download PDF", str(exc), parent=self._win)
                 return
         self._status_var.set(f"Saved PDF to {path}")
+
+
+def _print_pdf_file(parent: tk.Misc, path: str,
+                    status=lambda _s: None) -> None:
+    """Send a PDF file to the OS print path; if that fails, open it in the
+    default viewer so the user can print from there."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path, "print")  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["lpr", path])
+        else:  # Linux/BSD: CUPS
+            try:
+                subprocess.Popen(["lp", path])
+            except FileNotFoundError:
+                subprocess.Popen(["lpr", path])
+        status("Sent to the printer.")
+        return
+    except Exception as exc:
+        print(f"[print] direct print failed: {exc}")
+    try:  # fall back to opening the PDF so the user can print manually
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            webbrowser.open("file://" + path)
+        status("Opened the PDF — print it from the viewer (Ctrl/Cmd-P).")
+    except Exception as exc:
+        messagebox.showerror("Print", str(exc), parent=parent)
 
 
 def _open_statute_pdf(parent: tk.Misc, url: str,
