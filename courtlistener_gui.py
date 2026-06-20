@@ -4577,6 +4577,9 @@ class _ScholarTextWindow:
         # Base cite ("vol reporter firstpage") of the most recently emitted
         # case citation, so an "Id. at N" links to that case.  Reset per render.
         self._last_cite_ref: str = ""
+        # A bare "Id." whose pin ("at N") sits in a following span — (link tag,
+        # base cite) — so the pin can be attached when that span arrives.
+        self._pending_id: Optional[tuple[str, str]] = None
         self._fonts: dict[str, tkfont.Font] = {}
         self._fn_text: dict[str, str] = {}  # footnote id → body text (for hover tips)
         self._fn_tip: Optional[tk.Toplevel] = None
@@ -4964,6 +4967,20 @@ class _ScholarTextWindow:
         C.F.R. citations into clickable links (Scholar lookup / OLRC and
         eCFR statute viewers)."""
         txt = self._text
+        # A bare "Id." in the previous span may have its pin ("at N") here —
+        # Scholar italicizes "Id." into its own span, splitting it from the
+        # page.  Attach the pin to that link and fold "at N" into it.
+        pend = self._pending_id
+        self._pending_id = None
+        if pend:
+            mp = re.match(r"\s*,?\s*at\s+(\d{1,5})\b", text)
+            if mp:
+                tag, ref = pend
+                self._link_actions[tag] = ("cite", f"{ref}@{mp.group(1)}")
+                txt.insert("end", text[:mp.end()], tags + ("citelink", tag))
+                text = text[mp.end():]
+                if not text:
+                    return
         matches: list[tuple[int, int, str, re.Match]] = []
         for m in _TEXT_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "cite", m))
@@ -5049,11 +5066,20 @@ class _ScholarTextWindow:
             if action is None:
                 txt.insert("end", text[start:end], tags)  # unresolved Id. cite
             else:
-                ltags = tags + ("citelink", self._new_link(action))
-                txt.insert("end", text[start:end], ltags)
+                link_tag = self._new_link(action)
+                txt.insert("end", text[start:end], tags + ("citelink", link_tag))
+                # A pin-less "Id." may take its pin from the next span.
+                if kind == "idcite" and m.group(1) is None:
+                    self._pending_id = (link_tag, self._last_cite_ref)
+                else:
+                    self._pending_id = None
             pos = end
         if pos < len(text):
-            txt.insert("end", text[pos:], tags)
+            tail = text[pos:]
+            txt.insert("end", tail, tags)
+            # Real text after a pin-less "Id." means its pin isn't coming.
+            if re.search(r"[A-Za-z0-9]", tail):
+                self._pending_id = None
 
     def _render_footnotes(self, footnotes: list, part_tag: Optional[str]) -> None:
         """Insert a part's footnote blocks, recording each note's rendered
@@ -5143,6 +5169,7 @@ class _ScholarTextWindow:
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(self._scholar_text)
         self._last_cite_ref = ""
+        self._pending_id = None
         if not self._parts:
             txt.insert("1.0", self._scholar_text)
         else:
@@ -5429,6 +5456,7 @@ class _ScholarTextWindow:
         self._short_cite_index = _build_short_cite_index(
             self._scholar_text or self._cl_text or "")
         self._last_cite_ref = ""
+        self._pending_id = None
         if not parts:
             self._insert_plain_with_links(self._cl_text or "(no text)", ())
         else:
