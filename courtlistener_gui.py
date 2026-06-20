@@ -3368,6 +3368,28 @@ def _build_short_cite_index(text: str) -> dict[tuple[str, str], list[int]]:
     return {k: sorted(v) for k, v in idx.items()}
 
 
+def _base_cite_from_text(text: str,
+                         index: dict[tuple[str, str], list[int]]) -> str:
+    """The base "vol reporter firstpage" cite named in `text`, whether written
+    in full ("8 F.4th 557") or short ("8 F.4th at 565" — resolved to its first
+    page via `index`).  Empty string when no reporter cite is present."""
+    cm = _CITE_CAPTURE_RE.search(text)
+    if cm:
+        return re.sub(r"\s+", " ", cm.group(0)).replace("U. S.", "U.S.")
+    sm = _SHORT_CITE_RE.search(text)
+    if sm:
+        rep = re.sub(r"\s+", " ", sm.group(2)).strip().replace("U. S.", "U.S.")
+        pages = index.get((sm.group(1), _norm_reporter(sm.group(2))))
+        pin = int(sm.group(3))
+        if pages:
+            below = [p for p in pages if p <= pin]
+            first = max(below) if below else pages[0]
+        else:
+            first = pin  # no full cite indexed — best effort
+        return f"{sm.group(1)} {rep} {first}"
+    return ""
+
+
 # A citation line in the Scholar header: each parallel cite sits on its own
 # centered line, e.g. "306 Md. 556 (1986)" / "510 A.2d 562" / "87 F.4th 563 (2023)"
 _HEADER_CITE_RE = re.compile(
@@ -4952,10 +4974,11 @@ class _ScholarTextWindow:
             # _insert_plain_with_links — capture any reporter cite in the link
             # text here too, so a following "Id." resolves to THIS case rather
             # than the last plain-text cite (often the opinion's own caption).
-            cm = _CITE_CAPTURE_RE.search(span.text)
-            if cm:
-                self._last_cite_ref = re.sub(
-                    r"\s+", " ", cm.group(0)).replace("U. S.", "U.S.")
+            # The cite may be a short form ("Quinn, 8 F.4th at 565"); resolve
+            # it back to the case's full cite via the document index.
+            ref = _base_cite_from_text(span.text, self._short_cite_index)
+            if ref:
+                self._last_cite_ref = ref
             tags += ["citelink", self._new_link(("url", span.link))]
             txt.insert("end", span.text, tuple(tags))
             return
