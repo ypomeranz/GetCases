@@ -4347,10 +4347,14 @@ class _ScholarTextWindow:
     # In the full-opinion view the region behind a concurrence/dissent gets a
     # light background tint; the body text itself stays black and the active
     # part is named, in color, at the top of the window.
+    _MAJORITY_COLOR = "#1a3e72"  # dark blue — the main opinion on the part map
     _PART_BOX_TAGS = {"dissent": "box-dissent", "concurrence": "box-concurrence"}
     _PART_LABEL_COLORS = {"dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR}
+    # The part map (right strip) also points to the main opinion.
+    _PARTMAP_COLORS = {"dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR,
+                       "majority": _MAJORITY_COLOR}
     _PAGECOL_W = 48     # left gutter: reporter page numbers (px)
-    _PARTMAP_W = 138    # right strip: map of concurrences/dissents (px)
+    _PARTMAP_W = 138    # right strip: map of the opinion's parts (px)
 
     def __init__(
         self,
@@ -4419,6 +4423,14 @@ class _ScholarTextWindow:
         self._bb = self._compute_bluebook_parts()
         if not self._cl_primary:
             self._refine_part_labels(self._parts)
+        # Whether Google Scholar actually carries the opinion text (it usually
+        # doesn't for Federal Appendix cases — they're scans only).  Gates the
+        # "Google Scholar Text" toggle while the PDF is showing.
+        self._scholar_has_text = (
+            not self._cl_primary
+            and len(re.sub(r"\s+", "", self._scholar_text or "")) >= 500
+        )
+        self._fed_appx = (not self._cl_primary) and self._is_fed_appx()
 
         self._win = tk.Toplevel(parent)
         self._win.title(
@@ -4436,6 +4448,10 @@ class _ScholarTextWindow:
             self._render_scholar()
             # Warm the official PDF in the background so "View PDF" is instant.
             self._prefetch_pdf()
+            # Federal Appendix cases are scans, not text — open straight on the
+            # PDF (Scholar rarely has the opinion text for them).
+            if self._fed_appx:
+                self._win.after(0, self._view_pdf)
 
     # ------------------------------------------------------------------
     # UI
@@ -5101,7 +5117,7 @@ class _ScholarTextWindow:
         marks = [
             (rs, parts[p].kind, parts[p].label)
             for rs, _re, p in regions
-            if parts[p].kind in ("concurrence", "dissent")
+            if parts[p].kind in ("majority", "concurrence", "dissent")
         ]
         if not marks:
             canvas.config(width=0)
@@ -5120,7 +5136,7 @@ class _ScholarTextWindow:
         for rs, kind, label in marks:
             off = self._ypixels(rs)
             y = max(6, min(h - 6, int(off / total * h)))
-            color = self._PART_LABEL_COLORS.get(kind, "black")
+            color = self._PARTMAP_COLORS.get(kind, "black")
             canvas.create_line(2, y, w - 2, y, fill=color, width=2)
             canvas.create_rectangle(2, y, 8, y + 10, fill=color, outline=color)
             short = self._partmap_short_label(label, kind)
@@ -5134,19 +5150,28 @@ class _ScholarTextWindow:
     @staticmethod
     def _partmap_short_label(label: str, kind: str) -> str:
         """A compact label for the narrow part-map strip: the author's surname
-        plus the opinion role, e.g. 'Thomas, dissenting'."""
+        plus the opinion role, e.g. 'Thomas, dissenting', or 'Opinion
+        (Roberts)' for the main opinion."""
         text = re.sub(r"\s+", " ", label or "").strip()
-        role = "dissenting" if kind == "dissent" else "concurring"
         m = (re.search(r"\b(?:[Cc]hief\s+)?(?:JUSTICE|Justice)\s+"
                        r"([A-Z][A-Za-z'’.]+)", text)
              or re.search(r"\b([A-Z][A-Za-z'’]{2,}),\s*(?:C\.\s*)?J\.", text)
-             or re.search(r"\b([A-Z][A-Za-z'’]{2,})\b", text))
-        if not m:
-            return role.capitalize()
-        name = m.group(1).rstrip(".")
-        if name.isupper():  # THOMAS → Thomas
-            name = name[:1] + name[1:].lower()
-        return f"{name}, {role}"
+             or re.search(r"\(([A-Z][A-Za-z'’.]+)", text))
+        name = None
+        if m:
+            name = m.group(1).rstrip(".")
+            if name.isupper():  # THOMAS → Thomas
+                name = name[:1] + name[1:].lower()
+        if kind == "majority":
+            return f"Opinion ({name})" if name else "Opinion"
+        role = "dissenting" if kind == "dissent" else "concurring"
+        if name is None:  # last resort: any capitalised token
+            m2 = re.search(r"\b([A-Z][A-Za-z'’]{2,})\b", text)
+            if m2:
+                name = m2.group(1)
+                if name.isupper():
+                    name = name[:1] + name[1:].lower()
+        return f"{name}, {role}" if name else role.capitalize()
 
     def _on_partmap_click(self, event) -> None:
         for y1, y2, rs in getattr(self, "_partmap_rows", []):
@@ -6201,6 +6226,21 @@ class _ScholarTextWindow:
             item["citation"] = cites
         return item
 
+    # Federal Appendix reporter: "F. App'x", "F.App'x", "Fed. Appx.", etc.
+    # (straight or typographic apostrophe).
+    _FED_APPX_RE = re.compile(r"F(?:ed)?\.?\s*App['’]?x\.?", re.IGNORECASE)
+
+    def _is_fed_appx(self) -> bool:
+        """True if any known citation places this case in the Federal Appendix
+        (a scan-only reporter that Google Scholar seldom has text for)."""
+        cites = list(self._header_cites)
+        if self._bb.get("cite"):
+            cites.append(self._bb["cite"])
+        raw = self._item.get("citation") if self._item else None
+        if raw:
+            cites += raw if isinstance(raw, list) else [raw]
+        return any(self._FED_APPX_RE.search(str(c)) for c in cites)
+
     def _prefetch_pdf(self) -> None:
         """Resolve and fetch the official PDF in the background right after the
         Scholar view opens, caching the bytes so a later 'View PDF' is instant.
@@ -6304,8 +6344,15 @@ class _ScholarTextWindow:
         self._view_label_var.set("PDF of opinion")
         self._view_label.config(foreground="black")
         self._source_var.set(url)
-        self._toggle_btn.config(text="Google Scholar Text",
-                                command=self._back_from_pdf, state="normal")
+        # The "Google Scholar Text" toggle is disabled only for a Federal
+        # Appendix case whose Scholar page has no opinion text (a scan-only
+        # case); every other case keeps it active.
+        toggle_state = ("disabled"
+                        if self._fed_appx and not self._scholar_has_text
+                        else "normal")
+        self._toggle_btn.config(
+            text="Google Scholar Text", command=self._back_from_pdf,
+            state=toggle_state)
         # In PDF view, the RTF export becomes a "Download PDF" action and the
         # text-size buttons zoom the page.
         self._export_btn.config(text="Download PDF", command=self._download_pdf)
@@ -6931,7 +6978,10 @@ class _StatuteWindow:
                     self._insert_refs(text, (indtag,))
                 txt.insert("end", "\n", (indtag,))
             elif kind == "credit":
-                txt.insert("end", text + "\n", ("credit",))
+                # The source-credit parenthetical carries the Statutes at Large
+                # (and Pub. L.) cites — link them like the notes do.
+                self._insert_refs(text, ("credit",))
+                txt.insert("end", "\n", ("credit",))
             elif kind == "note-head":
                 txt.insert("end", text + "\n", ("notehead",))
             elif kind == "note-body":
@@ -6979,6 +7029,13 @@ class _StatuteWindow:
                 refs.append((m.start(), m.end(), "cfr",
                              f"{self._doc.title}:{m.group(1)}:"
                              f"{','.join(subs)}"))
+        elif self._doc.kind == "rule":
+            # A bare "Rule 801" on a federal-rules page means a rule in the
+            # same set (e.g. FRE 801 → fre:801).  Qualified forms ("Fed. R.
+            # Evid. 801") are caught above and win the overlap.
+            for m in fed_rules.BARE_RULE_RE.finditer(text):
+                refs.append((m.start(), m.end(), "rule",
+                             fed_rules.bare_rule_spec(m, self._doc.set_key)))
         refs.sort(key=lambda r: (r[0], -r[1]))
         txt = self._text
         pos = 0

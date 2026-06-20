@@ -131,6 +131,24 @@ def cite_spec(m: re.Match) -> str:
     return f"{set_key}:{rule}:{','.join(subs)}"
 
 
+# A bare "Rule 801" / "Rule 12(b)(6)" carrying no federal-rules marker.  On its
+# own this is ambiguous (it could be a local or state rule), so RULE_CITE_RE
+# deliberately skips it — but *inside* a federal-rules page a bare "Rule N"
+# means a rule in the SAME set, and the viewer resolves it that way.
+BARE_RULE_RE = re.compile(
+    r"\bRule\s+(?P<rule>" + _NUM + r")(?P<subs>" + _SUBS + r")",
+    re.IGNORECASE,
+)
+
+
+def bare_rule_spec(m: re.Match, set_key: str) -> str:
+    """"set:rule:sub,sub" spec for a BARE_RULE_RE match, resolved against the
+    rule set `set_key` of the page it appears on."""
+    rule = m.group("rule")
+    subs = re.findall(r"\(([^)]+)\)", m.group("subs") or "")
+    return f"{set_key}:{rule}:{','.join(subs)}"
+
+
 def spec_label(spec: str) -> str:
     """Display form of a spec: 'Fed. R. Evid. 404(b)(1)'."""
     set_key, rule, subs = spec.split(":", 2)
