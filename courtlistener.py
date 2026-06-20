@@ -204,6 +204,23 @@ class CourtListenerClient:
             params.update(extra)
         return self._get("search/", self._clean_params(params))
 
+    def lookup_citation(self, text: str) -> list[dict]:
+        """Resolve the citation(s) in ``text`` to the exact matching clusters
+        via CourtListener's citation-lookup endpoint.
+
+        Far more precise than full-text :meth:`search` for a bare reporter
+        citation like ``"514 F. App'x 210"`` (which full-text search often
+        mismatches).  Returns the raw list of citation objects, each with a
+        ``status`` (200 when resolved) and a ``clusters`` array of matching
+        OpinionCluster records.
+        """
+        url = urljoin(BASE_URL, "citation-lookup/")
+        response: Response = self._session.post(
+            url, data={"text": text}, timeout=self._timeout
+        )
+        self._raise_for_status(response)
+        return response.json()
+
     def search_iter(
         self,
         query: str,
