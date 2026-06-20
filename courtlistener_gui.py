@@ -3328,15 +3328,40 @@ def _extract_opinion_id(url: str) -> Optional[int]:
 
 # Citations recognized inside opinion text (made clickable → Scholar lookup).
 # Pattern: volume, reporter abbreviation, page.
-_TEXT_CITE_RE = re.compile(
-    r"\b\d{1,4}\s+"
+_REPORTER_ALT = (
     r"(?:U\.\s?S\.(?!\s?C)|S\.\s?Ct\.|L\.\s?Ed\.(?:\s?2d)?|"
     r"F\.\s?Supp\.(?:\s?[23]d)?|F\.\s?(?:2d|3d|4th)|F\.\s?App[’']x|Fed\.\s?Appx\.|B\.R\.|"
     r"A\.(?:2d|3d)?|P\.(?:2d|3d)?|N\.E\.(?:2d|3d)?|N\.W\.(?:2d)?|S\.E\.(?:2d)?|"
     r"S\.W\.(?:2d|3d)?|So\.(?:\s?[23]d)?|Cal\.\s?Rptr\.(?:\s?[23]d)?|"
     r"N\.Y\.S\.(?:2d|3d)?|Ohio\s?St\.\s?(?:2d|3d)?|Ill\.\s?2d|Wis\.\s?2d|Wn\.\s?(?:2d|App\.))"
-    r"\s+\d{1,5}\b"
 )
+_TEXT_CITE_RE = re.compile(r"\b\d{1,4}\s+" + _REPORTER_ALT + r"\s+\d{1,5}\b")
+
+# Capturing form (volume, reporter, page) — used to index every full citation
+# in an opinion so short forms can be resolved back to it.
+_CITE_CAPTURE_RE = re.compile(
+    r"\b(\d{1,4})\s+(" + _REPORTER_ALT + r")\s+(\d{1,5})\b")
+
+# Short-form citation: "Roe, 410 U.S., at 152" → volume, reporter, pin page.
+# The case name in front is matched separately; here we link the cite itself.
+_SHORT_CITE_RE = re.compile(
+    r"\b(\d{1,4})\s+(" + _REPORTER_ALT + r")\s*,?\s+at\s+(\d{1,5})\b")
+
+
+def _norm_reporter(rep: str) -> str:
+    """Reporter key for matching, ignoring spacing/case ('U. S.' == 'U.S.')."""
+    return re.sub(r"\s+", "", rep or "").lower()
+
+
+def _build_short_cite_index(text: str) -> dict[tuple[str, str], list[int]]:
+    """Map (volume, reporter) → sorted first-pages of every full citation in
+    `text`, so a short form ('410 U.S. at 152') can be resolved to the case's
+    first page (and thence opened and pin-jumped)."""
+    idx: dict[tuple[str, str], set] = {}
+    for m in _CITE_CAPTURE_RE.finditer(text or ""):
+        idx.setdefault((m.group(1), _norm_reporter(m.group(2))),
+                       set()).add(int(m.group(3)))
+    return {k: sorted(v) for k, v in idx.items()}
 
 
 # A citation line in the Scholar header: each parallel cite sits on its own
@@ -4542,6 +4567,9 @@ class _ScholarTextWindow:
         self._pdf_prefetch_started = False
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
+        # (volume, reporter) → first pages, so short forms ("410 U.S. at 152")
+        # link back to the full citation's case.  Rebuilt on each render.
+        self._short_cite_index: dict[tuple[str, str], list[int]] = {}
         self._fonts: dict[str, tkfont.Font] = {}
         self._fn_text: dict[str, str] = {}  # footnote id → body text (for hover tips)
         self._fn_tip: Optional[tk.Toplevel] = None
@@ -4932,6 +4960,22 @@ class _ScholarTextWindow:
             matches.append((m.start(), m.end(), "rule", m))
         for m in constitution.CONST_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "const", m))
+        # Short-form citations ("Roe, 410 U.S. at 152"): resolve to the case's
+        # full citation (indexed from the opinion) so the link opens it and
+        # jumps to the pin page.
+        for m in _SHORT_CITE_RE.finditer(text):
+            pages = self._short_cite_index.get(
+                (m.group(1), _norm_reporter(m.group(2))))
+            if not pages:
+                continue
+            pin = int(m.group(3))
+            below = [p for p in pages if p <= pin]
+            first = max(below) if below else pages[0]
+            rep = re.sub(r"\s+", " ", m.group(2)).strip().replace("U. S.", "U.S.")
+            cite = f"{m.group(1)} {rep} {first}"
+            if pin != first:
+                cite += f"@{pin}"
+            matches.append((m.start(), m.end(), "shortcite", cite))
         for c in state_statutes.iter_cites(text):
             matches.append((c.start, c.end, "statestat", c))
         for m in statutes_at_large.STAT_CITE_RE.finditer(text):
@@ -4961,6 +5005,8 @@ class _ScholarTextWindow:
                 action = ("rule", fed_rules.cite_spec(m))
             elif kind == "const":
                 action = ("const", constitution.cite_spec(m))
+            elif kind == "shortcite":
+                action = ("cite", m)  # m is the pre-built "vol rep page@pin"
             elif kind == "statestat":
                 # In-app for priority states (once a parser exists), else a
                 # browser link-out.  `m` here is a state_statutes.Cite record.
@@ -5063,6 +5109,7 @@ class _ScholarTextWindow:
         self._fn_def_pos: dict[str, str] = {}  # footnote id → body marker index
         self._page_pos: dict[int, str] = {}    # star page → start index
         self._cur_page: Optional[int] = None
+        self._short_cite_index = _build_short_cite_index(self._scholar_text)
         if not self._parts:
             txt.insert("1.0", self._scholar_text)
         else:
@@ -5346,6 +5393,8 @@ class _ScholarTextWindow:
         self._fn_def_pos: dict[str, str] = {}
         self._page_pos: dict[int, str] = {}
         self._cur_page: Optional[int] = None
+        self._short_cite_index = _build_short_cite_index(
+            self._scholar_text or self._cl_text or "")
         if not parts:
             self._insert_plain_with_links(self._cl_text or "(no text)", ())
         else:
@@ -6920,32 +6969,23 @@ class _PdfWindow:
 
 def _print_pdf_file(parent: tk.Misc, path: str,
                     status=lambda _s: None) -> None:
-    """Send a PDF file to the OS print path; if that fails, open it in the
-    default viewer so the user can print from there."""
+    """Open the PDF in the system's default viewer so the user can print it —
+    choosing a printer in the viewer's own Print dialog — rather than sending it
+    straight to the default printer."""
     try:
-        if sys.platform.startswith("win"):
-            os.startfile(path, "print")  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.Popen(["lpr", path])
-        else:  # Linux/BSD: CUPS
-            try:
-                subprocess.Popen(["lp", path])
-            except FileNotFoundError:
-                subprocess.Popen(["lpr", path])
-        status("Sent to the printer.")
-        return
-    except Exception as exc:
-        print(f"[print] direct print failed: {exc}")
-    try:  # fall back to opening the PDF so the user can print manually
         if sys.platform.startswith("win"):
             os.startfile(path)  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
             subprocess.Popen(["open", path])
         else:
+            subprocess.Popen(["xdg-open", path])
+        status("Opened the PDF — print it (Ctrl/Cmd-P) and choose your printer.")
+    except Exception:
+        try:
             webbrowser.open("file://" + path)
-        status("Opened the PDF — print it from the viewer (Ctrl/Cmd-P).")
-    except Exception as exc:
-        messagebox.showerror("Print", str(exc), parent=parent)
+            status("Opened the PDF — print it and choose your printer.")
+        except Exception as exc:
+            messagebox.showerror("Print", str(exc), parent=parent)
 
 
 def _open_statute_pdf(parent: tk.Misc, url: str,
@@ -7179,6 +7219,12 @@ class _StatuteWindow:
             if kind == "sechead":
                 txt.insert("end", text + "\n", ("sechead",))
             elif kind == "head":
+                # Constitution citations pin a section of an article/amendment
+                # ("art. I, § 8"); jump to and flash that "Section N." heading.
+                if (self._doc.kind == "const" and target and target_pos is None):
+                    mh = re.match(r"Section\s+(\d+)", text)
+                    if mh and mh.group(1) == target[0]:
+                        target_pos = txt.index("end-1c")
                 txt.insert("end", text + "\n", ("headline", indtag))
             elif kind == "body":
                 if lead:
