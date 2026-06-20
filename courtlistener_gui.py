@@ -4354,7 +4354,7 @@ class _ScholarTextWindow:
     _PARTMAP_COLORS = {"dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR,
                        "majority": _MAJORITY_COLOR}
     _PAGECOL_W = 48     # left gutter: reporter page numbers (px)
-    _PARTMAP_W = 138    # right strip: map of the opinion's parts (px)
+    _PARTMAP_W = 104    # right strip: map of the opinion's parts (px)
 
     def __init__(
         self,
@@ -5149,9 +5149,10 @@ class _ScholarTextWindow:
 
     @staticmethod
     def _partmap_short_label(label: str, kind: str) -> str:
-        """A compact label for the narrow part-map strip: the author's surname
-        plus the opinion role, e.g. 'Thomas, dissenting', or 'Opinion
-        (Roberts)' for the main opinion."""
+        """A compact label for the narrow part-map strip.  For separate
+        opinions just the author's surname (the colour already says whether
+        it's a dissent or concurrence); for the main opinion 'Opinion
+        (Author)'."""
         text = re.sub(r"\s+", " ", label or "").strip()
         m = (re.search(r"\b(?:[Cc]hief\s+)?(?:JUSTICE|Justice)\s+"
                        r"([A-Z][A-Za-z'’.]+)", text)
@@ -5164,14 +5165,14 @@ class _ScholarTextWindow:
                 name = name[:1] + name[1:].lower()
         if kind == "majority":
             return f"Opinion ({name})" if name else "Opinion"
-        role = "dissenting" if kind == "dissent" else "concurring"
+        # Dissent / concurrence: surname alone (colour distinguishes the two).
         if name is None:  # last resort: any capitalised token
             m2 = re.search(r"\b([A-Z][A-Za-z'’]{2,})\b", text)
             if m2:
                 name = m2.group(1)
                 if name.isupper():
                     name = name[:1] + name[1:].lower()
-        return f"{name}, {role}" if name else role.capitalize()
+        return name or ("Dissent" if kind == "dissent" else "Concurrence")
 
     def _on_partmap_click(self, event) -> None:
         for y1, y2, rs in getattr(self, "_partmap_rows", []):
