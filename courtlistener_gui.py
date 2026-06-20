@@ -3347,6 +3347,10 @@ _CITE_CAPTURE_RE = re.compile(
 _SHORT_CITE_RE = re.compile(
     r"\b(\d{1,4})\s+(" + _REPORTER_ALT + r")\s*,?\s+at\s+(\d{1,5})\b")
 
+# "Id." / "Ibid." short form — refers to the immediately preceding citation;
+# group 1 is the optional pin page ("Id. at 152").
+_ID_CITE_RE = re.compile(r"\b(?:[Ii]d|[Ii]bid)\.(?:\s*,?\s*at\s+(\d{1,5}))?")
+
 
 def _norm_reporter(rep: str) -> str:
     """Reporter key for matching, ignoring spacing/case ('U. S.' == 'U.S.')."""
@@ -4570,6 +4574,9 @@ class _ScholarTextWindow:
         # (volume, reporter) → first pages, so short forms ("410 U.S. at 152")
         # link back to the full citation's case.  Rebuilt on each render.
         self._short_cite_index: dict[tuple[str, str], list[int]] = {}
+        # Base cite ("vol reporter firstpage") of the most recently emitted
+        # case citation, so an "Id. at N" links to that case.  Reset per render.
+        self._last_cite_ref: str = ""
         self._fonts: dict[str, tkfont.Font] = {}
         self._fn_text: dict[str, str] = {}  # footnote id → body text (for hover tips)
         self._fn_tip: Optional[tk.Toplevel] = None
@@ -4976,6 +4983,10 @@ class _ScholarTextWindow:
             if pin != first:
                 cite += f"@{pin}"
             matches.append((m.start(), m.end(), "shortcite", cite))
+        # "Id. at 152" / "Ibid." — refer to the previous citation; resolved in
+        # document order in the processing loop below.
+        for m in _ID_CITE_RE.finditer(text):
+            matches.append((m.start(), m.end(), "idcite", m))
         for c in state_statutes.iter_cites(text):
             matches.append((c.start, c.end, "statestat", c))
         for m in statutes_at_large.STAT_CITE_RE.finditer(text):
@@ -4991,6 +5002,7 @@ class _ScholarTextWindow:
             if kind == "cite":
                 cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
                 cite = cite.replace("’", "'")  # straight apostrophe for the search query
+                self._last_cite_ref = cite  # base for a following "Id. at N"
                 # A pincite right after ("365 U.S. 167, 171") rides along
                 # so the opened case can jump to that page.  A number that
                 # opens a parallel cite ("556, 510 A.2d 562") is excluded
@@ -5007,6 +5019,15 @@ class _ScholarTextWindow:
                 action = ("const", constitution.cite_spec(m))
             elif kind == "shortcite":
                 action = ("cite", m)  # m is the pre-built "vol rep page@pin"
+                self._last_cite_ref = m.split("@")[0]
+            elif kind == "idcite":
+                # "Id. at N" → the previous citation's case, pinned to N.
+                ref = self._last_cite_ref
+                if not ref:
+                    action = None  # nothing to point at — leave it as plain text
+                else:
+                    pin = m.group(1)
+                    action = ("cite", ref + (f"@{pin}" if pin else ""))
             elif kind == "statestat":
                 # In-app for priority states (once a parser exists), else a
                 # browser link-out.  `m` here is a state_statutes.Cite record.
@@ -5017,8 +5038,11 @@ class _ScholarTextWindow:
                 action = ("statpdf", statutes_at_large.url_for(m))
             else:
                 action = ("cfr", ecfr.cite_spec(m))
-            ltags = tags + ("citelink", self._new_link(action))
-            txt.insert("end", text[start:end], ltags)
+            if action is None:
+                txt.insert("end", text[start:end], tags)  # unresolved Id. cite
+            else:
+                ltags = tags + ("citelink", self._new_link(action))
+                txt.insert("end", text[start:end], ltags)
             pos = end
         if pos < len(text):
             txt.insert("end", text[pos:], tags)
@@ -5110,6 +5134,7 @@ class _ScholarTextWindow:
         self._page_pos: dict[int, str] = {}    # star page → start index
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(self._scholar_text)
+        self._last_cite_ref = ""
         if not self._parts:
             txt.insert("1.0", self._scholar_text)
         else:
@@ -5395,6 +5420,7 @@ class _ScholarTextWindow:
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(
             self._scholar_text or self._cl_text or "")
+        self._last_cite_ref = ""
         if not parts:
             self._insert_plain_with_links(self._cl_text or "(no text)", ())
         else:
@@ -6300,27 +6326,29 @@ class _ScholarTextWindow:
             win.jump_to_cite_page(cite, pin)
 
     def jump_to_cite_page(self, cite: str, pin: str) -> None:
-        """Scroll to and flash the star marker for a pin-cited page, when
-        this window's star pagination follows the same reporter as the
-        citation that was clicked."""
-        m_link = _CITE_PARSE_RE.match(cite)
-        m_here = _CITE_PARSE_RE.match(self._bb["cite"])
-        if not (m_link and m_here):
+        """Scroll to and briefly flash the star-pagination marker for the pin
+        page in this freshly opened opinion.  Deferred until the window has laid
+        out (an immediate ``see`` on an unmapped widget does nothing), with one
+        retry while the text is still rendering."""
+        m_page = re.match(r"\d+", pin or "")
+        if not m_page:
             return
-        norm = lambda r: re.sub(r"[\s.]", "", r).lower()
-        if norm(m_link.group(2)) != norm(m_here.group(2)):
-            self._status_var.set(
-                f"Pin page {pin} is in {m_link.group(2).strip()}; this text "
-                f"is paginated by {m_here.group(2).strip()}."
-            )
-            return
-        m_page = re.match(r"\d+", pin)
-        pos = self._page_pos.get(int(m_page.group(0))) if m_page else None
-        if pos:
-            self._jump_to(pos)
-            self._status_var.set(f"Jumped to page *{m_page.group(0)}.")
-        else:
-            self._status_var.set(f"Page *{pin} not marked in this text.")
+        page = int(m_page.group(0))
+
+        def do(attempt: int = 0) -> None:
+            try:
+                pos = (self._page_pos or {}).get(page)
+            except tk.TclError:
+                return
+            if pos:
+                self._jump_to(pos)
+                self._status_var.set(f"Jumped to page *{page}.")
+            elif attempt < 2:
+                self._win.after(250, lambda: do(attempt + 1))
+            else:
+                self._status_var.set(f"Page *{page} not marked in this text.")
+
+        self._win.after(200, do)
 
     def _open_statute(self, kind: str, spec: str) -> None:
         """Fetch a U.S. Code (OLRC) or C.F.R. (eCFR) section and show it."""
