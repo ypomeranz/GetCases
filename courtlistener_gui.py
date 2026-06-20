@@ -4945,6 +4945,14 @@ class _ScholarTextWindow:
             txt.insert("end", span.text, tuple(tags))
             return
         if span.link:
+            # Scholar pre-hyperlinks cited cases, so they never pass through
+            # _insert_plain_with_links — capture any reporter cite in the link
+            # text here too, so a following "Id." resolves to THIS case rather
+            # than the last plain-text cite (often the opinion's own caption).
+            cm = _CITE_CAPTURE_RE.search(span.text)
+            if cm:
+                self._last_cite_ref = re.sub(
+                    r"\s+", " ", cm.group(0)).replace("U. S.", "U.S.")
             tags += ["citelink", self._new_link(("url", span.link))]
             txt.insert("end", span.text, tuple(tags))
             return
