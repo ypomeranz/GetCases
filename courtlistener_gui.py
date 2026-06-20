@@ -104,6 +104,7 @@ import requests as _requests
 from bluebook_names import abbreviate_case_name
 from cl_parse import parse_cl_html as _parse_cl_html
 from courtlistener import CourtListenerClient, CourtListenerError
+import constitution
 import ecfr
 import fed_rules
 import state_statutes
@@ -4923,6 +4924,8 @@ class _ScholarTextWindow:
             matches.append((m.start(), m.end(), "cfr", m))
         for m in fed_rules.RULE_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "rule", m))
+        for m in constitution.CONST_CITE_RE.finditer(text):
+            matches.append((m.start(), m.end(), "const", m))
         for c in state_statutes.iter_cites(text):
             matches.append((c.start, c.end, "statestat", c))
         for m in statutes_at_large.STAT_CITE_RE.finditer(text):
@@ -4950,6 +4953,8 @@ class _ScholarTextWindow:
                 action = ("usc", us_code.cite_spec(m))
             elif kind == "rule":
                 action = ("rule", fed_rules.cite_spec(m))
+            elif kind == "const":
+                action = ("const", constitution.cite_spec(m))
             elif kind == "statestat":
                 # In-app for priority states (once a parser exists), else a
                 # browser link-out.  `m` here is a state_statutes.Cite record.
@@ -6626,6 +6631,9 @@ def _parse_statute_query(query: str) -> Optional[tuple[str, str]]:
     rule = fed_rules.parse_query(query)
     if rule:
         return rule
+    const = constitution.parse_query(query)
+    if const:
+        return const
     statestat = state_statutes.parse_query(query)
     if statestat:
         return statestat
@@ -6651,12 +6659,14 @@ _STATUTE_SOURCES: dict[str, object] = {
     "cfr": ecfr,
     "rule": fed_rules,
     "statestat": state_statutes,  # in-app state statutes (CA; more to follow)
+    "const": constitution,        # U.S. Constitution (bundled text)
 }
 _SOURCE_HOST: dict[str, str] = {
     "usc": "uscode.house.gov",
     "cfr": "ecfr.gov",
     "rule": "law.cornell.edu",
     "statestat": "the official source",
+    "const": "the U.S. Constitution",
 }
 
 
@@ -7134,6 +7144,8 @@ class _StatuteWindow:
             refs.append((m.start(), m.end(), "cfr", ecfr.cite_spec(m)))
         for m in fed_rules.RULE_CITE_RE.finditer(text):
             refs.append((m.start(), m.end(), "rule", fed_rules.cite_spec(m)))
+        for m in constitution.CONST_CITE_RE.finditer(text):
+            refs.append((m.start(), m.end(), "const", constitution.cite_spec(m)))
         for c in state_statutes.iter_cites(text):
             kind, value = state_statutes.action_for(c)
             refs.append((c.start, c.end, kind, value))
