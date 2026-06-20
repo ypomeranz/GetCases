@@ -3347,9 +3347,10 @@ _CITE_CAPTURE_RE = re.compile(
 _SHORT_CITE_RE = re.compile(
     r"\b(\d{1,4})\s+(" + _REPORTER_ALT + r")\s*,?\s+at\s+(\d{1,5})\b")
 
-# "Id." / "Ibid." short form — refers to the immediately preceding citation;
-# group 1 is the optional pin page ("Id. at 152").
-_ID_CITE_RE = re.compile(r"\b(?:[Ii]d|[Ii]bid)\.(?:\s*,?\s*at\s+(\d{1,5}))?")
+# "Id." short form — refers to the immediately preceding citation; group 1 is
+# the optional pin page ("Id. at 152").  ("Ibid." is deliberately not traced —
+# it usually points at a non-case source.)
+_ID_CITE_RE = re.compile(r"\b[Ii]d\.(?:\s*,?\s*at\s+(\d{1,5}))?")
 
 
 def _norm_reporter(rep: str) -> str:
@@ -3368,26 +3369,30 @@ def _build_short_cite_index(text: str) -> dict[tuple[str, str], list[int]]:
     return {k: sorted(v) for k, v in idx.items()}
 
 
-def _base_cite_from_text(text: str,
-                         index: dict[tuple[str, str], list[int]]) -> str:
-    """The base "vol reporter firstpage" cite named in `text`, whether written
-    in full ("8 F.4th 557") or short ("8 F.4th at 565" — resolved to its first
-    page via `index`).  Empty string when no reporter cite is present."""
+def _cite_target_from_text(
+    text: str, index: dict[tuple[str, str], list[int]]
+) -> tuple[str, str]:
+    """(base cite, pin) named in `text`.  The base is "vol reporter firstpage"
+    whether the cite is written in full ("8 F.4th 557, 565") or short
+    ("8 F.4th at 565", resolved to its first page via `index`); the pin is the
+    pincite/short page, or "".  Empty base when no reporter cite is present."""
     cm = _CITE_CAPTURE_RE.search(text)
     if cm:
-        return re.sub(r"\s+", " ", cm.group(0)).replace("U. S.", "U.S.")
+        base = re.sub(r"\s+", " ", cm.group(0)).replace("U. S.", "U.S.")
+        pm = _PINCITE_AFTER_RE.match(text, cm.end())
+        return base, (pm.group(1) if pm else "")
     sm = _SHORT_CITE_RE.search(text)
     if sm:
         rep = re.sub(r"\s+", " ", sm.group(2)).strip().replace("U. S.", "U.S.")
-        pages = index.get((sm.group(1), _norm_reporter(sm.group(2))))
         pin = int(sm.group(3))
+        pages = index.get((sm.group(1), _norm_reporter(sm.group(2))))
         if pages:
             below = [p for p in pages if p <= pin]
             first = max(below) if below else pages[0]
         else:
             first = pin  # no full cite indexed — best effort
-        return f"{sm.group(1)} {rep} {first}"
-    return ""
+        return f"{sm.group(1)} {rep} {first}", str(pin)
+    return "", ""
 
 
 # A citation line in the Scholar header: each parallel cite sits on its own
@@ -4596,9 +4601,10 @@ class _ScholarTextWindow:
         # (volume, reporter) → first pages, so short forms ("410 U.S. at 152")
         # link back to the full citation's case.  Rebuilt on each render.
         self._short_cite_index: dict[tuple[str, str], list[int]] = {}
-        # Base cite ("vol reporter firstpage") of the most recently emitted
-        # case citation, so an "Id. at N" links to that case.  Reset per render.
-        self._last_cite_ref: str = ""
+        # The most recently emitted citation's action — a case ("cite", base),
+        # a statute ("usc"/"cfr"/"rule"/"const"/"statpdf"/…), etc. — so an "Id."
+        # links back to whatever was last cited.  Reset per render.
+        self._last_cite_action: Optional[tuple[str, str]] = None
         # A bare "Id." whose pin ("at N") sits in a following span — (link tag,
         # base cite) — so the pin can be attached when that span arrives.
         self._pending_id: Optional[tuple[str, str]] = None
@@ -4976,10 +4982,13 @@ class _ScholarTextWindow:
             # than the last plain-text cite (often the opinion's own caption).
             # The cite may be a short form ("Quinn, 8 F.4th at 565"); resolve
             # it back to the case's full cite via the document index.
-            ref = _base_cite_from_text(span.text, self._short_cite_index)
+            ref, pin = _cite_target_from_text(span.text, self._short_cite_index)
             if ref:
-                self._last_cite_ref = ref
-            tags += ["citelink", self._new_link(("url", span.link))]
+                self._last_cite_action = ("cite", ref)
+            # Carry any pincite so the opened case jumps to it (Scholar's own
+            # hyperlink otherwise opens the case at the top).
+            value = f"{span.link}\tpin={pin}" if pin else span.link
+            tags += ["citelink", self._new_link(("url", value))]
             txt.insert("end", span.text, tuple(tags))
             return
         # Plain text: make recognizable citations clickable
@@ -5031,8 +5040,8 @@ class _ScholarTextWindow:
             if pin != first:
                 cite += f"@{pin}"
             matches.append((m.start(), m.end(), "shortcite", cite))
-        # "Id. at 152" / "Ibid." — refer to the previous citation; resolved in
-        # document order in the processing loop below.
+        # "Id. at 152" — refers to the previous citation; resolved in document
+        # order in the processing loop below.
         for m in _ID_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "idcite", m))
         for c in state_statutes.iter_cites(text):
@@ -5047,10 +5056,11 @@ class _ScholarTextWindow:
                 continue  # overlapping match — first/longest wins
             if start > pos:
                 txt.insert("end", text[pos:start], tags)
+            cite_base = ""  # set for case cites, to track the last citation
             if kind == "cite":
                 cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
                 cite = cite.replace("’", "'")  # straight apostrophe for the search query
-                self._last_cite_ref = cite  # base for a following "Id. at N"
+                cite_base = cite  # base for a following "Id. at N"
                 # A pincite right after ("365 U.S. 167, 171") rides along
                 # so the opened case can jump to that page.  A number that
                 # opens a parallel cite ("556, 510 A.2d 562") is excluded
@@ -5067,15 +5077,18 @@ class _ScholarTextWindow:
                 action = ("const", constitution.cite_spec(m))
             elif kind == "shortcite":
                 action = ("cite", m)  # m is the pre-built "vol rep page@pin"
-                self._last_cite_ref = m.split("@")[0]
+                cite_base = m.split("@")[0]
             elif kind == "idcite":
-                # "Id. at N" → the previous citation's case, pinned to N.
-                ref = self._last_cite_ref
-                if not ref:
+                # "Id. at N" → whatever was cited last, be it a case or a
+                # statute, pinned to N when it's a case.
+                la = self._last_cite_action
+                if not la:
                     action = None  # nothing to point at — leave it as plain text
-                else:
+                elif la[0] == "cite":
                     pin = m.group(1)
-                    action = ("cite", ref + (f"@{pin}" if pin else ""))
+                    action = ("cite", la[1] + (f"@{pin}" if pin else ""))
+                else:
+                    action = la  # statute/regulation/rule/constitution → reopen
             elif kind == "statestat":
                 # In-app for priority states (once a parser exists), else a
                 # browser link-out.  `m` here is a state_statutes.Cite record.
@@ -5088,14 +5101,25 @@ class _ScholarTextWindow:
                 action = ("cfr", ecfr.cite_spec(m))
             if action is None:
                 txt.insert("end", text[start:end], tags)  # unresolved Id. cite
+                self._pending_id = None
             else:
                 link_tag = self._new_link(action)
                 txt.insert("end", text[start:end], tags + ("citelink", link_tag))
-                # A pin-less "Id." may take its pin from the next span.
-                if kind == "idcite" and m.group(1) is None:
-                    self._pending_id = (link_tag, self._last_cite_ref)
+                if kind == "idcite":
+                    # A pin-less "Id." pointing at a case may take its pin from
+                    # the next span (Scholar splits "Id." off from "at N").
+                    la = self._last_cite_action
+                    if m.group(1) is None and la and la[0] == "cite":
+                        self._pending_id = (link_tag, la[1])
+                    else:
+                        self._pending_id = None
                 else:
                     self._pending_id = None
+                    # Remember this citation so a following "Id." points to it.
+                    if kind in ("cite", "shortcite"):
+                        self._last_cite_action = ("cite", cite_base)
+                    else:
+                        self._last_cite_action = action
             pos = end
         if pos < len(text):
             tail = text[pos:]
@@ -5191,7 +5215,7 @@ class _ScholarTextWindow:
         self._page_pos: dict[int, str] = {}    # star page → start index
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(self._scholar_text)
-        self._last_cite_ref = ""
+        self._last_cite_action = None
         self._pending_id = None
         if not self._parts:
             txt.insert("1.0", self._scholar_text)
@@ -5478,7 +5502,7 @@ class _ScholarTextWindow:
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(
             self._scholar_text or self._cl_text or "")
-        self._last_cite_ref = ""
+        self._last_cite_action = None
         self._pending_id = None
         if not parts:
             self._insert_plain_with_links(self._cl_text or "(no text)", ())
@@ -6276,12 +6300,21 @@ class _ScholarTextWindow:
         if kind == "statpdf":
             _open_statute_pdf(self._win, value, self._status_var.set)
             return
+        # A Scholar case URL may carry a pincite ("<url>\tpin=565") so the
+        # opened case jumps to that page (Scholar's own hyperlink doesn't).
+        if kind == "url":
+            url_val, _, pin = value.partition("\tpin=")
+            cite = ""
+        elif kind == "cite":
+            cite, _, pin = value.partition("@")
+            url_val = ""
+        else:
+            cite, pin, url_val = value, "", ""
         # CourtListener opinion URL: fetch structured text from CL directly
-        if kind == "url" and "courtlistener.com/opinion/" in value:
-            self._follow_cl_link(value)
+        if kind == "url" and "courtlistener.com/opinion/" in url_val:
+            self._follow_cl_link(url_val)
             return
         fetcher = self._app._get_scholar()
-        cite, _, pin = value.partition("@") if kind == "cite" else (value, "", "")
         label = cite if kind == "cite" else "cited case"
         if fetcher is None:
             if kind == "cite":
@@ -6293,7 +6326,7 @@ class _ScholarTextWindow:
 
         def run() -> None:
             if kind == "url":
-                result = fetcher.fetch_by_url(value)
+                result = fetcher.fetch_by_url(url_val)
             else:
                 result = fetcher.fetch_by_citation(cite)
             self._post(self._on_link_ready, result, cite, pin)
@@ -6381,7 +6414,7 @@ class _ScholarTextWindow:
         url, html = result
         self._status_var.set("Cited case loaded.")
         win = _ScholarTextWindow(self._win, self._app, url, html, item=None)
-        if cite and pin:
+        if pin:  # cite or Scholar-URL pincite — jump once the window lays out
             win.jump_to_cite_page(cite, pin)
 
     def jump_to_cite_page(self, cite: str, pin: str) -> None:
