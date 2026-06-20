@@ -531,9 +531,17 @@ _FED_APPX_RE = re.compile(r"F(?:ed)?\.?\s*App['’]?x\.?", re.IGNORECASE)
 
 def _item_is_fed_appx(item: dict) -> bool:
     """True if any citation on a search-result item is to the Federal Appendix."""
+    return _fed_appx_cite(item) is not None
+
+
+def _fed_appx_cite(item: dict) -> Optional[str]:
+    """The Federal Appendix citation on an item (HTML-stripped), or None."""
     raw = (item or {}).get("citation")
     cites = raw if isinstance(raw, list) else [raw] if raw else []
-    return any(_FED_APPX_RE.search(str(c)) for c in cites)
+    for c in cites:
+        if _FED_APPX_RE.search(str(c)):
+            return re.sub(r"<[^>]+>", "", str(c)).strip()
+    return None
 
 
 def _item_from_cluster(cluster: dict) -> dict:
@@ -1537,6 +1545,27 @@ class CourtListenerGUI:
             except tk.TclError:
                 pass
 
+        # Federal Appendix citations: Google Scholar and CourtListener both
+        # mismatch these scans to the wrong case, so when the query *is* an
+        # F. App'x citation, skip those searches and offer the static.case.law
+        # PDF built straight from the citation the user typed.
+        cite_m = _LINE_CITE_RE.search(query)
+        appx_url = (_static_case_law_url(cite_m.group(0))
+                    if cite_m and _FED_APPX_RE.search(cite_m.group(0)) else None)
+        if appx_url:
+            cite_label = re.sub(r"\s+", " ", cite_m.group(0)).strip()
+
+            def _open_appx(u=appx_url, t=cite_label):
+                _PdfWindow(self.root, u, t, self._status_var.set)
+
+            self.root.after(
+                0, _add_result, "", f"{cite_label} — Federal Appendix",
+                cite_label, "", "case.law PDF", _open_appx,
+            )
+            search_done[0] = 2
+            self.root.after(0, _update_status)
+            return
+
         # Launch Scholar and CL searches in parallel
         def scholar_search() -> None:
             if not _SCHOLAR_AVAILABLE:
@@ -1665,14 +1694,10 @@ class CourtListenerGUI:
                         def run():
                             # Federal Appendix cases are scans that Google
                             # Scholar almost never has — open straight on the
-                            # official PDF instead of falling back to the
+                            # static.case.law PDF instead of falling back to the
                             # (often wrong) CourtListener text.
                             if _item_is_fed_appx(it):
-                                def show_appx():
-                                    _ScholarTextWindow(
-                                        self.root, self, "", "", item=it,
-                                    )
-                                self._post_root(show_appx)
+                                self._post_root(self._open_fed_appx_pdf, it)
                                 return
                             # Try Google Scholar first, same as the main window
                             if fetcher is not None:
@@ -1882,22 +1907,17 @@ class CourtListenerGUI:
         worker thread).  Google Scholar by citation first — retrying as a
         name+citation search — with a pin-cite jump; then the
         CourtListener text.  Returns False when nothing was found."""
-        # Federal Appendix cases are scans Google Scholar rarely has — resolve
-        # the citation precisely and open straight on the official PDF.
-        if client is not None and _FED_APPX_RE.search(cite):
-            try:
-                for entry in client.lookup_citation(cite):
-                    if entry.get("status") != 200:
-                        continue
-                    for cl in entry.get("clusters") or []:
-                        it = _item_from_cluster(cl)
-                        self._post_root(
-                            lambda it=it: _ScholarTextWindow(
-                                self.root, self, "", "", item=it)
-                        )
-                        return True
-            except Exception as exc:
-                print(f"[citelist] fed appx lookup {cite!r}: {exc}")
+        # Federal Appendix cases are scans Google Scholar rarely has — open the
+        # static.case.law PDF built straight from the citation.
+        if _FED_APPX_RE.search(cite):
+            url = _static_case_law_url(cite)
+            if url:
+                title = f"{name} — {cite}" if name else cite
+                self._post_root(
+                    lambda u=url, t=title: _PdfWindow(
+                        self.root, u, t, self._status_var.set)
+                )
+                return True
         if fetcher is not None:
             result = None
             try:
@@ -2872,10 +2892,22 @@ class CourtListenerGUI:
         threading.Thread(target=run, daemon=True).start()
 
     def _open_fed_appx_pdf(self, item: dict) -> None:
-        """Open a Federal Appendix case straight on its official PDF: an empty
-        Scholar window whose F. App'x detection auto-switches to the PDF view
-        (the Scholar text toggle stays disabled — there's no text)."""
+        """Open a Federal Appendix case straight on its official PDF.  These
+        are scans Google Scholar lacks, so build the static.case.law URL from
+        the F. App'x citation and show it directly; if that can't be built,
+        fall back to resolving the PDF from the case record."""
         self._restore_buttons()
+        cite = _fed_appx_cite(item)
+        url = _static_case_law_url(cite) if cite else None
+        if url:
+            name = re.sub(
+                r"<[^>]+>", "",
+                item.get("caseName") or item.get("case_name") or "",
+            ).strip()
+            title = f"{name} — {cite}" if name else cite
+            self._status_var.set(f"Opening {cite} (case.law)…")
+            _PdfWindow(self.root, url, title, self._status_var.set)
+            return
         self._status_var.set("Federal Appendix case — opening the PDF…")
         _ScholarTextWindow(self.root, self, "", "", item=item)
 
