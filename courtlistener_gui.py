@@ -112,6 +112,7 @@ import state_statutes
 import statutes_at_large
 import us_code
 import brief_reader
+import oyez
 from citations import (
     PINCITE_AFTER_RE as _PINCITE_AFTER_RE,
     TEXT_CITE_RE as _TEXT_CITE_RE,
@@ -6135,23 +6136,32 @@ class _ScholarTextWindow:
     def _details_panel(self) -> ttk.Frame:
         if self._details_frame is None:
             f = ttk.Frame(self._text_frame)
+            self._details_title_var = tk.StringVar(value="Opinions & Joins")
             ttk.Label(
-                f, text="Opinions & Joins",
+                f, textvariable=self._details_title_var, anchor="w",
                 font=("TkDefaultFont", 9, "bold"),
-            ).pack(anchor="w", padx=6, pady=(4, 2))
+            ).pack(fill="x", padx=6, pady=(4, 2))
             body = tk.Text(
-                f, width=34, wrap="word", font=("TkDefaultFont", 9),
+                f, width=38, wrap="word", font=("TkDefaultFont", 9),
                 state="disabled", padx=8, pady=4, relief="flat",
-                background="#f7f5ef",
+                background="#f7f5ef", cursor="",
             )
             dvsb = ttk.Scrollbar(f, orient="vertical", command=body.yview)
             body.configure(yscrollcommand=dvsb.set)
             dvsb.pack(side="right", fill="y")
             body.pack(side="left", fill="both", expand=True)
+            body.tag_configure("title", font=("TkDefaultFont", 11, "bold"),
+                               spacing1=2, spacing3=2)
             body.tag_configure("h", font=("TkDefaultFont", 9, "bold"),
                                spacing1=10)
             body.tag_configure("lbl", font=("TkDefaultFont", 9, "italic"),
                                foreground="#666666")
+            body.tag_configure("olink", foreground=self._LINK_COLOR,
+                               underline=True)
+            body.tag_bind("olink", "<Enter>",
+                          lambda _e: body.config(cursor="hand2"))
+            body.tag_bind("olink", "<Leave>",
+                          lambda _e: body.config(cursor=""))
             self._details_text = body
             self._details_frame = f
         return self._details_frame
@@ -6165,13 +6175,41 @@ class _ScholarTextWindow:
         elif self._details_frame is not None:
             self._details_frame.pack_forget()
 
-    def _set_details(self, lines: list[tuple[str, str]]) -> None:
+    def _set_details(self, lines: list[tuple]) -> None:
+        """Render the details pane.  Each line is ``(style, text)`` or, for a
+        clickable link, ``(style, text, url)`` — the latter is underlined and
+        opens *url* in the browser when clicked."""
         body = self._details_text
         body.config(state="normal")
         body.delete("1.0", "end")
-        for style, text in lines:
-            body.insert("end", text + "\n", (style,) if style else ())
+        link_n = 0
+        for item in lines:
+            if len(item) == 3:
+                style, text, url = item
+                tag = f"olink{link_n}"
+                link_n += 1
+                body.tag_bind(
+                    tag, "<Button-1>",
+                    lambda _e, u=url: self._open_details_link(u),
+                )
+                tags = ("olink", tag)
+                if style:
+                    tags += (style,)
+                body.insert("end", text + "\n", tags)
+            else:
+                style, text = item
+                body.insert("end", text + "\n", (style,) if style else ())
         body.config(state="disabled")
+
+    def _apply_details(self, title: str, lines: list[tuple]) -> None:
+        """Set the panel heading and body together (called on the main thread)."""
+        if getattr(self, "_details_title_var", None) is not None and title:
+            self._details_title_var.set(title)
+        self._set_details(lines)
+
+    def _open_details_link(self, url: str) -> None:
+        webbrowser.open(url)
+        self._status_var.set("Opened in your browser.")
 
     def _load_details(self) -> None:
         """Fetch authorship/join data from CourtListener (author_str /
@@ -6186,49 +6224,68 @@ class _ScholarTextWindow:
         )
         item = dict(self._item)
         cite = self._bb["cite"]
+        is_scotus = self._is_scotus
+        oyez_cites = [c for c in ([cite] + list(self._header_cites)) if c]
+        name = self._bb.get("name", "")
+        year = self._bb.get("year", "")
 
         def run() -> None:
-            lines: list[tuple[str, str]] = []
-            try:
-                if client is None:
-                    raise RuntimeError("no CourtListener token configured")
-                cid = item.get("cluster_id") or item.get("id")
-                if not cid:
-                    if not cite:
-                        raise RuntimeError("no citation to locate the case")
-                    data = client.search(f"citation:({cite})", type="o",
-                                         page_size=1)
-                    results = data.get("results") or []
-                    if not results:
-                        data = client.search(f'"{cite}"', type="o",
+            title = "Opinions & Joins"
+            lines: list[tuple] = []
+            # Supreme Court cases: Oyez first — its majority/dissent line-up,
+            # plain-English summary and oral-argument audio are far richer than
+            # CourtListener's authorship strings.  Any failure falls through to
+            # the CourtListener / Scholar paths below.
+            if is_scotus:
+                try:
+                    case = oyez.lookup(cites=oyez_cites, name=name, year=year)
+                    if case is not None and case.is_substantive:
+                        lines = self._details_lines_oyez(case)
+                        if lines:
+                            title = "Supreme Court · Oyez"
+                except Exception as exc:
+                    print(f"[details] oyez: {exc}")
+            if not lines:
+                try:
+                    if client is None:
+                        raise RuntimeError("no CourtListener token configured")
+                    cid = item.get("cluster_id") or item.get("id")
+                    if not cid:
+                        if not cite:
+                            raise RuntimeError("no citation to locate the case")
+                        data = client.search(f"citation:({cite})", type="o",
                                              page_size=1)
                         results = data.get("results") or []
-                    if not results:
-                        raise RuntimeError("case not found on CourtListener")
-                    cid = (results[0].get("cluster_id")
-                           or results[0].get("id"))
-                cluster = client.get_cluster(
-                    int(cid), fields="judges,sub_opinions")
-                ops = []
-                for url in cluster.get("sub_opinions") or []:
-                    try:
-                        ops.append(client._get_url(url, {
-                            "fields": "ordering_key,type,author_str,"
-                                      "joined_by_str,per_curiam",
-                        }))
-                    except Exception as exc:
-                        print(f"[details] sub-opinion fetch failed: {exc}")
-                ops.sort(key=lambda o: (o.get("ordering_key") is None,
-                                        o.get("ordering_key") or 0))
-                lines = self._details_lines_cl(cluster, ops)
-            except Exception as exc:
-                print(f"[details] {exc}")
+                        if not results:
+                            data = client.search(f'"{cite}"', type="o",
+                                                 page_size=1)
+                            results = data.get("results") or []
+                        if not results:
+                            raise RuntimeError("case not found on CourtListener")
+                        cid = (results[0].get("cluster_id")
+                               or results[0].get("id"))
+                    cluster = client.get_cluster(
+                        int(cid), fields="judges,sub_opinions")
+                    ops = []
+                    for url in cluster.get("sub_opinions") or []:
+                        try:
+                            ops.append(client._get_url(url, {
+                                "fields": "ordering_key,type,author_str,"
+                                          "joined_by_str,per_curiam",
+                            }))
+                        except Exception as exc:
+                            print(f"[details] sub-opinion fetch failed: {exc}")
+                    ops.sort(key=lambda o: (o.get("ordering_key") is None,
+                                            o.get("ordering_key") or 0))
+                    lines = self._details_lines_cl(cluster, ops)
+                except Exception as exc:
+                    print(f"[details] {exc}")
             if not lines:
                 lines = self._details_lines_parts()
             if not lines:
                 lines = [("lbl", "No authorship details available "
                                  "for this case.")]
-            self._post(self._set_details, lines)
+            self._post(self._apply_details, title, lines)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -6298,6 +6355,82 @@ class _ScholarTextWindow:
                 lines.append(("h", "Dissent" if part.kind == "dissent"
                               else "Concurrence"))
                 lines.append(("", _fix_name_case(clean(part.label))))
+        return lines
+
+    @staticmethod
+    def _details_lines_oyez(case: "oyez.OyezCase") -> list[tuple]:
+        """Render an Oyez case: name + citation, a plain-English summary, the
+        majority-vs-dissent line-up (or, when Oyez has no per-justice vote, the
+        opinion authors), and links to the oral-argument recording(s) and the
+        full Oyez page.  Link lines are 3-tuples (style, text, url)."""
+        lines: list[tuple] = []
+        if case.name:
+            lines.append(("title", case.name))
+        if case.citation:
+            lines.append(("lbl", case.citation))
+        if case.court:
+            lines.append(("lbl", case.court))
+
+        about = case.description or case.question
+        if about:
+            lines.append(("h", "What it's about"))
+            lines.append(("", about))
+        if case.question and case.question != about:
+            lines.append(("h", "Question presented"))
+            lines.append(("", case.question))
+
+        if case.has_votes:
+            decs = case.voted_decisions
+            multi = len(decs) > 1
+            for dec in decs:
+                # A fractured case decided several questions with different
+                # majorities; name each holding so the line-up isn't ambiguous.
+                if multi and dec.description:
+                    lines.append(("h", "Holding"))
+                    lines.append(("", dec.description))
+                head = "Decision"
+                if dec.vote_line:
+                    head += f": {dec.vote_line}"
+                if dec.decision_type:
+                    head += f" ({dec.decision_type})"
+                lines.append(("h", head))
+                if dec.winning_party:
+                    lines.append(("", f"In favor of {dec.winning_party}"))
+                maj, dis, oth = dec.majority, dec.dissent, dec.other
+                if maj:
+                    lines.append(("h", f"Majority ({len(maj)})"))
+                    lines.append(("", ", ".join(j.label for j in maj)))
+                if dis:
+                    lines.append(("h", f"Dissent ({len(dis)})"))
+                    lines.append(("", ", ".join(j.label for j in dis)))
+                if oth:
+                    lines.append(("h", "Did not participate"))
+                    lines.append(("", ", ".join(j.last for j in oth)))
+        elif case.opinions:
+            # No per-justice vote recorded — show who *wrote* each opinion.
+            for kind, label in (("majority", "Majority opinion"),
+                                ("concurrence", "Concurrences"),
+                                ("dissent", "Dissents")):
+                ops = case.opinions_of(kind)
+                if ops:
+                    lines.append(("h", label))
+                    lines.append(("", ", ".join(o.last for o in ops)))
+            lines.append(("lbl", "Opinion authors only — Oyez records no "
+                                 "per-justice vote for this case."))
+
+        if case.oral_arguments:
+            lines.append(("h", "Oral argument"))
+            for oa in case.oral_arguments:
+                lines.append(("", oa.title, oa.url))
+
+        # The Oyez page carries the rest — full facts, the holding/reasoning,
+        # the audio player with synchronized transcript, advocate info.  (No
+        # Justia "read the opinion" link: the app is already showing the
+        # opinion text, and Oyez's Justia URL is malformed for cases whose
+        # U.S. Reports page isn't assigned yet.)
+        if case.web_url:
+            lines.append(("", ""))
+            lines.append(("", "View full details on Oyez →", case.web_url))
         return lines
 
     # ------------------------------------------------------------------
