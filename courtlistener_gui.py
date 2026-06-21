@@ -6378,6 +6378,11 @@ class _ScholarTextWindow:
         if case.question and case.question != about:
             lines.append(("h", "Question presented"))
             lines.append(("", case.question))
+        # Oyez's "Conclusion" answers the question presented (how the Court
+        # resolved it, with the reasoning) — show it directly under the QP.
+        if case.conclusion:
+            lines.append(("h", "Answer"))
+            lines.append(("", case.conclusion))
 
         if case.has_votes:
             decs = case.voted_decisions
@@ -6423,8 +6428,8 @@ class _ScholarTextWindow:
             for oa in case.oral_arguments:
                 lines.append(("", oa.title, oa.url))
 
-        # The Oyez page carries the rest — full facts, the holding/reasoning,
-        # the audio player with synchronized transcript, advocate info.  (No
+        # The Oyez page carries the rest — full facts, the audio player with
+        # synchronized transcript, advocate info.  (No
         # Justia "read the opinion" link: the app is already showing the
         # opinion text, and Oyez's Justia URL is malformed for cases whose
         # U.S. Reports page isn't assigned yet.)
