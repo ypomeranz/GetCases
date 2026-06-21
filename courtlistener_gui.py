@@ -7303,8 +7303,11 @@ class _BriefPdfPane(_PdfPane):
     # --- text-layer extraction + citation detection ---------------------
 
     def _compute_highlights(self) -> None:
+        # Pass 1: read each page's text only.  Crucially we do NOT pull a box
+        # for every character here — that's tens of thousands of native calls
+        # on a real brief and would freeze the window while it opens.  The text
+        # alone is cheap and is all the detector needs.
         page_texts: list[str] = []
-        page_boxes: list[list] = []
         for i in range(len(self._doc)):
             page = self._doc[i]
             try:
@@ -7314,20 +7317,13 @@ class _BriefPdfPane(_PdfPane):
                     if n < 0:
                         n = 0
                     ptext = tp.get_text_range(0, n) if n else ""
-                    boxes: list = []
-                    for ci in range(min(n, len(ptext))):
-                        try:
-                            boxes.append(tp.get_charbox(ci))
-                        except Exception:
-                            boxes.append(None)
                 finally:
                     tp.close()
             except Exception:
-                ptext, boxes = "", []
+                ptext = ""
             finally:
                 page.close()
             page_texts.append(ptext)
-            page_boxes.append(boxes)
 
         sep = "\n"
         full = sep.join(page_texts)
@@ -7337,6 +7333,8 @@ class _BriefPdfPane(_PdfPane):
             starts.append(off)
             off += len(t) + len(sep)
 
+        # Detect across the whole document, then group the hits by page.
+        per_page: dict[int, list[tuple[int, int, tuple[str, str]]]] = {}
         for start, end, action in detect_brief_links(full):
             pi = self._page_of(start, starts, page_texts)
             if pi is None:
@@ -7345,10 +7343,33 @@ class _BriefPdfPane(_PdfPane):
             b = min(end - starts[pi], len(page_texts[pi]))
             if a < 0 or a >= len(page_texts[pi]):
                 continue
-            rects = _boxes_to_rects(page_boxes[pi], a, b)
-            if rects:
-                self._highlights.setdefault(pi, []).append((action, rects))
-                self._link_count += 1
+            per_page.setdefault(pi, []).append((a, b, action))
+
+        # Pass 2: pull character boxes for citation characters only — a few
+        # hundred per brief, not the whole text — so this stays fast.
+        for pi, spans in per_page.items():
+            page = self._doc[pi]
+            try:
+                tp = page.get_textpage()
+                try:
+                    for a, b, action in spans:
+                        boxes: list = []
+                        for ci in range(a, b):
+                            try:
+                                boxes.append(tp.get_charbox(ci))
+                            except Exception:
+                                boxes.append(None)
+                        rects = _boxes_to_rects(boxes, 0, len(boxes))
+                        if rects:
+                            self._highlights.setdefault(pi, []).append(
+                                (action, rects))
+                            self._link_count += 1
+                finally:
+                    tp.close()
+            except Exception:
+                pass
+            finally:
+                page.close()
 
     @staticmethod
     def _page_of(idx: int, starts: list[int], texts: list[str]):
@@ -7416,9 +7437,13 @@ class _BriefPdfPane(_PdfPane):
         ybot = y + self._margin + cy1
         return x0, ytop, x1, ybot
 
-    def _on_click(self, action) -> None:
+    def _on_click(self, action):
+        # Run the follow on a fresh main-loop turn (and swallow the canvas's
+        # own click handling) so opening the cited case never executes nested
+        # inside the canvas event dispatch.
         if self._follow_cb:
-            self._follow_cb(action)
+            self._canvas.after(0, lambda a=action: self._follow_cb(a))
+        return "break"
 
 
 def _boxes_to_rects(boxes: list, a: int, b: int) -> list:
