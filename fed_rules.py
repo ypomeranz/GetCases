@@ -33,7 +33,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 
-from us_code import infer_enum_level  # shared enumerator-indent engine
+from us_code import infer_enum_level, _enum_value  # shared enumerator engine
 
 # ---------------------------------------------------------------------------
 # Rule sets
@@ -522,7 +522,23 @@ def parse_rule_html(page_html: str) -> list[tuple[str, int, str]]:
             mlvl = _STAT_BODY_LEVEL_RE.search(attrs)
             if mlvl:
                 level = min(int(mlvl.group(1)), 6)
-                _sync_enum_stack(stack, level, enums, RULES_HIERARCHY)
+                # LII's em-class is normally authoritative, but it occasionally
+                # flattens a whole subtree to a single class — Rule 23(e) tags
+                # every nested item "statutory-body-1em", which would collapse
+                # (1)/(A)/(i) all to one indent.  Trust the class only when the
+                # leading enumerator is a valid token for that level's kind
+                # ((1)=digit, (A)=upper letter, (i)=lower roman); otherwise the
+                # class is wrong here, so infer the depth from the enumerator
+                # hierarchy as on a class-less page.
+                hk = RULES_HIERARCHY[min(level, len(RULES_HIERARCHY) - 1)]
+                if enums and not _enum_value(enums[0], hk):
+                    lvl = infer_enum_level(enums, stack, RULES_HIERARCHY)
+                    if lvl is not None:
+                        level = lvl
+                    else:
+                        _sync_enum_stack(stack, level, enums, RULES_HIERARCHY)
+                else:
+                    _sync_enum_stack(stack, level, enums, RULES_HIERARCHY)
             elif enums:
                 lvl = infer_enum_level(enums, stack, RULES_HIERARCHY)
                 level = lvl if lvl is not None else 0
@@ -688,5 +704,30 @@ if __name__ == "__main__":
     body_a1 = next(t for k, i, t in paras if (k, i) == ("body", 1))
     check("<i>" not in body_a1 and "Prohibited" in body_a1,
           "inline tags stripped")
+
+    # --- regression: LII flattens Rule 23(e)'s whole subtree to one em-class ---
+    # Every nested item is tagged "statutory-body-1em"; the parser must still
+    # nest (1) -> (A) -> (i) from the enumerators, while a correctly-classed 2em
+    # item is still trusted.
+    sample23 = (
+        '<html><head><title>x</title></head><body>'
+        '<h1 id="page-title">Rule 23. Class Actions</h1>'
+        '<article><div>'
+        '<p>(e) <b>Settlement.</b> The claims, issues, or defenses.</p>'
+        '<p class="statutory-body-1em">(1) Notice to the Class.</p>'
+        '<p class="statutory-body-1em">(A) Information parties must provide.</p>'
+        '<p class="statutory-body-1em">(B) Grounds for a decision.</p>'
+        '<p class="statutory-body-1em">(i) approve the proposal; and</p>'
+        '<p class="statutory-body-1em">(ii) certify the class.</p>'
+        '<p class="statutory-body-1em">(2) Approval of the Proposal.</p>'
+        '<p class="statutory-body-2em">(A) adequately represented;</p>'
+        '</div></article></body></html>'
+    )
+    p23 = parse_rule_html(sample23)
+    seq = [(re.match(r"\(([^)]+)\)", t).group(1), i)
+           for k, i, t in p23 if k == "body" and t.startswith("(")]
+    check(seq == [("e", 0), ("1", 1), ("A", 2), ("B", 2), ("i", 3),
+                  ("ii", 3), ("2", 1), ("A", 2)],
+          f"Rule 23(e) flat-1em subtree nested by enumerator: {seq!r}")
 
     raise SystemExit(1 if failed else 0)
