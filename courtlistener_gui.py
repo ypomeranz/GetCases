@@ -7146,35 +7146,30 @@ def _brief_action_category(kind: str) -> str:
 def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
                          action: tuple[str, str],
                          status=lambda _s: None) -> None:
-    """Open whatever a highlighted brief citation points at."""
-    kind = action[0]
+    """Open whatever a highlighted brief citation points at, reusing the exact
+    paths the rest of the app uses — so briefs behave like the opinion reader
+    and the Quick Look Up dialog rather than a parallel implementation:
+
+      * statutes / rules / regulations / Constitution → ``_open_statute_action``
+        (in-app viewer, or a browser link-out for link-only states),
+      * cases → ``CourtListenerGUI._try_open_citation`` (Google Scholar by
+        citation with a name retry, the static.case.law shortcut for Federal
+        Appendix scans, then the CourtListener text), with the pincite jump.
+    """
+    kind, value = action
     if kind in _STATUTE_SOURCES or kind in ("browse", "statpdf"):
         _open_statute_action(parent, action, status)
         return
-    if kind in ("cite", "url"):
-        _open_case_action(app, parent, action, status)
+    if kind != "cite":
+        status("Don't know how to open that citation.")
         return
-    status("Don't know how to open that citation.")
 
-
-def _open_case_action(app: "CourtListenerGUI", parent: tk.Misc,
-                      action: tuple[str, str],
-                      status=lambda _s: None) -> None:
-    """Fetch a cited case (Google Scholar, then CourtListener) and open it in a
-    _ScholarTextWindow, pin-jumping when the citation carried a pincite."""
-    kind, value = action
-    if kind == "url":
-        url_val, _, pin = value.partition("\tpin=")
-        cite = ""
-    else:  # "cite"
-        cite, _, pin = value.partition("@")
-        url_val = ""
-
-    def post(fn, *args) -> None:
-        try:
-            parent.after(0, fn, *args)
-        except tk.TclError:
-            pass
+    cite, _, pin = value.partition("@")
+    fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
+    client = app._get_client() if app._token_var.get().strip() else None
+    if fetcher is None and client is None:
+        status("Neither Google Scholar nor CourtListener is available.")
+        return
 
     def safe_status(s: str) -> None:
         try:
@@ -7182,105 +7177,17 @@ def _open_case_action(app: "CourtListenerGUI", parent: tk.Misc,
         except tk.TclError:
             pass
 
-    # Federal Appendix cases are scan-only: Google Scholar and CourtListener
-    # both mismatch them to the wrong case (and the Scholar fetch can hang on
-    # these), so open the static.case.law PDF straight from the citation —
-    # exactly as the citation-list / Quick Look Up dialogs do.
-    if kind == "cite" and _FED_APPX_RE.search(cite):
-        appx_url = _static_case_law_url(cite)
-        if appx_url:
-            safe_status(f"Opening {cite} (case.law)…")
-            _PdfWindow(parent, appx_url, cite, status)
-            return
-
-    fetcher = app._get_scholar()
-    if fetcher is None:
-        if cite:
-            _open_case_via_cl(app, parent, cite, pin, status)
-        else:
-            safe_status("Google Scholar is not available.")
-        return
-    safe_status(f"Fetching {cite or 'cited case'} from Google Scholar…")
+    safe_status(f"Opening {cite}…")
 
     def run() -> None:
+        ok = app._try_open_citation("", cite, pin, fetcher, client)
         try:
-            if kind == "url":
-                result = fetcher.fetch_by_url(url_val)
-            else:
-                result = fetcher.fetch_by_citation(cite)
-        except Exception:
-            result = None
-
-        def show() -> None:
-            if not result:
-                if cite:
-                    _open_case_via_cl(app, parent, cite, pin, status)
-                else:
-                    safe_status("Cited case not found (or blocked).")
-                return
-            url, html = result
-            safe_status("Cited case loaded.")
-            win = _ScholarTextWindow(parent, app, url, html, item=None)
-            if pin:
-                win.jump_to_cite_page(cite, pin)
-
-        post(show)
-
-    threading.Thread(target=run, daemon=True).start()
-
-
-def _open_case_via_cl(app: "CourtListenerGUI", parent: tk.Misc,
-                      cite: str, pin: str = "",
-                      status=lambda _s: None) -> None:
-    """Open a cited case via CourtListener (Scholar unavailable / missed)."""
-    client = app._get_client()
-
-    def post(fn, *args) -> None:
-        try:
-            parent.after(0, fn, *args)
+            parent.after(0, lambda: safe_status(
+                f"Opened {cite}." if ok else f"Not found: {cite}"))
         except tk.TclError:
             pass
 
-    if client is None:
-        try:
-            status("Neither Google Scholar nor CourtListener is available.")
-        except tk.TclError:
-            pass
-        return
-    try:
-        status(f"Fetching {cite} from CourtListener…")
-    except tk.TclError:
-        pass
-
-    def run() -> None:
-        try:
-            data = client.search(f'"{cite}"', type="o", page_size=1)
-            results = data.get("results") or []
-            if not results:
-                post(_set_status_safe, status, f"No match for {cite!r}.")
-                return
-            target = results[0]
-            parts, blocks, plain, cluster = _assemble_case_parts(client, target)
-
-            def show() -> None:
-                _set_status_safe(status, "Cited case loaded from CourtListener.")
-                _ScholarTextWindow(
-                    parent, app, "", "", item=target, cl_text=plain,
-                    cl_parts=parts, cl_blocks=blocks,
-                )
-
-            post(show)
-        except Exception as exc:
-            post(_set_status_safe, status, f"CourtListener: {exc}")
-
     threading.Thread(target=run, daemon=True).start()
-
-
-def _set_status_safe(status, msg: str) -> None:
-    try:
-        status(msg)
-    except tk.TclError:
-        pass
 
 
 # Highlight colours, keyed by category (see _brief_action_category).  The text
