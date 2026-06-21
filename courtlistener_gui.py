@@ -7182,6 +7182,12 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
         return
 
     cite, _, pin = value.partition("@")
+    if not prefetch_pdf:
+        # PDF brief view: build the case window entirely on the main thread —
+        # see _open_brief_case_main_thread for why.
+        _open_brief_case_main_thread(app, parent, cite, pin, status)
+        return
+
     fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
     client = app._get_client() if app._token_var.get().strip() else None
     if fetcher is None and client is None:
@@ -7206,6 +7212,104 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
             pass
 
     threading.Thread(target=run, daemon=True).start()
+
+
+def _open_brief_case_main_thread(app: "CourtListenerGUI", parent: tk.Misc,
+                                 cite: str, pin: str,
+                                 status=lambda _s: None) -> None:
+    """Open a cited case for the PDF brief viewer touching Tk on the MAIN
+    THREAD only.
+
+    The normal path fetches on a worker thread and then calls ``root.after``
+    *from that worker* to build the window.  Tkinter is not thread-safe, and
+    that cross-thread call deadlocks the app when the main thread is busy with
+    the live pdfium brief canvas (the docx/rtf text brief has no such canvas,
+    so it never hit this).  Here the worker only does the network fetch and
+    drops the result in a dict; a main-thread ``after`` poll builds the window.
+    """
+    def safe_status(s: str) -> None:
+        try:
+            status(s)
+        except tk.TclError:
+            pass
+
+    # Federal Appendix scans open straight to the static.case.law PDF.
+    if _FED_APPX_RE.search(cite):
+        url = _static_case_law_url(cite)
+        if url:
+            safe_status(f"Opening {cite} (case.law)…")
+            _PdfWindow(parent, url, cite, status)
+            return
+
+    fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
+    client = app._get_client() if app._token_var.get().strip() else None
+    if fetcher is None and client is None:
+        safe_status("Neither Google Scholar nor CourtListener is available.")
+        return
+    safe_status(f"Opening {cite}…")
+
+    holder: dict = {}
+
+    def worker() -> None:
+        out: dict = {}
+        try:
+            if fetcher is not None:
+                out["scholar"] = fetcher.fetch_by_citation(cite)
+        except Exception:
+            out["scholar"] = None
+        if not out.get("scholar") and client is not None:
+            try:
+                data = client.search(f'"{cite}"', type="o", page_size=1)
+                results = data.get("results") or []
+                if results:
+                    target = results[0]
+                    parts, blocks, plain, _cluster = _assemble_case_parts(
+                        client, target)
+                    if parts or plain:
+                        out["cl"] = (target, parts, blocks, plain)
+            except Exception:
+                pass
+        holder["result"] = out
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def build() -> None:
+        if "result" not in holder:
+            try:
+                parent.after(150, build)
+            except tk.TclError:
+                pass
+            return
+        out = holder["result"]
+        scholar = out.get("scholar")
+        if scholar:
+            url, html = scholar
+            try:
+                w = _ScholarTextWindow(app.root, app, url, html, item=None,
+                                       prefetch_pdf=False)
+                if pin:
+                    w.jump_to_cite_page(cite, pin)
+                safe_status(f"Opened {cite}.")
+            except tk.TclError:
+                pass
+            return
+        cl = out.get("cl")
+        if cl:
+            target, parts, blocks, plain = cl
+            try:
+                _ScholarTextWindow(app.root, app, "", "", item=target,
+                                   cl_text=plain, cl_parts=parts,
+                                   cl_blocks=blocks, prefetch_pdf=False)
+                safe_status(f"Opened {cite}.")
+            except tk.TclError:
+                pass
+            return
+        safe_status(f"Not found: {cite}")
+
+    try:
+        parent.after(150, build)
+    except tk.TclError:
+        pass
 
 
 # Highlight colours, keyed by category (see _brief_action_category).  The text
