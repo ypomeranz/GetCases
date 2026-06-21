@@ -4,7 +4,14 @@
 requests
 beautifulsoup4
 
-# In-app PDF viewer (View PDF button in the opinion window).  Optional —
-# without these the app still runs and offers to open the PDF in a browser.
+# In-app PDF viewer (View PDF button in the opinion window, and the
+# "Open Brief…" PDF viewer that highlights citations).  Optional — without
+# these the app still runs and offers to open the PDF in a browser.
 pypdfium2
 Pillow
+
+# "Open Brief…" reads .docx and .rtf with the standard library (no extra
+# package needed).  Legacy .doc files are read via an external converter when
+# one is installed — any of `antiword`, `catdoc`, or LibreOffice (`soffice`) —
+# otherwise a built-in best-effort text scan is used.  These are system tools,
+# not pip packages.

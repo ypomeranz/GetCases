@@ -111,6 +111,17 @@ import fed_rules
 import state_statutes
 import statutes_at_large
 import us_code
+import brief_reader
+from citations import (
+    PINCITE_AFTER_RE as _PINCITE_AFTER_RE,
+    TEXT_CITE_RE as _TEXT_CITE_RE,
+    SHORT_CITE_RE as _SHORT_CITE_RE,
+    ID_CITE_RE as _ID_CITE_RE,
+    norm_reporter as _norm_reporter,
+    build_short_cite_index as _build_short_cite_index,
+    cite_target_from_text as _cite_target_from_text,
+    detect_links as detect_brief_links,
+)
 from court_catalog import (
     CATALOG as _COURT_CATALOG,
     COURT_BLUEBOOK as _COURT_BLUEBOOK,
@@ -945,8 +956,15 @@ class CourtListenerGUI:
             label="Quick Look Up (case or statute)…", accelerator="Ctrl+S",
             command=self._show_quick_lookup,
         )
+        brief_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Brief", menu=brief_menu)
+        brief_menu.add_command(
+            label="Open Brief (highlight citations)…", accelerator="Ctrl+B",
+            command=self._open_brief,
+        )
         self.root.bind("<Control-l>", lambda _e: self._show_statute_lookup())
         self.root.bind("<Control-s>", lambda _e: self._show_quick_lookup())
+        self.root.bind("<Control-b>", lambda _e: self._open_brief())
 
         # --- Search frame ---
         search_frame = ttk.LabelFrame(self.root, text="Search", padding=6)
@@ -2202,6 +2220,71 @@ class CourtListenerGUI:
         entry.bind("<Return>", go)
         frame.columnconfigure(1, weight=1)
 
+    # ------------------------------------------------------------------
+    # Open Brief — load a brief and highlight every citation in it
+    # ------------------------------------------------------------------
+
+    def _open_brief(self) -> None:
+        """Ctrl+B / Brief menu: pick a brief and open it with its citations
+        highlighted and clickable.  Word/RTF files render as text; a PDF with
+        selectable text renders as the PDF with citations highlighted in place.
+        """
+        path = filedialog.askopenfilename(
+            title="Open a brief",
+            parent=self.root,
+            filetypes=[
+                ("Briefs", "*.pdf *.docx *.doc *.rtf *.txt"),
+                ("PDF", "*.pdf"),
+                ("Word document", "*.docx *.doc"),
+                ("Rich Text", "*.rtf"),
+                ("Text", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".pdf":
+            self._open_brief_pdf(path)
+        else:
+            self._open_brief_text(path)
+
+    def _open_brief_text(self, path: str) -> None:
+        try:
+            text = brief_reader.extract_text(path)
+        except Exception as exc:
+            messagebox.showerror(
+                "Open Brief", f"Could not read this file:\n\n{exc}",
+                parent=self.root,
+            )
+            return
+        if not text.strip():
+            messagebox.showwarning(
+                "Open Brief",
+                "No text was found in this file.  If it's a scanned document, "
+                "open it as a PDF instead.",
+                parent=self.root,
+            )
+            return
+        _BriefTextWindow(self.root, self, os.path.basename(path), text)
+
+    def _open_brief_pdf(self, path: str) -> None:
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            messagebox.showerror(
+                "Open Brief", f"Could not read this file:\n\n{exc}",
+                parent=self.root,
+            )
+            return
+        if not data.startswith(b"%PDF"):
+            messagebox.showerror(
+                "Open Brief", "That file isn't a PDF.", parent=self.root,
+            )
+            return
+        _BriefPdfWindow(self.root, self, os.path.basename(path), data)
+
     def _show_settings_dialog(self) -> None:
         dlg = tk.Toplevel(self.root)
         dlg.title("Settings")
@@ -3308,13 +3391,6 @@ class _CourtPickerDialog:
 
 _OP_ID_RE = re.compile(r"/opinions/(\d+)/?")
 
-# A pinpoint page following a case citation: ", 171" or ", 171-72" — but
-# not the volume of a parallel citation (", 510 A.2d 562"), recognized by
-# the capital letter that follows the number.
-_PINCITE_AFTER_RE = re.compile(
-    r",\s*(\d{1,5})(?:\s*[-–—]\s*\d{1,5})?(?!\d|\s*[A-Z])"
-)
-
 
 def _extract_opinion_id(url: str) -> Optional[int]:
     """Parse an opinion ID out of a CourtListener opinions URL."""
@@ -3325,75 +3401,10 @@ def _extract_opinion_id(url: str) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # RTF generation + rich clipboard (used by the Scholar text window)
 # ---------------------------------------------------------------------------
-
-# Citations recognized inside opinion text (made clickable → Scholar lookup).
-# Pattern: volume, reporter abbreviation, page.
-_REPORTER_ALT = (
-    r"(?:U\.\s?S\.(?!\s?C)|S\.\s?Ct\.|L\.\s?Ed\.(?:\s?2d)?|"
-    r"F\.\s?Supp\.(?:\s?[23]d)?|F\.\s?(?:2d|3d|4th)|F\.\s?App[’']x|Fed\.\s?Appx\.|B\.R\.|"
-    r"A\.(?:2d|3d)?|P\.(?:2d|3d)?|N\.E\.(?:2d|3d)?|N\.W\.(?:2d)?|S\.E\.(?:2d)?|"
-    r"S\.W\.(?:2d|3d)?|So\.(?:\s?[23]d)?|Cal\.\s?Rptr\.(?:\s?[23]d)?|"
-    r"N\.Y\.S\.(?:2d|3d)?|Ohio\s?St\.\s?(?:2d|3d)?|Ill\.\s?2d|Wis\.\s?2d|Wn\.\s?(?:2d|App\.))"
-)
-_TEXT_CITE_RE = re.compile(r"\b\d{1,4}\s+" + _REPORTER_ALT + r"\s+\d{1,5}\b")
-
-# Capturing form (volume, reporter, page) — used to index every full citation
-# in an opinion so short forms can be resolved back to it.
-_CITE_CAPTURE_RE = re.compile(
-    r"\b(\d{1,4})\s+(" + _REPORTER_ALT + r")\s+(\d{1,5})\b")
-
-# Short-form citation: "Roe, 410 U.S., at 152" → volume, reporter, pin page.
-# The case name in front is matched separately; here we link the cite itself.
-_SHORT_CITE_RE = re.compile(
-    r"\b(\d{1,4})\s+(" + _REPORTER_ALT + r")\s*,?\s+at\s+(\d{1,5})\b")
-
-# "Id." short form — refers to the immediately preceding citation; group 1 is
-# the optional pin page ("Id. at 152").  ("Ibid." is deliberately not traced —
-# it usually points at a non-case source.)
-_ID_CITE_RE = re.compile(r"\b[Ii]d\.(?:\s*,?\s*at\s+(\d{1,5}))?")
-
-
-def _norm_reporter(rep: str) -> str:
-    """Reporter key for matching, ignoring spacing/case ('U. S.' == 'U.S.')."""
-    return re.sub(r"\s+", "", rep or "").lower()
-
-
-def _build_short_cite_index(text: str) -> dict[tuple[str, str], list[int]]:
-    """Map (volume, reporter) → sorted first-pages of every full citation in
-    `text`, so a short form ('410 U.S. at 152') can be resolved to the case's
-    first page (and thence opened and pin-jumped)."""
-    idx: dict[tuple[str, str], set] = {}
-    for m in _CITE_CAPTURE_RE.finditer(text or ""):
-        idx.setdefault((m.group(1), _norm_reporter(m.group(2))),
-                       set()).add(int(m.group(3)))
-    return {k: sorted(v) for k, v in idx.items()}
-
-
-def _cite_target_from_text(
-    text: str, index: dict[tuple[str, str], list[int]]
-) -> tuple[str, str]:
-    """(base cite, pin) named in `text`.  The base is "vol reporter firstpage"
-    whether the cite is written in full ("8 F.4th 557, 565") or short
-    ("8 F.4th at 565", resolved to its first page via `index`); the pin is the
-    pincite/short page, or "".  Empty base when no reporter cite is present."""
-    cm = _CITE_CAPTURE_RE.search(text)
-    if cm:
-        base = re.sub(r"\s+", " ", cm.group(0)).replace("U. S.", "U.S.")
-        pm = _PINCITE_AFTER_RE.match(text, cm.end())
-        return base, (pm.group(1) if pm else "")
-    sm = _SHORT_CITE_RE.search(text)
-    if sm:
-        rep = re.sub(r"\s+", " ", sm.group(2)).strip().replace("U. S.", "U.S.")
-        pin = int(sm.group(3))
-        pages = index.get((sm.group(1), _norm_reporter(sm.group(2))))
-        if pages:
-            below = [p for p in pages if p <= pin]
-            first = max(below) if below else pages[0]
-        else:
-            first = pin  # no full cite indexed — best effort
-        return f"{sm.group(1)} {rep} {first}", str(pin)
-    return "", ""
-
+# The reporter-citation regexes (case cites, short forms, ``Id.``) and the
+# short-cite index live in ``citations`` so the brief viewer can reuse them
+# without pulling in tkinter; they're imported above under their old private
+# names (``_TEXT_CITE_RE`` etc.).
 
 # A citation line in the Scholar header: each parallel cite sits on its own
 # centered line, e.g. "306 Md. 556 (1986)" / "510 A.2d 562" / "87 F.4th 563 (2023)"
@@ -7114,6 +7125,511 @@ def _open_statute_pdf(parent: tk.Misc, url: str,
     cite = _stat_cite_from_url(url)
     status(f"Opening {cite}…")
     _PdfWindow(parent, url, cite, status)
+
+
+# ---------------------------------------------------------------------------
+# Open Brief — follow a highlighted citation to its source
+# ---------------------------------------------------------------------------
+# These mirror _ScholarTextWindow._follow_link but stand alone so the brief
+# viewer (text or PDF) can open the same statute/regulation/rule/constitution
+# viewers and the same case reader.
+
+#: Categories used to colour-code highlights by what the citation points at.
+def _brief_action_category(kind: str) -> str:
+    if kind in ("cite", "url"):
+        return "case"
+    if kind == "const":
+        return "const"
+    return "statute"
+
+
+def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
+                         action: tuple[str, str],
+                         status=lambda _s: None) -> None:
+    """Open whatever a highlighted brief citation points at."""
+    kind = action[0]
+    if kind in _STATUTE_SOURCES or kind in ("browse", "statpdf"):
+        _open_statute_action(parent, action, status)
+        return
+    if kind in ("cite", "url"):
+        _open_case_action(app, parent, action, status)
+        return
+    status("Don't know how to open that citation.")
+
+
+def _open_case_action(app: "CourtListenerGUI", parent: tk.Misc,
+                      action: tuple[str, str],
+                      status=lambda _s: None) -> None:
+    """Fetch a cited case (Google Scholar, then CourtListener) and open it in a
+    _ScholarTextWindow, pin-jumping when the citation carried a pincite."""
+    kind, value = action
+    if kind == "url":
+        url_val, _, pin = value.partition("\tpin=")
+        cite = ""
+    else:  # "cite"
+        cite, _, pin = value.partition("@")
+        url_val = ""
+
+    def post(fn, *args) -> None:
+        try:
+            parent.after(0, fn, *args)
+        except tk.TclError:
+            pass
+
+    def safe_status(s: str) -> None:
+        try:
+            status(s)
+        except tk.TclError:
+            pass
+
+    fetcher = app._get_scholar()
+    if fetcher is None:
+        if cite:
+            _open_case_via_cl(app, parent, cite, pin, status)
+        else:
+            safe_status("Google Scholar is not available.")
+        return
+    safe_status(f"Fetching {cite or 'cited case'} from Google Scholar…")
+
+    def run() -> None:
+        try:
+            if kind == "url":
+                result = fetcher.fetch_by_url(url_val)
+            else:
+                result = fetcher.fetch_by_citation(cite)
+        except Exception:
+            result = None
+
+        def show() -> None:
+            if not result:
+                if cite:
+                    _open_case_via_cl(app, parent, cite, pin, status)
+                else:
+                    safe_status("Cited case not found (or blocked).")
+                return
+            url, html = result
+            safe_status("Cited case loaded.")
+            win = _ScholarTextWindow(parent, app, url, html, item=None)
+            if pin:
+                win.jump_to_cite_page(cite, pin)
+
+        post(show)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _open_case_via_cl(app: "CourtListenerGUI", parent: tk.Misc,
+                      cite: str, pin: str = "",
+                      status=lambda _s: None) -> None:
+    """Open a cited case via CourtListener (Scholar unavailable / missed)."""
+    client = app._get_client()
+
+    def post(fn, *args) -> None:
+        try:
+            parent.after(0, fn, *args)
+        except tk.TclError:
+            pass
+
+    if client is None:
+        try:
+            status("Neither Google Scholar nor CourtListener is available.")
+        except tk.TclError:
+            pass
+        return
+    try:
+        status(f"Fetching {cite} from CourtListener…")
+    except tk.TclError:
+        pass
+
+    def run() -> None:
+        try:
+            data = client.search(f'"{cite}"', type="o", page_size=1)
+            results = data.get("results") or []
+            if not results:
+                post(_set_status_safe, status, f"No match for {cite!r}.")
+                return
+            target = results[0]
+            parts, blocks, plain, cluster = _assemble_case_parts(client, target)
+
+            def show() -> None:
+                _set_status_safe(status, "Cited case loaded from CourtListener.")
+                _ScholarTextWindow(
+                    parent, app, "", "", item=target, cl_text=plain,
+                    cl_parts=parts, cl_blocks=blocks,
+                )
+
+            post(show)
+        except Exception as exc:
+            post(_set_status_safe, status, f"CourtListener: {exc}")
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _set_status_safe(status, msg: str) -> None:
+    try:
+        status(msg)
+    except tk.TclError:
+        pass
+
+
+# Highlight colours, keyed by category (see _brief_action_category).  The text
+# viewer uses the pale tints as a highlighter background; the PDF viewer uses
+# the strong colour stippled over the page so the underlying text stays legible.
+_BRIEF_TINTS = {"case": "#cfe2ff", "statute": "#d6f0d6", "const": "#fff3bf"}
+_BRIEF_INKS = {"case": "#1a56b0", "statute": "#1f7a3d", "const": "#9a6b00"}
+
+
+class _BriefTextWindow:
+    """Renders a Word/RTF brief's text with every detected citation highlighted
+    (by category) and clickable — cases open in the Scholar reader, statutes /
+    rules / regulations / the Constitution in the statute viewer."""
+
+    def __init__(self, parent: tk.Misc, app: "CourtListenerGUI",
+                 name: str, text: str) -> None:
+        self._app = app
+        self._src = text
+        self._link_actions: dict[str, tuple[str, str]] = {}
+        self._link_n = 0
+
+        self._win = tk.Toplevel(parent)
+        self._win.title(f"Brief — {name}")
+        self._win.geometry("860x720")
+        self._win.minsize(500, 320)
+        self._build_ui()
+        self._render()
+
+    def _build_ui(self) -> None:
+        win = self._win
+        legend = ttk.Frame(win)
+        legend.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(legend, text="Citations are highlighted and clickable:").pack(
+            side="left")
+        for cat, label in (("case", "Cases"), ("statute", "Statutes / Rules"),
+                           ("const", "Constitution")):
+            tk.Label(legend, text=f" {label} ", background=_BRIEF_TINTS[cat],
+                     foreground="#222222").pack(side="left", padx=(8, 0))
+
+        text_frame = ttk.Frame(win)
+        text_frame.pack(fill="both", expand=True, padx=8, pady=6)
+        base = tkfont.Font(family="Georgia", size=_OPINION_FONT_PT)
+        txt = tk.Text(text_frame, wrap="word", font=base, padx=14, pady=10)
+        self._text = txt
+        vsb = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        for cat, color in _BRIEF_TINTS.items():
+            txt.tag_configure(cat, background=color)
+        txt.tag_configure("brieflink", underline=False)
+        txt.tag_bind("brieflink", "<Enter>",
+                     lambda _e: txt.config(cursor="hand2"))
+        txt.tag_bind("brieflink", "<Leave>", lambda _e: txt.config(cursor=""))
+        self._finder = _TextFinder(win, txt, text_frame)
+
+        bottom = ttk.Frame(win)
+        bottom.pack(fill="x", padx=8, pady=(0, 8))
+        self._status_var = tk.StringVar(value="")
+        ttk.Label(bottom, textvariable=self._status_var,
+                  foreground="gray").pack(side="left", fill="x", expand=True)
+
+    def _render(self) -> None:
+        txt = self._text
+        src = self._src
+        links = detect_brief_links(src)
+        pos = 0
+        for start, end, action in links:
+            if start < pos:
+                continue
+            if start > pos:
+                txt.insert("end", src[pos:start])
+            self._link_n += 1
+            tag = f"lnk{self._link_n}"
+            self._link_actions[tag] = action
+            cat = _brief_action_category(action[0])
+            txt.insert("end", src[start:end], (cat, "brieflink", tag))
+            txt.tag_bind(tag, "<Button-1>",
+                         lambda _e, t=tag: self._follow(t))
+            pos = end
+        if pos < len(src):
+            txt.insert("end", src[pos:])
+        txt.config(state="disabled")
+        n = len(links)
+        self._status_var.set(
+            f"{n} citation{'' if n == 1 else 's'} found — click any "
+            "highlight to open it." if n else "No citations detected."
+        )
+
+    def _follow(self, tag: str):
+        action = self._link_actions.get(tag)
+        if action:
+            _follow_brief_action(self._app, self._win, action,
+                                 self._status_var.set)
+        return "break"
+
+
+class _BriefPdfPane(_PdfPane):
+    """A _PdfPane that highlights detected citations in place and makes them
+    clickable.  The PDF's own text layer is read once to locate each citation's
+    character boxes (in PDF points); the boxes are mapped to canvas pixels every
+    time a page renders, so the highlights track zooming and scrolling."""
+
+    def __init__(self, parent: tk.Misc, pdf_bytes: bytes,
+                 follow=None, width: int = 800) -> None:
+        super().__init__(parent, pdf_bytes, width=width)
+        self._follow_cb = follow
+        # page index → list of (action, [ (l, b, r, t) in PDF points ])
+        self._highlights: dict[int, list] = {}
+        self._link_count = 0
+        self._compute_highlights()
+
+    # --- text-layer extraction + citation detection ---------------------
+
+    def _compute_highlights(self) -> None:
+        page_texts: list[str] = []
+        page_boxes: list[list] = []
+        for i in range(len(self._doc)):
+            page = self._doc[i]
+            try:
+                tp = page.get_textpage()
+                try:
+                    n = tp.count_chars()
+                    if n < 0:
+                        n = 0
+                    ptext = tp.get_text_range(0, n) if n else ""
+                    boxes: list = []
+                    for ci in range(min(n, len(ptext))):
+                        try:
+                            boxes.append(tp.get_charbox(ci))
+                        except Exception:
+                            boxes.append(None)
+                finally:
+                    tp.close()
+            except Exception:
+                ptext, boxes = "", []
+            finally:
+                page.close()
+            page_texts.append(ptext)
+            page_boxes.append(boxes)
+
+        sep = "\n"
+        full = sep.join(page_texts)
+        starts: list[int] = []
+        off = 0
+        for t in page_texts:
+            starts.append(off)
+            off += len(t) + len(sep)
+
+        for start, end, action in detect_brief_links(full):
+            pi = self._page_of(start, starts, page_texts)
+            if pi is None:
+                continue
+            a = start - starts[pi]
+            b = min(end - starts[pi], len(page_texts[pi]))
+            if a < 0 or a >= len(page_texts[pi]):
+                continue
+            rects = _boxes_to_rects(page_boxes[pi], a, b)
+            if rects:
+                self._highlights.setdefault(pi, []).append((action, rects))
+                self._link_count += 1
+
+    @staticmethod
+    def _page_of(idx: int, starts: list[int], texts: list[str]):
+        for pi, s in enumerate(starts):
+            if s <= idx < s + len(texts[pi]):
+                return pi
+        return None
+
+    def link_count(self) -> int:
+        return self._link_count
+
+    # --- drawing --------------------------------------------------------
+
+    def _render_visible(self) -> None:
+        super()._render_visible()
+        # Redraw highlights for whatever pages are currently rendered so they
+        # stay aligned (and on top) after any scroll / zoom / resize.
+        self._canvas.delete("highlight")
+        for i in list(self._img_ids.keys()):
+            self._draw_highlights(i)
+
+    def _draw_highlights(self, i: int) -> None:
+        for action, rects in self._highlights.get(i, []):
+            cat = _brief_action_category(action[0])
+            color = _BRIEF_INKS.get(cat, "#1a56b0")
+            for rect in rects:
+                coords = self._page_rect_to_canvas(i, rect)
+                if coords is None:
+                    continue
+                x0, y0, x1, y1 = coords
+                rid = self._canvas.create_rectangle(
+                    x0, y0, x1, y1, fill=color, outline=color,
+                    stipple="gray25", width=0, tags=("highlight",),
+                )
+                self._canvas.tag_bind(
+                    rid, "<Button-1>",
+                    lambda _e, a=action: self._on_click(a))
+                self._canvas.tag_bind(
+                    rid, "<Enter>",
+                    lambda _e: self._canvas.config(cursor="hand2"))
+                self._canvas.tag_bind(
+                    rid, "<Leave>",
+                    lambda _e: self._canvas.config(cursor=""))
+
+    def _page_rect_to_canvas(self, i: int, rect):
+        """Map a rectangle in PDF points (origin bottom-left) on page i to
+        canvas pixels, accounting for the page's content-box crop, render scale,
+        white margin and centred left offset."""
+        try:
+            y, slot_h, frac, scale = self._slots[i]
+        except (IndexError, ValueError):
+            return None
+        w_pt, h_pt, _ = self._meta[i]
+        fl, ft, fr, fb = frac
+        W = w_pt * scale
+        H = h_pt * scale
+        l, b, r, t = rect
+        ix0, ix1 = l * scale, r * scale
+        iy0, iy1 = H - t * scale, H - b * scale   # flip y (PDF origin is bottom)
+        cx0, cx1 = ix0 - fl * W, ix1 - fl * W
+        cy0, cy1 = iy0 - ft * H, iy1 - ft * H
+        x0 = self._page_x + self._margin + cx0
+        x1 = self._page_x + self._margin + cx1
+        ytop = y + self._margin + cy0
+        ybot = y + self._margin + cy1
+        return x0, ytop, x1, ybot
+
+    def _on_click(self, action) -> None:
+        if self._follow_cb:
+            self._follow_cb(action)
+
+
+def _boxes_to_rects(boxes: list, a: int, b: int) -> list:
+    """Group the character boxes for indices [a, b) into one rectangle per
+    visual line (a citation that wraps spans two), each (l, b, r, t) in points."""
+    rects: list = []
+    cur = None
+    for box in boxes[a:b]:
+        if not box:
+            continue
+        l, bm, r, t = box[0], box[1], box[2], box[3]
+        if r <= l and t <= bm:
+            continue  # zero-area (whitespace) box
+        if cur is None:
+            cur = [l, bm, r, t]
+            continue
+        cl, cb, cr, ct = cur
+        line_h = max(1e-6, ct - cb)
+        overlap = min(ct, t) - max(cb, bm)
+        if overlap > 0.3 * line_h:           # same line — extend the rect
+            cur = [min(cl, l), min(cb, bm), max(cr, r), max(ct, t)]
+        else:                                 # new line — flush and start over
+            rects.append(tuple(cur))
+            cur = [l, bm, r, t]
+    if cur is not None:
+        rects.append(tuple(cur))
+    return rects
+
+
+class _BriefPdfWindow:
+    """A standalone in-app PDF viewer that highlights every citation it finds in
+    the PDF's text layer and makes each one clickable.  Falls back to opening
+    the PDF in the browser when the PDF libraries are missing."""
+
+    def __init__(self, parent: tk.Misc, app: "CourtListenerGUI",
+                 name: str, pdf_bytes: bytes) -> None:
+        self._app = app
+        self._name = name
+        self._bytes = pdf_bytes
+        self._pane: Optional[_BriefPdfPane] = None
+
+        self._win = tk.Toplevel(parent)
+        self._win.title(f"Brief — {name}")
+        self._win.geometry("820x900")
+        self._win.minsize(500, 320)
+
+        legend = ttk.Frame(self._win)
+        legend.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(legend, text="Highlighted citations are clickable:").pack(
+            side="left")
+        for cat, label in (("case", "Cases"), ("statute", "Statutes / Rules"),
+                           ("const", "Constitution")):
+            tk.Label(legend, text="  ", background=_BRIEF_INKS[cat]).pack(
+                side="left", padx=(8, 2))
+            ttk.Label(legend, text=label).pack(side="left")
+
+        btns = ttk.Frame(self._win)
+        btns.pack(fill="x", side="bottom", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="−", width=3,
+                   command=lambda: self._zoom(-1)).pack(side="left")
+        ttk.Button(btns, text="+", width=3,
+                   command=lambda: self._zoom(+1)).pack(side="left", padx=(2, 8))
+        self._status_var = tk.StringVar(value="Loading PDF…")
+        ttk.Label(btns, textvariable=self._status_var,
+                  foreground="gray").pack(side="left", fill="x", expand=True)
+
+        self._body = ttk.Frame(self._win)
+        self._body.pack(fill="both", expand=True)
+
+        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            self._win.bind(seq, lambda _e: self._zoom(+1))
+        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
+            self._win.bind(seq, lambda _e: self._zoom(-1))
+        self._win.bind("<Control-0>", lambda _e: self._zoom(0))
+
+        self._build_pane()
+
+    def _build_pane(self) -> None:
+        try:
+            import pypdfium2  # noqa: F401
+            from PIL import ImageTk  # noqa: F401
+        except ImportError:
+            if messagebox.askyesno(
+                "PDF viewer not installed",
+                "Viewing PDFs inside the app needs two Python packages:\n\n"
+                "    pip install pypdfium2 Pillow\n\n"
+                "Open the PDF in your web browser instead?",
+                parent=self._win,
+            ):
+                self._open_in_browser()
+            self._win.destroy()
+            return
+        try:
+            pane = _BriefPdfPane(self._body, self._bytes,
+                                 follow=self._follow, width=760)
+        except Exception as exc:  # pragma: no cover - render/lib failure
+            self._status_var.set(f"PDF: {exc}")
+            messagebox.showerror("Open Brief", str(exc), parent=self._win)
+            self._win.destroy()
+            return
+        pane.pack(fill="both", expand=True, padx=8, pady=4)
+        self._pane = pane
+        n = pane.link_count()
+        if n:
+            self._status_var.set(
+                f"{n} citation{'' if n == 1 else 's'} highlighted — "
+                "click any to open it.")
+        else:
+            self._status_var.set(
+                "No citations detected.  If the page is a scan with no text "
+                "layer, citations can't be found.")
+
+    def _open_in_browser(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".pdf")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(self._bytes)
+            webbrowser.open("file://" + path)
+        except Exception:
+            pass
+
+    def _follow(self, action) -> None:
+        _follow_brief_action(self._app, self._win, action,
+                             self._status_var.set)
+
+    def _zoom(self, delta: int) -> None:
+        if self._pane is not None:
+            self._pane.zoom(delta)
+            self._status_var.set(f"Zoom: {self._pane.zoom_percent()}%")
 
 
 def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:
