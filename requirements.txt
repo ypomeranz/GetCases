@@ -4,9 +4,10 @@
 requests
 beautifulsoup4
 
-# In-app PDF viewer (View PDF button in the opinion window, and the
-# "Open Brief…" PDF viewer that highlights citations).  Optional — without
-# these the app still runs and offers to open the PDF in a browser.
+# In-app PDF viewer (View PDF button in the opinion window) and PDF-brief text
+# extraction ("Open Brief…" reads a PDF's text layer via pypdfium2).  Optional —
+# without these the app still runs; the opinion viewer offers the browser and
+# PDF briefs report that the text layer can't be read.
 pypdfium2
 Pillow
 

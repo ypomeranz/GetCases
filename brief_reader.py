@@ -31,7 +31,7 @@ from xml.etree import ElementTree as ET
 
 __all__ = ["extract_text", "SUPPORTED_EXTS"]
 
-SUPPORTED_EXTS = (".docx", ".rtf", ".doc", ".txt")
+SUPPORTED_EXTS = (".pdf", ".docx", ".rtf", ".doc", ".txt")
 
 
 def extract_text(path: str) -> str:
@@ -41,6 +41,8 @@ def extract_text(path: str) -> str:
     (e.g. a bad zip) when a known type can't be read.
     """
     ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        return _pdf_text(path)
     if ext == ".docx":
         return _docx_text(path)
     if ext == ".rtf":
@@ -54,8 +56,56 @@ def extract_text(path: str) -> str:
             return fh.read().decode("utf-8", "replace")
     raise ValueError(
         f"Unsupported brief format {ext!r}. "
-        "Use a .docx, .rtf, .doc or .pdf file."
+        "Use a .pdf, .docx, .rtf, .doc or .txt file."
     )
+
+
+# ---------------------------------------------------------------------------
+# .pdf  (text layer via pypdfium2; the visual PDF is no longer shown — the
+# extracted text is displayed in the same reader as Word/RTF briefs)
+# ---------------------------------------------------------------------------
+
+def _pdf_text(path: str) -> str:
+    """Extract a PDF's text layer with pypdfium2, page by page, then clean it
+    up for display: join hyphenated line-breaks and trim runaway blank lines
+    while keeping paragraph structure.  Citations that wrap across a line are
+    handled by the detector (its patterns tolerate the embedded newline), so
+    line breaks are otherwise preserved to keep the brief's formatting."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise ValueError(
+            "Reading PDF briefs needs the 'pypdfium2' package.\n"
+            "Install it with:  pip install pypdfium2"
+        ) from exc
+
+    doc = pdfium.PdfDocument(path)
+    pages: list[str] = []
+    try:
+        for i in range(len(doc)):
+            page = doc[i]
+            try:
+                tp = page.get_textpage()
+                try:
+                    pages.append(tp.get_text_range())
+                finally:
+                    tp.close()
+            except Exception:
+                pages.append("")
+            finally:
+                page.close()
+    finally:
+        doc.close()
+    return _clean_pdf_text("\n\n".join(pages))
+
+
+def _clean_pdf_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # De-hyphenate words split across a line break ("evi-\ndence" → "evidence").
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    # Collapse runs of blank lines (page joins, sparse layouts) to one gap.
+    text = re.sub(r"\n[ \t]*\n[ \t]*(\n[ \t]*)+", "\n\n", text)
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +355,15 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     import tempfile
 
     failures = 0
+
+    # --- .pdf text cleanup (no pypdfium2 needed for this part) ---
+    cleaned = _clean_pdf_text("The evi-\ndence in 251 F.3d\n612 was clear.\n\n\n\nNext para.")
+    if "evidence" not in cleaned:
+        print("PDF de-hyphenation FAIL:", repr(cleaned)); failures += 1
+    if "251 F.3d\n612" not in cleaned:
+        print("PDF line break not preserved:", repr(cleaned)); failures += 1
+    if "\n\n\n" in cleaned:
+        print("PDF blank-line collapse FAIL:", repr(cleaned)); failures += 1
 
     # --- .rtf ---
     rtf = (

@@ -2232,9 +2232,9 @@ class CourtListenerGUI:
 
     def _open_brief(self) -> None:
         """Ctrl+B / Brief menu: pick a brief and open it with its citations
-        highlighted and clickable.  Word/RTF files render as text; a PDF with
-        selectable text renders as the PDF with citations highlighted in place.
-        """
+        highlighted and clickable.  PDF, Word, RTF and text briefs are all read
+        to text and shown in the same reader (a PDF's text layer is extracted;
+        scanned PDFs with no text layer have nothing to detect)."""
         path = filedialog.askopenfilename(
             title="Open a brief",
             parent=self.root,
@@ -2249,11 +2249,7 @@ class CourtListenerGUI:
         )
         if not path:
             return
-        ext = os.path.splitext(path)[1].lower()
-        if ext == ".pdf":
-            self._open_brief_pdf(path)
-        else:
-            self._open_brief_text(path)
+        self._open_brief_text(path)
 
     def _open_brief_text(self, path: str) -> None:
         try:
@@ -2267,29 +2263,12 @@ class CourtListenerGUI:
         if not text.strip():
             messagebox.showwarning(
                 "Open Brief",
-                "No text was found in this file.  If it's a scanned document, "
-                "open it as a PDF instead.",
+                "No selectable text was found in this file.  If it's a scanned "
+                "document (images only), its citations can't be detected.",
                 parent=self.root,
             )
             return
         _BriefTextWindow(self.root, self, os.path.basename(path), text)
-
-    def _open_brief_pdf(self, path: str) -> None:
-        try:
-            with open(path, "rb") as fh:
-                data = fh.read()
-        except OSError as exc:
-            messagebox.showerror(
-                "Open Brief", f"Could not read this file:\n\n{exc}",
-                parent=self.root,
-            )
-            return
-        if not data.startswith(b"%PDF"):
-            messagebox.showerror(
-                "Open Brief", "That file isn't a PDF.", parent=self.root,
-            )
-            return
-        _BriefPdfWindow(self.root, self, os.path.basename(path), data)
 
     def _show_settings_dialog(self) -> None:
         dlg = tk.Toplevel(self.root)
@@ -7178,8 +7157,7 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
 
 def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
                          action: tuple[str, str],
-                         status=lambda _s: None,
-                         prefetch_pdf: bool = True) -> None:
+                         status=lambda _s: None) -> None:
     """Open whatever a highlighted brief citation points at, reusing the exact
     paths the rest of the app uses — so briefs behave like the opinion reader
     and the Quick Look Up dialog rather than a parallel implementation:
@@ -7189,10 +7167,6 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
       * cases → ``CourtListenerGUI._try_open_citation`` (Google Scholar by
         citation with a name retry, the static.case.law shortcut for Federal
         Appendix scans, then the CourtListener text), with the pincite jump.
-
-    ``prefetch_pdf=False`` (passed by the PDF brief viewer) opens cases straight
-    to the Scholar/CL text without the background PDF prefetch — a second PDF
-    loading alongside the open brief PDF can hang the app.
     """
     kind, value = action
     if kind in _STATUTE_SOURCES or kind in ("browse", "statpdf"):
@@ -7203,12 +7177,6 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
         return
 
     cite, _, pin = value.partition("@")
-    if not prefetch_pdf:
-        # PDF brief view: build the case window entirely on the main thread —
-        # see _open_brief_case_main_thread for why.
-        _open_brief_case_main_thread(app, parent, cite, pin, status)
-        return
-
     fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
     client = app._get_client() if app._token_var.get().strip() else None
     if fetcher is None and client is None:
@@ -7224,8 +7192,7 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
     safe_status(f"Opening {cite}…")
 
     def run() -> None:
-        ok = app._try_open_citation("", cite, pin, fetcher, client,
-                                    prefetch_pdf=prefetch_pdf)
+        ok = app._try_open_citation("", cite, pin, fetcher, client)
         try:
             parent.after(0, lambda: safe_status(
                 f"Opened {cite}." if ok else f"Not found: {cite}"))
@@ -7235,115 +7202,16 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
     threading.Thread(target=run, daemon=True).start()
 
 
-def _open_brief_case_main_thread(app: "CourtListenerGUI", parent: tk.Misc,
-                                 cite: str, pin: str,
-                                 status=lambda _s: None) -> None:
-    """Open a cited case for the PDF brief viewer touching Tk on the MAIN
-    THREAD only.
-
-    The normal path fetches on a worker thread and then calls ``root.after``
-    *from that worker* to build the window.  Tkinter is not thread-safe, and
-    that cross-thread call deadlocks the app when the main thread is busy with
-    the live pdfium brief canvas (the docx/rtf text brief has no such canvas,
-    so it never hit this).  Here the worker only does the network fetch and
-    drops the result in a dict; a main-thread ``after`` poll builds the window.
-    """
-    def safe_status(s: str) -> None:
-        try:
-            status(s)
-        except tk.TclError:
-            pass
-
-    # Federal Appendix scans open straight to the static.case.law PDF.
-    if _FED_APPX_RE.search(cite):
-        url = _static_case_law_url(cite)
-        if url:
-            safe_status(f"Opening {cite} (case.law)…")
-            _PdfWindow(parent, url, cite, status)
-            return
-
-    fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
-    client = app._get_client() if app._token_var.get().strip() else None
-    if fetcher is None and client is None:
-        safe_status("Neither Google Scholar nor CourtListener is available.")
-        return
-    safe_status(f"Opening {cite}…")
-
-    holder: dict = {}
-
-    def worker() -> None:
-        out: dict = {}
-        try:
-            if fetcher is not None:
-                out["scholar"] = fetcher.fetch_by_citation(cite)
-        except Exception:
-            out["scholar"] = None
-        if not out.get("scholar") and client is not None:
-            try:
-                data = client.search(f'"{cite}"', type="o", page_size=1)
-                results = data.get("results") or []
-                if results:
-                    target = results[0]
-                    parts, blocks, plain, _cluster = _assemble_case_parts(
-                        client, target)
-                    if parts or plain:
-                        out["cl"] = (target, parts, blocks, plain)
-            except Exception:
-                pass
-        holder["result"] = out
-
-    threading.Thread(target=worker, daemon=True).start()
-
-    def build() -> None:
-        if "result" not in holder:
-            try:
-                parent.after(150, build)
-            except tk.TclError:
-                pass
-            return
-        out = holder["result"]
-        scholar = out.get("scholar")
-        if scholar:
-            url, html = scholar
-            try:
-                w = _ScholarTextWindow(app.root, app, url, html, item=None,
-                                       prefetch_pdf=False)
-                if pin:
-                    w.jump_to_cite_page(cite, pin)
-                safe_status(f"Opened {cite}.")
-            except tk.TclError:
-                pass
-            return
-        cl = out.get("cl")
-        if cl:
-            target, parts, blocks, plain = cl
-            try:
-                _ScholarTextWindow(app.root, app, "", "", item=target,
-                                   cl_text=plain, cl_parts=parts,
-                                   cl_blocks=blocks, prefetch_pdf=False)
-                safe_status(f"Opened {cite}.")
-            except tk.TclError:
-                pass
-            return
-        safe_status(f"Not found: {cite}")
-
-    try:
-        parent.after(150, build)
-    except tk.TclError:
-        pass
-
-
-# Highlight colours, keyed by category (see _brief_action_category).  The text
-# viewer uses the pale tints as a highlighter background; the PDF viewer uses
-# the strong colour stippled over the page so the underlying text stays legible.
+# Background tints for highlighted citations in the brief reader,
+# keyed by category (see _brief_action_category).
 _BRIEF_TINTS = {"case": "#cfe2ff", "statute": "#d6f0d6", "const": "#fff3bf"}
-_BRIEF_INKS = {"case": "#1a56b0", "statute": "#1f7a3d", "const": "#9a6b00"}
 
 
 class _BriefTextWindow:
-    """Renders a Word/RTF brief's text with every detected citation highlighted
-    (by category) and clickable — cases open in the Scholar reader, statutes /
-    rules / regulations / the Constitution in the statute viewer."""
+    """Renders a brief's text (extracted from PDF, Word, RTF or plain text) with
+    every detected citation highlighted (by category) and clickable — cases open
+    in the Scholar reader, statutes / rules / regulations / the Constitution in
+    the statute viewer; right-click opens any citation in the web browser."""
 
     def __init__(self, parent: tk.Misc, app: "CourtListenerGUI",
                  name: str, text: str) -> None:
@@ -7435,363 +7303,6 @@ class _BriefTextWindow:
         if entry:
             _open_citation_in_browser(entry[0], entry[1])
         return "break"
-
-
-class _BriefPdfPane(_PdfPane):
-    """A _PdfPane that highlights detected citations in place and makes them
-    clickable.  The PDF's own text layer is read once to locate each citation's
-    character boxes (in PDF points); the boxes are mapped to canvas pixels every
-    time a page renders, so the highlights track zooming and scrolling."""
-
-    def __init__(self, parent: tk.Misc, pdf_bytes: bytes,
-                 follow=None, width: int = 800) -> None:
-        super().__init__(parent, pdf_bytes, width=width)
-        self._follow_cb = follow
-        # page index → list of (action, [ (l, b, r, t) in PDF points ])
-        self._highlights: dict[int, list] = {}
-        self._link_count = 0
-        self._compute_highlights()
-
-    # --- text-layer extraction + citation detection ---------------------
-
-    def _compute_highlights(self) -> None:
-        # Pass 1: read each page's text only.  Crucially we do NOT pull a box
-        # for every character here — that's tens of thousands of native calls
-        # on a real brief and would freeze the window while it opens.  The text
-        # alone is cheap and is all the detector needs.
-        page_texts: list[str] = []
-        for i in range(len(self._doc)):
-            page = self._doc[i]
-            try:
-                tp = page.get_textpage()
-                try:
-                    n = tp.count_chars()
-                    if n < 0:
-                        n = 0
-                    ptext = tp.get_text_range(0, n) if n else ""
-                finally:
-                    tp.close()
-            except Exception:
-                ptext = ""
-            finally:
-                page.close()
-            page_texts.append(ptext)
-
-        sep = "\n"
-        full = sep.join(page_texts)
-        starts: list[int] = []
-        off = 0
-        for t in page_texts:
-            starts.append(off)
-            off += len(t) + len(sep)
-
-        # Detect across the whole document, then group the hits by page.
-        per_page: dict[int, list[tuple[int, int, tuple[str, str]]]] = {}
-        for start, end, action in detect_brief_links(full):
-            pi = self._page_of(start, starts, page_texts)
-            if pi is None:
-                continue
-            a = start - starts[pi]
-            b = min(end - starts[pi], len(page_texts[pi]))
-            if a < 0 or a >= len(page_texts[pi]):
-                continue
-            per_page.setdefault(pi, []).append((a, b, action))
-
-        # Pass 2: pull character boxes for citation characters only — a few
-        # hundred per brief, not the whole text — so this stays fast.
-        for pi, spans in per_page.items():
-            page = self._doc[pi]
-            try:
-                tp = page.get_textpage()
-                try:
-                    for a, b, action in spans:
-                        boxes: list = []
-                        for ci in range(a, b):
-                            try:
-                                boxes.append(tp.get_charbox(ci))
-                            except Exception:
-                                boxes.append(None)
-                        rects = _boxes_to_rects(boxes, 0, len(boxes))
-                        if rects:
-                            text = re.sub(r"\s+", " ",
-                                          page_texts[pi][a:b]).strip()
-                            self._highlights.setdefault(pi, []).append(
-                                (action, rects, text))
-                            self._link_count += 1
-                finally:
-                    tp.close()
-            except Exception:
-                pass
-            finally:
-                page.close()
-
-    @staticmethod
-    def _page_of(idx: int, starts: list[int], texts: list[str]):
-        for pi, s in enumerate(starts):
-            if s <= idx < s + len(texts[pi]):
-                return pi
-        return None
-
-    def link_count(self) -> int:
-        return self._link_count
-
-    # --- drawing --------------------------------------------------------
-
-    def _render_visible(self) -> None:
-        super()._render_visible()
-        # Redraw highlights for whatever pages are currently rendered so they
-        # stay aligned (and on top) after any scroll / zoom / resize.
-        self._canvas.delete("highlight")
-        for i in list(self._img_ids.keys()):
-            self._draw_highlights(i)
-
-    def _draw_highlights(self, i: int) -> None:
-        for action, rects, text in self._highlights.get(i, []):
-            cat = _brief_action_category(action[0])
-            color = _BRIEF_INKS.get(cat, "#1a56b0")
-            for rect in rects:
-                coords = self._page_rect_to_canvas(i, rect)
-                if coords is None:
-                    continue
-                x0, y0, x1, y1 = coords
-                rid = self._canvas.create_rectangle(
-                    x0, y0, x1, y1, fill=color, outline=color,
-                    stipple="gray25", width=0, tags=("highlight",),
-                )
-                self._canvas.tag_bind(
-                    rid, "<Button-1>",
-                    lambda _e, a=action: self._on_click(a))
-                # Right-click is a guaranteed-reliable fallback: open the
-                # citation in the web browser, bypassing the in-app window.
-                self._canvas.tag_bind(
-                    rid, "<Button-3>",
-                    lambda _e, a=action, t=text: self._on_right_click(a, t))
-                self._canvas.tag_bind(
-                    rid, "<Enter>",
-                    lambda _e: self._canvas.config(cursor="hand2"))
-                self._canvas.tag_bind(
-                    rid, "<Leave>",
-                    lambda _e: self._canvas.config(cursor=""))
-
-    def _page_rect_to_canvas(self, i: int, rect):
-        """Map a rectangle in PDF points (origin bottom-left) on page i to
-        canvas pixels, accounting for the page's content-box crop, render scale,
-        white margin and centred left offset."""
-        try:
-            y, slot_h, frac, scale = self._slots[i]
-        except (IndexError, ValueError):
-            return None
-        w_pt, h_pt, _ = self._meta[i]
-        fl, ft, fr, fb = frac
-        W = w_pt * scale
-        H = h_pt * scale
-        l, b, r, t = rect
-        ix0, ix1 = l * scale, r * scale
-        iy0, iy1 = H - t * scale, H - b * scale   # flip y (PDF origin is bottom)
-        cx0, cx1 = ix0 - fl * W, ix1 - fl * W
-        cy0, cy1 = iy0 - ft * H, iy1 - ft * H
-        x0 = self._page_x + self._margin + cx0
-        x1 = self._page_x + self._margin + cx1
-        ytop = y + self._margin + cy0
-        ybot = y + self._margin + cy1
-        return x0, ytop, x1, ybot
-
-    def _on_click(self, action):
-        # Run the follow on a fresh main-loop turn (and swallow the canvas's
-        # own click handling) so opening the cited case never executes nested
-        # inside the canvas event dispatch.
-        if self._follow_cb:
-            self._canvas.after(0, lambda a=action: self._follow_cb(a))
-        return "break"
-
-    def _on_right_click(self, action, text):
-        self._canvas.after(0, lambda a=action, t=text:
-                           _open_citation_in_browser(a, t))
-        return "break"
-
-
-def _boxes_to_rects(boxes: list, a: int, b: int) -> list:
-    """Group the character boxes for indices [a, b) into one rectangle per
-    visual line (a citation that wraps spans two), each (l, b, r, t) in points."""
-    rects: list = []
-    cur = None
-    for box in boxes[a:b]:
-        if not box:
-            continue
-        l, bm, r, t = box[0], box[1], box[2], box[3]
-        if r <= l and t <= bm:
-            continue  # zero-area (whitespace) box
-        if cur is None:
-            cur = [l, bm, r, t]
-            continue
-        cl, cb, cr, ct = cur
-        line_h = max(1e-6, ct - cb)
-        overlap = min(ct, t) - max(cb, bm)
-        if overlap > 0.3 * line_h:           # same line — extend the rect
-            cur = [min(cl, l), min(cb, bm), max(cr, r), max(ct, t)]
-        else:                                 # new line — flush and start over
-            rects.append(tuple(cur))
-            cur = [l, bm, r, t]
-    if cur is not None:
-        rects.append(tuple(cur))
-    return rects
-
-
-class _BriefPdfWindow:
-    """A standalone in-app PDF viewer that highlights every citation it finds in
-    the PDF's text layer and makes each one clickable.  Falls back to opening
-    the PDF in the browser when the PDF libraries are missing."""
-
-    def __init__(self, parent: tk.Misc, app: "CourtListenerGUI",
-                 name: str, pdf_bytes: bytes) -> None:
-        self._app = app
-        self._name = name
-        self._bytes = pdf_bytes
-        self._pane: Optional[_BriefPdfPane] = None
-
-        self._win = tk.Toplevel(parent)
-        self._win.title(f"Brief — {name}")
-        self._win.geometry("820x900")
-        self._win.minsize(500, 320)
-
-        legend = ttk.Frame(self._win)
-        legend.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(legend, text="Highlighted citations are clickable:").pack(
-            side="left")
-        for cat, label in (("case", "Cases"), ("statute", "Statutes / Rules"),
-                           ("const", "Constitution")):
-            tk.Label(legend, text="  ", background=_BRIEF_INKS[cat]).pack(
-                side="left", padx=(8, 2))
-            ttk.Label(legend, text=label).pack(side="left")
-
-        btns = ttk.Frame(self._win)
-        btns.pack(fill="x", side="bottom", padx=8, pady=(0, 8))
-        ttk.Button(btns, text="−", width=3,
-                   command=lambda: self._zoom(-1)).pack(side="left")
-        ttk.Button(btns, text="+", width=3,
-                   command=lambda: self._zoom(+1)).pack(side="left", padx=(2, 8))
-        self._status_var = tk.StringVar(value="Loading PDF…")
-        ttk.Label(btns, textvariable=self._status_var,
-                  foreground="gray").pack(side="left", fill="x", expand=True)
-
-        self._body = ttk.Frame(self._win)
-        self._body.pack(fill="both", expand=True)
-
-        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
-            self._win.bind(seq, lambda _e: self._zoom(+1))
-        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
-            self._win.bind(seq, lambda _e: self._zoom(-1))
-        self._win.bind("<Control-0>", lambda _e: self._zoom(0))
-
-        self._build_pane()
-
-    def _build_pane(self) -> None:
-        try:
-            import pypdfium2  # noqa: F401
-            from PIL import ImageTk  # noqa: F401
-        except ImportError:
-            if messagebox.askyesno(
-                "PDF viewer not installed",
-                "Viewing PDFs inside the app needs two Python packages:\n\n"
-                "    pip install pypdfium2 Pillow\n\n"
-                "Open the PDF in your web browser instead?",
-                parent=self._win,
-            ):
-                self._open_in_browser()
-            self._win.destroy()
-            return
-        try:
-            pane = _BriefPdfPane(self._body, self._bytes,
-                                 follow=self._follow, width=760)
-        except Exception as exc:  # pragma: no cover - render/lib failure
-            self._status_var.set(f"PDF: {exc}")
-            messagebox.showerror("Open Brief", str(exc), parent=self._win)
-            self._win.destroy()
-            return
-        pane.pack(fill="both", expand=True, padx=8, pady=4)
-        self._pane = pane
-        n = pane.link_count()
-        if n:
-            self._status_var.set(
-                f"{n} citation{'' if n == 1 else 's'} highlighted — left-click "
-                "to open, right-click to open in browser.")
-        else:
-            self._status_var.set(
-                "No citations detected.  If the page is a scan with no text "
-                "layer, citations can't be found.")
-
-    def _open_in_browser(self) -> None:
-        fd, path = tempfile.mkstemp(suffix=".pdf")
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(self._bytes)
-            webbrowser.open("file://" + path)
-        except Exception:
-            pass
-
-    def _follow(self, action) -> None:
-        # No PDF prefetch from the PDF brief viewer: resolving/downloading a
-        # second PDF while this large pdfium view is live froze the app, so
-        # cases open straight to the Scholar/CL text here (the case window's own
-        # "View PDF" button still loads it on demand).
-        _follow_brief_action(self._app, self._win, action,
-                             self._status_var.set, prefetch_pdf=False)
-
-    def _zoom(self, delta: int) -> None:
-        if self._pane is not None:
-            self._pane.zoom(delta)
-            self._status_var.set(f"Zoom: {self._pane.zoom_percent()}%")
-
-
-def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:
-    """Convert a range of the statute viewer's Text widget (with its
-    sechead/headline/enum/credit/ind* tags) to an RTF body that keeps the
-    bolding and hanging indents."""
-    out: list[str] = []
-    active: set[str] = set(txt.tag_names(start))
-    active.discard("sel")
-    par_open = False
-
-    def par_prefix() -> str:
-        if "sechead" in active:
-            return "\\pard\\sb60\\sa180 "
-        ind = 0
-        for t in active:
-            if t.startswith("ind") and t[3:].isdigit():
-                ind = int(t[3:])
-        return f"\\pard\\li{240 * ind + 180}\\fi-180\\sa100 "
-
-    def run_codes() -> str:
-        codes = ""
-        if active & {"sechead", "headline", "enum", "notehead"}:
-            codes += "\\b"
-        if "sechead" in active:
-            codes += "\\fs26"
-        elif active & {"credit", "notebody"}:
-            codes += "\\fs18"
-        return codes
-
-    for key, value, _index in txt.dump(start, end, text=True, tag=True):
-        if key == "tagon":
-            active.add(value)
-        elif key == "tagoff":
-            active.discard(value)
-        elif key == "text":
-            for i, seg in enumerate(value.split("\n")):
-                if i and par_open:
-                    out.append("\\par\n")
-                    par_open = False
-                if seg:
-                    if not par_open:
-                        out.append(par_prefix())
-                        par_open = True
-                    codes = run_codes()
-                    esc = _rtf_escape(seg)
-                    out.append("{" + codes + " " + esc + "}" if codes
-                               else esc)
-    if par_open:
-        out.append("\\par\n")
-    return "".join(out)
 
 
 class _StatuteWindow:
@@ -8100,10 +7611,13 @@ class _StatuteWindow:
                 if self._doc is not doc:
                     return  # user already navigated elsewhere
                 self._neighbors = nb
-                self._prev_btn.config(
-                    state="normal" if nb[0] else "disabled")
-                self._next_btn.config(
-                    state="normal" if nb[1] else "disabled")
+                try:
+                    self._prev_btn.config(
+                        state="normal" if nb[0] else "disabled")
+                    self._next_btn.config(
+                        state="normal" if nb[1] else "disabled")
+                except tk.TclError:
+                    pass  # window closed while neighbors were resolving
 
             try:
                 self._win.after(0, apply)
