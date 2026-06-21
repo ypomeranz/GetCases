@@ -7182,6 +7182,17 @@ def _open_case_action(app: "CourtListenerGUI", parent: tk.Misc,
         except tk.TclError:
             pass
 
+    # Federal Appendix cases are scan-only: Google Scholar and CourtListener
+    # both mismatch them to the wrong case (and the Scholar fetch can hang on
+    # these), so open the static.case.law PDF straight from the citation —
+    # exactly as the citation-list / Quick Look Up dialogs do.
+    if kind == "cite" and _FED_APPX_RE.search(cite):
+        appx_url = _static_case_law_url(cite)
+        if appx_url:
+            safe_status(f"Opening {cite} (case.law)…")
+            _PdfWindow(parent, appx_url, cite, status)
+            return
+
     fetcher = app._get_scholar()
     if fetcher is None:
         if cite:
