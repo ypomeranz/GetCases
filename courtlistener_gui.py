@@ -1922,11 +1922,15 @@ class CourtListenerGUI:
             pass
 
     def _try_open_citation(self, name: str, cite: str, pin: str,
-                           fetcher, client) -> bool:
+                           fetcher, client, prefetch_pdf: bool = True) -> bool:
         """Resolve one case citation and open its window (call from a
         worker thread).  Google Scholar by citation first — retrying as a
         name+citation search — with a pin-cite jump; then the
-        CourtListener text.  Returns False when nothing was found."""
+        CourtListener text.  Returns False when nothing was found.
+
+        ``prefetch_pdf=False`` opens the Scholar/CL text without warming the
+        official PDF in the background — used by the PDF brief viewer, where a
+        second PDF load alongside the open brief can hang the app."""
         # Federal Appendix cases are scans Google Scholar rarely has — open the
         # static.case.law PDF built straight from the citation.
         if _FED_APPX_RE.search(cite):
@@ -1954,7 +1958,8 @@ class CourtListenerGUI:
                 def open_scholar() -> None:
                     try:
                         w = _ScholarTextWindow(self.root, self, url, html,
-                                               item=None)
+                                               item=None,
+                                               prefetch_pdf=prefetch_pdf)
                         if pin:
                             w.jump_to_cite_page(cite, pin)
                     except tk.TclError:
@@ -1983,6 +1988,7 @@ class CourtListenerGUI:
                                     self.root, self, "", "",
                                     item=target, cl_text=plain,
                                     cl_parts=parts, cl_blocks=blocks,
+                                    prefetch_pdf=prefetch_pdf,
                                 )
                             except tk.TclError:
                                 pass
@@ -4560,6 +4566,7 @@ class _ScholarTextWindow:
         note: str = "",
         cl_parts: Optional[list] = None,
         cl_blocks: Optional[list] = None,
+        prefetch_pdf: bool = True,
     ) -> None:
         self._app = app
         self._item = item or {}
@@ -4650,11 +4657,16 @@ class _ScholarTextWindow:
         else:
             self._render_scholar()
             # Warm the official PDF in the background so "View PDF" is instant.
-            self._prefetch_pdf()
-            # Federal Appendix cases are scans, not text — open straight on the
-            # PDF (Scholar rarely has the opinion text for them).
-            if self._fed_appx:
-                self._win.after(0, self._view_pdf)
+            # Suppressed when opened from the PDF brief viewer: a second PDF
+            # being resolved/downloaded while that big pdfium view is live could
+            # hang the app, so those cases open straight to the Scholar text and
+            # leave the PDF to the on-demand "View PDF" button.
+            if prefetch_pdf:
+                self._prefetch_pdf()
+                # Federal Appendix cases are scans, not text — open straight on
+                # the PDF (Scholar rarely has the opinion text for them).
+                if self._fed_appx:
+                    self._win.after(0, self._view_pdf)
 
     # ------------------------------------------------------------------
     # UI
@@ -7145,7 +7157,8 @@ def _brief_action_category(kind: str) -> str:
 
 def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
                          action: tuple[str, str],
-                         status=lambda _s: None) -> None:
+                         status=lambda _s: None,
+                         prefetch_pdf: bool = True) -> None:
     """Open whatever a highlighted brief citation points at, reusing the exact
     paths the rest of the app uses — so briefs behave like the opinion reader
     and the Quick Look Up dialog rather than a parallel implementation:
@@ -7155,6 +7168,10 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
       * cases → ``CourtListenerGUI._try_open_citation`` (Google Scholar by
         citation with a name retry, the static.case.law shortcut for Federal
         Appendix scans, then the CourtListener text), with the pincite jump.
+
+    ``prefetch_pdf=False`` (passed by the PDF brief viewer) opens cases straight
+    to the Scholar/CL text without the background PDF prefetch — a second PDF
+    loading alongside the open brief PDF can hang the app.
     """
     kind, value = action
     if kind in _STATUTE_SOURCES or kind in ("browse", "statpdf"):
@@ -7180,7 +7197,8 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
     safe_status(f"Opening {cite}…")
 
     def run() -> None:
-        ok = app._try_open_citation("", cite, pin, fetcher, client)
+        ok = app._try_open_citation("", cite, pin, fetcher, client,
+                                    prefetch_pdf=prefetch_pdf)
         try:
             parent.after(0, lambda: safe_status(
                 f"Opened {cite}." if ok else f"Not found: {cite}"))
@@ -7566,8 +7584,12 @@ class _BriefPdfWindow:
             pass
 
     def _follow(self, action) -> None:
+        # No PDF prefetch from the PDF brief viewer: resolving/downloading a
+        # second PDF while this large pdfium view is live froze the app, so
+        # cases open straight to the Scholar/CL text here (the case window's own
+        # "View PDF" button still loads it on demand).
         _follow_brief_action(self._app, self._win, action,
-                             self._status_var.set)
+                             self._status_var.set, prefetch_pdf=False)
 
     def _zoom(self, delta: int) -> None:
         if self._pane is not None:
