@@ -4534,6 +4534,11 @@ class _ScholarTextWindow:
                        "majority": _MAJORITY_COLOR}
     _PAGECOL_W = 48     # left gutter: reporter page numbers (px)
     _PARTMAP_W = 104    # right strip: map of the opinion's parts (px)
+    # Approx. on-screen width of the right "Case details" panel (a 38-char Text
+    # plus its scrollbar and padding).  Used to widen the window for SCOTUS
+    # cases, where the panel opens by default, so the opinion text keeps its
+    # full width instead of shrinking to make room.
+    _DETAILS_PANEL_W = 300
 
     def __init__(
         self,
@@ -4632,7 +4637,11 @@ class _ScholarTextWindow:
                 else "Google Scholar Opinion Text"
             )
         )
-        self._win.geometry("860x680")
+        # SCOTUS cases open the Oyez "Case details" panel by default (wired up
+        # in _build_ui); widen the window by the panel's width so the opinion
+        # text keeps its usual room with the panel added to the right of it.
+        win_w = 860 + (self._DETAILS_PANEL_W if self._is_scotus else 0)
+        self._win.geometry(f"{win_w}x680")
         self._win.minsize(500, 300)
         self._build_ui()
         if self._cl_primary:
@@ -4789,7 +4798,9 @@ class _ScholarTextWindow:
             btn_frame, text="A+", width=3, command=lambda: self._zoom(+1)
         )
         self._zoom_in_btn.pack(side="left", padx=(2, 8))
-        self._details_var = tk.BooleanVar(value=False)
+        # On by default for Supreme Court cases (Oyez fills the panel); the
+        # window was widened to fit it.  _toggle_details is fired below.
+        self._details_var = tk.BooleanVar(value=self._is_scotus)
         ttk.Checkbutton(
             btn_frame, text="Case details", variable=self._details_var,
             command=self._toggle_details,
@@ -4818,6 +4829,11 @@ class _ScholarTextWindow:
         ttk.Label(btn_frame, textvariable=self._status_var, foreground="gray").pack(
             side="left", fill="x", expand=True
         )
+
+        # Supreme Court cases: open the Oyez case-details panel from the start
+        # (the checkbox above defaults on and the window is sized to fit it).
+        if self._is_scotus:
+            self._toggle_details()
 
     def _zoom(self, delta: int) -> None:
         """In the reader, grow/shrink every font (delta 0 resets to default);
