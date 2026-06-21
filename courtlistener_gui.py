@@ -4605,6 +4605,9 @@ class _ScholarTextWindow:
         # A bare "Id." whose pin ("at N") sits in a following span — (link tag,
         # base cite) — so the pin can be attached when that span arrives.
         self._pending_id: Optional[tuple[str, str]] = None
+        # Amendment numbers already linked in this render, so a repeated bare
+        # prose mention ("the First Amendment guarantees …") isn't re-linked.
+        self._const_linked: set[int] = set()
         self._fonts: dict[str, tkfont.Font] = {}
         self._fn_text: dict[str, str] = {}  # footnote id → body text (for hover tips)
         self._fn_tip: Optional[tk.Toplevel] = None
@@ -4996,6 +4999,23 @@ class _ScholarTextWindow:
         # Plain text: make recognizable citations clickable
         self._insert_plain_with_links(span.text, tuple(tags))
 
+    def _const_link_action(self, spec: str, matched_text: str):
+        """Action for a U.S. Constitution citation, or None to leave it as plain
+        text.  A bare *prose* amendment reference ("the First Amendment …", no
+        section/clause and not a "U.S. Const." citation) is linked only the
+        first time that amendment appears in the opinion — repeated prose
+        mentions of the same amendment aren't re-linked.  Formal citations
+        ("U.S. Const. amend. I", or any reference carrying a § section) always
+        link."""
+        kind, num, sec = (spec.split(":") + ["", "", ""])[:3]
+        prose = "const" not in re.sub(r"\s+", " ", matched_text).lower()
+        if kind == "amend" and num.isdigit():
+            n = int(num)
+            if prose and not sec and n in self._const_linked:
+                return None  # repeated bare prose mention — leave as plain text
+            self._const_linked.add(n)
+        return ("const", spec)
+
     def _insert_plain_with_links(self, text: str, tags: tuple) -> None:
         """Insert text, turning case citations, U.S. Code citations, and
         C.F.R. citations into clickable links (Scholar lookup / OLRC and
@@ -5076,7 +5096,8 @@ class _ScholarTextWindow:
             elif kind == "rule":
                 action = ("rule", fed_rules.cite_spec(m))
             elif kind == "const":
-                action = ("const", constitution.cite_spec(m))
+                action = self._const_link_action(
+                    constitution.cite_spec(m), m.group(0))
             elif kind == "shortcite":
                 action = ("cite", m)  # m is the pre-built "vol rep page@pin"
                 cite_base = m.split("@")[0]
@@ -5219,6 +5240,7 @@ class _ScholarTextWindow:
         self._short_cite_index = _build_short_cite_index(self._scholar_text)
         self._last_cite_action = None
         self._pending_id = None
+        self._const_linked = set()
         if not self._parts:
             txt.insert("1.0", self._scholar_text)
         else:
@@ -5425,9 +5447,26 @@ class _ScholarTextWindow:
         except tk.TclError:
             h = txt.winfo_height()
         w = self._PARTMAP_W
-        for rs, kind, label in marks:
-            off = self._ypixels(rs)
-            y = max(6, min(h - 6, int(off / total * h)))
+        # Ideal vertical position of each marker (proportional to where the part
+        # begins in the document).
+        top, bot = 6, max(6, h - 6)
+        ys = [max(top, min(bot, int(self._ypixels(rs) / total * h)))
+              for rs, _kind, _label in marks]
+        # Several short separate opinions clustered at the end would overlap, so
+        # enforce a minimum gap: push collisions down, and if that runs off the
+        # bottom, pack the run upward from the bottom edge.  The markers then no
+        # longer line up exactly with the text, but every label stays readable.
+        gap = self._partmap_font.metrics("linespace") + 3
+        for i in range(1, len(ys)):
+            if ys[i] - ys[i - 1] < gap:
+                ys[i] = ys[i - 1] + gap
+        if ys and ys[-1] > bot:
+            ys[-1] = bot
+            for i in range(len(ys) - 2, -1, -1):
+                if ys[i + 1] - ys[i] < gap:
+                    ys[i] = ys[i + 1] - gap
+            ys[0] = max(ys[0], top)
+        for (rs, kind, label), y in zip(marks, ys):
             color = self._PARTMAP_COLORS.get(kind, "black")
             canvas.create_line(2, y, w - 2, y, fill=color, width=2)
             canvas.create_rectangle(2, y, 8, y + 10, fill=color, outline=color)
@@ -5446,6 +5485,10 @@ class _ScholarTextWindow:
         it's a dissent or concurrence); for the main opinion 'Opinion
         (Author)'."""
         text = re.sub(r"\s+", " ", label or "").strip()
+        # Per curiam opinions: the parenthetical should read "(per curiam)", not
+        # the truncated "(Per)" the surname extraction below would produce.
+        if re.search(r"per\s+curiam", text, re.IGNORECASE):
+            return "Opinion (per curiam)" if kind == "majority" else "per curiam"
         m = (re.search(r"\b(?:[Cc]hief\s+)?(?:JUSTICE|Justice)\s+"
                        r"([A-Z][A-Za-z'’.]+)", text)
              or re.search(r"\b([A-Z][A-Za-z'’]{2,}),\s*(?:C\.\s*)?J\.", text)
@@ -5506,6 +5549,7 @@ class _ScholarTextWindow:
             self._scholar_text or self._cl_text or "")
         self._last_cite_action = None
         self._pending_id = None
+        self._const_linked = set()
         if not parts:
             self._insert_plain_with_links(self._cl_text or "(no text)", ())
         else:

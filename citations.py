@@ -160,6 +160,7 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     out: list[tuple[int, int, tuple[str, str]]] = []
     pos = 0
     last_cite_action: tuple[str, str] | None = None
+    const_linked: set[int] = set()  # amendments already linked (prose dedup)
     for start, end, kind, m in matches:
         if start < pos:
             continue  # overlapping match — first/longest wins
@@ -180,7 +181,21 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         elif kind == "rule":
             action = ("rule", fed_rules.cite_spec(m))
         elif kind == "const":
-            action = ("const", constitution.cite_spec(m))
+            # Link a bare prose amendment mention ("the First Amendment …", no
+            # section, not a "U.S. Const." citation) only the first time that
+            # amendment appears; formal citations always link.
+            spec = constitution.cite_spec(m)
+            ck, cnum, csec = (spec.split(":") + ["", "", ""])[:3]
+            prose = "const" not in re.sub(r"\s+", " ", m.group(0)).lower()
+            if ck == "amend" and cnum.isdigit():
+                cn = int(cnum)
+                if prose and not csec and cn in const_linked:
+                    action = None
+                else:
+                    const_linked.add(cn)
+                    action = ("const", spec)
+            else:
+                action = ("const", spec)
         elif kind == "shortcite":
             action = ("cite", m)  # m is the pre-built "vol rep page@pin"
             cite_base = m.split("@")[0]
