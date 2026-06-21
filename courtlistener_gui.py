@@ -7155,6 +7155,27 @@ def _brief_action_category(kind: str) -> str:
     return "statute"
 
 
+def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
+    """Open a brief citation in the user's web browser — a guaranteed-reliable
+    fallback (right-click) that never touches the in-app window machinery:
+    cases go to Google Scholar, link-out actions to their URL, and anything
+    else to a web search of the citation text."""
+    kind, value = action
+    if kind in ("browse", "statpdf"):
+        url = value
+    elif kind == "cite":
+        cite = value.split("@")[0]
+        url = ("https://scholar.google.com/scholar?q="
+               + urllib.parse.quote(f'"{cite}"'))
+    else:
+        q = (text or value).strip()
+        url = "https://www.google.com/search?q=" + urllib.parse.quote(q)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
 def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
                          action: tuple[str, str],
                          status=lambda _s: None,
@@ -7384,26 +7405,35 @@ class _BriefTextWindow:
                 txt.insert("end", src[pos:start])
             self._link_n += 1
             tag = f"lnk{self._link_n}"
-            self._link_actions[tag] = action
+            seg = re.sub(r"\s+", " ", src[start:end]).strip()
+            self._link_actions[tag] = (action, seg)
             cat = _brief_action_category(action[0])
             txt.insert("end", src[start:end], (cat, "brieflink", tag))
             txt.tag_bind(tag, "<Button-1>",
                          lambda _e, t=tag: self._follow(t))
+            txt.tag_bind(tag, "<Button-3>",
+                         lambda _e, t=tag: self._follow_browser(t))
             pos = end
         if pos < len(src):
             txt.insert("end", src[pos:])
         txt.config(state="disabled")
         n = len(links)
         self._status_var.set(
-            f"{n} citation{'' if n == 1 else 's'} found — click any "
-            "highlight to open it." if n else "No citations detected."
+            f"{n} citation{'' if n == 1 else 's'} found — left-click to open, "
+            "right-click to open in browser." if n else "No citations detected."
         )
 
     def _follow(self, tag: str):
-        action = self._link_actions.get(tag)
-        if action:
-            _follow_brief_action(self._app, self._win, action,
+        entry = self._link_actions.get(tag)
+        if entry:
+            _follow_brief_action(self._app, self._win, entry[0],
                                  self._status_var.set)
+        return "break"
+
+    def _follow_browser(self, tag: str):
+        entry = self._link_actions.get(tag)
+        if entry:
+            _open_citation_in_browser(entry[0], entry[1])
         return "break"
 
 
@@ -7483,8 +7513,10 @@ class _BriefPdfPane(_PdfPane):
                                 boxes.append(None)
                         rects = _boxes_to_rects(boxes, 0, len(boxes))
                         if rects:
+                            text = re.sub(r"\s+", " ",
+                                          page_texts[pi][a:b]).strip()
                             self._highlights.setdefault(pi, []).append(
-                                (action, rects))
+                                (action, rects, text))
                             self._link_count += 1
                 finally:
                     tp.close()
@@ -7514,7 +7546,7 @@ class _BriefPdfPane(_PdfPane):
             self._draw_highlights(i)
 
     def _draw_highlights(self, i: int) -> None:
-        for action, rects in self._highlights.get(i, []):
+        for action, rects, text in self._highlights.get(i, []):
             cat = _brief_action_category(action[0])
             color = _BRIEF_INKS.get(cat, "#1a56b0")
             for rect in rects:
@@ -7529,6 +7561,11 @@ class _BriefPdfPane(_PdfPane):
                 self._canvas.tag_bind(
                     rid, "<Button-1>",
                     lambda _e, a=action: self._on_click(a))
+                # Right-click is a guaranteed-reliable fallback: open the
+                # citation in the web browser, bypassing the in-app window.
+                self._canvas.tag_bind(
+                    rid, "<Button-3>",
+                    lambda _e, a=action, t=text: self._on_right_click(a, t))
                 self._canvas.tag_bind(
                     rid, "<Enter>",
                     lambda _e: self._canvas.config(cursor="hand2"))
@@ -7565,6 +7602,11 @@ class _BriefPdfPane(_PdfPane):
         # inside the canvas event dispatch.
         if self._follow_cb:
             self._canvas.after(0, lambda a=action: self._follow_cb(a))
+        return "break"
+
+    def _on_right_click(self, action, text):
+        self._canvas.after(0, lambda a=action, t=text:
+                           _open_citation_in_browser(a, t))
         return "break"
 
 
@@ -7671,8 +7713,8 @@ class _BriefPdfWindow:
         n = pane.link_count()
         if n:
             self._status_var.set(
-                f"{n} citation{'' if n == 1 else 's'} highlighted — "
-                "click any to open it.")
+                f"{n} citation{'' if n == 1 else 's'} highlighted — left-click "
+                "to open, right-click to open in browser.")
         else:
             self._status_var.set(
                 "No citations detected.  If the page is a scan with no text "
