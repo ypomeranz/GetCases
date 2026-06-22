@@ -28,6 +28,7 @@ import tkinter as tk
 import urllib.parse
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace as _dc_replace
 
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
@@ -562,6 +563,77 @@ def _fed_appx_cite(item: dict) -> Optional[str]:
         if _FED_APPX_RE.search(str(c)):
             return re.sub(r"<[^>]+>", "", str(c)).strip()
     return None
+
+
+# Text that can sit between a Scholar-linked case name and its English Reports
+# cite while still being part of the same citation: parallel reporter cites,
+# commas, an "at" pin, a trailing year — citation scaffolding, never prose.
+_ER_CONNECTIVE_RE = re.compile(
+    r"^[\s,;.]*"
+    r"(?:(?:and\s+)?\(?\d{1,4}\)?\s+[A-Za-z][A-Za-z.'’ ]{0,20}?\s+\d{1,5}[a-z]?"
+    r"(?:\s*,\s*\d{1,5}(?:\s*[-–]\s*\d{1,5})?)?[\s,;.]*)*"
+    r"(?:at\s+\d{1,5}[\s,;.]*)?"
+    r"\s*$"
+)
+_ER_YEAR_RE = re.compile(r"\s*\(\d{4}[a-z]?\)")
+
+
+def _engrep_citation_ranges(spans) -> "list[tuple[int, int, str]]":
+    """Character ranges in a block's concatenated span text that should render
+    as a single English Reports link.
+
+    Each English Reports cite that resolves in our index is extended forward
+    over a trailing "(year)" and backward over any parallel citations to a
+    Scholar-hyperlinked case name — so the whole reference (case name, parallel
+    cites, E.R. cite) becomes our CommonLII link and none of Scholar's links
+    survive inside it.  Returns sorted, non-overlapping (start, end, spec)."""
+    text = "".join(s.text for s in spans)
+    if not text:
+        return []
+    # Maximal runs of consecutive spans that share one Scholar hyperlink — these
+    # mark the case name (Scholar wraps the name, sometimes split across spans
+    # by its own italics, in a single <a> to the cited case).
+    linked: list[tuple[int, int]] = []
+    pos = 0
+    run_start = None
+    run_link = ""
+    for s in spans:
+        lk = s.link or ""
+        if not (lk and lk == run_link):
+            if run_link:
+                linked.append((run_start, pos))
+            run_link = lk
+            run_start = pos if lk else None
+        pos += len(s.text)
+    if run_link:
+        linked.append((run_start, pos))
+
+    out: list[tuple[int, int, str]] = []
+    for m in eng_rep.ER_CITE_RE.finditer(text):
+        spec = eng_rep.cite_spec(m)
+        if not eng_rep.resolve(spec):
+            continue  # only cases we actually have — unknown E.R. cites untouched
+        es, ee = m.start(), m.end()
+        ym = _ER_YEAR_RE.match(text, ee)
+        if ym:
+            ee = ym.end()
+        start = es
+        for ls, le in linked:
+            if ls <= es < le:                 # cite sits inside the linked name
+                start = min(start, ls)
+                ee = max(ee, le)
+            elif le <= es and _ER_CONNECTIVE_RE.match(text[le:es]):
+                start = min(start, ls)        # linked name precedes, cites between
+        out.append((start, ee, spec))
+    out.sort()
+    merged: list[tuple[int, int, str]] = []
+    for s, e, spec in out:
+        if merged and s <= merged[-1][1]:
+            ps, pe, psp = merged[-1]
+            merged[-1] = (ps, max(pe, e), psp)
+        else:
+            merged.append((s, e, spec))
+    return merged
 
 
 def _item_from_cluster(cluster: dict) -> dict:
@@ -5062,6 +5134,15 @@ class _ScholarTextWindow:
             ref, pin = _cite_target_from_text(span.text, self._short_cite_index)
             if ref:
                 self._last_cite_action = ("cite", ref)
+            # Federal Appendix cite Scholar hyperlinked (often to the wrong
+            # scholar_case page) — route it through our cite handler, which opens
+            # the official static.case.law PDF instead of Scholar's text.
+            if ref and _FED_APPX_RE.search(ref):
+                action = ("cite", ref + (f"@{pin}" if pin else ""))
+                self._last_cite_action = ("cite", ref)
+                tags += ["citelink", self._new_link(action)]
+                txt.insert("end", span.text, tuple(tags))
+                return
             # If Scholar's hyperlink covers an English Reports citation we have
             # in our own index ("156 Eng. Rep. 145"), point it at our CommonLII
             # scan instead — Scholar's own copy of these old English cases is
@@ -5308,9 +5389,72 @@ class _ScholarTextWindow:
                        "".join(s.text for s in block.spans if not s.pagenum)).strip()
             )
         )
-        for span in block.spans:
-            self._insert_span(span, block_tags, neutral=neutral)
+        # English Reports citations in our index render as a single CommonLII
+        # link spanning the whole reference (case name → parallel cites → E.R.
+        # cite), replacing any Google Scholar links inside it.
+        er_ranges = _engrep_citation_ranges(block.spans)
+        if er_ranges:
+            self._insert_spans_with_engrep(block, block_tags, neutral, er_ranges)
+        else:
+            for span in block.spans:
+                self._insert_span(span, block_tags, neutral=neutral)
         self._text.insert("end", "\n\n", block_tags)
+
+    def _insert_spans_with_engrep(self, block, block_tags: tuple,
+                                  neutral: bool, ranges: list) -> None:
+        """Render a block whose text contains English Reports citation runs:
+        text inside a run gets one shared engrep link (Scholar links dropped);
+        everything outside renders exactly as it normally would."""
+        range_tag: list = [None] * len(ranges)  # one link tag per run
+        pos = 0
+        for span in block.spans:
+            s_start = pos
+            s_end = pos + len(span.text)
+            pos = s_end
+            # Page/footnote markers never overlap a citation run — render whole.
+            if span.pagenum or span.fnref or span.fndef or not span.text:
+                self._insert_span(span, block_tags, neutral=neutral)
+                continue
+            cur = s_start
+            while cur < s_end:
+                ri = next((i for i, (rs, re_, _sp) in enumerate(ranges)
+                           if rs <= cur < re_), None)
+                if ri is None:
+                    nxt = min([s_end] + [rs for rs, _e, _sp in ranges
+                                         if rs > cur])
+                    seg = span.text[cur - s_start: nxt - s_start]
+                    if seg:
+                        self._insert_span(_dc_replace(span, text=seg),
+                                          block_tags, neutral=neutral)
+                    cur = nxt
+                else:
+                    rs, re_, spec = ranges[ri]
+                    seg_end = min(s_end, re_)
+                    seg = span.text[cur - s_start: seg_end - s_start]
+                    if seg:
+                        if range_tag[ri] is None:
+                            range_tag[ri] = self._new_link(("engrep", spec))
+                        self._insert_engrep_segment(seg, span, block_tags,
+                                                    neutral, range_tag[ri])
+                    cur = seg_end
+
+    def _insert_engrep_segment(self, text: str, span, block_tags: tuple,
+                               neutral: bool, link_tag: str) -> None:
+        """Insert one piece of an English Reports citation run with the shared
+        engrep link, preserving the span's own formatting."""
+        tags = list(block_tags)
+        tags.append(self._font_tag(
+            span.italic, span.bold, span.small, span.sup,
+            family="Georgia" if neutral else None,
+        ))
+        if span.underline:
+            tags.append("underline")
+        tags += ["citelink", link_tag]
+        self._text.insert("end", text, tuple(tags))
+        # A following "Id." should resolve to this E.R. case, not the last
+        # plain-text cite.
+        self._last_cite_action = self._link_actions.get(
+            link_tag, self._last_cite_action)
 
     def _render_scholar(self) -> None:
         txt = self._text
@@ -6591,6 +6735,18 @@ class _ScholarTextWindow:
         if kind == "url" and "courtlistener.com/opinion/" in url_val:
             self._follow_cl_link(url_val)
             return
+        # Federal Appendix citations are scans Google Scholar lacks — open the
+        # official static.case.law PDF straight from the citation rather than
+        # fetching (often the wrong) Scholar text.  Covers both plain-text
+        # F. App'x cites and Scholar links we rewrote to ("cite", …).
+        if kind == "cite" and _FED_APPX_RE.search(cite):
+            appx = _static_case_law_url(cite)
+            if appx:
+                self._status_var.set(f"Opening {cite} (case.law)…")
+                _PdfWindow(self._win, appx,
+                           cite + (f" at {pin}" if pin else ""),
+                           self._status_var.set)
+                return
         fetcher = self._app._get_scholar()
         label = cite if kind == "cite" else "cited case"
         if fetcher is None:
