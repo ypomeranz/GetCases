@@ -10,8 +10,12 @@ works -- discovered empirically -- is:
      cookies, unlike Chrome's app-bound-encrypted store, are readable without
      admin).  This is the only manual step, and only when there is no valid
      clearance yet.
-  2. We read Firefox's ``cf_clearance`` (+ ``__cf_bm``/``__cflb``) with
-     ``browser_cookie3``.
+  2. We read Firefox's ``cf_clearance`` (+ ``__cf_bm``/``__cflb``) straight from
+     the profile's ``cookies.sqlite`` (Firefox stores cookies unencrypted).  We
+     search every profile location ourselves -- standard, Microsoft Store,
+     custom ``profiles.ini`` paths, Snap/Flatpak -- so this works where
+     ``browser_cookie3``'s single hard-coded path fails ("Could not find firefox
+     profile directory"); ``browser_cookie3`` remains a last-ditch fallback.
   3. We GET the PDF with ``curl_cffi`` impersonating Firefox's TLS fingerprint,
      sending the user's real Firefox User-Agent (so it matches the cookie) and a
      ``Referer`` to the case's ``.html`` page -- the origin Apache hotlink-blocks
@@ -19,9 +23,9 @@ works -- discovered empirically -- is:
   4. The bytes are cached on disk, so the same case never needs the network (or
      the captcha) again.
 
-All of this is optional: ``curl_cffi``/``browser_cookie3`` and Firefox may be
-absent, in which case :func:`can_fetch` is False and the caller falls back to
-simply opening the citation in the user's browser.
+All of this is optional: ``curl_cffi`` and Firefox may be absent, in which case
+:func:`can_fetch` is False and the caller falls back to simply opening the
+citation in the user's browser.
 
 No tkinter here -- the GUI drives the user-facing hand-off/retry; this module is
 the headless fetch+cache engine.  Run ``python -X utf8 eng_rep_pdf.py`` to fetch
@@ -163,7 +167,10 @@ def _have(mod: str) -> bool:
 
 
 def deps_present() -> bool:
-    return _have("curl_cffi") and _have("browser_cookie3")
+    # curl_cffi does the TLS-impersonating fetch.  The Firefox clearance cookie
+    # is read straight from cookies.sqlite (Firefox stores cookies unencrypted),
+    # so browser_cookie3 is only an optional fallback now, not a hard requirement.
+    return _have("curl_cffi")
 
 
 def can_fetch() -> bool:
@@ -199,16 +206,164 @@ def _impersonate_target() -> str:
     return target
 
 
+def _safe_mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _firefox_data_roots() -> "list[Path]":
+    """Every directory a Firefox profile tree might live under -- far more
+    thorough than browser_cookie3's single hard-coded location, which is why it
+    raises "Could not find firefox profile directory" for these layouts:
+
+      * Windows standard      %APPDATA%/%LOCALAPPDATA%\\Mozilla\\Firefox
+      * Windows Microsoft Store %LOCALAPPDATA%\\Packages\\Mozilla.Firefox_*\\...
+      * macOS                 ~/Library/Application Support/Firefox
+      * Linux native / Snap / Flatpak
+    """
+    roots: list[Path] = []
+    home = Path.home()
+    if sys.platform == "win32":
+        for env in ("APPDATA", "LOCALAPPDATA"):
+            base = os.environ.get(env)
+            if base:
+                roots.append(Path(base) / "Mozilla" / "Firefox")
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            # Microsoft Store package keeps its own Roaming tree.
+            roots += [Path(p) for p in glob.glob(os.path.join(
+                local, "Packages", "Mozilla.Firefox_*", "LocalCache",
+                "Roaming", "Mozilla", "Firefox"))]
+    elif sys.platform == "darwin":
+        roots.append(home / "Library" / "Application Support" / "Firefox")
+    else:
+        roots += [
+            home / ".mozilla" / "firefox",
+            home / "snap" / "firefox" / "common" / ".mozilla" / "firefox",
+            home / ".var" / "app" / "org.mozilla.firefox" / ".mozilla" / "firefox",
+        ]
+    seen: set[str] = set()
+    out: list[Path] = []
+    for r in roots:
+        key = os.path.normcase(str(r))
+        if key not in seen and r.is_dir():
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def _profiles_ini_cookie_dbs(root: Path) -> "list[Path]":
+    """cookies.sqlite for every profile named in *root*/profiles.ini -- the
+    authoritative list, and the only way to find profiles stored outside the
+    usual ``Profiles`` folder (a custom ``IsRelative=0`` path)."""
+    ini = root / "profiles.ini"
+    if not ini.is_file():
+        return []
+    cp = configparser.ConfigParser()
+    try:
+        cp.read(str(ini), encoding="utf-8")
+    except Exception:
+        return []
+    out: list[Path] = []
+    for sec in cp.sections():
+        path = cp.get(sec, "Path", fallback="").strip()
+        if not path:
+            continue
+        relative = cp.get(sec, "IsRelative", fallback="1").strip() != "0"
+        prof = (root / path) if relative else Path(path)
+        out.append(prof / "cookies.sqlite")
+    return out
+
+
+def _firefox_cookie_dbs() -> "list[Path]":
+    """All Firefox cookies.sqlite files we can find, newest first (the profile
+    the user just cleared CloudFlare in has the freshest mtime)."""
+    dbs: list[Path] = []
+    seen: set[str] = set()
+    for root in _firefox_data_roots():
+        cands = _profiles_ini_cookie_dbs(root)
+        for pat in ("Profiles/*/cookies.sqlite", "*/cookies.sqlite",
+                    "cookies.sqlite"):
+            cands += [Path(p) for p in glob.glob(str(root / pat))]
+        for db in cands:
+            key = os.path.normcase(str(db))
+            if key not in seen and db.is_file():
+                seen.add(key)
+                dbs.append(db)
+    dbs.sort(key=_safe_mtime, reverse=True)
+    return dbs
+
+
+def _read_cookies_sqlite(db: Path, domain_substr: str) -> dict:
+    """{name: value} for hosts containing *domain_substr*, read straight from a
+    Firefox cookies.sqlite.  Firefox stores cookies unencrypted, so no
+    browser_cookie3/decryption is needed.  The DB (and any -wal/-shm) is copied
+    first so a running Firefox can't block the read and recent writes (the
+    just-obtained clearance) are visible."""
+    import shutil
+    import sqlite3
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix="engr_ff_")
+    try:
+        tmp = os.path.join(tmpdir, "cookies.sqlite")
+        shutil.copyfile(str(db), tmp)
+        for ext in ("-wal", "-shm"):
+            side = Path(str(db) + ext)
+            if side.is_file():
+                try:
+                    shutil.copyfile(str(side), tmp + ext)
+                except OSError:
+                    pass
+        con = sqlite3.connect(tmp)
+        try:
+            rows = con.execute(
+                "SELECT name, value FROM moz_cookies WHERE host LIKE ?",
+                (f"%{domain_substr}%",),
+            ).fetchall()
+        finally:
+            con.close()
+        return {name: value for name, value in rows}
+    except Exception as exc:
+        print(f"[eng_rep_pdf] reading {db} failed: {exc}")
+        return {}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _firefox_cookies() -> Optional[dict]:
-    """{name: value} of commonlii.org cookies from Firefox, or None on failure.
-    Must include ``cf_clearance`` to be useful."""
+    """{name: value} of commonlii.org cookies from Firefox, or None.  Must
+    include ``cf_clearance`` to be useful.
+
+    Searches every known Firefox profile location (newest first) and reads
+    cookies.sqlite directly -- so a Microsoft Store install or a non-default
+    profile path, which trip browser_cookie3's "Could not find firefox profile
+    directory", are handled.  Falls back to browser_cookie3 for any exotic
+    layout the direct search misses."""
+    best: Optional[dict] = None
+    dbs = _firefox_cookie_dbs()
+    for db in dbs:
+        cookies = _read_cookies_sqlite(db, "commonlii")
+        if not cookies:
+            continue
+        if "cf_clearance" in cookies:
+            return cookies          # the profile that holds the clearance
+        best = best or cookies      # commonlii cookies but no clearance yet
+    if not dbs:
+        print("[eng_rep_pdf] no Firefox cookies.sqlite found in: "
+              + ", ".join(str(r) for r in _firefox_data_roots()))
+    # Fallback: browser_cookie3 (covers any layout our globs/profiles.ini miss).
     try:
         import browser_cookie3
         cj = browser_cookie3.firefox(domain_name="commonlii.org")
+        cookies = {c.name: c.value for c in cj if "commonlii" in (c.domain or "")}
+        if "cf_clearance" in cookies:
+            return cookies
+        best = best or (cookies or None)
     except Exception as exc:
-        print(f"[eng_rep_pdf] reading Firefox cookies failed: {exc}")
-        return None
-    return {c.name: c.value for c in cj if "commonlii" in (c.domain or "")}
+        print(f"[eng_rep_pdf] browser_cookie3 fallback failed: {exc}")
+    return best
 
 
 # ---------------------------------------------------------------------------
