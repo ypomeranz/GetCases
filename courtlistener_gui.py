@@ -565,28 +565,31 @@ def _fed_appx_cite(item: dict) -> Optional[str]:
     return None
 
 
-# Text that can sit between a Scholar-linked case name and its English Reports
-# cite while still being part of the same citation: parallel reporter cites,
-# commas, an "at" pin, a trailing year — citation scaffolding, never prose.
-_ER_CONNECTIVE_RE = re.compile(
+# Text that can sit between a Scholar-linked case name and its citation while
+# still being part of the same reference: parallel reporter cites, commas, an
+# "at" pin, a trailing year — citation scaffolding, never prose.
+_CITE_CONNECTIVE_RE = re.compile(
     r"^[\s,;.]*"
     r"(?:(?:and\s+)?\(?\d{1,4}\)?\s+[A-Za-z][A-Za-z.'’ ]{0,20}?\s+\d{1,5}[a-z]?"
     r"(?:\s*,\s*\d{1,5}(?:\s*[-–]\s*\d{1,5})?)?[\s,;.]*)*"
     r"(?:at\s+\d{1,5}[\s,;.]*)?"
     r"\s*$"
 )
-_ER_YEAR_RE = re.compile(r"\s*\(\d{4}[a-z]?\)")
+_CITE_YEAR_RE = re.compile(r"\s*\(\d{4}[a-z]?\)")
 
 
-def _engrep_citation_ranges(spans) -> "list[tuple[int, int, str]]":
+def _special_citation_ranges(spans) -> "list[tuple[int, int, tuple[str, str]]]":
     """Character ranges in a block's concatenated span text that should render
-    as a single English Reports link.
+    as a single one of *our* links instead of Google Scholar's, paired with the
+    action to use:
 
-    Each English Reports cite that resolves in our index is extended forward
-    over a trailing "(year)" and backward over any parallel citations to a
-    Scholar-hyperlinked case name — so the whole reference (case name, parallel
-    cites, E.R. cite) becomes our CommonLII link and none of Scholar's links
-    survive inside it.  Returns sorted, non-overlapping (start, end, spec)."""
+      * English Reports cites in our index → ("engrep", spec) — the CommonLII scan
+      * Federal Appendix cites             → ("cite", cite)   — the case.law PDF
+
+    Each such cite is extended forward over a trailing "(year)" and backward over
+    any parallel citations to a Scholar-hyperlinked case name, so the whole
+    reference (case name, parallel cites, the cite) becomes our link and no
+    Scholar link survives inside it.  Sorted, non-overlapping (start, end, action)."""
     text = "".join(s.text for s in spans)
     if not text:
         return []
@@ -608,13 +611,21 @@ def _engrep_citation_ranges(spans) -> "list[tuple[int, int, str]]":
     if run_link:
         linked.append((run_start, pos))
 
-    out: list[tuple[int, int, str]] = []
+    # The cites we link ourselves, as (start, end, action).
+    targets: list[tuple[int, int, tuple[str, str]]] = []
     for m in eng_rep.ER_CITE_RE.finditer(text):
         spec = eng_rep.cite_spec(m)
-        if not eng_rep.resolve(spec):
-            continue  # only cases we actually have — unknown E.R. cites untouched
-        es, ee = m.start(), m.end()
-        ym = _ER_YEAR_RE.match(text, ee)
+        if eng_rep.resolve(spec):  # only cases we actually have
+            targets.append((m.start(), m.end(), ("engrep", spec)))
+    if _FED_APPX_RE.search(text):  # cheap guard before the full reporter scan
+        for m in _TEXT_CITE_RE.finditer(text):
+            cite = re.sub(r"\s+", " ", m.group(0)).strip()
+            if _FED_APPX_RE.search(cite) and _static_case_law_url(cite):
+                targets.append((m.start(), m.end(), ("cite", cite)))
+
+    out: list[tuple[int, int, tuple[str, str]]] = []
+    for es, ee, action in targets:
+        ym = _CITE_YEAR_RE.match(text, ee)
         if ym:
             ee = ym.end()
         start = es
@@ -622,17 +633,17 @@ def _engrep_citation_ranges(spans) -> "list[tuple[int, int, str]]":
             if ls <= es < le:                 # cite sits inside the linked name
                 start = min(start, ls)
                 ee = max(ee, le)
-            elif le <= es and _ER_CONNECTIVE_RE.match(text[le:es]):
+            elif le <= es and _CITE_CONNECTIVE_RE.match(text[le:es]):
                 start = min(start, ls)        # linked name precedes, cites between
-        out.append((start, ee, spec))
-    out.sort()
-    merged: list[tuple[int, int, str]] = []
-    for s, e, spec in out:
+        out.append((start, ee, action))
+    out.sort(key=lambda r: (r[0], r[1]))
+    merged: list[tuple[int, int, tuple[str, str]]] = []
+    for s, e, action in out:
         if merged and s <= merged[-1][1]:
-            ps, pe, psp = merged[-1]
-            merged[-1] = (ps, max(pe, e), psp)
+            ps, pe, pa = merged[-1]
+            merged[-1] = (ps, max(pe, e), pa)
         else:
-            merged.append((s, e, spec))
+            merged.append((s, e, action))
     return merged
 
 
@@ -5389,22 +5400,23 @@ class _ScholarTextWindow:
                        "".join(s.text for s in block.spans if not s.pagenum)).strip()
             )
         )
-        # English Reports citations in our index render as a single CommonLII
-        # link spanning the whole reference (case name → parallel cites → E.R.
+        # English Reports and Federal Appendix citations render as a single one
+        # of our links spanning the whole reference (case name → parallel cites →
         # cite), replacing any Google Scholar links inside it.
-        er_ranges = _engrep_citation_ranges(block.spans)
-        if er_ranges:
-            self._insert_spans_with_engrep(block, block_tags, neutral, er_ranges)
+        link_ranges = _special_citation_ranges(block.spans)
+        if link_ranges:
+            self._insert_spans_with_links(block, block_tags, neutral, link_ranges)
         else:
             for span in block.spans:
                 self._insert_span(span, block_tags, neutral=neutral)
         self._text.insert("end", "\n\n", block_tags)
 
-    def _insert_spans_with_engrep(self, block, block_tags: tuple,
-                                  neutral: bool, ranges: list) -> None:
-        """Render a block whose text contains English Reports citation runs:
-        text inside a run gets one shared engrep link (Scholar links dropped);
-        everything outside renders exactly as it normally would."""
+    def _insert_spans_with_links(self, block, block_tags: tuple,
+                                 neutral: bool, ranges: list) -> None:
+        """Render a block whose text contains citation runs we link ourselves
+        (English Reports → CommonLII scan, Federal Appendix → case.law PDF): text
+        inside a run gets one shared link (Scholar links dropped); everything
+        outside renders exactly as it normally would."""
         range_tag: list = [None] * len(ranges)  # one link tag per run
         pos = 0
         for span in block.spans:
@@ -5417,10 +5429,10 @@ class _ScholarTextWindow:
                 continue
             cur = s_start
             while cur < s_end:
-                ri = next((i for i, (rs, re_, _sp) in enumerate(ranges)
+                ri = next((i for i, (rs, re_, _a) in enumerate(ranges)
                            if rs <= cur < re_), None)
                 if ri is None:
-                    nxt = min([s_end] + [rs for rs, _e, _sp in ranges
+                    nxt = min([s_end] + [rs for rs, _e, _a in ranges
                                          if rs > cur])
                     seg = span.text[cur - s_start: nxt - s_start]
                     if seg:
@@ -5428,20 +5440,20 @@ class _ScholarTextWindow:
                                           block_tags, neutral=neutral)
                     cur = nxt
                 else:
-                    rs, re_, spec = ranges[ri]
+                    rs, re_, action = ranges[ri]
                     seg_end = min(s_end, re_)
                     seg = span.text[cur - s_start: seg_end - s_start]
                     if seg:
                         if range_tag[ri] is None:
-                            range_tag[ri] = self._new_link(("engrep", spec))
-                        self._insert_engrep_segment(seg, span, block_tags,
+                            range_tag[ri] = self._new_link(action)
+                        self._insert_linked_segment(seg, span, block_tags,
                                                     neutral, range_tag[ri])
                     cur = seg_end
 
-    def _insert_engrep_segment(self, text: str, span, block_tags: tuple,
+    def _insert_linked_segment(self, text: str, span, block_tags: tuple,
                                neutral: bool, link_tag: str) -> None:
-        """Insert one piece of an English Reports citation run with the shared
-        engrep link, preserving the span's own formatting."""
+        """Insert one piece of a citation run with the shared link, preserving
+        the span's own formatting."""
         tags = list(block_tags)
         tags.append(self._font_tag(
             span.italic, span.bold, span.small, span.sup,
