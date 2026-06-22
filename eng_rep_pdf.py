@@ -106,27 +106,46 @@ def _firefox_exe() -> Optional[str]:
 _UA_CACHE: Optional[str] = None
 
 
+def _major_from_ini(path: str, section: str, option: str) -> Optional[str]:
+    """The leading version number of *option* in an INI file, or None."""
+    try:
+        cp = configparser.ConfigParser()
+        with open(path, encoding="utf-8") as fh:
+            cp.read_file(fh)
+        m = re.match(r"(\d+)", cp.get(section, option, fallback=""))
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _detect_firefox_major() -> Optional[str]:
+    """The installed Firefox's major version.  Prefer ``application.ini`` next to
+    a real firefox.exe; for a Microsoft Store install the exe is a stub alias
+    with no application.ini beside it, so fall back to the active profile's
+    ``compatibility.ini`` (which records the exact version Firefox last ran)."""
+    exe = _firefox_exe()
+    if exe:
+        major = _major_from_ini(
+            os.path.join(os.path.dirname(exe), "application.ini"),
+            "App", "Version")
+        if major:
+            return major
+    for db in _firefox_cookie_dbs():  # newest profile first
+        major = _major_from_ini(
+            str(db.parent / "compatibility.ini"), "Compatibility", "LastVersion")
+        if major:
+            return major
+    return None
+
+
 def firefox_user_agent() -> str:
-    """The user's real Firefox UA, derived from the install's version so it
-    matches the UA Firefox used to obtain ``cf_clearance``.  Falls back to a
-    recent UA if the version can't be read."""
+    """The user's real Firefox UA, derived from the install/profile version so it
+    matches the UA Firefox used to obtain ``cf_clearance`` (CloudFlare ties the
+    clearance to the exact UA).  Falls back to a recent UA if unreadable."""
     global _UA_CACHE
     if _UA_CACHE:
         return _UA_CACHE
-    major = "128"
-    exe = _firefox_exe()
-    if exe:
-        ini = os.path.join(os.path.dirname(exe), "application.ini")
-        try:
-            cp = configparser.ConfigParser()
-            with open(ini, encoding="utf-8") as fh:
-                cp.read_file(fh)
-            ver = cp.get("App", "Version", fallback="")
-            m = re.match(r"(\d+)", ver)
-            if m:
-                major = m.group(1)
-        except Exception:
-            pass
+    major = _detect_firefox_major() or "128"
     _UA_CACHE = (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{major}.0) "
                  f"Gecko/20100101 Firefox/{major}.0")
     return _UA_CACHE
@@ -277,21 +296,71 @@ def _profiles_ini_cookie_dbs(root: Path) -> "list[Path]":
     return out
 
 
+def _find_cookie_sqlites(base: Path, limit: int = 40) -> "list[Path]":
+    """Recursively locate cookies.sqlite under *base*, pruning Firefox's large
+    cache/storage/AppContainer subtrees so the walk stays fast.  Used for a
+    Microsoft Store install, whose internal profile path varies by build."""
+    skip = {
+        "cache2", "startupcache", "storage", "thumbnails", "crashes",
+        "datareporting", "minidumps", "saved-telemetry-pings", "gmp",
+        "gmp-gmpopenh264", "ac", "temp", "tempstate", "inetcache",
+        "settingsbackup", "doh-rollout", "weave",
+    }
+    found: list[Path] = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d.lower() not in skip]
+            if "cookies.sqlite" in filenames:
+                found.append(Path(dirpath) / "cookies.sqlite")
+                if len(found) >= limit:
+                    break
+    except Exception:
+        pass
+    return found
+
+
+def _windows_store_cookie_dbs() -> "list[Path]":
+    """cookies.sqlite for a Microsoft Store Firefox (its firefox.EXE resolves to
+    the WindowsApps alias).  The profile lives somewhere under
+    ``%LOCALAPPDATA%\\Packages\\Mozilla.Firefox_*`` — redirected to a LocalCache
+    subpath whose exact shape varies between builds — so search the package tree
+    rather than guess the path."""
+    if sys.platform != "win32":
+        return []
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return []
+    pkgs = Path(local) / "Packages"
+    out: list[Path] = []
+    seen: set[str] = set()
+    for pat in ("Mozilla.Firefox_*", "*Firefox*", "*Mozilla*"):
+        for pkg in pkgs.glob(pat):
+            key = os.path.normcase(str(pkg))
+            if key in seen or not pkg.is_dir():
+                continue
+            seen.add(key)
+            out += _find_cookie_sqlites(pkg)
+    return out
+
+
 def _firefox_cookie_dbs() -> "list[Path]":
     """All Firefox cookies.sqlite files we can find, newest first (the profile
     the user just cleared CloudFlare in has the freshest mtime)."""
-    dbs: list[Path] = []
-    seen: set[str] = set()
+    cands: list[Path] = []
     for root in _firefox_data_roots():
-        cands = _profiles_ini_cookie_dbs(root)
+        cands += _profiles_ini_cookie_dbs(root)
         for pat in ("Profiles/*/cookies.sqlite", "*/cookies.sqlite",
                     "cookies.sqlite"):
             cands += [Path(p) for p in glob.glob(str(root / pat))]
-        for db in cands:
-            key = os.path.normcase(str(db))
-            if key not in seen and db.is_file():
-                seen.add(key)
-                dbs.append(db)
+    # Microsoft Store install: the profile is buried in the package tree.
+    cands += _windows_store_cookie_dbs()
+    dbs: list[Path] = []
+    seen: set[str] = set()
+    for db in cands:
+        key = os.path.normcase(str(db))
+        if key not in seen and db.is_file():
+            seen.add(key)
+            dbs.append(db)
     dbs.sort(key=_safe_mtime, reverse=True)
     return dbs
 
@@ -468,6 +537,20 @@ if __name__ == "__main__":
     print("impersonate target:", _impersonate_target())
     print("cache dir         :", CACHE_DIR)
 
+    # Profile search diagnostics: shows where we looked and whether the
+    # clearance cookie is actually on disk (the two distinct failure modes are
+    # "no profile/cookie found" vs "found but rejected at fetch").
+    print("\nfirefox profile search:")
+    print("  data roots      :",
+          [str(r) for r in _firefox_data_roots()] or "(none)")
+    dbs = _firefox_cookie_dbs()
+    if not dbs:
+        print("  cookies.sqlite  : (none found)")
+    for db in dbs:
+        ck = _read_cookies_sqlite(db, "commonlii")
+        flag = "cf_clearance=YES" if "cf_clearance" in ck else "cf_clearance=no"
+        print(f"  - {db}\n      commonlii cookies {sorted(ck)}  {flag}")
+
     # Hadley v Baxendale, 156 E.R. 145  ->  [1854] EngR 296
     year, num = 1854, 296
     web = f"https://www.commonlii.org/uk/cases/EngR/{year}/{num}.html"
@@ -486,7 +569,7 @@ if __name__ == "__main__":
             open_in_firefox(exc.web_url)
             print("  opened Firefox -- solve the check and re-run.")
     except FetchUnavailable:
-        print("  in-app fetch unavailable (install Firefox + curl_cffi + "
-              "browser_cookie3); would link out.")
+        print("  in-app fetch unavailable (needs Firefox + curl_cffi); "
+              "would link out.")
     except OriginError as exc:
         print(f"  origin error: {exc}")
