@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shipped gzipped data indexes (e.g. eng_rep_index.tsv.gz) are binary.
+*.gz binary

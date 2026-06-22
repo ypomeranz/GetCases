@@ -16,3 +16,12 @@ Pillow
 # one is installed — any of `antiword`, `catdoc`, or LibreOffice (`soffice`) —
 # otherwise a built-in best-effort text scan is used.  These are system tools,
 # not pip packages.
+
+# English Reports citations ("156 Eng. Rep. 145") link to the free CommonLII
+# scan.  Detection + the shipped index (eng_rep_index.tsv.gz) are offline and
+# need nothing extra.  Viewing the PDF *inside* the app is optional: CommonLII
+# is behind CloudFlare, so the app reads Firefox's clearance cookie and fetches
+# with a browser-matching TLS fingerprint.  Without these (or without Firefox),
+# E.R. citations simply open in the user's browser instead.
+curl_cffi
+browser_cookie3

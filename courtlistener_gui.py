@@ -107,6 +107,8 @@ from cl_parse import parse_cl_html as _parse_cl_html
 from courtlistener import CourtListenerClient, CourtListenerError
 import constitution
 import ecfr
+import eng_rep
+import eng_rep_pdf
 import fed_rules
 import state_statutes
 import statutes_at_large
@@ -5088,6 +5090,8 @@ class _ScholarTextWindow:
         for m in statutes_at_large.STAT_CITE_RE.finditer(text):
             if statutes_at_large.url_for(m):  # only link volumes GovInfo has
                 matches.append((m.start(), m.end(), "stat", m))
+        for m in eng_rep.ER_CITE_RE.finditer(text):
+            matches.append((m.start(), m.end(), "engrep", m))
         matches.sort(key=lambda t: (t[0], -t[1]))
         pos = 0
         for start, end, kind, m in matches:
@@ -5137,6 +5141,9 @@ class _ScholarTextWindow:
                 # Statutes at Large → free GovInfo scan, shown in the in-app
                 # PDF viewer (with a Download option).
                 action = ("statpdf", statutes_at_large.url_for(m))
+            elif kind == "engrep":
+                # English Reports cite ("156 Eng. Rep. 145") → CommonLII scan.
+                action = ("engrep", eng_rep.cite_spec(m))
             else:
                 action = ("cfr", ecfr.cite_spec(m))
             if action is None:
@@ -6500,6 +6507,9 @@ class _ScholarTextWindow:
         if kind == "statpdf":
             _open_statute_pdf(self._win, value, self._status_var.set)
             return
+        if kind == "engrep":
+            _open_eng_rep(self._win, value, self._status_var.set)
+            return
         # A Scholar case URL may carry a pincite ("<url>\tpin=565") so the
         # opened case jumps to that page (Scholar's own hyperlink doesn't).
         if kind == "url":
@@ -7317,6 +7327,182 @@ def _open_statute_pdf(parent: tk.Misc, url: str,
 
 
 # ---------------------------------------------------------------------------
+# English Reports — open the CommonLII scan (cached; CloudFlare hand-off)
+# ---------------------------------------------------------------------------
+
+class _EngRepPdfWindow(_PdfWindow):
+    """The in-app viewer for an English Reports scan from CommonLII.  Reuses the
+    Statutes-at-Large PDF pane (centered, zoomable, Download/Print) but fetches
+    through :mod:`eng_rep_pdf` — disk cache first, then a ``curl_cffi`` fetch
+    using Firefox's CloudFlare clearance.  When there is no clearance yet it
+    shows a hand-off panel that opens the case in Firefox and offers Retry."""
+
+    def __init__(self, parent: tk.Misc, case: "eng_rep.ERCase",
+                 status=lambda _s: None) -> None:
+        self._case = case
+        name = case.name if len(case.name) <= 60 else case.name[:57] + "…"
+        super().__init__(parent, case.pdf_url, f"{name} — {case.er_cite}", status)
+
+    def _fetch(self) -> None:  # overrides _PdfWindow._fetch
+        try:
+            import pypdfium2  # noqa: F401
+            from PIL import ImageTk  # noqa: F401
+        except ImportError:
+            if messagebox.askyesno(
+                "PDF viewer not installed",
+                "Viewing PDFs inside the app needs two Python packages:\n\n"
+                "    pip install pypdfium2 Pillow\n\n"
+                "Open this English Reports scan in your browser instead?",
+                parent=self._win,
+            ):
+                eng_rep_pdf.open_in_browser(self._case.pdf_url)
+            self._win.destroy()
+            return
+        self._status_var.set("Loading the English Reports scan…")
+        case = self._case
+
+        def run() -> None:
+            try:
+                data = eng_rep_pdf.fetch_pdf(case.year, case.num, case.web_url)
+                self._post(self._show, data)
+            except eng_rep_pdf.CloudflareChallenge as exc:
+                self._post(self._need_clearance, exc.web_url)
+            except eng_rep_pdf.FetchUnavailable:
+                self._post(self._link_out)
+            except eng_rep_pdf.OriginError as exc:
+                self._post(self._error,
+                           f"CommonLII returned an error (HTTP {exc.status}).")
+            except Exception as exc:  # pragma: no cover - defensive
+                self._post(self._error, str(exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _clear_body(self) -> None:
+        for child in self._body.winfo_children():
+            child.destroy()
+
+    def _need_clearance(self, web_url: str) -> None:
+        """Show the CloudFlare hand-off panel (open in Firefox, then Retry)."""
+        self._clear_body()
+        self._status_var.set("CommonLII needs a CloudFlare check.")
+        frame = ttk.Frame(self._body)
+        frame.pack(fill="both", expand=True, padx=24, pady=24)
+        ttk.Label(
+            frame, wraplength=560, justify="left",
+            text=("CommonLII is behind a CloudFlare check.\n\n"
+                  "To view this scan in the app, click “Open in Firefox”, pass "
+                  "the “Just a moment…” check there, then click “Retry”.  Once "
+                  "cleared, this and other English Reports cases load straight "
+                  "in the app (and are cached so you won't be asked again)."),
+        ).pack(anchor="w", pady=(0, 16))
+        row = ttk.Frame(frame)
+        row.pack(anchor="w")
+
+        def open_ff() -> None:
+            if eng_rep_pdf.open_in_firefox(web_url):
+                self._status_var.set("Pass the check in Firefox, then Retry.")
+            else:
+                eng_rep_pdf.open_in_browser(web_url)
+
+        def retry() -> None:
+            self._clear_body()
+            self._fetch()
+
+        ttk.Button(row, text="Open in Firefox", command=open_ff).pack(side="left")
+        ttk.Button(row, text="Retry", command=retry).pack(side="left", padx=8)
+        ttk.Button(row, text="Open in browser instead",
+                   command=lambda: (eng_rep_pdf.open_in_browser(self._case.pdf_url),
+                                    self._win.destroy())).pack(side="left")
+
+    def _link_out(self) -> None:
+        """In-app fetch isn't possible here (no Firefox / packages) — open the
+        scan in the user's browser and explain."""
+        eng_rep_pdf.open_in_browser(self._case.pdf_url)
+        self._clear_body()
+        ttk.Label(
+            self._body, wraplength=560, justify="left", padding=24,
+            text=("Opened in your browser.\n\nFor in-app viewing of English "
+                  "Reports scans (cached, no repeat checks), install Firefox "
+                  "and run:\n\n    pip install curl_cffi browser_cookie3"),
+        ).pack(anchor="w")
+        self._status_var.set("Opened in your browser.")
+
+
+def _choose_eng_rep_case(parent: tk.Misc,
+                         cases: "list[eng_rep.ERCase]") -> "eng_rep.ERCase | None":
+    """Several cases share one E.R. page — let the user pick.  Returns the chosen
+    case, or None if cancelled."""
+    dlg = tk.Toplevel(parent)
+    dlg.title(f"{cases[0].er_cite} — {len(cases)} cases")
+    dlg.geometry("640x360")
+    dlg.transient(parent)
+    ttk.Label(dlg, padding=(10, 8),
+              text=f"{len(cases)} cases are reported at {cases[0].er_cite}. "
+                   "Pick one:").pack(anchor="w")
+    box = ttk.Frame(dlg)
+    box.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+    lb = tk.Listbox(box, activestyle="dotbox")
+    sb = ttk.Scrollbar(box, orient="vertical", command=lb.yview)
+    lb.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    lb.pack(side="left", fill="both", expand=True)
+    for c in cases:
+        tag = f"({c.letter}) " if c.letter else ""
+        lb.insert("end", f"{tag}{c.name}  ·  {c.neutral}")
+    lb.selection_set(0)
+    chosen: dict[str, "eng_rep.ERCase | None"] = {"case": None}
+
+    def ok() -> None:
+        sel = lb.curselection()
+        chosen["case"] = cases[sel[0]] if sel else None
+        dlg.destroy()
+
+    def cancel() -> None:
+        chosen["case"] = None
+        dlg.destroy()
+
+    lb.bind("<Double-Button-1>", lambda _e: ok())
+    btns = ttk.Frame(dlg)
+    btns.pack(fill="x", padx=10, pady=(0, 10))
+    ttk.Button(btns, text="Open", command=ok).pack(side="right")
+    ttk.Button(btns, text="Cancel", command=cancel).pack(side="right", padx=8)
+    dlg.bind("<Return>", lambda _e: ok())
+    dlg.bind("<Escape>", lambda _e: cancel())
+    lb.focus_set()
+    dlg.grab_set()
+    parent.wait_window(dlg)
+    return chosen["case"]
+
+
+def _open_eng_rep(parent: tk.Misc, spec: str,
+                  status=lambda _s: None) -> None:
+    """Open an English Reports citation ("<vol>:<page>" spec): resolve it to the
+    CommonLII case(s), let the user pick when a page holds several, and show the
+    scan in-app (cached, with the CloudFlare hand-off) — or, when in-app fetching
+    isn't available and it isn't cached, open it in the browser."""
+    cases = eng_rep.resolve(spec)
+    if not cases:
+        vp = eng_rep.parse_spec(spec)
+        if vp:
+            status(f"{vp[0]} Eng. Rep. {vp[1]} isn't in the index — "
+                   "searching CommonLII…")
+            eng_rep_pdf.open_in_browser(eng_rep.search_url(*vp))
+        else:
+            status("Couldn't parse that English Reports citation.")
+        return
+    case = cases[0] if len(cases) == 1 else _choose_eng_rep_case(parent, cases)
+    if case is None:
+        return
+    if (not eng_rep_pdf.is_cached(case.year, case.num)
+            and not eng_rep_pdf.can_fetch()):
+        status(f"Opening {case.er_cite} in your browser…")
+        eng_rep_pdf.open_in_browser(case.pdf_url)
+        return
+    status(f"Opening {case.name[:40]} ({case.er_cite})…")
+    _EngRepPdfWindow(parent, case, status)
+
+
+# ---------------------------------------------------------------------------
 # Open Brief — follow a highlighted citation to its source
 # ---------------------------------------------------------------------------
 # These mirror _ScholarTextWindow._follow_link but stand alone so the brief
@@ -7325,8 +7511,8 @@ def _open_statute_pdf(parent: tk.Misc, url: str,
 
 #: Categories used to colour-code highlights by what the citation points at.
 def _brief_action_category(kind: str) -> str:
-    if kind in ("cite", "url"):
-        return "case"
+    if kind in ("cite", "url", "engrep"):
+        return "case"  # English Reports cites are cases too
     if kind == "const":
         return "const"
     return "statute"
@@ -7344,6 +7530,15 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
         cite = value.split("@")[0]
         url = ("https://scholar.google.com/scholar?q="
                + urllib.parse.quote(f'"{cite}"'))
+    elif kind == "engrep":
+        # English Reports → the CommonLII scan (first case at that page), or a
+        # CommonLII search when the citation isn't in our index.
+        cases = eng_rep.resolve(value)
+        vp = eng_rep.parse_spec(value)
+        url = (cases[0].pdf_url if cases
+               else (eng_rep.search_url(*vp) if vp else ""))
+        if not url:
+            return
     else:
         q = (text or value).strip()
         url = "https://www.google.com/search?q=" + urllib.parse.quote(q)
@@ -7369,6 +7564,9 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
     kind, value = action
     if kind in _STATUTE_SOURCES or kind in ("browse", "statpdf"):
         _open_statute_action(parent, action, status)
+        return
+    if kind == "engrep":
+        _open_eng_rep(parent, value, status)
         return
     if kind != "cite":
         status("Don't know how to open that citation.")
@@ -8560,6 +8758,7 @@ class _CitingOpinionsWindow:
 def main() -> None:
     root = tk.Tk()
     app = CourtListenerGUI(root)
+    eng_rep.warm()  # load the English Reports index in the background
 
     # Run in the background by default: rather than greeting the user with the
     # full search window, GetCases starts hidden and waits.  Ctrl+Space opens

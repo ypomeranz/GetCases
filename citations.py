@@ -22,6 +22,7 @@ import re
 
 import constitution
 import ecfr
+import eng_rep
 import fed_rules
 import state_statutes
 import statutes_at_large
@@ -155,6 +156,8 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     for m in statutes_at_large.STAT_CITE_RE.finditer(text):
         if statutes_at_large.url_for(m):  # only link volumes GovInfo has
             matches.append((m.start(), m.end(), "stat", m))
+    for m in eng_rep.ER_CITE_RE.finditer(text):
+        matches.append((m.start(), m.end(), "engrep", m))
 
     matches.sort(key=lambda t: (t[0], -t[1]))
     out: list[tuple[int, int, tuple[str, str]]] = []
@@ -212,6 +215,9 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
             action = state_statutes.action_for(m)
         elif kind == "stat":
             action = ("statpdf", statutes_at_large.url_for(m))
+        elif kind == "engrep":
+            # English Reports cite ("156 Eng. Rep. 145") -> CommonLII scan.
+            action = ("engrep", eng_rep.cite_spec(m))
         else:  # pragma: no cover - defensive
             action = None
         if action is not None:

@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# English Reports index build scratch (raw toc HTML + intermediates + builders).
+# The shipped product, eng_rep_index.tsv.gz, lives in the repo root.
+_engr_build/
