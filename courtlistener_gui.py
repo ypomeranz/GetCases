@@ -7502,7 +7502,12 @@ def _choose_eng_rep_case(parent: tk.Misc,
     dlg = tk.Toplevel(parent)
     dlg.title(f"{cases[0].er_cite} — {len(cases)} cases")
     dlg.geometry("640x360")
-    dlg.transient(parent)
+    # Only tie the dialog to the parent when the parent is actually on screen.
+    # Invoked from the spotlight the main window is withdrawn, and making a modal
+    # dialog transient to (or grabbing against) a hidden window leaves it
+    # invisible / raises "grab failed: window not viewable".
+    if parent.winfo_viewable():
+        dlg.transient(parent)
     ttk.Label(dlg, padding=(10, 8),
               text=f"{len(cases)} cases are reported at {cases[0].er_cite}. "
                    "Pick one:").pack(anchor="w")
@@ -7535,8 +7540,18 @@ def _choose_eng_rep_case(parent: tk.Misc,
     ttk.Button(btns, text="Cancel", command=cancel).pack(side="right", padx=8)
     dlg.bind("<Return>", lambda _e: ok())
     dlg.bind("<Escape>", lambda _e: cancel())
+    # Make sure the dialog is mapped and focused before grabbing — with the main
+    # window hidden it must stand on its own — and never let a failed grab abort
+    # the caller (it just means the dialog isn't modal).
+    dlg.update_idletasks()
+    dlg.deiconify()
+    dlg.lift()
+    dlg.focus_force()
     lb.focus_set()
-    dlg.grab_set()
+    try:
+        dlg.grab_set()
+    except tk.TclError:
+        pass
     parent.wait_window(dlg)
     return chosen["case"]
 
