@@ -5056,6 +5056,20 @@ class _ScholarTextWindow:
             ref, pin = _cite_target_from_text(span.text, self._short_cite_index)
             if ref:
                 self._last_cite_action = ("cite", ref)
+            # If Scholar's hyperlink covers an English Reports citation we have
+            # in our own index ("156 Eng. Rep. 145"), point it at our CommonLII
+            # scan instead — Scholar's own copy of these old English cases is
+            # usually missing or a poor scan.  Only override on a real index
+            # match, so unknown E.R. cites keep Scholar's link.
+            er_m = eng_rep.ER_CITE_RE.search(span.text)
+            if er_m:
+                er_spec = eng_rep.cite_spec(er_m)
+                if eng_rep.resolve(er_spec):
+                    action = ("engrep", er_spec)
+                    self._last_cite_action = action
+                    tags += ["citelink", self._new_link(action)]
+                    txt.insert("end", span.text, tuple(tags))
+                    return
             # Carry any pincite so the opened case jumps to it (Scholar's own
             # hyperlink otherwise opens the case at the top).
             value = f"{span.link}\tpin={pin}" if pin else span.link
