@@ -1462,6 +1462,8 @@ class CourtListenerGUI:
             )
             if court_id == "scotus":
                 court_abbr = "SCOTUS"
+            elif court_id == "engrep":
+                court_abbr = "Eng. Rep."
 
             # Court badge on the left
             badge = tk.Label(
@@ -1565,6 +1567,7 @@ class CourtListenerGUI:
         )
         status_lbl.pack(fill="x", padx=8, pady=(4, 4))
         search_done = [0]  # track how many searches completed
+        total_searches = 3  # Google Scholar + CourtListener + English Reports
 
         def _update_status() -> None:
             if my_gen != self._spotlight_generation:
@@ -1573,7 +1576,7 @@ class CourtListenerGUI:
                 if not popup.winfo_exists():
                     return
                 n = len(result_rows)
-                if search_done[0] >= 2:
+                if search_done[0] >= total_searches:
                     status_lbl.config(
                         text=f"{n} results" if n else "No results found"
                     )
@@ -1599,7 +1602,7 @@ class CourtListenerGUI:
                 0, _add_result, "", f"{cite_label} — Federal Appendix",
                 cite_label, "", "case.law PDF", _open_appx,
             )
-            search_done[0] = 2
+            search_done[0] = total_searches  # nothing else runs for an F. App'x cite
             self.root.after(0, _update_status)
             return
 
@@ -1824,8 +1827,38 @@ class CourtListenerGUI:
             search_done[0] += 1
             self.root.after(0, _update_status)
 
+        # English Reports name search: offline, against our own index, so a
+        # pre-1865 English case (which Scholar/CL often lack a clean scan of)
+        # surfaces by name next to the online results.  search_by_name is
+        # strict — a U.S. or post-1865 name returns nothing — so this row only
+        # appears for a genuine English Reports case.
+        def engrep_search() -> None:
+            try:
+                cases = eng_rep.search_by_name(query, limit=1)
+            except Exception:
+                cases = []
+            for case in cases:
+                def make_opener(c=case):
+                    def open_it():
+                        _open_eng_rep_case(
+                            self.root, c, self._status_var.set,
+                        )
+                    return open_it
+
+                # No year column: ERCase.year is CommonLII's neutral-cite year,
+                # which for older cases isn't the decision year (Entick is
+                # "[1799] EngR 236" but was decided 1765).  The E.R. citation
+                # already identifies the case, so show it without a wrong year.
+                self.root.after(
+                    0, _add_result, "engrep", case.name, case.er_cite,
+                    "", "English Reports", make_opener(),
+                )
+            search_done[0] += 1
+            self.root.after(0, _update_status)
+
         threading.Thread(target=scholar_search, daemon=True).start()
         threading.Thread(target=cl_search, daemon=True).start()
+        threading.Thread(target=engrep_search, daemon=True).start()
 
     @staticmethod
     def _win_force_foreground(popup: tk.Misc) -> bool:
@@ -7507,6 +7540,15 @@ def _open_eng_rep(parent: tk.Misc, spec: str,
     case = cases[0] if len(cases) == 1 else _choose_eng_rep_case(parent, cases)
     if case is None:
         return
+    _open_eng_rep_case(parent, case, status)
+
+
+def _open_eng_rep_case(parent: tk.Misc, case: "eng_rep.ERCase",
+                       status=lambda _s: None) -> None:
+    """Show one already-resolved English Reports case: the in-app scan (cached,
+    with the CloudFlare hand-off) or — when in-app fetching isn't available and
+    it isn't cached — the browser.  Used when the exact case is known (a name
+    search hit), so it skips the same-page chooser :func:`_open_eng_rep` runs."""
     if (not eng_rep_pdf.is_cached(case.year, case.num)
             and not eng_rep_pdf.can_fetch()):
         status(f"Opening {case.er_cite} in your browser…")

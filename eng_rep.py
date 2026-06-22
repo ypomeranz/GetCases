@@ -187,6 +187,122 @@ def lookup_nearest(vol: int, page: int) -> list[ERCase]:
 
 
 # ---------------------------------------------------------------------------
+# Name search -- best-effort match of a typed case name to the index, so the
+# GUI's case-name search can surface the English Reports case alongside its
+# Google Scholar / CourtListener results.
+# ---------------------------------------------------------------------------
+
+# Connector / role words that carry no identifying weight in a case name, so
+# they're ignored when deciding whether a typed name matches an indexed one
+# ("Entick v Carrington" should still match "John Entick, Clerk, versus Nathan
+# Carrington and Three Others").  "versus"/"against" are the old long forms of
+# "v"; the party-role words ("plaintiff", "respondent", ...) are 18th-century
+# reporting boilerplate.
+_NAME_STOPWORDS = frozenset({
+    "v", "vs", "versus", "against", "and", "the", "of", "in", "on", "an", "a",
+    "re", "ex", "parte", "or", "to", "for", "his", "her", "wife", "al", "ux",
+    "anor", "another", "others", "co", "ltd", "limited", "esq", "esqrs",
+    "gent", "clerk", "knt", "bart", "appellant", "appellants", "respondent",
+    "respondents", "plaintiff", "plaintiffs", "defendant", "defendants",
+    "executor", "executors", "administratrix", "administrator", "deceased",
+    "same", "case",
+})
+
+_NAME_NORM_RE = re.compile(r"[^a-z0-9 ]+")
+
+# Built lazily from the citation index: (normalised name, token set, case).
+_NAME_INDEX: "list[tuple[str, frozenset, ERCase]] | None" = None
+
+
+def _norm_name(s: str) -> str:
+    """Fold a case name to a comparison key: lowercase, '&'->'and', punctuation
+    dropped, spaces collapsed -- so 'Hadley v. Baxendale' and 'Hadley v
+    Baxendale' compare equal."""
+    s = s.lower().replace("&", " and ")
+    s = _NAME_NORM_RE.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _distinctive(tokens: "list[str]") -> "list[str]":
+    """The identifying tokens of a name: not connector/role words, not bare
+    numbers, at least three letters (drops 'v', 'and', years, single initials)."""
+    return [t for t in tokens
+            if t not in _NAME_STOPWORDS and len(t) >= 3 and not t.isdigit()]
+
+
+def _tok_match(qt: str, name_tokens: frozenset) -> bool:
+    """A query token matches a name when an indexed token equals it or extends
+    it by a short suffix -- so 'pinnel' matches the possessive 'pinnels' (as in
+    "Pinnel's Case") without 'bury' bleeding into 'canterbury'."""
+    if qt in name_tokens:
+        return True
+    for nt in name_tokens:
+        if nt.startswith(qt) and 0 < len(nt) - len(qt) <= 2:
+            return True
+    return False
+
+
+def _load_names() -> None:
+    """Build the name-search index once from the already-loaded citation index
+    (idempotent, thread-safe).  Best-effort: leaves an empty index on failure."""
+    global _NAME_INDEX
+    if _NAME_INDEX is not None:
+        return
+    _load()
+    with _LOCK:
+        if _NAME_INDEX is not None:
+            return
+        idx: list[tuple[str, frozenset, ERCase]] = []
+        seen: set[tuple[int, int]] = set()
+        for cases in (_INDEX or {}).values():
+            for c in cases:
+                if not c.name:
+                    continue
+                key = (c.year, c.num)   # one row per case, not per page-letter
+                if key in seen:
+                    continue
+                seen.add(key)
+                nn = _norm_name(c.name)
+                if nn:
+                    idx.append((nn, frozenset(nn.split()), c))
+        _NAME_INDEX = idx
+
+
+def search_by_name(query: str, limit: int = 1) -> "list[ERCase]":
+    """Best match(es) for a typed case name ("Entick v Carrington") among the
+    indexed English Reports cases -- best first, up to *limit*, or [] when
+    nothing matches well.
+
+    Matching is deliberately strict: every identifying word of the query must
+    appear in the case name.  So a U.S. or post-1865 case name (which the
+    English Reports don't contain) yields nothing rather than a misleading
+    near-miss -- the caller can show the result unconditionally."""
+    qn = _norm_name(query)
+    if not qn:
+        return []
+    qdist = _distinctive(qn.split())
+    if not qdist:
+        return []
+    _load_names()
+    assert _NAME_INDEX is not None
+    padded_q = f" {qn} "
+    scored: list[tuple[float, int, ERCase]] = []
+    for nn, nset, case in _NAME_INDEX:
+        if not all(_tok_match(t, nset) for t in qdist):
+            continue
+        if nn == qn:
+            score = 1.0                              # exact name
+        elif padded_q in f" {nn} ":
+            score = 0.9                              # query is a contiguous run
+        else:
+            score = 0.7                              # all words present, scattered
+        scored.append((score, len(nn), case))
+    # Best score first; among equals prefer the shorter (more precise) name.
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [c for _s, _ln, c in scored[:limit]]
+
+
+# ---------------------------------------------------------------------------
 # Helpers for the citation-detection / link-dispatch plumbing (mirrors the
 # other source modules: a regex match -> a compact spec string the GUI stores
 # on the link and hands back on click).
@@ -292,6 +408,21 @@ if __name__ == "__main__":
 
     # a bogus citation resolves to nothing
     check(lookup(999, 99999) == [], "bogus cite -> no cases")
+
+    # --- name search ---
+    def name_one(query, expect_substr):
+        hits = search_by_name(query, limit=1)
+        ok = bool(hits) and expect_substr.lower() in hits[0].name.lower()
+        check(ok, f"name {query!r} -> {expect_substr!r} "
+                  f"(got {hits[0].name[:40] if hits else None!r})")
+
+    name_one("Hadley v Baxendale", "Hadley")        # "...v Baxendale and Others"
+    name_one("Entick v Carrington", "Entick")       # "...versus Nathan Carrington..."
+    name_one("Pinnel", "Pinnel")                    # possessive: "Pinnel's Case"
+    name_one("Planche v Colburn", "Planche")
+    # A U.S. case name (not in the English Reports) must not match anything.
+    check(search_by_name("Monroe v Pape") == [], "U.S. name -> no match")
+    check(search_by_name("") == [], "empty name -> no match")
 
     total = sum(len(v) for v in (_INDEX or {}).values())
     print(f"\nindex: {len(_INDEX or {}):,} pages, {total:,} cases")
