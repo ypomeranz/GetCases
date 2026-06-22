@@ -1303,6 +1303,20 @@ class CourtListenerGUI:
                 _open_statute_action(self.root, statute)
                 return
 
+            # 1b. English Reports citation ("156 Eng. Rep. 145", "95 E.R. 807"):
+            # open the CommonLII scan straight away when we recognize the cite
+            # (it's in our index).  An unrecognized E.R. cite falls through to
+            # the normal search below (which won't find it on Scholar/CL either,
+            # but at least keeps a single, predictable code path).
+            er_m = eng_rep.ER_CITE_RE.search(query)
+            if er_m:
+                spec = eng_rep.cite_spec(er_m)
+                if eng_rep.resolve(spec):
+                    popup.destroy()
+                    self._quick_popup = None
+                    _open_eng_rep(self.root, spec, self._status_var.set)
+                    return
+
             # 2. Case citation: "365 U.S. 167" or "Monroe v. Pape, 365 U.S. 167, 171"
             parsed = _parse_citation_line(query)
             if parsed:
