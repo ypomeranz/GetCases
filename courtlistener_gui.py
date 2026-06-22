@@ -41,8 +41,10 @@ def _ensure_dependencies() -> None:
 
     ``requests`` is required; the rest enable features and declining just
     disables them: ``beautifulsoup4`` (Google Scholar / opinion parsing),
-    ``pynput`` (global hotkey), and ``pypdfium2`` + ``Pillow`` (the in-app
-    PDF viewer).
+    ``pynput`` (global hotkey), ``pypdfium2`` + ``Pillow`` (the in-app PDF
+    viewer), and ``curl_cffi`` + ``browser_cookie3`` (fetching the CommonLII
+    English Reports scans in-app through CloudFlare; without them E.R. cases
+    open in the browser instead).
     """
     import importlib
     import importlib.util
@@ -56,6 +58,8 @@ def _ensure_dependencies() -> None:
                 ("pynput", "pynput"),
                 ("pypdfium2", "pypdfium2"),  # in-app PDF viewer
                 ("PIL", "Pillow"),           # in-app PDF viewer (imports as PIL)
+                ("curl_cffi", "curl_cffi"),  # English Reports scan fetch (CloudFlare)
+                ("browser_cookie3", "browser_cookie3"),  # reads Firefox clearance cookie
             )
             if importlib.util.find_spec(module) is None
         ]
