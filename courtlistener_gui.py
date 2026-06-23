@@ -4028,6 +4028,67 @@ def _dump_to_rtf(
     return "".join(out)
 
 
+def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:
+    """Convert a statute / rule / constitution window's Text range to an RTF
+    body, mapping the ``_StatuteWindow`` tag set — section headings, bold
+    enumerators, indent levels, source credits and notes — to RTF.  Mirrors
+    :func:`_dump_to_rtf` but for that window's tags (the Scholar tags it knows
+    don't appear here, so the two need separate dumpers)."""
+    out: list[str] = []
+    active: set[str] = set(txt.tag_names(start))
+    active.discard("sel")
+    par_open = False
+
+    def indent_level() -> int:
+        for i in range(6, -1, -1):
+            if f"ind{i}" in active:
+                return i
+        return 0
+
+    def par_prefix() -> str:
+        parts = ["\\pard"]
+        li = indent_level() * 360  # ~0.25" per nesting level
+        if li:
+            parts.append(f"\\li{li}")
+        if "sechead" in active:
+            parts.append("\\sb120\\sa120")
+        elif "credit" in active or "notehead" in active:
+            parts.append("\\sb120\\sa60")
+        else:
+            parts.append("\\sa120")
+        return "".join(parts) + " "
+
+    def run_to_rtf(seg: str) -> str:
+        codes: list[str] = []
+        if "sechead" in active:
+            codes.append("\\b\\fs28")
+        elif "headline" in active or "notehead" in active or "enum" in active:
+            codes.append("\\b")
+        if "credit" in active or "notebody" in active:
+            codes.append("\\fs18")
+        esc = _rtf_escape(seg)
+        return "{" + "".join(codes) + " " + esc + "}" if codes else esc
+
+    for key, value, _index in txt.dump(start, end, text=True, tag=True):
+        if key == "tagon":
+            active.add(value)
+        elif key == "tagoff":
+            active.discard(value)
+        elif key == "text":
+            for i, seg in enumerate(value.split("\n")):
+                if i and par_open:
+                    out.append("\\par\n")
+                    par_open = False
+                if seg:
+                    if not par_open:
+                        out.append(par_prefix())
+                        par_open = True
+                    out.append(run_to_rtf(seg))
+    if par_open:
+        out.append("\\par\n")
+    return "".join(out)
+
+
 def _copy_rich_clipboard(widget: tk.Misc, rtf: str, plain: str) -> str:
     """
     Put *rtf* on the system clipboard (with *plain* as fallback where the
