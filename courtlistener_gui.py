@@ -485,6 +485,11 @@ _CASE_LAW_REPORTER_ALIASES = {
     "fed-rep": "f",        # Federal Reporter (old "Fed. Rep." → "F.")
     "fed-rep-2d": "f2d",
     "fed-rep-3d": "f3d",
+    # Federal Appendix spelled without the canonical spacing/apostrophe slugs to
+    # several forms; static.case.law uses "f-appx".
+    "fappx": "f-appx",     # "F.App'x", "F.Appx."
+    "fedappx": "f-appx",   # "Fed.App'x", "Fed.Appx."
+    "fed-appx": "f-appx",  # "Fed. App'x", "Fed. Appx."
 }
 
 
