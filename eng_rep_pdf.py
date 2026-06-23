@@ -253,6 +253,33 @@ def _impersonate_target() -> str:
     return target
 
 
+_CHROMIUM_IMPERSONATE_CACHE: Optional[str] = None
+
+
+def _chromium_impersonate_target() -> str:
+    """The newest Chrome TLS-fingerprint target curl_cffi offers.  Chromium's
+    fingerprint covers Edge too (Edge is Chromium), so this matches a clearance
+    obtained in either browser via Playwright."""
+    global _CHROMIUM_IMPERSONATE_CACHE
+    if _CHROMIUM_IMPERSONATE_CACHE:
+        return _CHROMIUM_IMPERSONATE_CACHE
+    target = "chrome"
+    try:
+        import typing
+        from curl_cffi.requests.impersonate import BrowserTypeLiteral
+        chromes = []
+        for t in typing.get_args(BrowserTypeLiteral):
+            m = re.fullmatch(r"chrome(\d+)", t)
+            if m:
+                chromes.append((int(m.group(1)), t))
+        if chromes:
+            target = max(chromes)[1]
+    except Exception:
+        pass
+    _CHROMIUM_IMPERSONATE_CACHE = target
+    return target
+
+
 def _safe_mtime(p: Path) -> float:
     try:
         return p.stat().st_mtime
@@ -654,25 +681,33 @@ def _wait_for_clearance(ctx, page, timeout: int) -> dict:
 
 def _pw_fetch_pdf(page, pdf_url: str) -> bytes:
     """Fetch the PDF from inside the (cleared) page with a same-origin fetch, so
-    it goes through the real browser's network, cookies and TLS.  Returns the
-    bytes, or b"" on failure."""
+    it goes through the real browser's network, cookies and TLS.  Base64 is done
+    via FileReader (no String.fromCharCode argument limit on large scans).
+    Returns the bytes, or b"" on failure."""
     import base64
-    b64 = page.evaluate(
+    result = page.evaluate(
         """async (url) => {
             try {
                 const r = await fetch(url, {credentials: 'include'});
-                if (!r.ok) return '';
-                const buf = await r.arrayBuffer();
-                const bytes = new Uint8Array(buf);
-                let bin = '';
-                const chunk = 0x8000;
-                for (let i = 0; i < bytes.length; i += chunk)
-                    bin += String.fromCharCode.apply(
-                        null, bytes.subarray(i, i + chunk));
-                return btoa(bin);
-            } catch (e) { return ''; }
+                if (!r.ok) return 'ERR:status ' + r.status;
+                const blob = await r.blob();
+                const b64 = await new Promise((resolve) => {
+                    const fr = new FileReader();
+                    fr.onloadend = () => resolve(
+                        String(fr.result).split(',')[1] || '');
+                    fr.onerror = () => resolve('');
+                    fr.readAsDataURL(blob);
+                });
+                return b64;
+            } catch (e) { return 'ERR:' + (e && e.message || e); }
         }""", pdf_url)
-    return base64.b64decode(b64) if b64 else b""
+    if isinstance(result, str) and result.startswith("ERR:"):
+        print(f"[eng_rep_pdf] in-page PDF fetch failed: {result[4:]}")
+        return b""
+    try:
+        return base64.b64decode(result) if result else b""
+    except Exception:
+        return b""
 
 
 def fetch_pdf_via_playwright(year: int, num: int, web_url: str,
@@ -696,6 +731,10 @@ def fetch_pdf_via_playwright(year: int, num: int, web_url: str,
         raise FetchUnavailable()
 
     pdf_url = re.sub(r"\.html?$", ".pdf", web_url)
+    cookies: dict = {}
+    ua = ""
+    data = b""
+    impersonate = _chromium_impersonate_target()
     with sync_playwright() as p:
         ctx, channel = _launch_user_browser(p)
         if ctx is None:
@@ -712,23 +751,37 @@ def fetch_pdf_via_playwright(year: int, num: int, web_url: str,
                 raise CloudflareChallenge(web_url)
             on_status("Check passed — downloading the scan…")
             ua = page.evaluate("() => navigator.userAgent")
-            try:  # make sure we're on a real same-origin page before fetching
-                page.goto(web_url, wait_until="domcontentloaded", timeout=30000)
-            except _PWTimeout:
-                pass
-            data = _pw_fetch_pdf(page, pdf_url)
+            # Primary: fetch with curl_cffi using the fresh clearance — the same
+            # proven mechanism as the Firefox path (cookie + Referer + a
+            # browser-matching TLS fingerprint), just with Edge/Chrome's cookie.
+            if _have("curl_cffi"):
+                try:
+                    data = _fetch_pdf_with(cookies, ua, impersonate,
+                                           year, num, web_url)
+                except (CloudflareChallenge, OriginError) as exc:
+                    print(f"[eng_rep_pdf] playwright+curl_cffi fetch failed: {exc}")
+                    data = b""
+            # Fallback (e.g. no curl_cffi): fetch inside the browser itself.
+            if not data:
+                try:
+                    page.goto(web_url, wait_until="domcontentloaded", timeout=30000)
+                except _PWTimeout:
+                    pass
+                raw = _pw_fetch_pdf(page, pdf_url)
+                if raw[:4] == b"%PDF":
+                    _store(year, num, raw)
+                    data = raw
         finally:
             try:
                 ctx.close()
             except Exception:
                 pass
 
+    # Save the clearance so later cases reuse it via curl_cffi without a browser.
+    if cookies.get("cf_clearance"):
+        _save_clearance(cookies, ua, impersonate)
     if not data or data[:4] != b"%PDF":
         raise OriginError(0)
-    _store(year, num, data)
-    # Chrome and Edge are both Chromium (Chromium TLS), so impersonate "chrome"
-    # for the saved curl_cffi reuse regardless of which channel solved it.
-    _save_clearance(cookies, ua, "chrome")
     return data
 
 
