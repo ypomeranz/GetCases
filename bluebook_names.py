@@ -665,6 +665,37 @@ def _format_anonymous_initials(party: str) -> str | None:
     return "".join(f"{c}." for c in letters)
 
 
+# Procedural captions naming an anonymized party by initials ("In re J.W.",
+# "Ex parte D.L.").  The remainder after the prefix is reformatted like any
+# other anonymized-initials party; the prefix is kept in canonical Bluebook
+# form (rule 10.2.1(b): "In re", "Ex parte").
+_PROCEDURAL_PREFIX_RE = re.compile(
+    r"^(in\s+re|ex\s+parte|in\s+the\s+matter\s+of|matter\s+of)\b[\s,:]*",
+    re.IGNORECASE,
+)
+_PROCEDURAL_CANON = {
+    "in re": "In re",
+    "ex parte": "Ex parte",
+    "in the matter of": "In re",
+    "matter of": "In re",
+}
+
+
+def _format_procedural_initials(party: str) -> str | None:
+    """Anonymized party by initials behind a procedural prefix —
+    "In re JW" -> "In re J.W.", "Ex parte D. L." -> "Ex parte D.L.".
+    Returns None when there's no procedural prefix or the remainder isn't a
+    bare run of initials ("In re Gault" is left to the ordinary path)."""
+    m = _PROCEDURAL_PREFIX_RE.match(party)
+    if not m:
+        return None
+    anon = _format_anonymous_initials(party[m.end():])
+    if anon is None:
+        return None
+    prefix = _PROCEDURAL_CANON[re.sub(r"\s+", " ", m.group(1).lower())]
+    return f"{prefix} {anon}"
+
+
 def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     p = re.sub(r"\s+", " ", party).strip()
     p = _ET_AL_RE.sub("", p)
@@ -679,6 +710,9 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     anon = _format_anonymous_initials(p)
     if anon is not None:
         return anon
+    anon_prefixed = _format_procedural_initials(p)
+    if anon_prefixed is not None:
+        return anon_prefixed
     if p.strip(" ,.").lower() in _GEO_PARTIES:
         return p
 
@@ -810,6 +844,10 @@ if __name__ == "__main__":
         ("The Florida Star v. B. J. F.", "Fla. Star v. B.J.F."),
         ("DL v. Huebner", "D.L. v. Huebner"),
         ("Trump v. J. G. G.", "Trump v. J.G.G."),
+        ("In re JW", "In re J.W."),
+        ("Ex parte D. L.", "Ex parte D.L."),
+        ("In the Matter of JW", "In re J.W."),
+        ("In re Gault", "In re Gault"),
         ("Nat'l Lab. Rels. Bd. v. Jones & Laughlin Steel Corp.",
          "NLRB v. Jones & Laughlin Steel Corp."),
         # Given names (rule 10.2.1(g))
