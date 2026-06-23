@@ -1847,84 +1847,10 @@ class CourtListenerGUI:
                             if _item_is_fed_appx(it):
                                 self._post_root(self._open_fed_appx_pdf, it)
                                 return
-                            # Try Google Scholar first, same as the main window
-                            if fetcher is not None:
-                                primary = _pick_citation(
-                                    it.get("citation", [])
-                                )
-                                quick_result = None
-                                if primary:
-                                    try:
-                                        quick_result = fetcher.fetch_by_citation(
-                                            primary
-                                        )
-                                    except Exception:
-                                        pass
-                                if quick_result:
-                                    url, html = quick_result
-                                    def show_quick():
-                                        win = _ScholarTextWindow(
-                                            self.root, self, url, html,
-                                            item=it,
-                                            note="verifying against CourtListener…",
-                                        )
-                                        def verify():
-                                            self._spotlight_verify_scholar(
-                                                win, url, html, it,
-                                                fetcher, c,
-                                            )
-                                        threading.Thread(
-                                            target=verify, daemon=True,
-                                        ).start()
-                                    self._post_root(show_quick)
-                                    return
-                                # Quick fetch failed — try full search
-                                try:
-                                    result, cl_text, note = _find_scholar_for_item(
-                                        c, fetcher, it, lambda m: None,
-                                    )
-                                except Exception:
-                                    result, cl_text, note = None, None, ""
-                                if result:
-                                    s_url, s_html = result
-                                    def show_full():
-                                        _ScholarTextWindow(
-                                            self.root, self, s_url, s_html,
-                                            item=it, cl_text=cl_text,
-                                            note=note,
-                                        )
-                                    self._post_root(show_full)
-                                    return
-
-                            # Scholar unavailable or failed — fall back to CL
-                            if c is None:
-                                def fail_no():
-                                    messagebox.showerror(
-                                        "Error",
-                                        f'Could not load "{nm}".',
-                                    )
-                                self._post_root(fail_no)
-                                return
-                            try:
-                                parts, blocks, plain, cluster = (
-                                    _assemble_case_parts(c, it)
-                                )
-                            except Exception as exc:
-                                def fail(e=exc):
-                                    messagebox.showerror(
-                                        "CourtListener Error",
-                                        f'Could not load "{nm}".\n\n{e}',
-                                    )
-                                self._post_root(fail)
-                                return
-                            if parts or plain:
-                                def show():
-                                    _ScholarTextWindow(
-                                        self.root, self, "", "",
-                                        item=it, cl_text=plain,
-                                        cl_parts=parts, cl_blocks=blocks,
-                                    )
-                                self._post_root(show)
+                            # Same Scholar-first / CourtListener-fallback flow
+                            # as the main window: show Scholar only when its
+                            # first case verifies against the CourtListener text.
+                            self._scholar_first_worker(it, fetcher, c)
                         threading.Thread(target=run, daemon=True).start()
                     return open_it
 
@@ -3062,21 +2988,6 @@ class CourtListenerGUI:
         self._search_btn.config(state="disabled")
         self._status_var.set("Searching Google Scholar…")
 
-        cluster_id = item.get("cluster_id") or item.get("id")
-        vkey = f"verified:cluster:{cluster_id}" if cluster_id else ""
-
-        # Check verified cache first — if found, open immediately
-        if vkey:
-            cached = fetcher.get_cached(vkey)
-            if cached:
-                self._restore_buttons()
-                self._status_var.set("Scholar text loaded (cached).")
-                _ScholarTextWindow(
-                    self.root, self, cached[0], cached[1],
-                    item=item, note="verified match (cached)",
-                )
-                return
-
         def status_cb(msg: str) -> None:
             self.root.after(0, self._status_var.set, msg)
 
@@ -3087,35 +2998,10 @@ class CourtListenerGUI:
             if _item_is_fed_appx(item):
                 self.root.after(0, self._open_fed_appx_pdf, item)
                 return
-            # Step 1: Quick fetch — get the first Scholar result fast
-            primary = _pick_citation(item.get("citation", []))
-            quick_result = None
-            if primary:
-                try:
-                    quick_result = fetcher.fetch_by_citation(primary)
-                except Exception:
-                    pass
-
-            if quick_result:
-                # Show the result immediately (unverified)
-                url, html = quick_result
-                self.root.after(
-                    0, self._on_scholar_quick_show,
-                    url, html, item, fetcher, client,
-                )
-            else:
-                # No quick result — fall through to the full search
-                try:
-                    result, cl_text, note = _find_scholar_for_item(
-                        client, fetcher, item, status_cb,
-                    )
-                except Exception as exc:
-                    import traceback
-                    traceback.print_exc()
-                    result, cl_text, note = None, None, str(exc)
-                self.root.after(
-                    0, self._on_scholar_result, result, item, cl_text, note,
-                )
+            self._scholar_first_worker(
+                item, fetcher, client,
+                status=status_cb, done=self._restore_buttons,
+            )
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -3139,165 +3025,202 @@ class CourtListenerGUI:
         self._status_var.set("Federal Appendix case — opening the PDF…")
         _ScholarTextWindow(self.root, self, "", "", item=item)
 
-    def _on_scholar_quick_show(
-        self, url: str, html: str, item: dict,
-        fetcher, client,
-    ) -> None:
-        """Open the Scholar text immediately, then verify in background."""
-        self._restore_buttons()
-        self._status_var.set("Scholar text loaded — verifying…")
-        win = _ScholarTextWindow(
-            self.root, self, url, html, item=item,
-            note="verifying against CourtListener…",
-        )
+    # ------------------------------------------------------------------
+    # Scholar-first open: prefer Google Scholar, but only show it when its
+    # first case verifies against the CourtListener text.
+    # ------------------------------------------------------------------
 
-        def verify() -> None:
-            cluster_id = item.get("cluster_id") or item.get("id")
-            vkey = f"verified:cluster:{cluster_id}" if cluster_id else ""
-            cl_text: Optional[str] = None
-            if client is not None and cluster_id:
+    def _scholar_first_worker(
+        self, item: dict, fetcher, client,
+        prefetch_pdf: bool = True, status=None, done=None,
+    ) -> None:
+        """Worker-thread body for opening a CourtListener-identified case.
+
+        Tries Google Scholar's first case (by primary citation):
+          • Scholar errors           → give up, show the CourtListener text.
+          • first case matches CL    → show the Scholar text and we're done.
+          • first case doesn't match → show the CourtListener text now, but
+            keep hunting for a matching Scholar case in the background; if one
+            turns up the "Google Scholar Text" button lights up so the reader
+            can switch over.
+
+        (Federal Appendix cases are handled by callers before this runs.)
+        """
+        def finish() -> None:
+            if done is not None:
+                self._post_root(done)
+
+        cluster_id = item.get("cluster_id") or item.get("id")
+        vkey = f"verified:cluster:{cluster_id}" if cluster_id else ""
+
+        # A previously verified Scholar copy — open it straight away.
+        if fetcher is not None and vkey:
+            cached = fetcher.get_cached(vkey)
+            if cached:
+                url, html = cached
+                self._post_root(
+                    self._open_scholar_window, url, html, item, None,
+                    "verified match (cached)", prefetch_pdf,
+                )
+                finish()
+                return
+
+        # Step 1 — Google Scholar's first case, by the primary citation.
+        quick_result = None
+        quick_error = False
+        if fetcher is not None:
+            primary = _pick_citation(item.get("citation", []))
+            if primary:
+                if status:
+                    status("Searching Google Scholar…")
                 try:
-                    cl_text = _assemble_case_text(client, item)
-                except Exception:
-                    pass
+                    quick_result = fetcher.fetch_by_citation(primary)
+                except Exception as exc:
+                    print(f"[scholar] first-case fetch error for {primary!r}: {exc}")
+                    quick_error = True
+
+        # An error from Google Scholar — give up right away, show the CL text.
+        if quick_error:
+            self._assemble_and_open_cl(
+                item, client, prefetch_pdf, finish, search=False,
+                note="Google Scholar error — showing CourtListener text",
+            )
+            return
+
+        # Step 2 — assemble the CourtListener case (to verify against, and to
+        # show if Scholar doesn't pan out).
+        cl_parts: list = []
+        cl_blocks: list = []
+        cl_text: Optional[str] = None
+        if client is not None and cluster_id:
+            if status:
+                status("Loading CourtListener text…")
+            try:
+                cl_parts, cl_blocks, cl_plain, _ = _assemble_case_parts(
+                    client, item,
+                )
+                cl_text = cl_plain or None
+            except Exception as exc:
+                print(f"[scholar] CourtListener assembly failed: {exc}")
+
+        # Step 3 — decide based on Scholar's first case vs. the CL text.
+        if quick_result is not None:
+            url, html = quick_result
             if cl_text is None:
-                # Can't verify — accept what we have
-                self.root.after(0, self._on_verify_done, win, True,
-                                url, html, cl_text, None, vkey, fetcher)
+                # Nothing to verify against — accept the first Scholar result.
+                self._post_root(
+                    self._open_scholar_window, url, html, item, None,
+                    "unverified (no CourtListener text)", prefetch_pdf,
+                )
+                finish()
                 return
             sim = text_similarity(
                 blocks_to_text(parse_opinion_blocks(html)), cl_text,
             )
+            print(f"[scholar] first-case similarity {sim:.2f}")
             if sim >= _SCHOLAR_MATCH_THRESHOLD:
-                if vkey:
+                # Matches — show it and we're done.
+                if vkey and fetcher is not None:
                     fetcher.put_cached(vkey, url, html)
-                self.root.after(0, self._on_verify_done, win, True,
-                                url, html, cl_text, sim, vkey, fetcher)
+                self._post_root(
+                    self._open_scholar_window, url, html, item, cl_text,
+                    "verified against CourtListener", prefetch_pdf,
+                )
+                finish()
                 return
-            # First result didn't match — run full search for better match
-            def status_cb(msg: str) -> None:
-                self.root.after(0, self._status_var.set, msg)
+            # Doesn't match — fall through to the CourtListener text below.
+
+        # Scholar's first case either didn't match or wasn't there: open the
+        # CourtListener text now and keep looking for a Scholar match.
+        search = fetcher is not None
+        if cl_parts or cl_text:
+            self._post_root(
+                self._open_cl_window, item, cl_parts, cl_blocks, cl_text,
+                "", prefetch_pdf, search,
+            )
+            finish()
+            return
+
+        # No CourtListener text at all — last resort: a full Scholar search.
+        if fetcher is not None:
             try:
                 result, cl_text2, note = _find_scholar_for_item(
-                    client, fetcher, item, status_cb,
+                    client, fetcher, item, status or (lambda _m: None),
                 )
-            except Exception:
-                result = None
-                cl_text2 = cl_text
-            self.root.after(0, self._on_verify_done, win, False,
-                            url, html, cl_text2 or cl_text, sim,
-                            vkey, fetcher, result)
-
-        threading.Thread(target=verify, daemon=True).start()
-
-    def _on_verify_done(
-        self, win, matched: bool, orig_url: str, orig_html: str,
-        cl_text: Optional[str], sim: Optional[float],
-        vkey: str, fetcher, better_result=None,
-    ) -> None:
-        try:
-            if not win._win.winfo_exists():
+            except Exception as exc:
+                print(f"[scholar] full search failed: {exc}")
+                result, cl_text2, note = None, None, ""
+            if result:
+                s_url, s_html = result
+                self._post_root(
+                    self._open_scholar_window, s_url, s_html, item,
+                    cl_text2, note, prefetch_pdf,
+                )
+                finish()
                 return
-        except tk.TclError:
-            return
+        self._post_root(self._scholar_open_failed, item, "")
+        finish()
 
-        if matched:
-            note = "verified against CourtListener"
-            if sim is None:
-                note = "unverified (no CourtListener text)"
-            win._note = note
-            if cl_text is not None:
-                win._cl_text = cl_text
-            win._status_var.set(
-                f"{len(win._scholar_text):,} characters | "
-                f"Google Scholar version | {note}"
-            )
-            return
-
-        # Verification failed
-        if better_result is not None:
-            url2, html2 = better_result
-            # Replace the window contents with the verified match
-            win._scholar_url = url2
-            win._source_var.set(url2)
-            win._blocks = parse_opinion_blocks(html2)
-            win._scholar_text = (
-                blocks_to_text(win._blocks) or _strip_html(html2)
-            )
-            win._parts = segment_blocks(win._blocks)
-            win._refine_part_labels(win._parts)
-            win._note = "verified against CourtListener (replaced)"
-            if cl_text is not None:
-                win._cl_text = cl_text
-            # Rebuild part selector
-            part_values = ["Full opinion"] + [
-                f"{i + 1}. {p.label}" for i, p in enumerate(win._parts)
-            ]
-            win._part_combo.config(values=part_values)
-            win._current_part = None
-            win._part_combo.current(0)
-            win._render_scholar()
-            self._status_var.set(
-                "Scholar text replaced — initial result didn't match."
+    def _assemble_and_open_cl(
+        self, item: dict, client, prefetch_pdf, finish,
+        search: bool = False, note: str = "",
+    ) -> None:
+        """Worker thread: assemble the CourtListener case and open it (showing
+        a failure dialog when there's nothing to display)."""
+        parts: list = []
+        blocks: list = []
+        plain = ""
+        if client is not None:
+            try:
+                parts, blocks, plain, _ = _assemble_case_parts(client, item)
+            except Exception as exc:
+                print(f"[scholar] CourtListener assembly failed: {exc}")
+        if parts or plain:
+            self._post_root(
+                self._open_cl_window, item, parts, blocks, plain,
+                note, prefetch_pdf, search,
             )
         else:
-            # No better match found — warn the user
-            sim_pct = f"{sim:.0%}" if sim is not None else "unknown"
-            win._note = f"unverified (similarity {sim_pct})"
-            win._status_var.set(
-                f"{len(win._scholar_text):,} characters | "
-                f"Google Scholar version | WARNING: may be wrong case "
-                f"(similarity {sim_pct})"
-            )
-            messagebox.showwarning(
-                "Possible Mismatch",
-                f"The Google Scholar text shown may not match this case.\n\n"
-                f"Best similarity score: {sim_pct}\n"
-                f"Threshold: {_SCHOLAR_MATCH_THRESHOLD:.0%}\n\n"
-                f"The text is displayed but may be for a different case.",
-                parent=win._win,
-            )
+            self._post_root(self._scholar_open_failed, item, note)
+        finish()
 
-    def _spotlight_verify_scholar(
-        self, win, url: str, html: str, item: dict, fetcher, client,
+    def _open_scholar_window(
+        self, url: str, html: str, item: Optional[dict],
+        cl_text: Optional[str], note: str, prefetch_pdf: bool = True,
     ) -> None:
-        """Background verification for Scholar text opened from the spotlight.
-
-        Same logic as ``_on_scholar_quick_show``'s verify thread, but
-        self-contained — doesn't touch the main window's status bar or
-        buttons.
-        """
-        cluster_id = item.get("cluster_id") or item.get("id")
-        vkey = f"verified:cluster:{cluster_id}" if cluster_id else ""
-        cl_text: Optional[str] = None
-        if client is not None and cluster_id:
-            try:
-                cl_text = _assemble_case_text(client, item)
-            except Exception:
-                pass
-        if cl_text is None:
-            self.root.after(0, self._on_verify_done, win, True,
-                            url, html, cl_text, None, vkey, fetcher)
-            return
-        sim = text_similarity(
-            blocks_to_text(parse_opinion_blocks(html)), cl_text,
+        self._status_var.set(
+            f"Scholar text loaded — {note}" if note
+            else f"Scholar text loaded from {url}"
         )
-        if sim >= _SCHOLAR_MATCH_THRESHOLD:
-            if vkey:
-                fetcher.put_cached(vkey, url, html)
-            self.root.after(0, self._on_verify_done, win, True,
-                            url, html, cl_text, sim, vkey, fetcher)
-            return
-        try:
-            result, cl_text2, note = _find_scholar_for_item(
-                client, fetcher, item, lambda m: None,
-            )
-        except Exception:
-            result = None
-            cl_text2 = cl_text
-        self.root.after(0, self._on_verify_done, win, False,
-                        url, html, cl_text2 or cl_text, sim,
-                        vkey, fetcher, result)
+        _ScholarTextWindow(
+            self.root, self, url, html, item=item, cl_text=cl_text,
+            note=note, prefetch_pdf=prefetch_pdf,
+        )
+
+    def _open_cl_window(
+        self, item: Optional[dict], parts, blocks, plain,
+        note: str = "", prefetch_pdf: bool = True, search: bool = False,
+    ) -> "_ScholarTextWindow":
+        self._status_var.set(
+            "Loaded CourtListener text — searching Google Scholar…"
+            if search else "Loaded CourtListener text."
+        )
+        win = _ScholarTextWindow(
+            self.root, self, "", "", item=item, cl_text=plain, note=note,
+            cl_parts=parts or [], cl_blocks=blocks or [],
+            prefetch_pdf=prefetch_pdf,
+        )
+        if search:
+            win._search_for_scholar_version(plain)
+        return win
+
+    def _scholar_open_failed(self, item: Optional[dict], note: str) -> None:
+        self._status_var.set("Could not load this case.")
+        messagebox.showwarning(
+            "Case Unavailable",
+            "Could not load this case from Google Scholar or CourtListener."
+            + (f"\n\n({note})" if note else ""),
+        )
 
     def _on_scholar_result(
         self,
@@ -5568,6 +5491,16 @@ class _ScholarTextWindow:
         self._last_cite_action = None
         self._pending_id = None
         self._const_linked = set()
+        # Keep the part selector in step with the parts being rendered — the
+        # Scholar parts may differ from the CourtListener ones when this window
+        # opened on CL and later switched to a found Scholar match.
+        self._part_combo.config(values=["Full opinion"] + [
+            f"{i + 1}. {p.label}" for i, p in enumerate(self._parts)
+        ])
+        if (self._current_part is not None
+                and self._current_part >= len(self._parts)):
+            self._current_part = None  # CL part index out of range for Scholar
+            self._part_combo.current(0)
         if not self._parts:
             txt.insert("1.0", self._scholar_text)
         else:
@@ -7034,6 +6967,93 @@ class _ScholarTextWindow:
         self._toggle_btn.config(state="normal")
         self._status_var.set(f"CourtListener: {msg}")
         messagebox.showerror("CourtListener", msg, parent=self._win)
+
+    def _search_for_scholar_version(self, cl_text: Optional[str] = None) -> None:
+        """The CourtListener text is showing because Google Scholar's first
+        case didn't match; keep hunting for a matching Scholar opinion in the
+        background and, when one turns up, light up the "Google Scholar Text"
+        button so the reader can switch to it."""
+        if not _SCHOLAR_AVAILABLE:
+            return
+        if cl_text is not None and self._cl_text is None:
+            self._cl_text = cl_text
+        app = self._app
+        fetcher = app._get_scholar()
+        if fetcher is None:
+            return
+        client = app._get_client()
+        item = dict(self._item)
+        if not (item.get("cluster_id") or item.get("id")):
+            return
+
+        def run() -> None:
+            try:
+                result, _cl, note = _find_scholar_for_item(
+                    client, fetcher, item, lambda _m: None,
+                )
+            except Exception as exc:
+                print(f"[scholar] background match search failed: {exc}")
+                result, note = None, ""
+            if result:
+                url, html = result
+                self._post(
+                    self._attach_scholar_version, url, html,
+                    note or "matching Google Scholar version found",
+                )
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _attach_scholar_version(
+        self, url: str, html: str, note: str = "",
+    ) -> None:
+        """Wire a (later-found) matching Google Scholar opinion into a window
+        that opened on the CourtListener text, and enable the toggle so the
+        reader can switch over."""
+        try:
+            if not self._win.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        blocks = parse_opinion_blocks(html)
+        text = blocks_to_text(blocks) or _strip_html(html)
+        if not (text or "").strip():
+            return
+        self._scholar_url = url
+        self._blocks = blocks
+        self._scholar_text = text
+        self._parts = segment_blocks(blocks)
+        self._refine_part_labels(self._parts)
+        # Per-part starting pages, for pin cites when a single part is shown.
+        self._part_start_pages = []
+        page: Optional[int] = None
+        for part in self._parts:
+            self._part_start_pages.append(page)
+            for b in part.blocks:
+                for s in b.spans:
+                    if s.pagenum:
+                        m = re.search(r"\d+", s.text)
+                        if m:
+                            page = int(m.group(0))
+        self._scholar_has_text = len(re.sub(r"\s+", "", text or "")) >= 500
+        self._cl_primary = False
+        if note:
+            self._note = note
+        # Showing the CourtListener text: enable the switch-to-Scholar button.
+        # (If the PDF is up, its button is left alone — the Scholar text is
+        # picked up when the reader returns to the text view.)
+        if self._mode == "courtlistener":
+            self._toggle_btn.config(
+                text="Google Scholar Text", command=self._toggle_source,
+                state="normal",
+            )
+            char_count = len(self._cl_text or self._scholar_text or "")
+            try:
+                self._status_var.set(
+                    f"{char_count:,} characters | CourtListener version | "
+                    f"Google Scholar version available — use the button to switch"
+                )
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
     # PDF view (official opinion PDF, shown in-app)
