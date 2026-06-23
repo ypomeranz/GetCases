@@ -36,18 +36,25 @@ from __future__ import annotations
 
 import configparser
 import glob
+import json
 import os
 import re
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import Optional
 
 # CommonLII case PDFs land here; keyed by the neutral cite (year-num), which is
 # unique per case.  Sits next to the app's existing config file.
-CACHE_DIR = Path.home() / ".config" / "courtlistener" / "engr_cache"
+_CONFIG_DIR = Path.home() / ".config" / "courtlistener"
+CACHE_DIR = _CONFIG_DIR / "engr_cache"
+# Playwright's persistent browser profile (so a passed CloudFlare check carries
+# over between cases) and the clearance we lift from it for the curl_cffi path.
+_PW_PROFILE_DIR = _CONFIG_DIR / "pw_profile"
+_PW_STATE_FILE = _CONFIG_DIR / "pw_clearance.json"
 
 _TIMEOUT = 45
 
@@ -57,13 +64,19 @@ _TIMEOUT = 45
 # ---------------------------------------------------------------------------
 
 class FetchUnavailable(Exception):
-    """In-app fetching isn't possible here (Firefox or a dependency missing);
+    """In-app fetching isn't possible here (no clearance path available);
     the caller should just open the citation in the browser."""
 
 
+class PlaywrightUnavailable(Exception):
+    """Playwright is installed but couldn't drive a browser (no Chrome/Edge and
+    no bundled Chromium).  The caller should fall back to the other options."""
+
+
 class CloudflareChallenge(Exception):
-    """CommonLII served a CloudFlare challenge -- the user must clear it in
-    Firefox.  ``web_url`` is the page to open for them to do so."""
+    """CommonLII served a CloudFlare challenge -- the user must clear it (in
+    Firefox, or in their own browser via Playwright).  ``web_url`` is the page
+    to open for them to do so."""
 
     def __init__(self, web_url: str):
         super().__init__("CloudFlare challenge")
@@ -192,10 +205,25 @@ def deps_present() -> bool:
     return _have("curl_cffi")
 
 
+def firefox_path_available() -> bool:
+    """The Firefox clearance path: read Firefox's cf_clearance cookie and fetch
+    with curl_cffi.  Needs Firefox installed and curl_cffi importable."""
+    return firefox_available() and _have("curl_cffi")
+
+
+def playwright_available() -> bool:
+    """The Playwright path: let the user pass the CloudFlare check in their own
+    browser (Chrome/Edge) and fetch the PDF through it.  Needs the playwright
+    package importable (system Chrome/Edge is used via channels, so the browser
+    binaries needn't be downloaded)."""
+    return _have("playwright")
+
+
 def can_fetch() -> bool:
-    """True when in-app fetching is possible: Firefox installed and both
-    optional packages importable.  When False the caller links out instead."""
-    return firefox_available() and deps_present()
+    """True when in-app fetching is possible by some clearance path -- the
+    Firefox cookie path or the Playwright path.  When False the caller links
+    out to the browser instead."""
+    return firefox_path_available() or playwright_available()
 
 
 _IMPERSONATE_CACHE: Optional[str] = None
@@ -477,13 +505,46 @@ _CHALLENGE_MARKERS = (b"Just a moment", b"challenge-platform",
                       b"cf-browser-verification", b"__cf_chl")
 
 
-def fetch_pdf(year: int, num: int, web_url: str) -> bytes:
-    """Return the PDF bytes for a CommonLII case, from cache or the network.
+def _fetch_pdf_with(cookies: dict, ua: str, impersonate: str,
+                    year: int, num: int, web_url: str) -> bytes:
+    """Fetch and cache the PDF with curl_cffi given a clearance cookie set, a
+    matching User-Agent and a browser TLS-impersonation target.  Raises
+    :class:`CloudflareChallenge` on a re-challenge (cookie expired) or
+    :class:`OriginError` on any other origin error."""
+    from curl_cffi import requests as creq
 
-    Raises :class:`FetchUnavailable` when in-app fetching isn't possible (the
-    caller links out), :class:`CloudflareChallenge` when the user must clear the
-    check in Firefox, or :class:`OriginError` on an origin HTTP error.
-    Successful fetches are cached.
+    pdf_url = re.sub(r"\.html?$", ".pdf", web_url)
+    headers = {
+        "User-Agent": ua,
+        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                   "image/avif,image/webp,*/*;q=0.8"),
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": web_url,  # origin Apache hotlink-blocks PDFs without this
+    }
+    try:
+        resp = creq.get(pdf_url, headers=headers, cookies=cookies,
+                        impersonate=impersonate, timeout=_TIMEOUT)
+    except Exception as exc:
+        raise OriginError(0) from exc
+
+    data = resp.content or b""
+    if resp.status_code == 200 and data[:4] == b"%PDF":
+        _store(year, num, data)
+        return data
+    if resp.status_code in (403, 503) and any(mk in data for mk in _CHALLENGE_MARKERS):
+        raise CloudflareChallenge(web_url)
+    raise OriginError(resp.status_code)
+
+
+def fetch_pdf(year: int, num: int, web_url: str) -> bytes:
+    """Return the PDF bytes for a CommonLII case, from cache or the network,
+    using any clearance we can get without bothering the user.
+
+    Tries the disk cache, then Firefox's cf_clearance cookie, then a clearance
+    saved from an earlier Playwright solve.  Raises :class:`CloudflareChallenge`
+    when none is available (the caller offers the interactive options),
+    :class:`FetchUnavailable` when no clearance path exists at all, or
+    :class:`OriginError` on an origin HTTP error.  Successful fetches are cached.
     """
     cached = get_cached(year, num)
     if cached is not None:
@@ -492,37 +553,183 @@ def fetch_pdf(year: int, num: int, web_url: str) -> bytes:
     if not can_fetch():
         raise FetchUnavailable()
 
-    cookies = _firefox_cookies()
-    if not cookies or "cf_clearance" not in cookies:
-        # No clearance yet -- the user has to pass the check in Firefox first.
-        raise CloudflareChallenge(web_url)
+    # 1. Firefox's clearance cookie (read from cookies.sqlite) + curl_cffi.
+    if firefox_path_available():
+        cookies = _firefox_cookies()
+        if cookies and "cf_clearance" in cookies:
+            return _fetch_pdf_with(cookies, firefox_user_agent(),
+                                   _impersonate_target(), year, num, web_url)
 
-    from curl_cffi import requests as creq
+    # 2. Clearance saved from a previous Playwright solve, reused via curl_cffi
+    #    (no browser launch) until it expires.
+    if _have("curl_cffi"):
+        saved = _load_clearance()
+        if saved and (saved.get("cookies") or {}).get("cf_clearance"):
+            try:
+                return _fetch_pdf_with(saved["cookies"], saved["ua"],
+                                       saved.get("impersonate", "chrome"),
+                                       year, num, web_url)
+            except CloudflareChallenge:
+                _clear_saved_clearance()  # expired -- fall through to re-solve
+
+    # No silent clearance -- the caller must solve interactively (Firefox or
+    # Playwright).
+    raise CloudflareChallenge(web_url)
+
+
+# ---------------------------------------------------------------------------
+# Playwright path: pass the CloudFlare check in the user's own browser
+# ---------------------------------------------------------------------------
+
+def _save_clearance(cookies: dict, ua: str, impersonate: str) -> None:
+    """Persist a CloudFlare clearance (cookies + UA + TLS target) so later cases
+    reuse it via curl_cffi without launching a browser again."""
+    try:
+        _PW_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _PW_STATE_FILE.write_text(
+            json.dumps({"cookies": cookies, "ua": ua, "impersonate": impersonate}),
+            encoding="utf-8")
+    except Exception as exc:
+        print(f"[eng_rep_pdf] saving clearance failed: {exc}")
+
+
+def _load_clearance() -> Optional[dict]:
+    try:
+        return json.loads(_PW_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _clear_saved_clearance() -> None:
+    try:
+        _PW_STATE_FILE.unlink()
+    except Exception:
+        pass
+
+
+def _launch_user_browser(p):
+    """A persistent Playwright context driving the user's installed browser:
+    Google Chrome, then Microsoft Edge (via channels -- no browser download),
+    then a bundled Chromium.  Persistent so a passed CloudFlare check carries
+    over between cases.  Returns (context, channel) or (None, "")."""
+    _PW_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    args = ["--no-first-run", "--no-default-browser-check"]
+    for channel in ("chrome", "msedge"):
+        try:
+            ctx = p.chromium.launch_persistent_context(
+                str(_PW_PROFILE_DIR), channel=channel, headless=False, args=args)
+            return ctx, channel
+        except Exception as exc:
+            print(f"[eng_rep_pdf] playwright channel {channel!r}: {exc}")
+    try:  # bundled Chromium (needs `playwright install chromium`)
+        ctx = p.chromium.launch_persistent_context(
+            str(_PW_PROFILE_DIR), headless=False, args=args)
+        return ctx, "chromium"
+    except Exception as exc:
+        print(f"[eng_rep_pdf] playwright bundled chromium: {exc}")
+        return None, ""
+
+
+def _wait_for_clearance(ctx, page, timeout: int) -> dict:
+    """Poll until the commonlii.org cf_clearance cookie appears (the user passed
+    the check) or *timeout* seconds elapse / the window is closed.  Returns the
+    commonlii cookies (with cf_clearance) or {} on timeout/abort."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            cookies = {c["name"]: c["value"] for c in ctx.cookies()
+                       if "commonlii" in (c.get("domain") or "")}
+        except Exception:
+            return {}  # context closed
+        if "cf_clearance" in cookies:
+            return cookies
+        try:
+            if page.is_closed():
+                return {}
+            page.wait_for_timeout(1000)
+        except Exception:
+            return {}  # page/window closed by the user
+    return {}
+
+
+def _pw_fetch_pdf(page, pdf_url: str) -> bytes:
+    """Fetch the PDF from inside the (cleared) page with a same-origin fetch, so
+    it goes through the real browser's network, cookies and TLS.  Returns the
+    bytes, or b"" on failure."""
+    import base64
+    b64 = page.evaluate(
+        """async (url) => {
+            try {
+                const r = await fetch(url, {credentials: 'include'});
+                if (!r.ok) return '';
+                const buf = await r.arrayBuffer();
+                const bytes = new Uint8Array(buf);
+                let bin = '';
+                const chunk = 0x8000;
+                for (let i = 0; i < bytes.length; i += chunk)
+                    bin += String.fromCharCode.apply(
+                        null, bytes.subarray(i, i + chunk));
+                return btoa(bin);
+            } catch (e) { return ''; }
+        }""", pdf_url)
+    return base64.b64decode(b64) if b64 else b""
+
+
+def fetch_pdf_via_playwright(year: int, num: int, web_url: str,
+                             on_status=lambda _s: None,
+                             timeout: int = 180) -> bytes:
+    """Open the case in the user's own browser (driven by Playwright), let them
+    pass the CloudFlare check, then fetch the PDF through that browser.  The
+    clearance is saved so subsequent cases skip the browser.
+
+    Raises :class:`FetchUnavailable` (playwright not importable),
+    :class:`PlaywrightUnavailable` (no browser to drive),
+    :class:`CloudflareChallenge` (check not completed in time), or
+    :class:`OriginError`.  Successful fetches are cached."""
+    cached = get_cached(year, num)
+    if cached is not None:
+        return cached
+    try:
+        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import TimeoutError as _PWTimeout
+    except Exception:
+        raise FetchUnavailable()
 
     pdf_url = re.sub(r"\.html?$", ".pdf", web_url)
-    headers = {
-        "User-Agent": firefox_user_agent(),
-        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
-                   "image/avif,image/webp,*/*;q=0.8"),
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": web_url,  # origin Apache hotlink-blocks PDFs without this
-    }
-    try:
-        resp = creq.get(pdf_url, headers=headers, cookies=cookies,
-                        impersonate=_impersonate_target(), timeout=_TIMEOUT)
-    except Exception as exc:
-        raise OriginError(0) from exc
+    with sync_playwright() as p:
+        ctx, channel = _launch_user_browser(p)
+        if ctx is None:
+            raise PlaywrightUnavailable()
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            on_status("Opening your browser — pass the “Just a moment…” check…")
+            try:
+                page.goto(web_url, wait_until="domcontentloaded", timeout=60000)
+            except _PWTimeout:
+                pass  # the challenge page can stall load; we poll cookies anyway
+            cookies = _wait_for_clearance(ctx, page, timeout)
+            if "cf_clearance" not in cookies:
+                raise CloudflareChallenge(web_url)
+            on_status("Check passed — downloading the scan…")
+            ua = page.evaluate("() => navigator.userAgent")
+            try:  # make sure we're on a real same-origin page before fetching
+                page.goto(web_url, wait_until="domcontentloaded", timeout=30000)
+            except _PWTimeout:
+                pass
+            data = _pw_fetch_pdf(page, pdf_url)
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
 
-    data = resp.content or b""
-    if resp.status_code == 200 and data[:4] == b"%PDF":
-        _store(year, num, data)
-        return data
-
-    # CloudFlare re-challenge (cookie expired / fingerprint mismatch) -> user
-    # must re-clear in Firefox; a bare origin error -> surface the status.
-    if resp.status_code in (403, 503) and any(mk in data for mk in _CHALLENGE_MARKERS):
-        raise CloudflareChallenge(web_url)
-    raise OriginError(resp.status_code)
+    if not data or data[:4] != b"%PDF":
+        raise OriginError(0)
+    _store(year, num, data)
+    # Chrome and Edge are both Chromium (Chromium TLS), so impersonate "chrome"
+    # for the saved curl_cffi reuse regardless of which channel solved it.
+    _save_clearance(cookies, ua, "chrome")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -532,10 +739,25 @@ def fetch_pdf(year: int, num: int, web_url: str) -> bytes:
 if __name__ == "__main__":
     print("firefox exe       :", _firefox_exe())
     print("firefox UA        :", firefox_user_agent())
-    print("deps present      :", deps_present())
+    print("curl_cffi present :", _have("curl_cffi"))
+    print("firefox path      :", firefox_path_available())
+    print("playwright path   :", playwright_available())
     print("can_fetch         :", can_fetch())
     print("impersonate target:", _impersonate_target())
+    print("saved clearance   :", "yes" if _load_clearance() else "no")
     print("cache dir         :", CACHE_DIR)
+
+    if "--playwright" in sys.argv:
+        # Force the interactive Playwright solve for a quick manual check.
+        yr, nm = 1854, 296
+        wb = f"https://www.commonlii.org/uk/cases/EngR/{yr}/{nm}.html"
+        print("\nsolving via playwright (a browser window will open)...")
+        try:
+            d = fetch_pdf_via_playwright(yr, nm, wb, on_status=print)
+            print(f"  OK: {len(d):,} bytes, head={d[:8]!r}")
+        except Exception as exc:
+            print(f"  {type(exc).__name__}: {exc}")
+        raise SystemExit(0)
 
     # Profile search diagnostics: shows where we looked and whether the
     # clearance cookie is actually on disk (the two distinct failure modes are

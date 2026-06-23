@@ -20,8 +20,15 @@ Pillow
 # English Reports citations ("156 Eng. Rep. 145") link to the free CommonLII
 # scan.  Detection + the shipped index (eng_rep_index.tsv.gz) are offline and
 # need nothing extra.  Viewing the PDF *inside* the app is optional: CommonLII
-# is behind CloudFlare, so the app reads Firefox's clearance cookie and fetches
-# with a browser-matching TLS fingerprint.  Without these (or without Firefox),
-# E.R. citations simply open in the user's browser instead.
+# is behind CloudFlare, so the user passes the "Just a moment..." check once and
+# the app fetches the scan.  Two ways to clear it:
+#   * playwright — pass the check in the user's own browser (Chrome/Edge via
+#     channels, so no browser download); the clearance is then saved and reused.
+#   * curl_cffi (+ Firefox) — read Firefox's clearance cookie and fetch with a
+#     browser-matching TLS fingerprint.  browser_cookie3 is an optional fallback
+#     for reading that cookie.
+# Without any of these (or a browser to drive), E.R. citations simply open in
+# the user's browser instead.
+playwright
 curl_cffi
 browser_cookie3

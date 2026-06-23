@@ -43,9 +43,10 @@ def _ensure_dependencies() -> None:
     ``requests`` is required; the rest enable features and declining just
     disables them: ``beautifulsoup4`` (Google Scholar / opinion parsing),
     ``pynput`` (global hotkey), ``pypdfium2`` + ``Pillow`` (the in-app PDF
-    viewer), and ``curl_cffi`` + ``browser_cookie3`` (fetching the CommonLII
-    English Reports scans in-app through CloudFlare; without them E.R. cases
-    open in the browser instead).
+    viewer), ``curl_cffi`` + ``browser_cookie3`` (fetching the CommonLII English
+    Reports scans in-app through CloudFlare), and ``playwright`` (passing the
+    CloudFlare check in the user's own browser).  Without these E.R. cases open
+    in the browser instead.
     """
     import importlib
     import importlib.util
@@ -61,6 +62,7 @@ def _ensure_dependencies() -> None:
                 ("PIL", "Pillow"),           # in-app PDF viewer (imports as PIL)
                 ("curl_cffi", "curl_cffi"),  # English Reports scan fetch (CloudFlare)
                 ("browser_cookie3", "browser_cookie3"),  # reads Firefox clearance cookie
+                ("playwright", "playwright"),  # solve CloudFlare in the user's browser
             )
             if importlib.util.find_spec(module) is None
         ]
@@ -7622,19 +7624,28 @@ class _EngRepPdfWindow(_PdfWindow):
             child.destroy()
 
     def _need_clearance(self, web_url: str) -> None:
-        """Show the CloudFlare hand-off panel (open in Firefox, then Retry)."""
+        """Show the CloudFlare hand-off panel: pass the check in the user's own
+        browser (Playwright) or in Firefox, then load the scan in-app."""
         self._clear_body()
         self._status_var.set("CommonLII needs a CloudFlare check.")
+        have_pw = eng_rep_pdf.playwright_available()
+        have_ff = eng_rep_pdf.firefox_available()
         frame = ttk.Frame(self._body)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
-        ttk.Label(
-            frame, wraplength=560, justify="left",
-            text=("CommonLII is behind a CloudFlare check.\n\n"
-                  "To view this scan in the app, click “Open in Firefox”, pass "
-                  "the “Just a moment…” check there, then click “Retry”.  Once "
-                  "cleared, this and other English Reports cases load straight "
-                  "in the app (and are cached so you won't be asked again)."),
-        ).pack(anchor="w", pady=(0, 16))
+        if have_pw:
+            msg = ("CommonLII is behind a CloudFlare check.\n\n"
+                   "Click “Solve in your browser”: a window opens on this case — "
+                   "pass the “Just a moment…” check there and it closes and loads "
+                   "the scan here automatically.  The clearance is saved, so other "
+                   "English Reports cases then load straight in the app.")
+        else:
+            msg = ("CommonLII is behind a CloudFlare check.\n\n"
+                   "To view this scan in the app, click “Open in Firefox”, pass "
+                   "the “Just a moment…” check there, then click “Retry”.  Once "
+                   "cleared, this and other English Reports cases load straight "
+                   "in the app (and are cached so you won't be asked again).")
+        ttk.Label(frame, wraplength=560, justify="left", text=msg).pack(
+            anchor="w", pady=(0, 16))
         row = ttk.Frame(frame)
         row.pack(anchor="w")
 
@@ -7648,22 +7659,68 @@ class _EngRepPdfWindow(_PdfWindow):
             self._clear_body()
             self._fetch()
 
-        ttk.Button(row, text="Open in Firefox", command=open_ff).pack(side="left")
-        ttk.Button(row, text="Retry", command=retry).pack(side="left", padx=8)
+        if have_pw:
+            ttk.Button(row, text="Solve in your browser",
+                       command=lambda: self._solve_with_playwright(web_url),
+                       ).pack(side="left", padx=(0, 8))
+        if have_ff:
+            ttk.Button(row, text="Open in Firefox", command=open_ff).pack(
+                side="left")
+            ttk.Button(row, text="Retry", command=retry).pack(side="left", padx=8)
         ttk.Button(row, text="Open in browser instead",
                    command=lambda: (eng_rep_pdf.open_in_browser(self._case.pdf_url),
                                     self._win.destroy())).pack(side="left")
 
+    def _solve_with_playwright(self, web_url: str) -> None:
+        """Drive the user's own browser (Chrome/Edge) with Playwright so they can
+        pass the CloudFlare check, then fetch the scan through it."""
+        self._clear_body()
+        self._status_var.set("Launching your browser…")
+        ttk.Label(
+            self._body, wraplength=560, justify="left", padding=24,
+            text=("Your browser is opening on this case.\n\nPass the “Just a "
+                  "moment…” check; the window then closes and the scan loads "
+                  "here.  (If no window appears, make sure Chrome or Edge is "
+                  "installed.)"),
+        ).pack(anchor="w")
+        case = self._case
+
+        def run() -> None:
+            try:
+                data = eng_rep_pdf.fetch_pdf_via_playwright(
+                    case.year, case.num, case.web_url,
+                    on_status=lambda s: self._post(self._status_var.set, s))
+                self._post(self._show, data)
+            except eng_rep_pdf.CloudflareChallenge:
+                # Not completed in time — let the user try again.
+                self._post(self._status_var.set,
+                           "Check not completed — try again.")
+                self._post(self._need_clearance, web_url)
+            except eng_rep_pdf.PlaywrightUnavailable:
+                self._post(self._error,
+                           "Couldn't launch Chrome or Edge.  Install one, or run: "
+                           "playwright install chromium")
+            except eng_rep_pdf.FetchUnavailable:
+                self._post(self._error, "Playwright isn't installed.")
+            except eng_rep_pdf.OriginError as exc:
+                self._post(self._error,
+                           f"CommonLII returned an error (HTTP {exc.status}).")
+            except Exception as exc:  # pragma: no cover - defensive
+                self._post(self._error, str(exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _link_out(self) -> None:
-        """In-app fetch isn't possible here (no Firefox / packages) — open the
-        scan in the user's browser and explain."""
+        """No clearance path is available here — open the scan in the user's
+        browser and explain how to enable in-app viewing."""
         eng_rep_pdf.open_in_browser(self._case.pdf_url)
         self._clear_body()
         ttk.Label(
             self._body, wraplength=560, justify="left", padding=24,
             text=("Opened in your browser.\n\nFor in-app viewing of English "
-                  "Reports scans (cached, no repeat checks), install Firefox "
-                  "and run:\n\n    pip install curl_cffi browser_cookie3"),
+                  "Reports scans (cached, no repeat checks), install Playwright "
+                  "(then pass the check in your own browser) — or install "
+                  "Firefox and run:\n\n    pip install playwright curl_cffi"),
         ).pack(anchor="w")
         self._status_var.set("Opened in your browser.")
 
