@@ -641,16 +641,16 @@ def _launch_user_browser(p):
     over between cases.  Returns (context, channel) or (None, "")."""
     _PW_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     args = ["--no-first-run", "--no-default-browser-check"]
+    kw = dict(headless=False, accept_downloads=True, args=args)
     for channel in ("chrome", "msedge"):
         try:
             ctx = p.chromium.launch_persistent_context(
-                str(_PW_PROFILE_DIR), channel=channel, headless=False, args=args)
+                str(_PW_PROFILE_DIR), channel=channel, **kw)
             return ctx, channel
         except Exception as exc:
             print(f"[eng_rep_pdf] playwright channel {channel!r}: {exc}")
     try:  # bundled Chromium (needs `playwright install chromium`)
-        ctx = p.chromium.launch_persistent_context(
-            str(_PW_PROFILE_DIR), headless=False, args=args)
+        ctx = p.chromium.launch_persistent_context(str(_PW_PROFILE_DIR), **kw)
         return ctx, "chromium"
     except Exception as exc:
         print(f"[eng_rep_pdf] playwright bundled chromium: {exc}")
@@ -679,35 +679,64 @@ def _wait_for_clearance(ctx, page, timeout: int) -> dict:
     return {}
 
 
-def _pw_fetch_pdf(page, pdf_url: str) -> bytes:
-    """Fetch the PDF from inside the (cleared) page with a same-origin fetch, so
-    it goes through the real browser's network, cookies and TLS.  Base64 is done
-    via FileReader (no String.fromCharCode argument limit on large scans).
-    Returns the bytes, or b"" on failure."""
-    import base64
-    result = page.evaluate(
-        """async (url) => {
-            try {
-                const r = await fetch(url, {credentials: 'include'});
-                if (!r.ok) return 'ERR:status ' + r.status;
-                const blob = await r.blob();
-                const b64 = await new Promise((resolve) => {
-                    const fr = new FileReader();
-                    fr.onloadend = () => resolve(
-                        String(fr.result).split(',')[1] || '');
-                    fr.onerror = () => resolve('');
-                    fr.readAsDataURL(blob);
-                });
-                return b64;
-            } catch (e) { return 'ERR:' + (e && e.message || e); }
-        }""", pdf_url)
-    if isinstance(result, str) and result.startswith("ERR:"):
-        print(f"[eng_rep_pdf] in-page PDF fetch failed: {result[4:]}")
-        return b""
+def _pw_fetch_pdf(page, pdf_url: str, web_url: str) -> bytes:
+    """Download the PDF through the browser itself with a real document
+    navigation: the browser's own network/TLS/cookies, a proper Referer, and
+    Sec-Fetch-Dest: document — exactly like the user clicking the link.
+
+    (A plain in-page ``fetch()`` of the PDF is rejected 403 by CommonLII —
+    hotlink protection plus CloudFlare blocking the sub-resource request — and
+    curl_cffi can't always reproduce the browser's TLS, so neither is reliable;
+    a navigation is.)  Handles both an inline PDF (the navigation response *is*
+    the PDF) and an attachment (it arrives as a download).  Returns bytes or b\"\"."""
+    # 1) Navigate to the PDF (a document request: real TLS, Referer, and
+    #    Sec-Fetch-Dest: document) and read the response body — works for an
+    #    inline PDF.
+    resp = None
     try:
-        return base64.b64decode(result) if result else b""
+        resp = page.goto(pdf_url, wait_until="commit", referer=web_url,
+                         timeout=60000)
+    except Exception as exc:
+        if "ERR_ABORTED" not in str(exc):  # ERR_ABORTED == it became a download
+            print(f"[eng_rep_pdf] in-page PDF navigation failed: {exc}")
+    if resp is not None and resp.status != 200:
+        print(f"[eng_rep_pdf] in-page PDF navigation status {resp.status}")
+    if resp is not None and resp.status == 200:
+        try:
+            body = resp.body()
+            if body[:4] == b"%PDF":
+                return body
+            print("[eng_rep_pdf] in-page PDF navigation: response wasn't a PDF")
+        except Exception as exc:
+            print(f"[eng_rep_pdf] reading PDF body failed: {exc}")
+    # 2) Force a same-origin download with an <a download> click — a
+    #    navigation-style request that handles an inline PDF (Chromium otherwise
+    #    opens it in the viewer) or one whose navigation body wasn't exposed.
+    #    Re-anchor on the .html page first so the Referer is the case page.
+    try:
+        page.goto(web_url, wait_until="domcontentloaded", timeout=30000)
     except Exception:
-        return b""
+        pass
+    try:
+        with page.expect_download(timeout=60000) as dl_info:
+            page.evaluate(
+                """(url) => {
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = '';
+                    document.body.appendChild(a);
+                    a.click();
+                }""", pdf_url)
+        path = dl_info.value.path()
+        if path:
+            with open(path, "rb") as fh:
+                body = fh.read()
+            if body[:4] == b"%PDF":
+                return body
+            print("[eng_rep_pdf] in-page download wasn't a PDF")
+    except Exception as exc:
+        print(f"[eng_rep_pdf] in-page PDF download failed: {exc}")
+    return b""
 
 
 def fetch_pdf_via_playwright(year: int, num: int, web_url: str,
@@ -751,37 +780,36 @@ def fetch_pdf_via_playwright(year: int, num: int, web_url: str,
                 raise CloudflareChallenge(web_url)
             on_status("Check passed — downloading the scan…")
             ua = page.evaluate("() => navigator.userAgent")
-            # Primary: fetch with curl_cffi using the fresh clearance — the same
-            # proven mechanism as the Firefox path (cookie + Referer + a
-            # browser-matching TLS fingerprint), just with Edge/Chrome's cookie.
-            if _have("curl_cffi"):
+            # Primary: download through the browser itself.  Its real TLS matches
+            # the clearance it just obtained, and a navigation (not a sub-resource
+            # fetch) carries the Referer/headers CommonLII requires — so this
+            # works where curl_cffi's fingerprint and a plain fetch() are blocked.
+            try:
+                page.goto(web_url, wait_until="domcontentloaded", timeout=30000)
+            except _PWTimeout:
+                pass
+            data = _pw_fetch_pdf(page, pdf_url, web_url)
+            # Fallback: curl_cffi with the lifted clearance (works when the
+            # browser's fingerprint is close enough to a curl_cffi target).
+            if not data and _have("curl_cffi"):
                 try:
                     data = _fetch_pdf_with(cookies, ua, impersonate,
                                            year, num, web_url)
                 except (CloudflareChallenge, OriginError) as exc:
-                    print(f"[eng_rep_pdf] playwright+curl_cffi fetch failed: {exc}")
+                    print(f"[eng_rep_pdf] playwright+curl_cffi fallback failed: {exc}")
                     data = b""
-            # Fallback (e.g. no curl_cffi): fetch inside the browser itself.
-            if not data:
-                try:
-                    page.goto(web_url, wait_until="domcontentloaded", timeout=30000)
-                except _PWTimeout:
-                    pass
-                raw = _pw_fetch_pdf(page, pdf_url)
-                if raw[:4] == b"%PDF":
-                    _store(year, num, raw)
-                    data = raw
         finally:
             try:
                 ctx.close()
             except Exception:
                 pass
 
-    # Save the clearance so later cases reuse it via curl_cffi without a browser.
+    # Save the clearance so later cases can try curl_cffi without a browser.
     if cookies.get("cf_clearance"):
         _save_clearance(cookies, ua, impersonate)
     if not data or data[:4] != b"%PDF":
         raise OriginError(0)
+    _store(year, num, data)
     return data
 
 
