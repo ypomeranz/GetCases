@@ -43,9 +43,10 @@ def _ensure_dependencies() -> None:
     ``requests`` is required; the rest enable features and declining just
     disables them: ``beautifulsoup4`` (Google Scholar / opinion parsing),
     ``pynput`` (global hotkey), ``pypdfium2`` + ``Pillow`` (the in-app PDF
-    viewer), and ``curl_cffi`` + ``browser_cookie3`` (fetching the CommonLII
-    English Reports scans in-app through CloudFlare; without them E.R. cases
-    open in the browser instead).
+    viewer), ``curl_cffi`` + ``browser_cookie3`` (fetching the CommonLII English
+    Reports scans in-app through CloudFlare), and ``playwright`` (passing the
+    CloudFlare check in the user's own browser).  Without these E.R. cases open
+    in the browser instead.
     """
     import importlib
     import importlib.util
@@ -61,6 +62,7 @@ def _ensure_dependencies() -> None:
                 ("PIL", "Pillow"),           # in-app PDF viewer (imports as PIL)
                 ("curl_cffi", "curl_cffi"),  # English Reports scan fetch (CloudFlare)
                 ("browser_cookie3", "browser_cookie3"),  # reads Firefox clearance cookie
+                ("playwright", "playwright"),  # solve CloudFlare in the user's browser
             )
             if importlib.util.find_spec(module) is None
         ]
@@ -1515,7 +1517,8 @@ class CourtListenerGUI:
         row_h = 52
         max_rows = 6
         header_h = 48
-        dropdown_h = row_h * max_rows + 28  # extra for status label
+        # extra for the per-slot gap and the status label pinned at the bottom
+        dropdown_h = max_rows * (row_h + 2) + 36
         sx = popup.winfo_screenwidth()
         sy = popup.winfo_screenheight()
         popup.geometry(
@@ -1527,6 +1530,17 @@ class CourtListenerGUI:
         results_frame = tk.Frame(border, bg="#f0f0f0")
         results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
         self._spotlight_results_frame = results_frame
+
+        # Pre-place fixed-height result slots so streaming results land in stable
+        # positions: a result that comes back first never shifts when later ones
+        # fill the slots below it.  Empty slots match the dropdown background, so
+        # they stay invisible until filled.
+        slots: list[tk.Frame] = []
+        for _ in range(max_rows):
+            slot = tk.Frame(results_frame, bg="#f0f0f0", height=row_h)
+            slot.pack(side="top", fill="x", padx=4, pady=(2, 0))
+            slot.pack_propagate(False)  # keep the slot's height fixed
+            slots.append(slot)
 
         # Tracking state
         result_rows: list[dict] = []
@@ -1547,9 +1561,10 @@ class CourtListenerGUI:
             if idx >= max_rows:
                 return
 
-            row = tk.Frame(results_frame, bg="#ffffff", padx=6, pady=4,
-                           cursor="hand2")
-            row.pack(fill="x", padx=4, pady=(2, 0))
+            # Fill the pre-placed slot in situ (no new pack → no reflow, so the
+            # rows already on screen keep their exact position).
+            row = slots[idx]
+            row.config(bg="#ffffff", cursor="hand2")
 
             court_abbr = _COURT_BLUEBOOK.get(
                 court_id, court_id.upper() if court_id else "?"
@@ -1565,11 +1580,11 @@ class CourtListenerGUI:
                 font=("TkDefaultFont", 10, "bold"),
                 padx=6, pady=2, anchor="center", width=8,
             )
-            badge.pack(side="left", padx=(0, 8))
+            badge.pack(side="left", padx=(6, 8))
 
-            # Text on the right
+            # Text on the right (fill x only, so it sits centred in the slot)
             text_frame = tk.Frame(row, bg="#ffffff")
-            text_frame.pack(side="left", fill="x", expand=True)
+            text_frame.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
             # Truncate name for display
             display_name = name[:80] + ("…" if len(name) > 80 else "")
@@ -1654,12 +1669,13 @@ class CourtListenerGUI:
                 self._open_main_from_spotlight(popup)
         entry.bind("<Return>", _entry_return)
 
-        # Status label
+        # Status label, pinned at the bottom so the result slots above it stay
+        # put as results stream in.
         status_lbl = tk.Label(
             results_frame, text="Searching…", bg="#f0f0f0", fg="#999999",
             font=("TkDefaultFont", 8), anchor="w",
         )
-        status_lbl.pack(fill="x", padx=8, pady=(4, 4))
+        status_lbl.pack(side="bottom", fill="x", padx=8, pady=(4, 4))
         search_done = [0]  # track how many searches completed
         total_searches = 3  # Google Scholar + CourtListener + English Reports
 
@@ -4007,6 +4023,67 @@ def _dump_to_rtf(
                         run = ("{\\field{\\*\\fldinst{HYPERLINK \\\\l \""
                                + target + "\"}}{\\fldrslt " + run + "}}")
                     out.append(run)
+    if par_open:
+        out.append("\\par\n")
+    return "".join(out)
+
+
+def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:
+    """Convert a statute / rule / constitution window's Text range to an RTF
+    body, mapping the ``_StatuteWindow`` tag set — section headings, bold
+    enumerators, indent levels, source credits and notes — to RTF.  Mirrors
+    :func:`_dump_to_rtf` but for that window's tags (the Scholar tags it knows
+    don't appear here, so the two need separate dumpers)."""
+    out: list[str] = []
+    active: set[str] = set(txt.tag_names(start))
+    active.discard("sel")
+    par_open = False
+
+    def indent_level() -> int:
+        for i in range(6, -1, -1):
+            if f"ind{i}" in active:
+                return i
+        return 0
+
+    def par_prefix() -> str:
+        parts = ["\\pard"]
+        li = indent_level() * 360  # ~0.25" per nesting level
+        if li:
+            parts.append(f"\\li{li}")
+        if "sechead" in active:
+            parts.append("\\sb120\\sa120")
+        elif "credit" in active or "notehead" in active:
+            parts.append("\\sb120\\sa60")
+        else:
+            parts.append("\\sa120")
+        return "".join(parts) + " "
+
+    def run_to_rtf(seg: str) -> str:
+        codes: list[str] = []
+        if "sechead" in active:
+            codes.append("\\b\\fs28")
+        elif "headline" in active or "notehead" in active or "enum" in active:
+            codes.append("\\b")
+        if "credit" in active or "notebody" in active:
+            codes.append("\\fs18")
+        esc = _rtf_escape(seg)
+        return "{" + "".join(codes) + " " + esc + "}" if codes else esc
+
+    for key, value, _index in txt.dump(start, end, text=True, tag=True):
+        if key == "tagon":
+            active.add(value)
+        elif key == "tagoff":
+            active.discard(value)
+        elif key == "text":
+            for i, seg in enumerate(value.split("\n")):
+                if i and par_open:
+                    out.append("\\par\n")
+                    par_open = False
+                if seg:
+                    if not par_open:
+                        out.append(par_prefix())
+                        par_open = True
+                    out.append(run_to_rtf(seg))
     if par_open:
         out.append("\\par\n")
     return "".join(out)
@@ -7622,19 +7699,28 @@ class _EngRepPdfWindow(_PdfWindow):
             child.destroy()
 
     def _need_clearance(self, web_url: str) -> None:
-        """Show the CloudFlare hand-off panel (open in Firefox, then Retry)."""
+        """Show the CloudFlare hand-off panel: pass the check in the user's own
+        browser (Playwright) or in Firefox, then load the scan in-app."""
         self._clear_body()
         self._status_var.set("CommonLII needs a CloudFlare check.")
+        have_pw = eng_rep_pdf.playwright_available()
+        have_ff = eng_rep_pdf.firefox_available()
         frame = ttk.Frame(self._body)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
-        ttk.Label(
-            frame, wraplength=560, justify="left",
-            text=("CommonLII is behind a CloudFlare check.\n\n"
-                  "To view this scan in the app, click “Open in Firefox”, pass "
-                  "the “Just a moment…” check there, then click “Retry”.  Once "
-                  "cleared, this and other English Reports cases load straight "
-                  "in the app (and are cached so you won't be asked again)."),
-        ).pack(anchor="w", pady=(0, 16))
+        if have_pw:
+            msg = ("CommonLII is behind a CloudFlare check.\n\n"
+                   "Click “Solve in your browser”: a window opens on this case — "
+                   "pass the “Just a moment…” check there and it closes and loads "
+                   "the scan here automatically.  The clearance is saved, so other "
+                   "English Reports cases then load straight in the app.")
+        else:
+            msg = ("CommonLII is behind a CloudFlare check.\n\n"
+                   "To view this scan in the app, click “Open in Firefox”, pass "
+                   "the “Just a moment…” check there, then click “Retry”.  Once "
+                   "cleared, this and other English Reports cases load straight "
+                   "in the app (and are cached so you won't be asked again).")
+        ttk.Label(frame, wraplength=560, justify="left", text=msg).pack(
+            anchor="w", pady=(0, 16))
         row = ttk.Frame(frame)
         row.pack(anchor="w")
 
@@ -7648,22 +7734,68 @@ class _EngRepPdfWindow(_PdfWindow):
             self._clear_body()
             self._fetch()
 
-        ttk.Button(row, text="Open in Firefox", command=open_ff).pack(side="left")
-        ttk.Button(row, text="Retry", command=retry).pack(side="left", padx=8)
+        if have_pw:
+            ttk.Button(row, text="Solve in your browser",
+                       command=lambda: self._solve_with_playwright(web_url),
+                       ).pack(side="left", padx=(0, 8))
+        if have_ff:
+            ttk.Button(row, text="Open in Firefox", command=open_ff).pack(
+                side="left")
+            ttk.Button(row, text="Retry", command=retry).pack(side="left", padx=8)
         ttk.Button(row, text="Open in browser instead",
                    command=lambda: (eng_rep_pdf.open_in_browser(self._case.pdf_url),
                                     self._win.destroy())).pack(side="left")
 
+    def _solve_with_playwright(self, web_url: str) -> None:
+        """Drive the user's own browser (Chrome/Edge) with Playwright so they can
+        pass the CloudFlare check, then fetch the scan through it."""
+        self._clear_body()
+        self._status_var.set("Launching your browser…")
+        ttk.Label(
+            self._body, wraplength=560, justify="left", padding=24,
+            text=("Your browser is opening on this case.\n\nPass the “Just a "
+                  "moment…” check; the window then closes and the scan loads "
+                  "here.  (If no window appears, make sure Chrome or Edge is "
+                  "installed.)"),
+        ).pack(anchor="w")
+        case = self._case
+
+        def run() -> None:
+            try:
+                data = eng_rep_pdf.fetch_pdf_via_playwright(
+                    case.year, case.num, case.web_url,
+                    on_status=lambda s: self._post(self._status_var.set, s))
+                self._post(self._show, data)
+            except eng_rep_pdf.CloudflareChallenge:
+                # Not completed in time — let the user try again.
+                self._post(self._status_var.set,
+                           "Check not completed — try again.")
+                self._post(self._need_clearance, web_url)
+            except eng_rep_pdf.PlaywrightUnavailable:
+                self._post(self._error,
+                           "Couldn't launch Chrome or Edge.  Install one, or run: "
+                           "playwright install chromium")
+            except eng_rep_pdf.FetchUnavailable:
+                self._post(self._error, "Playwright isn't installed.")
+            except eng_rep_pdf.OriginError as exc:
+                self._post(self._error,
+                           f"CommonLII returned an error (HTTP {exc.status}).")
+            except Exception as exc:  # pragma: no cover - defensive
+                self._post(self._error, str(exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _link_out(self) -> None:
-        """In-app fetch isn't possible here (no Firefox / packages) — open the
-        scan in the user's browser and explain."""
+        """No clearance path is available here — open the scan in the user's
+        browser and explain how to enable in-app viewing."""
         eng_rep_pdf.open_in_browser(self._case.pdf_url)
         self._clear_body()
         ttk.Label(
             self._body, wraplength=560, justify="left", padding=24,
             text=("Opened in your browser.\n\nFor in-app viewing of English "
-                  "Reports scans (cached, no repeat checks), install Firefox "
-                  "and run:\n\n    pip install curl_cffi browser_cookie3"),
+                  "Reports scans (cached, no repeat checks), install Playwright "
+                  "(then pass the check in your own browser) — or install "
+                  "Firefox and run:\n\n    pip install playwright curl_cffi"),
         ).pack(anchor="w")
         self._status_var.set("Opened in your browser.")
 
