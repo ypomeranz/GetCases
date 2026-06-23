@@ -642,6 +642,29 @@ def _recognized_initialism(party: str) -> str:
     return ""
 
 
+# A party identified only by initials — an anonymized individual such as a
+# minor ("D.L.", "J.G.G.", "B.J.F.").  Matches 2-4 single capital letters
+# however the source spaced or punctuated them ("DL", "D. L.", "J. G. G.").
+_INITIALS_ONLY_RE = re.compile(r"[A-Z](?:\s*\.?\s*[A-Z]){1,3}\s*\.?")
+
+# Widely recognized acronym institutions keep bare initials (rule 10.2.1(c)),
+# so they're excluded from the anonymized-initials reformatting below.
+_RECOGNIZED_ACRONYMS = frozenset(_WIDELY_RECOGNIZED_INITIALS_RAW)
+
+
+def _format_anonymous_initials(party: str) -> str | None:
+    """Privacy practice: a party given only as initials is set with periods
+    and no spaces — "DL"/"D. L." -> "D.L.".  Returns None when the party
+    isn't a bare run of initials, or is a recognized acronym (SEC, NLRB…)."""
+    p = party.strip().strip(",")
+    if not _INITIALS_ONLY_RE.fullmatch(p):
+        return None
+    letters = re.findall(r"[A-Z]", p)
+    if "".join(letters) in _RECOGNIZED_ACRONYMS:
+        return None
+    return "".join(f"{c}." for c in letters)
+
+
 def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     p = re.sub(r"\s+", " ", party).strip()
     p = _ET_AL_RE.sub("", p)
@@ -653,6 +676,9 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
         initials = _recognized_initialism(p)
         if initials:
             return initials
+    anon = _format_anonymous_initials(p)
+    if anon is not None:
+        return anon
     if p.strip(" ,.").lower() in _GEO_PARTIES:
         return p
 
@@ -780,7 +806,10 @@ if __name__ == "__main__":
          "Doctor's Assocs., Inc. v. Casarotto"),
         ("West Virginia v. Environmental Protection Agency",
          "West Virginia v. EPA"),
-        ("The Florida Star v. B. J. F.", "Fla. Star v. B. J. F."),
+        # Anonymized party by initials: periods, no spaces (rule 10.2.1(b)).
+        ("The Florida Star v. B. J. F.", "Fla. Star v. B.J.F."),
+        ("DL v. Huebner", "D.L. v. Huebner"),
+        ("Trump v. J. G. G.", "Trump v. J.G.G."),
         ("Nat'l Lab. Rels. Bd. v. Jones & Laughlin Steel Corp.",
          "NLRB v. Jones & Laughlin Steel Corp."),
         # Given names (rule 10.2.1(g))
