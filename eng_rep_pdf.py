@@ -640,8 +640,14 @@ def _launch_user_browser(p):
     then a bundled Chromium.  Persistent so a passed CloudFlare check carries
     over between cases.  Returns (context, channel) or (None, "")."""
     _PW_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    args = ["--no-first-run", "--no-default-browser-check"]
-    kw = dict(headless=False, accept_downloads=True, args=args)
+    # Strip Playwright's automation fingerprint: CloudFlare otherwise flags the
+    # session (navigator.webdriver, the "controlled by automated software"
+    # switch) and re-challenges follow-up requests like the PDF even after the
+    # visible check is passed.
+    args = ["--no-first-run", "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled"]
+    kw = dict(headless=False, accept_downloads=True, args=args,
+              ignore_default_args=["--enable-automation"])
     for channel in ("chrome", "msedge"):
         try:
             ctx = p.chromium.launch_persistent_context(
@@ -769,6 +775,13 @@ def fetch_pdf_via_playwright(year: int, num: int, web_url: str,
         if ctx is None:
             raise PlaywrightUnavailable()
         try:
+            # Mask navigator.webdriver (the remaining obvious automation tell).
+            try:
+                ctx.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver',"
+                    " {get: () => undefined});")
+            except Exception:
+                pass
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             on_status("Opening your browser — pass the “Just a moment…” check…")
             try:
