@@ -1517,7 +1517,8 @@ class CourtListenerGUI:
         row_h = 52
         max_rows = 6
         header_h = 48
-        dropdown_h = row_h * max_rows + 28  # extra for status label
+        # extra for the per-slot gap and the status label pinned at the bottom
+        dropdown_h = max_rows * (row_h + 2) + 36
         sx = popup.winfo_screenwidth()
         sy = popup.winfo_screenheight()
         popup.geometry(
@@ -1529,6 +1530,17 @@ class CourtListenerGUI:
         results_frame = tk.Frame(border, bg="#f0f0f0")
         results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
         self._spotlight_results_frame = results_frame
+
+        # Pre-place fixed-height result slots so streaming results land in stable
+        # positions: a result that comes back first never shifts when later ones
+        # fill the slots below it.  Empty slots match the dropdown background, so
+        # they stay invisible until filled.
+        slots: list[tk.Frame] = []
+        for _ in range(max_rows):
+            slot = tk.Frame(results_frame, bg="#f0f0f0", height=row_h)
+            slot.pack(side="top", fill="x", padx=4, pady=(2, 0))
+            slot.pack_propagate(False)  # keep the slot's height fixed
+            slots.append(slot)
 
         # Tracking state
         result_rows: list[dict] = []
@@ -1549,9 +1561,10 @@ class CourtListenerGUI:
             if idx >= max_rows:
                 return
 
-            row = tk.Frame(results_frame, bg="#ffffff", padx=6, pady=4,
-                           cursor="hand2")
-            row.pack(fill="x", padx=4, pady=(2, 0))
+            # Fill the pre-placed slot in situ (no new pack → no reflow, so the
+            # rows already on screen keep their exact position).
+            row = slots[idx]
+            row.config(bg="#ffffff", cursor="hand2")
 
             court_abbr = _COURT_BLUEBOOK.get(
                 court_id, court_id.upper() if court_id else "?"
@@ -1567,11 +1580,11 @@ class CourtListenerGUI:
                 font=("TkDefaultFont", 10, "bold"),
                 padx=6, pady=2, anchor="center", width=8,
             )
-            badge.pack(side="left", padx=(0, 8))
+            badge.pack(side="left", padx=(6, 8))
 
-            # Text on the right
+            # Text on the right (fill x only, so it sits centred in the slot)
             text_frame = tk.Frame(row, bg="#ffffff")
-            text_frame.pack(side="left", fill="x", expand=True)
+            text_frame.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
             # Truncate name for display
             display_name = name[:80] + ("…" if len(name) > 80 else "")
@@ -1656,12 +1669,13 @@ class CourtListenerGUI:
                 self._open_main_from_spotlight(popup)
         entry.bind("<Return>", _entry_return)
 
-        # Status label
+        # Status label, pinned at the bottom so the result slots above it stay
+        # put as results stream in.
         status_lbl = tk.Label(
             results_frame, text="Searching…", bg="#f0f0f0", fg="#999999",
             font=("TkDefaultFont", 8), anchor="w",
         )
-        status_lbl.pack(fill="x", padx=8, pady=(4, 4))
+        status_lbl.pack(side="bottom", fill="x", padx=8, pady=(4, 4))
         search_done = [0]  # track how many searches completed
         total_searches = 3  # Google Scholar + CourtListener + English Reports
 
