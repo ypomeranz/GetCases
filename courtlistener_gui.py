@@ -2545,14 +2545,27 @@ class CourtListenerGUI:
         if self._search_thread and self._search_thread.is_alive():
             return
 
-        client = self._get_client()
-        if client is None:
-            return
-
         query = self._query_var.get().strip()
         if not query:
             messagebox.showwarning("Empty Query", "Please enter a search query.")
             return
+
+        # A CourtListener token is needed for the CourtListener results only.
+        # Without one, alert the user but still let Google Scholar (and the
+        # other resources) search — just skip the CourtListener half.
+        token = self._token_var.get().strip()
+        if token:
+            client = self._get_client()
+            if client is None:
+                return
+        else:
+            client = None
+            messagebox.showwarning(
+                "No CourtListener Token",
+                "No CourtListener API token is set — CourtListener results will "
+                "be skipped.\n\nGoogle Scholar will still search.  Add a token "
+                "under Settings → API Token… to include CourtListener.",
+            )
 
         # CourtListener accepts space-separated court IDs; empty set = all
         court = " ".join(sorted(self._selected_courts)) or None
@@ -2594,6 +2607,17 @@ class CourtListenerGUI:
             threading.Thread(target=scholar_run, daemon=True).start()
         else:
             self._scholar_status_var.set("(needs beautifulsoup4)")
+
+        # No CourtListener token: the Scholar search above is all there is to
+        # run, so re-enable the controls and stop here.
+        if client is None:
+            self._search_btn.config(state="normal")
+            self._status_var.set(
+                "Searching Google Scholar — CourtListener skipped (no token)."
+                if _SCHOLAR_AVAILABLE else
+                "CourtListener skipped (no token); Google Scholar unavailable."
+            )
+            return
 
         def run() -> None:
             try:
