@@ -4764,6 +4764,12 @@ class _ScholarTextWindow:
         # _prefetch_pdf, consumed by _view_pdf.
         self._pdf_prefetch: Optional[tuple[bytes, str]] = None
         self._pdf_prefetch_started = False
+        # CourtListener text view: whether a PDF was located anywhere (None =
+        # still looking, True/False = found/not), gating its "View PDF" button.
+        self._pdf_located: Optional[bool] = None
+        self._pdf_locate_started = False
+        self._prefetch_ok = prefetch_pdf
+        self._pre_pdf_mode = "scholar"  # text view to return to from the PDF
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
         # (volume, reporter) → first pages, so short forms ("410 U.S. at 152")
@@ -4952,6 +4958,12 @@ class _ScholarTextWindow:
             btn_frame, text="CourtListener Text", command=self._toggle_source
         )
         self._toggle_btn.pack(side="right", padx=4)
+        # The CourtListener text view gets its own "View PDF" button (the
+        # Scholar view reuses the toggle for that).  Packed in _render_cl_blocks
+        # / _show_courtlistener, hidden elsewhere; enabled once a PDF is located.
+        self._pdf_btn = ttk.Button(
+            btn_frame, text="View PDF", command=self._view_pdf, state="disabled"
+        )
 
         # Size controls: text size in the reader, PDF zoom in the PDF view
         # (also Ctrl +/−/0 and Ctrl+mouse wheel).
@@ -5563,6 +5575,7 @@ class _ScholarTextWindow:
         # is invariably worse, so it's no longer offered here).
         self._toggle_btn.config(text="View PDF", command=self._view_pdf,
                                 state="normal")
+        self._hide_pdf_button()  # Scholar view uses the toggle for the PDF
         self._export_btn.config(text="Export RTF…", command=self._export_rtf)
         self._print_btn.pack_forget()  # text view: no Print button
         self._zoom_out_btn.config(text="A−")
@@ -5888,6 +5901,7 @@ class _ScholarTextWindow:
         self._status_var.set(
             f"{char_count:,} characters | CourtListener version"
         )
+        self._show_pdf_button()
         self._finder.refresh()
         self._schedule_gutter_redraw()
 
@@ -5910,6 +5924,7 @@ class _ScholarTextWindow:
         self._status_var.set(
             f"{len(self._cl_text or ''):,} characters | CourtListener version"
         )
+        self._show_pdf_button()
         self._finder.refresh()
 
     # ------------------------------------------------------------------
@@ -7116,6 +7131,97 @@ class _ScholarTextWindow:
             cites += raw if isinstance(raw, list) else [raw]
         return any(self._FED_APPX_RE.search(str(c)) for c in cites)
 
+    # ------------------------------------------------------------------
+    # CourtListener-view "View PDF" button
+    # ------------------------------------------------------------------
+
+    def _show_pdf_button(self) -> None:
+        """Reveal the View PDF button (CourtListener text view), kicking off the
+        background PDF search the first time so it ends up enabled or greyed."""
+        btn = getattr(self, "_pdf_btn", None)
+        if btn is None:
+            return
+        if not btn.winfo_ismapped():
+            btn.pack(side="right", padx=4)
+        self._refresh_pdf_button()
+        self._locate_pdf()
+
+    def _hide_pdf_button(self) -> None:
+        btn = getattr(self, "_pdf_btn", None)
+        if btn is not None and btn.winfo_ismapped():
+            btn.pack_forget()
+
+    def _refresh_pdf_button(self) -> None:
+        btn = getattr(self, "_pdf_btn", None)
+        if btn is None:
+            return
+        try:
+            if self._pdf_located is True or self._pdf_prefetch is not None:
+                btn.config(state="normal", text="View PDF")
+            elif self._pdf_located is False:
+                btn.config(state="disabled", text="No PDF")
+            else:
+                btn.config(state="disabled", text="Finding PDF…")
+        except tk.TclError:
+            pass
+
+    def _locate_pdf(self) -> None:
+        """Find the opinion's PDF in the background — every PDF path the app
+        knows (LOC/GovInfo US Reports, static.case.law, the original court
+        source), then CourtListener's stored copy — recording whether one
+        exists so the View PDF button is enabled or left greyed out.  Warms the
+        bytes for an instant view when that's allowed and the libs are present.
+        """
+        if self._pdf_locate_started or self._pdf_prefetch is not None:
+            if self._pdf_prefetch is not None:
+                self._pdf_located = True
+                self._refresh_pdf_button()
+            return
+        self._pdf_locate_started = True
+        client = (self._app._get_client()
+                  if self._app._token_var.get().strip() else None)
+        item = self._pdf_item()
+
+        def run() -> None:
+            url = None
+            try:
+                url = self._app._resolve_pdf_url(client, item)
+            except Exception as exc:
+                print(f"[pdf] resolve failed: {exc}")
+            if not url:
+                self._post(self._on_pdf_located, False)
+                return
+            self._pdf_url = url
+            # Warm the bytes for an instant view (skipped when a big PDF is
+            # already live — prefetch_pdf=False — or the render libs are absent).
+            if self._prefetch_ok:
+                try:
+                    import pypdfium2  # noqa: F401
+                    from PIL import ImageTk  # noqa: F401
+                    resp = _anon_session.get(url, timeout=30)
+                    resp.raise_for_status()
+                    data = resp.content
+                    if data.startswith(b"%PDF"):
+                        self._pdf_prefetch = (data, url)
+                except ImportError:
+                    pass  # no render libs; View PDF will offer the browser
+                except Exception as exc:
+                    print(f"[pdf] prefetch failed: {exc}")
+            self._post(self._on_pdf_located, True)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_pdf_located(self, found: bool) -> None:
+        self._pdf_located = found
+        self._refresh_pdf_button()
+
+    def _render_courtlistener_view(self) -> None:
+        """Re-show whichever CourtListener text rendering this window uses."""
+        if self._cl_parts or self._cl_blocks:
+            self._render_cl_blocks()
+        else:
+            self._show_courtlistener()
+
     def _prefetch_pdf(self) -> None:
         """Resolve and fetch the official PDF in the background right after the
         Scholar view opens, caching the bytes so a later 'View PDF' is instant.
@@ -7165,6 +7271,9 @@ class _ScholarTextWindow:
             ):
                 self._open_pdf_in_browser()
             return
+        # Remember which text view to return to when leaving the PDF.
+        if self._mode in ("scholar", "courtlistener"):
+            self._pre_pdf_mode = self._mode
         if self._pdf_prefetch is not None:  # warmed in the background already
             data, url = self._pdf_prefetch
             self._pdf_url = url
@@ -7172,7 +7281,14 @@ class _ScholarTextWindow:
             return
         client = self._app._get_client()
         self._pdf_url = None
-        self._toggle_btn.config(state="disabled")
+        # Disable the control that was clicked while we look (the CL view uses
+        # its own View PDF button; the Scholar view reuses the toggle).
+        busy = (self._pdf_btn if self._pre_pdf_mode == "courtlistener"
+                else self._toggle_btn)
+        try:
+            busy.config(state="disabled")
+        except tk.TclError:
+            pass
         self._status_var.set("Locating a PDF of the opinion…")
         item = self._pdf_item()
 
@@ -7215,19 +7331,25 @@ class _ScholarTextWindow:
         self._pdf_url = url
         self._pdf_bytes = data
         self._mode = "pdf"
+        self._hide_pdf_button()  # the toggle below is the way back from the PDF
         self._part_combo.config(state="disabled")
         self._view_label_var.set("PDF of opinion")
         self._view_label.config(foreground="black")
         self._source_var.set(url)
-        # The "Google Scholar Text" toggle is disabled only for a Federal
-        # Appendix case whose Scholar page has no opinion text (a scan-only
-        # case); every other case keeps it active.
-        toggle_state = ("disabled"
-                        if self._fed_appx and not self._scholar_has_text
-                        else "normal")
+        # Returning from the PDF goes back to whichever text view we came from:
+        # the Scholar text, or — for a CourtListener-primary window — the CL text.
+        if self._pre_pdf_mode == "courtlistener":
+            back_label, back_state = "Back to Text", "normal"
+        else:
+            # The "Google Scholar Text" toggle is disabled only for a Federal
+            # Appendix case whose Scholar page has no opinion text (a scan-only
+            # case); every other case keeps it active.
+            back_label = "Google Scholar Text"
+            back_state = ("disabled"
+                          if self._fed_appx and not self._scholar_has_text
+                          else "normal")
         self._toggle_btn.config(
-            text="Google Scholar Text", command=self._back_from_pdf,
-            state=toggle_state)
+            text=back_label, command=self._back_from_pdf, state=back_state)
         # In PDF view, the RTF export becomes a "Download PDF" action, a Print
         # button appears, and the text-size buttons zoom the page.
         self._export_btn.config(text="Download PDF", command=self._download_pdf)
@@ -7288,17 +7410,26 @@ class _ScholarTextWindow:
         _print_pdf_file(self._win, path, self._status_var.set)
 
     def _back_from_pdf(self) -> None:
-        """Return from the PDF to the Google Scholar text view."""
+        """Return from the PDF to the text view it was opened from — the Google
+        Scholar text, or the CourtListener text for a CL-primary window."""
         if self._pdf_pane is not None:
             self._pdf_pane.destroy()
             self._pdf_pane = None
         self._text_frame.pack(fill="both", expand=True, padx=8, pady=4,
                               before=self._btn_frame)
-        self._render_scholar()  # restores the label, combo and "View PDF" button
+        if self._pre_pdf_mode == "courtlistener":
+            self._render_courtlistener_view()
+        else:
+            self._render_scholar()  # restores label, combo and "View PDF"
 
     def _on_pdf_error(self, msg: str) -> None:
-        self._toggle_btn.config(text="View PDF", command=self._view_pdf,
-                                state="normal")
+        if self._pre_pdf_mode == "courtlistener" and self._mode != "pdf":
+            # Failure came from the CL view's View PDF button — restore it
+            # rather than turning the Scholar toggle into a "View PDF".
+            self._refresh_pdf_button()
+        else:
+            self._toggle_btn.config(text="View PDF", command=self._view_pdf,
+                                    state="normal")
         self._status_var.set(f"PDF: {msg}")
         if self._pdf_url and messagebox.askyesno(
             "PDF", f"{msg}\n\nOpen the PDF in your web browser instead?",
