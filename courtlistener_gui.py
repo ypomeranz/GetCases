@@ -7687,10 +7687,10 @@ class _EngRepPdfWindow(_PdfWindow):
                 "PDF viewer not installed",
                 "Viewing PDFs inside the app needs two Python packages:\n\n"
                 "    pip install pypdfium2 Pillow\n\n"
-                "Open this English Reports scan in your browser instead?",
+                "Open this English Reports case on CommonLII instead?",
                 parent=self._win,
             ):
-                eng_rep_pdf.open_in_browser(self._case.pdf_url)
+                eng_rep_pdf.open_in_browser(self._case.web_url)
             self._win.destroy()
             return
         self._status_var.set("Loading the English Reports scan…")
@@ -7746,21 +7746,55 @@ class _EngRepPdfWindow(_PdfWindow):
         ttk.Button(row, text="Open in Firefox", command=open_ff).pack(side="left")
         ttk.Button(row, text="Retry", command=retry).pack(side="left", padx=8)
         ttk.Button(row, text="Open in browser instead",
-                   command=lambda: (eng_rep_pdf.open_in_browser(self._case.pdf_url),
+                   command=lambda: (eng_rep_pdf.open_in_browser(self._case.web_url),
                                     self._win.destroy())).pack(side="left")
 
     def _link_out(self) -> None:
-        """In-app fetch isn't possible here (no Firefox / packages) — open the
-        scan in the user's browser and explain."""
-        eng_rep_pdf.open_in_browser(self._case.pdf_url)
+        """In-app fetch isn't possible here (Firefox or a dependency missing).
+        Offer the same hand-off as the CloudFlare panel: open the case page on
+        CommonLII — the *main site*, so the scan's hotlink check passes when you
+        click through to it — preferring Firefox when it's installed."""
         self._clear_body()
-        ttk.Label(
-            self._body, wraplength=560, justify="left", padding=24,
-            text=("Opened in your browser.\n\nFor in-app viewing of English "
-                  "Reports scans (cached, no repeat checks), install Firefox "
-                  "and run:\n\n    pip install curl_cffi browser_cookie3"),
-        ).pack(anchor="w")
-        self._status_var.set("Opened in your browser.")
+        web_url = self._case.web_url
+        has_ff = eng_rep_pdf.firefox_available()
+        frame = ttk.Frame(self._body)
+        frame.pack(fill="both", expand=True, padx=24, pady=24)
+        msg = ("This English Reports scan can't be fetched inside the app "
+               "here.\n\nOpen the case on CommonLII and click through to the "
+               "scan there: the site only serves the PDF when you arrive from "
+               "a link on its own pages, so opening the case page first gets "
+               "you past that block.")
+        if not has_ff:
+            msg += ("\n\nFor in-app viewing (cached, no repeat checks), install "
+                    "Firefox and run:\n\n    pip install curl_cffi browser_cookie3")
+        ttk.Label(frame, wraplength=560, justify="left", text=msg).pack(
+            anchor="w", pady=(0, 16))
+        row = ttk.Frame(frame)
+        row.pack(anchor="w")
+        if has_ff:
+            ttk.Button(
+                row, text="Open in Firefox",
+                command=lambda: (eng_rep_pdf.open_in_firefox(web_url),
+                                 self._status_var.set("Opened in Firefox.")),
+            ).pack(side="left")
+        ttk.Button(
+            row, text="Open in browser",
+            command=lambda: (eng_rep_pdf.open_in_browser(web_url),
+                             self._status_var.set("Opened in your browser.")),
+        ).pack(side="left", padx=8)
+        self._status_var.set("In-app viewing unavailable — open on CommonLII.")
+
+    def _error(self, msg: str) -> None:  # overrides _PdfWindow._error
+        """Origin error fallback — open the CommonLII *case page* (not the
+        hotlink-blocked .pdf), so the scan loads when clicked from there."""
+        self._status_var.set(f"English Reports: {msg}")
+        if messagebox.askyesno(
+            "English Reports",
+            f"{msg}\n\nOpen this case on CommonLII instead?",
+            parent=self._win,
+        ):
+            eng_rep_pdf.open_in_browser(self._case.web_url)
+        self._win.destroy()
 
 
 def _choose_eng_rep_case(parent: tk.Misc,
@@ -7848,15 +7882,12 @@ def _open_eng_rep(parent: tk.Misc, spec: str,
 
 def _open_eng_rep_case(parent: tk.Misc, case: "eng_rep.ERCase",
                        status=lambda _s: None) -> None:
-    """Show one already-resolved English Reports case: the in-app scan (cached,
-    with the CloudFlare hand-off) or — when in-app fetching isn't available and
-    it isn't cached — the browser.  Used when the exact case is known (a name
-    search hit), so it skips the same-page chooser :func:`_open_eng_rep` runs."""
-    if (not eng_rep_pdf.is_cached(case.year, case.num)
-            and not eng_rep_pdf.can_fetch()):
-        status(f"Opening {case.er_cite} in your browser…")
-        eng_rep_pdf.open_in_browser(case.pdf_url)
-        return
+    """Show one already-resolved English Reports case in the in-app scan viewer.
+    Used when the exact case is known (a name-search hit from the spotlight, or
+    a citation link), so it skips the same-page chooser :func:`_open_eng_rep`
+    runs.  The viewer handles every outcome itself — disk cache, the in-app
+    fetch, the CloudFlare/Firefox hand-off, and the browser fall-back — so the
+    spotlight and a clicked link reach English Reports exactly the same way."""
     status(f"Opening {case.name[:40]} ({case.er_cite})…")
     _EngRepPdfWindow(parent, case, status)
 
@@ -7890,11 +7921,13 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
         url = ("https://scholar.google.com/scholar?q="
                + urllib.parse.quote(f'"{cite}"'))
     elif kind == "engrep":
-        # English Reports → the CommonLII scan (first case at that page), or a
-        # CommonLII search when the citation isn't in our index.
+        # English Reports → the CommonLII case page (first case at that page),
+        # not the .pdf directly: the origin hotlink-blocks the scan unless you
+        # reach it from a link on the site.  Falls back to a CommonLII search
+        # when the citation isn't in our index.
         cases = eng_rep.resolve(value)
         vp = eng_rep.parse_spec(value)
-        url = (cases[0].pdf_url if cases
+        url = (cases[0].web_url if cases
                else (eng_rep.search_url(*vp) if vp else ""))
         if not url:
             return
