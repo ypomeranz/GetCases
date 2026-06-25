@@ -739,8 +739,13 @@ class GoogleScholarFetcher:
             print(f"[scholar] cache hit for {key!r}")
             return cached
 
+        # Wrap the citation in double quotes so Scholar treats it as an exact
+        # phrase. (repr() here produced *single* quotes, which Scholar does not
+        # treat as a phrase operator -- that returned arbitrary cases from the
+        # same reporter volume, many of which 404/500 or lack an opinion div.)
+        phrase = f'"{citation.strip()}"'
         search_url = (
-            f"{SCHOLAR_BASE}/scholar?q={quote_plus(repr(citation))}&as_sdt=4"
+            f"{SCHOLAR_BASE}/scholar?q={quote_plus(phrase)}&as_sdt=4"
         )
         print(f"[scholar] searching {search_url}")
         try:
