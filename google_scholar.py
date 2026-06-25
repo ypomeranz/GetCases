@@ -732,29 +732,29 @@ class GoogleScholarFetcher:
 
         Returns (scholar_url, opinion_html) or None if not found / blocked.
         Result is cached permanently on success.
+
+        Goes through the same search-then-open path the rest of the app relies
+        on (the one that works when verifying against CourtListener): a quoted
+        case-law search parsed with :meth:`_parse_results`, then
+        :meth:`fetch_by_url` on the first hit.  The old shortcut — a bare
+        ``as_sdt=4`` search with the citation wrapped in ``repr()`` (single
+        quotes, which Scholar reads literally) plus "first scholar_case anchor
+        on the page" — could pick a non-opinion link and then report
+        "#gs_opinion div not found".
         """
-        key = f"cite:{citation.strip()}"
+        cite = citation.strip()
+        key = f"cite:{cite}"
         cached = self._cache_get(key)
         if cached:
             print(f"[scholar] cache hit for {key!r}")
             return cached
 
-        search_url = (
-            f"{SCHOLAR_BASE}/scholar?q={quote_plus(repr(citation))}&as_sdt=4"
-        )
-        print(f"[scholar] searching {search_url}")
-        try:
-            resp = self._get(search_url)
-        except Exception as exc:
-            print(f"[scholar] search request failed: {exc}")
+        results = self.search_cases(f'"{cite}"', limit=1)
+        if not results:
+            print(f"[scholar] no case results for citation {cite!r}")
             return None
 
-        case_url = self._first_case_url(resp.text)
-        if not case_url:
-            print("[scholar] no scholar_case link found in results page")
-            return None
-
-        result = self._fetch_case_page(case_url)
+        result = self.fetch_by_url(results[0].url)
         if result:
             self._cache_put(key, *result)
         return result
@@ -774,20 +774,13 @@ class GoogleScholarFetcher:
             print(f"[scholar] cache hit for {key!r}")
             return cached
 
-        search_url = f"{SCHOLAR_BASE}/scholar?q={quote_plus(q)}&as_sdt=4"
-        print(f"[scholar] searching {search_url}")
-        try:
-            resp = self._get(search_url)
-        except Exception as exc:
-            print(f"[scholar] search request failed: {exc}")
+        # Same search-then-open path as fetch_by_citation / the rest of the app.
+        results = self.search_cases(q, limit=1)
+        if not results:
+            print(f"[scholar] no case results for name {q!r}")
             return None
 
-        case_url = self._first_case_url(resp.text)
-        if not case_url:
-            print("[scholar] no scholar_case link found in results page")
-            return None
-
-        result = self._fetch_case_page(case_url)
+        result = self.fetch_by_url(results[0].url)
         if result:
             self._cache_put(key, *result)
         return result
@@ -896,18 +889,6 @@ class GoogleScholarFetcher:
         resp = self._session.get(url, timeout=20)
         resp.raise_for_status()
         return resp
-
-    def _first_case_url(self, html: str) -> Optional[str]:
-        """Return the first scholar_case href found in a Scholar results page."""
-        soup = BeautifulSoup(html, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href: str = a["href"]
-            if "scholar_case" in href:
-                if href.startswith("/"):
-                    href = SCHOLAR_BASE + href
-                print(f"[scholar] found case url: {href}")
-                return href
-        return None
 
     def _fetch_case_page(self, url: str) -> Optional[tuple[str, str]]:
         """Fetch a scholar_case page and extract the opinion HTML."""
