@@ -18,17 +18,22 @@ no separator, so sentences don't acquire stray gaps around formatting.
 
 Fetching:
     Google Scholar fingerprints the TLS handshake (JA3) and header order of
-    its callers, and increasingly serves a block/CAPTCHA page to plain
-    ``requests`` — whose fingerprint is unmistakably non-browser — even when
-    the same machine's real browser loads the page fine.  When ``curl_cffi``
-    is installed we therefore fetch with it, impersonating a current Chrome
-    so the TLS fingerprint and headers match a real browser.  ``requests``
-    remains a fallback when ``curl_cffi`` is unavailable.
+    its callers and challenges ones it doesn't trust with a "/sorry" CAPTCHA
+    page.  Counter-intuitively it is curl_cffi's *newest* Chrome profiles that
+    get challenged (chrome133a and up as of curl_cffi 0.15), while slightly
+    older but still-current Chrome builds and the Edge/Firefox/Safari profiles
+    pass — so we impersonate a proven target rather than the bleeding edge, and
+    rotate to another fingerprint on the same session if Scholar challenges the
+    current one.  This is a fingerprint block, not an IP ban: the same network
+    loads Scholar fine in a real browser.  ``requests`` remains a fallback when
+    ``curl_cffi`` is unavailable (and is almost always blocked).
 
 Requires:
     pip install beautifulsoup4
     pip install curl_cffi   # strongly recommended; avoids Scholar bot blocks
     pip install requests    # fallback fetcher if curl_cffi is absent
+    pip install browser-cookie3   # optional; reuse your browser's Google cookies
+                                  # so Scholar throttles far less (see cookies_from)
 """
 
 from __future__ import annotations
@@ -94,45 +99,80 @@ _FALLBACK_HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-_IMPERSONATE_CACHE: Optional[str] = None
+# Impersonation targets to try, best-first.  We deliberately AVOID curl_cffi's
+# newest Chrome profiles: Scholar's search endpoint challenges curl_cffi's
+# bleeding-edge Chrome JA3 (chrome133a and up as of curl_cffi 0.15) with its
+# "/sorry" CAPTCHA, while quietly accepting slightly older, proven Chrome builds
+# and the Edge/Firefox/Safari families.  (Verified empirically: chrome131/124/
+# 120/116, edge101, firefox144 and safari180 all load Scholar search 200; the
+# generic "chrome" alias — which maps to the newest — gets a 429.)  Listing
+# several across browser families lets the fetcher rotate to a fresh fingerprint
+# when one is challenged, which — not the IP — is what Scholar actually blocks.
+_PREFERRED_IMPERSONATIONS = (
+    "chrome131", "chrome124", "chrome120", "chrome116",
+    "edge101",
+    "firefox144", "firefox135",
+    "safari180", "safari170",
+)
+
+_IMP_CANDIDATES_CACHE: Optional[list[str]] = None
 
 
-def _impersonate_target() -> str:
-    """The newest Chrome TLS-fingerprint target curl_cffi offers.
+def _impersonation_candidates() -> list[str]:
+    """Ordered curl_cffi impersonation targets to try, best-first.
 
-    Scholar is a Google property that virtually every visitor reaches from
-    Chrome, so a current-Chrome JA3 is the least conspicuous profile.  We pick
-    the highest ``chromeNNN`` curl_cffi ships rather than hard-coding a version,
-    so the impersonation stays fresh as the library updates.
+    Returns those of ``_PREFERRED_IMPERSONATIONS`` the installed curl_cffi
+    supports, then family generics as deeper fallbacks.  If somehow none match
+    (a much newer/older curl_cffi), it computes a recent-but-not-bleeding-edge
+    Chrome from whatever the library ships, since the newest profiles are the
+    ones Scholar challenges.
     """
-    global _IMPERSONATE_CACHE
-    if _IMPERSONATE_CACHE:
-        return _IMPERSONATE_CACHE
-    target = "chrome"
+    global _IMP_CANDIDATES_CACHE
+    if _IMP_CANDIDATES_CACHE is not None:
+        return _IMP_CANDIDATES_CACHE
+    available: set[str] = set()
     try:
         import typing
         from curl_cffi.requests.impersonate import BrowserTypeLiteral
-        chromes = []
-        for t in typing.get_args(BrowserTypeLiteral):
-            m = re.fullmatch(r"chrome(\d+)", t)
-            if m:
-                chromes.append((int(m.group(1)), t))
-        if chromes:
-            target = max(chromes)[1]
+        available = set(typing.get_args(BrowserTypeLiteral))
     except Exception:
         pass
-    _IMPERSONATE_CACHE = target
-    return target
+
+    if not available:
+        cands = list(_PREFERRED_IMPERSONATIONS)
+    else:
+        cands = [t for t in _PREFERRED_IMPERSONATIONS if t in available]
+        if not cands:
+            # Newest available Chrome, minus the newest few Scholar challenges.
+            chromes = sorted(
+                (int(m.group(1)), t)
+                for t in available
+                for m in [re.fullmatch(r"chrome(\d+)", t)]
+                if m
+            )
+            if len(chromes) > 3:
+                cands = [chromes[-4][1]]
+            elif chromes:
+                cands = [chromes[-1][1]]
+        for g in ("edge", "firefox", "safari"):  # family generics, last resort
+            if g in available and g not in cands:
+                cands.append(g)
+    if not cands:
+        cands = ["chrome"]
+    _IMP_CANDIDATES_CACHE = cands
+    return cands
 
 
 _DEFAULT_DELAY = 3.0  # seconds between outbound requests
 
 # Rate-limit handling.  Scholar answers 429 (Too Many Requests) -- and
-# occasionally 503 -- when it thinks a client is asking too fast; this happens
-# even to a browser-impersonating fetcher when many opinions/links are pulled
-# in quick succession.  We retry such responses with exponential backoff
-# (honoring any Retry-After header) instead of failing the fetch outright.
-_RETRY_STATUSES = frozenset({429, 503})
+# occasionally 500/503 -- when it thinks a client is asking too fast; this
+# happens even to a browser-impersonating fetcher when many opinions/links are
+# pulled in quick succession.  We retry such responses with exponential backoff
+# (honoring any Retry-After header) instead of failing the fetch outright.  The
+# 500 is transient under load (a fresh retry usually renders the page); a 429
+# carrying the "/sorry" CAPTCHA is handled separately by fingerprint rotation.
+_RETRY_STATUSES = frozenset({429, 500, 503})
 _MAX_RETRIES = 4          # attempts after the first try
 _BACKOFF_BASE = 5.0       # seconds; doubles each retry (5, 10, 20, 40 …)
 _BACKOFF_MAX = 90.0       # cap on a single backoff wait
@@ -140,6 +180,18 @@ _BACKOFF_MAX = 90.0       # cap on a single backoff wait
 # rest of a link-following run doesn't keep tripping the limit.
 _DELAY_GROWTH = 1.5
 _MAX_DELAY = 30.0
+
+# A "/sorry/index" CAPTCHA ("Our systems have detected unusual traffic") is an
+# IP-level block of Scholar's *search* endpoint, not a transient 429: retrying
+# in-session never clears it and each extra hit only deepens the block.  When we
+# hit one we fail fast and stop touching Scholar for this long, so a
+# link-following run doesn't grind through dozens of CAPTCHAs.
+_BLOCK_COOLDOWN = 900.0   # seconds (15 min)
+
+# Scholar intermittently serves a JS "Loading…" shell (page chrome with an
+# absent/near-empty #gs_opinion) instead of the server-rendered opinion, mostly
+# when soft-throttling.  We re-fetch a few times until the opinion materializes.
+_SHELL_RETRIES = 3
 
 _CACHE_PATH = Path.home() / ".cache" / "courtlistener_scholar.db"
 
@@ -765,6 +817,75 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     return parts
 
 
+# ---------------------------------------------------------------------------
+# Browser cookie reuse
+# ---------------------------------------------------------------------------
+# Loading the user's real ``google.com`` cookies into the scraper makes Scholar
+# treat it like that signed-in browser, which sharply cuts the "unusual
+# traffic"/throttle (Loading… shell) responses.  Platform caveat: on Windows
+# Chrome and Edge encrypt their cookies (DPAPI + AES-GCM, and Chrome/Edge 127+
+# add App-Bound Encryption that needs *admin* to decrypt), whereas Firefox keeps
+# them in plaintext SQLite.  So we try Chrome first and fall back to Firefox
+# (then Edge) -- exactly the "use Chrome unless it's locked, else Firefox" flow.
+# We read only google.com cookies (not the whole store), and it's purely
+# best-effort: any failure just proceeds cookieless.
+_COOKIE_BROWSER_ORDER = ("chrome", "firefox", "edge")
+
+# Cookies that indicate a *signed-in* Google session (vs. a bare visitor).
+_SIGNED_IN_COOKIES = frozenset({
+    "SID", "HSID", "SSID", "APISID", "SAPISID", "LSID",
+    "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PAPISID", "__Secure-3PAPISID",
+})
+
+
+def _resolve_cookie_order(cookies_from: Optional[str]) -> tuple[str, ...]:
+    """Turn the ``cookies_from`` setting into an ordered list of browsers.
+
+    ``"auto"`` -> the default order; ``None``/``""``/``"off"``/``"none"`` ->
+    disabled; otherwise a single name or comma-separated list (e.g. ``"firefox"``
+    or ``"chrome,firefox"``).
+    """
+    s = (cookies_from or "").strip().lower()
+    if not s or s in ("off", "none", "false", "0", "disable", "disabled"):
+        return ()
+    if s == "auto":
+        return _COOKIE_BROWSER_ORDER
+    return tuple(p.strip() for p in s.split(",") if p.strip())
+
+
+def load_google_cookies(order: tuple[str, ...] = _COOKIE_BROWSER_ORDER):
+    """Load ``google.com`` cookies from the user's browser(s), best-first.
+
+    Returns ``(cookiejar, browser_name, note)``: the first browser whose cookies
+    we can actually read wins.  On total failure ``cookiejar`` is None and
+    ``note`` explains why (library missing, every browser locked behind
+    admin-only App-Bound Encryption, none signed in, etc.).
+    """
+    try:
+        import browser_cookie3 as bc3
+    except ImportError:
+        return None, "", "browser_cookie3 not installed (pip install browser-cookie3)"
+
+    problems: list[str] = []
+    for name in order:
+        loader = getattr(bc3, name, None)
+        if loader is None:
+            problems.append(f"{name}: unsupported")
+            continue
+        try:
+            jar = loader(domain_name="google.com")
+        except Exception as exc:
+            # e.g. RequiresAdminError (Chrome/Edge App-Bound Encryption) or
+            # BrowserCookieError (browser not installed / no profile).
+            first = (str(exc).splitlines() or [""])[0].strip()
+            problems.append(f"{name}: {type(exc).__name__}{(': ' + first[:70]) if first else ''}")
+            continue
+        if any(c.value for c in jar):
+            return jar, name, ""
+        problems.append(f"{name}: no readable google.com cookies (signed in?)")
+    return None, "", "; ".join(problems) or "no supported browser found"
+
+
 class GoogleScholarFetcher:
     """
     Fetch and cache US case law text from Google Scholar.
@@ -775,28 +896,44 @@ class GoogleScholarFetcher:
         Path to the SQLite cache file (created on first use).
     delay:
         Minimum seconds to wait between HTTP requests.
+    cookies_from:
+        Where to borrow google.com cookies so Scholar treats the fetcher like
+        your signed-in browser (far fewer throttle/CAPTCHA responses).
+        ``"auto"`` (default) tries Chrome, then Firefox, then Edge; pass a name
+        (``"firefox"``), a comma-separated list, or ``None`` to disable.  On
+        Windows, Chrome/Edge need admin to decrypt (App-Bound Encryption) while
+        Firefox cookies are plaintext and work without admin.
     """
 
     def __init__(
         self,
         cache_path: Path = _CACHE_PATH,
         delay: float = _DEFAULT_DELAY,
+        cookies_from: Optional[str] = "auto",
     ) -> None:
         self._delay = delay
         self._last_request: float = 0.0
+        self._warmed = False         # homepage cookie warm-up done this session?
+        self._blocked_until = 0.0    # monotonic time before which Scholar is blocked
 
-        # Prefer curl_cffi (browser TLS impersonation) over plain requests;
-        # see module docstring.  ``_impersonate`` is the curl_cffi browser
-        # target, or None when falling back to requests.
+        # Prefer curl_cffi (browser TLS impersonation) over plain requests; see
+        # module docstring.  ``_impersonate`` is the current curl_cffi target;
+        # ``_imp_candidates`` are fallbacks we rotate through when Scholar
+        # challenges a fingerprint.  None when falling back to plain requests.
         if _curl_requests is not None:
-            self._impersonate: Optional[str] = _impersonate_target()
+            self._imp_candidates: list[str] = _impersonation_candidates()
+            self._imp_index = 0
+            self._impersonate: Optional[str] = self._imp_candidates[0]
             self._session = _curl_requests.Session()
             self._session.headers.update(_HEADERS)
             print(
-                f"[scholar] using curl_cffi, impersonating {self._impersonate}"
+                f"[scholar] using curl_cffi, impersonating {self._impersonate} "
+                f"(fallbacks: {', '.join(self._imp_candidates[1:]) or 'none'})"
             )
         else:
             self._impersonate = None
+            self._imp_candidates = []
+            self._imp_index = 0
             self._session = _std_requests.Session()
             self._session.headers.update(_FALLBACK_HEADERS)
             print(
@@ -804,6 +941,13 @@ class GoogleScholarFetcher:
                 "(more likely to be blocked by Scholar -- "
                 "`pip install curl_cffi` to fix)"
             )
+
+        # Reuse the user's real browser cookies so Scholar treats us like their
+        # signed-in browser (far fewer throttle/CAPTCHA responses).  Opt out with
+        # cookies_from=None; force one with cookies_from="firefox".
+        cookie_order = _resolve_cookie_order(cookies_from)
+        if cookie_order:
+            self._install_browser_cookies(cookie_order)
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(cache_path), check_same_thread=False)
@@ -855,12 +999,12 @@ class GoogleScholarFetcher:
         )
         print(f"[scholar] searching {search_url}")
         try:
-            resp = self._get(search_url)
+            html = self._get_results_html(search_url)
         except Exception as exc:
             print(f"[scholar] search request failed: {exc}")
             return None
 
-        case_url = self._first_case_url(resp.text)
+        case_url = self._first_case_url(html)
         if not case_url:
             print("[scholar] no scholar_case link found in results page")
             return None
@@ -888,12 +1032,12 @@ class GoogleScholarFetcher:
         search_url = f"{SCHOLAR_BASE}/scholar?q={quote_plus(q)}&as_sdt=4"
         print(f"[scholar] searching {search_url}")
         try:
-            resp = self._get(search_url)
+            html = self._get_results_html(search_url)
         except Exception as exc:
             print(f"[scholar] search request failed: {exc}")
             return None
 
-        case_url = self._first_case_url(resp.text)
+        case_url = self._first_case_url(html)
         if not case_url:
             print("[scholar] no scholar_case link found in results page")
             return None
@@ -916,11 +1060,11 @@ class GoogleScholarFetcher:
         url = f"{SCHOLAR_BASE}/scholar?q={quote_plus(query)}&as_sdt=2006"
         print(f"[scholar] searching {url}")
         try:
-            resp = self._get(url)
+            html = self._get_results_html(url)
         except Exception as exc:
             print(f"[scholar] search request failed: {exc}")
             return []
-        results = self._parse_results(resp.text)
+        results = self._parse_results(html)
         print(f"[scholar] parsed {len(results)} case results")
         self._search_cache[key] = results
         return results[:limit]
@@ -951,10 +1095,12 @@ class GoogleScholarFetcher:
             snippet = _WS_RE.sub(" ", rs.get_text()).strip() if rs else ""
             out.append(ScholarResult(title=title, url=href, source=source, snippet=snippet))
         if not out:
-            # Markup changed?  Fall back to bare scholar_case anchors.
+            # Markup changed?  Fall back to bare scholar_case anchors -- but
+            # only opinion links (?case=<id>), never the "How cited"
+            # (?about=<id>) citation-analysis links Scholar now interleaves.
             for a in soup.find_all("a", href=True):
                 href = a["href"]
-                if "scholar_case" not in href:
+                if "scholar_case" not in href or "case=" not in href:
                     continue
                 if href.startswith("/"):
                     href = SCHOLAR_BASE + href
@@ -1027,6 +1173,104 @@ class GoogleScholarFetcher:
             pass
         return None
 
+    @staticmethod
+    def _is_block_page(resp) -> bool:
+        """True if *resp* is Google's "/sorry/index" CAPTCHA interstitial.
+
+        Scholar guards its *search* endpoint with an "unusual traffic" CAPTCHA
+        served from ``www.google.com/sorry/index``; curl_cffi follows the
+        redirect, so it surfaces as a 429 whose final URL is ``/sorry/`` and
+        whose body mentions unusual traffic / a reCAPTCHA.  Crucially this is a
+        *fingerprint* challenge, not an IP ban -- the same IP loads the page
+        fine under a real browser or a different impersonation target.
+        """
+        if "/sorry/" in (getattr(resp, "url", "") or ""):
+            return True
+        if getattr(resp, "status_code", None) in _RETRY_STATUSES:
+            low = (resp.text or "").lower()
+            return (
+                "unusual traffic" in low
+                or "/sorry/index" in low
+                or "g-recaptcha" in low
+                or 'id="captcha"' in low
+            )
+        return False
+
+    def _install_browser_cookies(self, order: tuple[str, ...]) -> None:
+        """Best-effort: copy the user's real google.com cookies into the session.
+
+        Mimics the signed-in browser so Scholar throttles far less.  When cookies
+        load we also skip the homepage warm-up (we already have a cookie set)."""
+        jar, source, note = load_google_cookies(order)
+        if jar is None:
+            print(
+                f"[scholar] no browser cookies loaded ({note}); proceeding "
+                "without. Tip: sign into Google Scholar in Firefox (plaintext "
+                "cookies, no admin needed), or run as admin to read Chrome."
+            )
+            return
+        n = 0
+        signed_in = False
+        for c in jar:
+            if not c.value:
+                continue
+            try:
+                self._session.cookies.set(
+                    c.name, c.value,
+                    domain=c.domain or ".google.com", path=c.path or "/",
+                )
+            except TypeError:                       # session jar w/o domain/path kwargs
+                try:
+                    self._session.cookies.set(c.name, c.value)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            n += 1
+            signed_in = signed_in or c.name in _SIGNED_IN_COOKIES
+        if n:
+            self._warmed = True   # have real cookies; homepage warm-up unneeded
+            print(
+                f"[scholar] loaded {n} google.com cookies from {source}"
+                f"{' (signed-in session)' if signed_in else ' (visitor session)'}"
+            )
+        else:
+            print(f"[scholar] {source} cookies present but none could be applied")
+
+    def _warm_up(self) -> None:
+        """Visit the Scholar homepage once per session to pick up Google's
+        cookies (NID/GSP) before hitting the search endpoint -- a cold request
+        with no cookies looks more bot-like.  Cheap hygiene; best-effort."""
+        if self._warmed or self._impersonate is None:
+            self._warmed = True
+            return
+        self._warmed = True
+        try:
+            self._throttle()
+            self._raw_get(SCHOLAR_BASE + "/")
+        except Exception:
+            pass
+
+    def _rotate_impersonation(self) -> bool:
+        """Advance to the next impersonation fingerprint after a block.
+
+        Returns True if a fresh target was selected, False once exhausted.
+        Switching the JA3/header profile on the *same* session (cookies intact)
+        is what actually clears Scholar's fingerprint block: a target Scholar
+        trusts loads the page the challenged one couldn't.
+        """
+        if self._impersonate is None:
+            return False
+        if self._imp_index + 1 >= len(self._imp_candidates):
+            return False
+        self._imp_index += 1
+        self._impersonate = self._imp_candidates[self._imp_index]
+        print(
+            f"[scholar] fingerprint challenged; rotating impersonation -> "
+            f"{self._impersonate}"
+        )
+        return True
+
     def _raw_get(self, url: str):
         if self._impersonate is not None:
             # Re-assert the impersonation on every request: it drives both the
@@ -1035,76 +1279,162 @@ class GoogleScholarFetcher:
         return self._session.get(url, timeout=20)
 
     def _get(self, url: str):
-        """GET *url*, retrying rate-limit responses with exponential backoff.
+        """GET *url*, handling Scholar's two distinct anti-bot responses.
 
-        On HTTP 429/503 we wait (Retry-After if given, else an exponentially
-        growing, jittered backoff) and try again, up to ``_MAX_RETRIES`` times.
-        A 429 also permanently slows the session's inter-request pace so the
-        remainder of a link-following run is gentler and less likely to retrip
-        the limit.  Other errors raise immediately.
+        * A 429 redirecting to ``/sorry/index`` is a *fingerprint* challenge,
+          not an IP ban: Scholar distrusts curl_cffi's newest Chrome JA3.  We
+          rotate to the next impersonation target (older Chrome, Edge, Firefox,
+          Safari) on the same session and retry immediately -- a fresh
+          fingerprint loads the page the old one couldn't, with no waiting.
+          Only when every fingerprint is exhausted do we cool down and fail.
+        * A bare 429/503 (no CAPTCHA) is a genuine transient rate limit; we wait
+          (Retry-After or jittered exponential backoff) and retry, easing the
+          steady-state pace so the rest of a run is gentler.
         """
-        for attempt in range(_MAX_RETRIES + 1):
+        if time.monotonic() < self._blocked_until:
+            raise ScholarError(
+                "Google Scholar challenged every available browser fingerprint "
+                "moments ago; pausing Scholar briefly. Retry shortly, switch "
+                "networks, or rely on the CourtListener results (which don't go "
+                "through Scholar)."
+            )
+        self._warm_up()
+        backoff_attempt = 0
+        while True:
             self._throttle()
             resp = self._raw_get(url)
+            if self._is_block_page(resp):
+                if self._rotate_impersonation():
+                    continue  # retry now with a fresh fingerprint, no backoff
+                # Every fingerprint challenged: unusual -- may be a real
+                # IP-level throttle.  Cool down so a link-following run stops
+                # hammering /sorry, and fail fast with guidance.
+                self._blocked_until = time.monotonic() + _BLOCK_COOLDOWN
+                raise ScholarError(
+                    "Google Scholar returned its 'unusual traffic' CAPTCHA for "
+                    "every browser fingerprint tried "
+                    f"({', '.join(self._imp_candidates)}). That's unusual for a "
+                    "fingerprint block, so this IP may be genuinely throttled: "
+                    "wait a few minutes, switch networks/VPN, solve the CAPTCHA "
+                    "once at https://scholar.google.com/, or rely on "
+                    "CourtListener results (which don't use Scholar)."
+                )
             if resp.status_code in _RETRY_STATUSES:
-                # Got rate-limited: ease off the steady-state pace for the
-                # rest of the session.
+                # Bare (non-CAPTCHA) 429/503: a real transient limit.  Ease the
+                # steady-state pace and back off before retrying.
                 self._delay = min(self._delay * _DELAY_GROWTH, _MAX_DELAY)
-                if attempt >= _MAX_RETRIES:
+                if backoff_attempt >= _MAX_RETRIES:
                     print(
                         f"[scholar] HTTP {resp.status_code} (rate limited) after "
-                        f"{_MAX_RETRIES} retries; giving up. Google Scholar is "
-                        "throttling this IP -- wait a few minutes before retrying."
+                        f"{_MAX_RETRIES} retries; giving up. Wait a few minutes "
+                        "before retrying."
                     )
-                    break
+                    resp.raise_for_status()
+                    return resp
                 wait = self._retry_after_seconds(resp)
                 if wait is None:
-                    wait = min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_MAX)
+                    wait = min(_BACKOFF_BASE * (2 ** backoff_attempt), _BACKOFF_MAX)
                     wait += random.uniform(0, wait * 0.25)  # jitter
                 print(
                     f"[scholar] HTTP {resp.status_code} (rate limited); backing "
-                    f"off {wait:.0f}s then retry {attempt + 1}/{_MAX_RETRIES}"
+                    f"off {wait:.0f}s then retry {backoff_attempt + 1}/{_MAX_RETRIES}"
                 )
                 time.sleep(wait)
+                backoff_attempt += 1
                 continue
             resp.raise_for_status()
             return resp
-        resp.raise_for_status()  # surface the final 429/503 to the caller
-        return resp
+
+    def _get_results_html(self, url: str) -> str:
+        """GET a search/results page, retrying past Scholar's "Loading…" shell.
+
+        Like case pages, a results page sometimes comes back as the JS shell
+        (page chrome, no ``gs_r`` rows) when Scholar is soft-throttling -- which
+        is indistinguishable from "no hits".  We re-fetch a few times until rows
+        render; a genuinely empty search (Scholar's "did not match" notice)
+        short-circuits immediately so true-empty queries stay fast.
+        """
+        html = self._get(url).text
+        for attempt in range(_SHELL_RETRIES):
+            soup = BeautifulSoup(html, "html.parser")
+            if soup.find("div", class_="gs_r") or "did not match" in html.lower():
+                return html
+            print(
+                f"[scholar] results not server-rendered (Loading… shell); retry "
+                f"{attempt + 1}/{_SHELL_RETRIES}"
+            )
+            time.sleep(_BACKOFF_BASE)
+            html = self._get(url).text
+        return html
 
     def _first_case_url(self, html: str) -> Optional[str]:
-        """Return the first scholar_case href found in a Scholar results page."""
+        """Return the first opinion URL (scholar_case?case=<id>) on a results page.
+
+        Result rows now also carry "How cited" links of the form
+        ``scholar_case?about=<id>`` -- a citation-analysis page, not an opinion --
+        and those can appear *before* the case title link in document order.  So
+        prefer the first parsed result's URL (its h3 title link, always a
+        ``case=`` opinion link), and only fall back to a raw scan that requires
+        ``case=`` and rejects ``about=``.
+        """
+        results = self._parse_results(html)
+        if results:
+            print(f"[scholar] found case url: {results[0].url}")
+            return results[0].url
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
             href: str = a["href"]
-            if "scholar_case" in href:
+            if "scholar_case" in href and "case=" in href and "about=" not in href:
                 if href.startswith("/"):
                     href = SCHOLAR_BASE + href
                 print(f"[scholar] found case url: {href}")
                 return href
         return None
 
+    @staticmethod
+    def _normalize_case_url(url: str) -> str:
+        """Reduce a scholar_case URL to a stable ``?case=<id>`` form.
+
+        Scholar appends q/as_sdt/hl clutter to result links; stripping it gives
+        a stable cache key and, in practice, a more reliably server-rendered
+        opinion (the param-laden variants more often return the JS shell)."""
+        m = re.search(r"[?&]case=(\d+)", url)
+        return f"{SCHOLAR_BASE}/scholar_case?case={m.group(1)}&hl=en" if m else url
+
     def _fetch_case_page(self, url: str) -> Optional[tuple[str, str]]:
-        """Fetch a scholar_case page and extract the opinion HTML."""
+        """Fetch a scholar_case page and extract the opinion HTML.
+
+        Scholar intermittently returns a JS "Loading…" shell -- the page chrome
+        with an absent or near-empty ``#gs_opinion`` -- instead of the
+        server-rendered opinion, especially while soft-throttling.  We re-fetch
+        a few times (easing the pace) until the opinion materializes rather than
+        reporting it missing.
+        """
+        url = self._normalize_case_url(url)
         print(f"[scholar] fetching case page {url}")
-        try:
-            resp = self._get(url)
-        except Exception as exc:
-            print(f"[scholar] case page request failed: {exc}")
-            return None
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        # Primary location Google uses for the opinion body
-        opinion_div = soup.find(id="gs_opinion") or soup.find(
-            "div", class_="gs_opinion"
-        )
-        if not opinion_div:
-            print("[scholar] #gs_opinion div not found on page")
-            return None
-
-        html = str(opinion_div)
-        print(f"[scholar] extracted {len(html):,} chars of opinion HTML")
-        return (url, html)
+        for attempt in range(_SHELL_RETRIES + 1):
+            try:
+                resp = self._get(url)
+            except Exception as exc:
+                print(f"[scholar] case page request failed: {exc}")
+                return None
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Primary location Google uses for the opinion body
+            opinion_div = soup.find(id="gs_opinion") or soup.find(
+                "div", class_="gs_opinion"
+            )
+            if opinion_div and len(opinion_div.get_text(strip=True)) > 200:
+                html = str(opinion_div)
+                print(f"[scholar] extracted {len(html):,} chars of opinion HTML")
+                return (url, html)
+            if attempt < _SHELL_RETRIES:
+                print(
+                    f"[scholar] opinion not server-rendered (Loading… shell); "
+                    f"retry {attempt + 1}/{_SHELL_RETRIES}"
+                )
+                time.sleep(_BACKOFF_BASE)
+        print("[scholar] #gs_opinion not found (only the Loading… shell)")
+        return None
 
     # ------------------------------------------------------------------
     # Cache
@@ -1126,3 +1456,21 @@ class GoogleScholarFetcher:
             (key, url, text, html, time.time()),
         )
         self._db.commit()
+
+
+if __name__ == "__main__":
+    # Quick cookie-availability self-check:
+    #   python google_scholar.py            # try Chrome, then Firefox, then Edge
+    #   python google_scholar.py firefox    # force one browser
+    import sys
+
+    _order = _resolve_cookie_order(sys.argv[1] if len(sys.argv) > 1 else "auto")
+    _jar, _src, _note = load_google_cookies(_order or _COOKIE_BROWSER_ORDER)
+    if _jar is None:
+        print(f"No browser cookies available: {_note}")
+        print("Sign into Google Scholar in Firefox, or run this as admin for Chrome.")
+    else:
+        _names = sorted({c.name for c in _jar if c.value})
+        _signed = [n for n in _names if n in _SIGNED_IN_COOKIES]
+        print(f"Loaded {len(_names)} google.com cookies from {_src}; "
+              f"signed-in session: {'yes' if _signed else 'no (visitor cookies only)'}")
