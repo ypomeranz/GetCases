@@ -16,8 +16,19 @@ the reporter star-pagination markers (``*123``) Google inserts into the
 text.  Unlike a plain ``get_text()`` pass, inline elements are joined with
 no separator, so sentences don't acquire stray gaps around formatting.
 
+Fetching:
+    Google Scholar fingerprints the TLS handshake (JA3) and header order of
+    its callers, and increasingly serves a block/CAPTCHA page to plain
+    ``requests`` — whose fingerprint is unmistakably non-browser — even when
+    the same machine's real browser loads the page fine.  When ``curl_cffi``
+    is installed we therefore fetch with it, impersonating a current Chrome
+    so the TLS fingerprint and headers match a real browser.  ``requests``
+    remains a fallback when ``curl_cffi`` is unavailable.
+
 Requires:
-    pip install requests beautifulsoup4
+    pip install beautifulsoup4
+    pip install curl_cffi   # strongly recommended; avoids Scholar bot blocks
+    pip install requests    # fallback fetcher if curl_cffi is absent
 """
 
 from __future__ import annotations
@@ -31,25 +42,87 @@ from typing import Optional
 from urllib.parse import quote_plus
 
 try:
-    import requests
     from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
-        "google_scholar requires 'requests' and 'beautifulsoup4'.\n"
-        "Install with: pip install requests beautifulsoup4"
+        "google_scholar requires 'beautifulsoup4'.\n"
+        "Install with: pip install beautifulsoup4"
     ) from exc
+
+# Preferred fetcher: curl_cffi impersonates a real browser's TLS/JA3
+# fingerprint and header order, which is what gets past Scholar's bot
+# detection.  Plain requests is kept as a fallback for environments where
+# curl_cffi isn't installed.
+try:
+    from curl_cffi import requests as _curl_requests
+except ImportError:  # pragma: no cover
+    _curl_requests = None
+
+try:
+    import requests as _std_requests
+except ImportError:  # pragma: no cover
+    _std_requests = None
+
+if _curl_requests is None and _std_requests is None:  # pragma: no cover
+    raise ImportError(
+        "google_scholar requires an HTTP client: 'curl_cffi' (recommended, "
+        "evades Scholar bot blocks) or 'requests'.\n"
+        "Install with: pip install curl_cffi   (or: pip install requests)"
+    )
 
 
 SCHOLAR_BASE = "https://scholar.google.com"
 
+# Headers we add on top of whatever the fetcher supplies.  When impersonating
+# with curl_cffi, the browser profile already sets a complete, self-consistent
+# header set (User-Agent, Accept, sec-ch-ua, ordering, …); we leave those
+# alone and only nudge the language.  For the plain-requests fallback there is
+# no browser profile, so a realistic UA is filled in by ``_browser_headers``.
 _HEADERS = {
-    # Realistic browser UA to avoid trivial blocks
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+# Fallback header set for plain requests (no TLS impersonation): a realistic
+# browser UA still avoids the most trivial blocks even if it can't beat JA3
+# fingerprinting.
+_FALLBACK_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
 }
+
+_IMPERSONATE_CACHE: Optional[str] = None
+
+
+def _impersonate_target() -> str:
+    """The newest Chrome TLS-fingerprint target curl_cffi offers.
+
+    Scholar is a Google property that virtually every visitor reaches from
+    Chrome, so a current-Chrome JA3 is the least conspicuous profile.  We pick
+    the highest ``chromeNNN`` curl_cffi ships rather than hard-coding a version,
+    so the impersonation stays fresh as the library updates.
+    """
+    global _IMPERSONATE_CACHE
+    if _IMPERSONATE_CACHE:
+        return _IMPERSONATE_CACHE
+    target = "chrome"
+    try:
+        import typing
+        from curl_cffi.requests.impersonate import BrowserTypeLiteral
+        chromes = []
+        for t in typing.get_args(BrowserTypeLiteral):
+            m = re.fullmatch(r"chrome(\d+)", t)
+            if m:
+                chromes.append((int(m.group(1)), t))
+        if chromes:
+            target = max(chromes)[1]
+    except Exception:
+        pass
+    _IMPERSONATE_CACHE = target
+    return target
+
 
 _DEFAULT_DELAY = 3.0  # seconds between outbound requests
 _CACHE_PATH = Path.home() / ".cache" / "courtlistener_scholar.db"
@@ -696,8 +769,25 @@ class GoogleScholarFetcher:
         self._delay = delay
         self._last_request: float = 0.0
 
-        self._session = requests.Session()
-        self._session.headers.update(_HEADERS)
+        # Prefer curl_cffi (browser TLS impersonation) over plain requests;
+        # see module docstring.  ``_impersonate`` is the curl_cffi browser
+        # target, or None when falling back to requests.
+        if _curl_requests is not None:
+            self._impersonate: Optional[str] = _impersonate_target()
+            self._session = _curl_requests.Session()
+            self._session.headers.update(_HEADERS)
+            print(
+                f"[scholar] using curl_cffi, impersonating {self._impersonate}"
+            )
+        else:
+            self._impersonate = None
+            self._session = _std_requests.Session()
+            self._session.headers.update(_FALLBACK_HEADERS)
+            print(
+                "[scholar] curl_cffi not installed; using plain requests "
+                "(more likely to be blocked by Scholar -- "
+                "`pip install curl_cffi` to fix)"
+            )
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(cache_path), check_same_thread=False)
@@ -896,9 +986,16 @@ class GoogleScholarFetcher:
             time.sleep(self._delay - elapsed)
         self._last_request = time.monotonic()
 
-    def _get(self, url: str) -> requests.Response:
+    def _get(self, url: str):
         self._throttle()
-        resp = self._session.get(url, timeout=20)
+        if self._impersonate is not None:
+            # Re-assert the impersonation on every request: it drives both the
+            # TLS fingerprint and the browser-matching header set.
+            resp = self._session.get(
+                url, timeout=20, impersonate=self._impersonate
+            )
+        else:
+            resp = self._session.get(url, timeout=20)
         resp.raise_for_status()
         return resp
 

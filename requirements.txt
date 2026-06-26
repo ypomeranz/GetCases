@@ -1,8 +1,14 @@
 # GetCases runtime dependencies.
 #
 # Core (case search, opinion text, statute/regulation viewer):
-requests
 beautifulsoup4
+# curl_cffi fetches Google Scholar opinions while impersonating a real
+# browser's TLS fingerprint -- Scholar increasingly blocks plain `requests`
+# (its non-browser fingerprint is easy to detect) while letting real browsers
+# through, so curl_cffi is strongly recommended here, not just for the English
+# Reports / CommonLII fetch below.  `requests` is the fallback fetcher.
+curl_cffi
+requests
 
 # In-app PDF viewer (View PDF button in the opinion window) and PDF-brief text
 # extraction ("Open Brief…" reads a PDF's text layer via pypdfium2).  Optional —
@@ -22,6 +28,6 @@ Pillow
 # need nothing extra.  Viewing the PDF *inside* the app is optional: CommonLII
 # is behind CloudFlare, so the app reads Firefox's clearance cookie and fetches
 # with a browser-matching TLS fingerprint.  Without these (or without Firefox),
-# E.R. citations simply open in the user's browser instead.
-curl_cffi
+# E.R. citations simply open in the user's browser instead.  (curl_cffi is
+# already listed above as core, since Google Scholar needs it too.)
 browser_cookie3
