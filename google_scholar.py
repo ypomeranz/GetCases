@@ -33,6 +33,7 @@ Requires:
 
 from __future__ import annotations
 
+import random
 import re
 import sqlite3
 import time
@@ -125,6 +126,21 @@ def _impersonate_target() -> str:
 
 
 _DEFAULT_DELAY = 3.0  # seconds between outbound requests
+
+# Rate-limit handling.  Scholar answers 429 (Too Many Requests) -- and
+# occasionally 503 -- when it thinks a client is asking too fast; this happens
+# even to a browser-impersonating fetcher when many opinions/links are pulled
+# in quick succession.  We retry such responses with exponential backoff
+# (honoring any Retry-After header) instead of failing the fetch outright.
+_RETRY_STATUSES = frozenset({429, 503})
+_MAX_RETRIES = 4          # attempts after the first try
+_BACKOFF_BASE = 5.0       # seconds; doubles each retry (5, 10, 20, 40 …)
+_BACKOFF_MAX = 90.0       # cap on a single backoff wait
+# After a 429 we also permanently slow the session's steady-state pace so the
+# rest of a link-following run doesn't keep tripping the limit.
+_DELAY_GROWTH = 1.5
+_MAX_DELAY = 30.0
+
 _CACHE_PATH = Path.home() / ".cache" / "courtlistener_scholar.db"
 
 
@@ -986,17 +1002,74 @@ class GoogleScholarFetcher:
             time.sleep(self._delay - elapsed)
         self._last_request = time.monotonic()
 
-    def _get(self, url: str):
-        self._throttle()
+    @staticmethod
+    def _retry_after_seconds(resp) -> Optional[float]:
+        """Seconds to wait per the response's Retry-After header, or None.
+
+        Handles both forms the header may take: a number of seconds, or an
+        HTTP date.  Scholar usually omits it on a 429, but we honor it when
+        present rather than guessing.
+        """
+        val = (resp.headers.get("Retry-After") or "").strip()
+        if not val:
+            return None
+        if val.isdigit():
+            return float(val)
+        try:
+            from datetime import datetime, timezone
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(val)
+            if dt is not None:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+        except Exception:
+            pass
+        return None
+
+    def _raw_get(self, url: str):
         if self._impersonate is not None:
             # Re-assert the impersonation on every request: it drives both the
             # TLS fingerprint and the browser-matching header set.
-            resp = self._session.get(
-                url, timeout=20, impersonate=self._impersonate
-            )
-        else:
-            resp = self._session.get(url, timeout=20)
-        resp.raise_for_status()
+            return self._session.get(url, timeout=20, impersonate=self._impersonate)
+        return self._session.get(url, timeout=20)
+
+    def _get(self, url: str):
+        """GET *url*, retrying rate-limit responses with exponential backoff.
+
+        On HTTP 429/503 we wait (Retry-After if given, else an exponentially
+        growing, jittered backoff) and try again, up to ``_MAX_RETRIES`` times.
+        A 429 also permanently slows the session's inter-request pace so the
+        remainder of a link-following run is gentler and less likely to retrip
+        the limit.  Other errors raise immediately.
+        """
+        for attempt in range(_MAX_RETRIES + 1):
+            self._throttle()
+            resp = self._raw_get(url)
+            if resp.status_code in _RETRY_STATUSES:
+                # Got rate-limited: ease off the steady-state pace for the
+                # rest of the session.
+                self._delay = min(self._delay * _DELAY_GROWTH, _MAX_DELAY)
+                if attempt >= _MAX_RETRIES:
+                    print(
+                        f"[scholar] HTTP {resp.status_code} (rate limited) after "
+                        f"{_MAX_RETRIES} retries; giving up. Google Scholar is "
+                        "throttling this IP -- wait a few minutes before retrying."
+                    )
+                    break
+                wait = self._retry_after_seconds(resp)
+                if wait is None:
+                    wait = min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_MAX)
+                    wait += random.uniform(0, wait * 0.25)  # jitter
+                print(
+                    f"[scholar] HTTP {resp.status_code} (rate limited); backing "
+                    f"off {wait:.0f}s then retry {attempt + 1}/{_MAX_RETRIES}"
+                )
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        resp.raise_for_status()  # surface the final 429/503 to the caller
         return resp
 
     def _first_case_url(self, html: str) -> Optional[str]:
