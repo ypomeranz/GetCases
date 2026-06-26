@@ -51,6 +51,73 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
+<<<<<<< Updated upstream
+=======
+# Impersonation targets to try, best-first.  We deliberately AVOID curl_cffi's
+# newest Chrome profiles: Scholar's search endpoint challenges curl_cffi's
+# bleeding-edge Chrome JA3 (chrome133a and up as of curl_cffi 0.15) with its
+# "/sorry" CAPTCHA, while quietly accepting slightly older, proven Chrome builds
+# and the Edge/Firefox/Safari families.  (Verified empirically: chrome131/124/
+# 120/116, edge101, firefox144 and safari180 all load Scholar search 200; the
+# generic "chrome" alias — which maps to the newest — gets a 429.)  Listing
+# several across browser families lets the fetcher rotate to a fresh fingerprint
+# when one is challenged, which — not the IP — is what Scholar actually blocks.
+_PREFERRED_IMPERSONATIONS = (
+    "firefox152", "chrome131","chrome123", "chrome124", "chrome120", "chrome116",
+    "edge101",
+    "firefox144", "firefox135",
+    "safari180", "safari170",
+)
+
+_IMP_CANDIDATES_CACHE: Optional[list[str]] = None
+
+
+def _impersonation_candidates() -> list[str]:
+    """Ordered curl_cffi impersonation targets to try, best-first.
+
+    Returns those of ``_PREFERRED_IMPERSONATIONS`` the installed curl_cffi
+    supports, then family generics as deeper fallbacks.  If somehow none match
+    (a much newer/older curl_cffi), it computes a recent-but-not-bleeding-edge
+    Chrome from whatever the library ships, since the newest profiles are the
+    ones Scholar challenges.
+    """
+    global _IMP_CANDIDATES_CACHE
+    if _IMP_CANDIDATES_CACHE is not None:
+        return _IMP_CANDIDATES_CACHE
+    available: set[str] = set()
+    try:
+        import typing
+        from curl_cffi.requests.impersonate import BrowserTypeLiteral
+        available = set(typing.get_args(BrowserTypeLiteral))
+    except Exception:
+        pass
+
+    if not available:
+        cands = list(_PREFERRED_IMPERSONATIONS)
+    else:
+        cands = [t for t in _PREFERRED_IMPERSONATIONS if t in available]
+        if not cands:
+            # Newest available Chrome, minus the newest few Scholar challenges.
+            chromes = sorted(
+                (int(m.group(1)), t)
+                for t in available
+                for m in [re.fullmatch(r"chrome(\d+)", t)]
+                if m
+            )
+            if len(chromes) > 3:
+                cands = [chromes[-4][1]]
+            elif chromes:
+                cands = [chromes[-1][1]]
+        for g in ("edge", "firefox", "safari"):  # family generics, last resort
+            if g in available and g not in cands:
+                cands.append(g)
+    if not cands:
+        cands = ["chrome"]
+    _IMP_CANDIDATES_CACHE = cands
+    return cands
+
+
+>>>>>>> Stashed changes
 _DEFAULT_DELAY = 3.0  # seconds between outbound requests
 _CACHE_PATH = Path.home() / ".cache" / "courtlistener_scholar.db"
 
@@ -676,6 +743,78 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     return parts
 
 
+<<<<<<< Updated upstream
+=======
+# ---------------------------------------------------------------------------
+# Browser cookie reuse
+# ---------------------------------------------------------------------------
+# Loading the user's real ``google.com`` cookies into the scraper makes Scholar
+# treat it like that signed-in browser, which sharply cuts the "unusual
+# traffic"/throttle (Loading… shell) responses.  Platform caveat: on Windows
+# Chrome and Edge encrypt their cookies (DPAPI + AES-GCM, and Chrome/Edge 127+
+# add App-Bound Encryption that needs *admin* to decrypt), whereas Firefox keeps
+# them in plaintext SQLite.  So we try Chrome first and fall back to Firefox
+# (then Edge) -- exactly the "use Chrome unless it's locked, else Firefox" flow.
+# We read only google.com cookies (not the whole store), and it's purely
+# best-effort: any failure just proceeds cookieless.
+_COOKIE_BROWSER_ORDER = ("firefox","chrome","edge")
+
+# Cookies that indicate a *signed-in* Google session (vs. a bare visitor).
+_SIGNED_IN_COOKIES = frozenset({
+    "SID", "HSID", "SSID", "APISID", "SAPISID", "LSID",
+    "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PAPISID", "__Secure-3PAPISID",
+})
+
+
+def _resolve_cookie_order(cookies_from: Optional[str]) -> tuple[str, ...]:
+    """Turn the ``cookies_from`` setting into an ordered list of browsers.
+
+    ``"auto"`` -> the default order; ``None``/``""``/``"off"``/``"none"`` ->
+    disabled; otherwise a single name or comma-separated list (e.g. ``"firefox"``
+    or ``"chrome,firefox"``).
+    """
+    s = (cookies_from or "").strip().lower()
+    if not s or s in ("off", "none", "false", "0", "disable", "disabled"):
+        return ()
+    if s == "auto":
+        return _COOKIE_BROWSER_ORDER
+    return tuple(p.strip() for p in s.split(",") if p.strip())
+
+
+def load_google_cookies(order: tuple[str, ...] = _COOKIE_BROWSER_ORDER):
+    """Load ``google.com`` cookies from the user's browser(s), best-first.
+
+    Returns ``(cookiejar, browser_name, note)``: the first browser whose cookies
+    we can actually read wins.  On total failure ``cookiejar`` is None and
+    ``note`` explains why (library missing, every browser locked behind
+    admin-only App-Bound Encryption, none signed in, etc.).
+    """
+    try:
+        import browser_cookie3 as bc3
+    except ImportError:
+        return None, "", "browser_cookie3 not installed (pip install browser-cookie3)"
+
+    problems: list[str] = []
+    for name in order:
+        loader = getattr(bc3, name, None)
+        if loader is None:
+            problems.append(f"{name}: unsupported")
+            continue
+        try:
+            jar = loader(domain_name="google.com")
+        except Exception as exc:
+            # e.g. RequiresAdminError (Chrome/Edge App-Bound Encryption) or
+            # BrowserCookieError (browser not installed / no profile).
+            first = (str(exc).splitlines() or [""])[0].strip()
+            problems.append(f"{name}: {type(exc).__name__}{(': ' + first[:70]) if first else ''}")
+            continue
+        if any(c.value for c in jar):
+            return jar, name, ""
+        problems.append(f"{name}: no readable google.com cookies (signed in?)")
+    return None, "", "; ".join(problems) or "no supported browser found"
+
+
+>>>>>>> Stashed changes
 class GoogleScholarFetcher:
     """
     Fetch and cache US case law text from Google Scholar.
