@@ -5,3 +5,8 @@ __pycache__/
 # English Reports index build scratch (raw toc HTML + intermediates + builders).
 # The shipped product, eng_rep_index.tsv.gz, lives in the repo root.
 _engr_build/
+
+# Opinion database: opinions.jsonl IS committed (the source of truth that syncs
+# via GitHub), but the local SQLite search index is derived from it and rebuilt
+# on demand, so it is never tracked.
+*.index.db

@@ -1007,6 +1007,8 @@ class CourtListenerGUI:
         self._selected_courts: set[str] = set()  # empty = all courts
         self._search_thread: Optional[threading.Thread] = None
         self._scholar: Optional["GoogleScholarFetcher"] = None
+        self._opinion_db = None          # opinion_db.OpinionDB (lazy)
+        self._opinion_db_failed = False  # don't retry a broken DB every call
 
         self._preview_cache: dict[int, str] = {}  # result index → snippet text
         self._sort_state: dict[int, tuple[str, bool]] = {}  # tree id → (col, reverse)
@@ -1056,6 +1058,18 @@ class CourtListenerGUI:
         brief_menu.add_command(
             label="Open Brief (highlight citations)…", accelerator="Ctrl+B",
             command=self._open_brief,
+        )
+        db_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Database", menu=db_menu)
+        db_menu.add_command(
+            label="Find Opinion in Database…", command=self._show_db_find,
+        )
+        db_menu.add_separator()
+        db_menu.add_command(
+            label="Merge In Database File…", command=self._merge_db_file,
+        )
+        db_menu.add_command(
+            label="Rebuild Search Index", command=self._rebuild_db_index,
         )
         self.root.bind("<Control-l>", lambda _e: self._show_statute_lookup())
         self.root.bind("<Control-s>", lambda _e: self._show_quick_lookup())
@@ -2311,6 +2325,170 @@ class CourtListenerGUI:
         frame.columnconfigure(1, weight=1)
 
     # ------------------------------------------------------------------
+    # Opinion database — find / open / merge / rebuild
+    # ------------------------------------------------------------------
+
+    def _open_db_record(self, scholar_id: str) -> None:
+        """Open an opinion stored in the database, by its Scholar id."""
+        db = self._get_opinion_db()
+        if db is None:
+            return
+        rec = db.get_by_scholar_id(scholar_id)
+        if not rec or not rec.get("html"):
+            messagebox.showwarning(
+                "Not in Database",
+                "That opinion is no longer in the database.",
+            )
+            return
+        self._open_scholar_window(
+            rec.get("url", ""), rec["html"], None, None, "from database", True,
+        )
+
+    def _show_db_find(self) -> None:
+        """Search the local opinion database by party name, reporter citation,
+        or Google Scholar number — without touching the network."""
+        db = self._get_opinion_db()
+        if db is None:
+            messagebox.showwarning(
+                "Database Unavailable",
+                "The opinion database could not be opened.",
+            )
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Find Opinion in Database")
+        dlg.resizable(False, False)
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Search:").grid(row=0, column=0, sticky="w")
+        query_var = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=query_var, width=46)
+        entry.grid(row=0, column=1, padx=6, sticky="we")
+        entry.focus_set()
+        status_var = tk.StringVar(
+            value=f"{db.count()} opinions stored   ·   "
+                  "e.g.  Roe v. Wade   ·   410 U.S. 113   ·   <Scholar number>"
+        )
+        ttk.Label(frame, textvariable=status_var, foreground="gray").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+        frame.columnconfigure(1, weight=1)
+
+        def go(_e=None) -> None:
+            q = query_var.get().strip()
+            if not q:
+                return
+            try:
+                hits = db.find(q)
+            except Exception as exc:
+                status_var.set(f"Search error: {exc}")
+                return
+            if not hits:
+                status_var.set(f"No opinion in the database for {q!r}.")
+                return
+            if len(hits) == 1:
+                dlg.destroy()
+                self._open_db_record(hits[0]["scholar_id"])
+                return
+            dlg.destroy()
+            _DbMatchDialog(self.root, self, hits)
+
+        ttk.Button(frame, text="Find", command=go).grid(row=0, column=2)
+        entry.bind("<Return>", go)
+
+    def _merge_db_file(self) -> None:
+        """Merge another ``opinions.jsonl`` into this one (e.g. one pulled from
+        GitHub or shared by a colleague).  De-duped by Scholar number."""
+        db = self._get_opinion_db()
+        if db is None:
+            messagebox.showwarning(
+                "Database Unavailable",
+                "The opinion database could not be opened.",
+            )
+            return
+        path = filedialog.askopenfilename(
+            title="Choose an opinions.jsonl to merge in",
+            filetypes=[("Opinion database", "*.jsonl"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            same = Path(path).resolve() == Path(db.jsonl_path).resolve()
+        except Exception:
+            same = False
+        if same:
+            messagebox.showinfo(
+                "Merge", "That is already the current database file."
+            )
+            return
+        self._status_var.set("Merging database file…")
+
+        def run() -> None:
+            try:
+                stats = db.merge_from(path)
+            except Exception as exc:
+                self._post_root(
+                    lambda e=exc: messagebox.showerror("Merge Failed", str(e))
+                )
+                self._post_root(lambda: self._status_var.set("Merge failed."))
+                return
+
+            def done() -> None:
+                self._status_var.set(
+                    f"Merged: +{stats['added']} new, "
+                    f"{stats['skipped']} already present."
+                )
+                msg = (
+                    f"Added {stats['added']} new opinion(s).\n"
+                    f"Skipped {stats['skipped']} already in the database."
+                )
+                if stats["errors"]:
+                    msg += f"\n{stats['errors']} line(s) could not be read."
+                if stats["added"]:
+                    msg += (
+                        f"\n\nRemember to commit {Path(db.jsonl_path).name} "
+                        "to Git to sync the change."
+                    )
+                messagebox.showinfo("Merge Complete", msg)
+
+            self._post_root(done)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _rebuild_db_index(self) -> None:
+        """Rebuild the local SQLite search index from ``opinions.jsonl`` (use
+        after editing it by hand or resolving a Git merge)."""
+        db = self._get_opinion_db()
+        if db is None:
+            messagebox.showwarning(
+                "Database Unavailable",
+                "The opinion database could not be opened.",
+            )
+            return
+        self._status_var.set("Rebuilding search index…")
+
+        def run() -> None:
+            try:
+                db.rebuild_index()
+                n = db.count()
+            except Exception as exc:
+                self._post_root(
+                    lambda e=exc: messagebox.showerror("Rebuild Failed", str(e))
+                )
+                return
+            self._post_root(
+                lambda: self._status_var.set(f"Search index rebuilt — {n} opinions.")
+            )
+            self._post_root(
+                lambda: messagebox.showinfo(
+                    "Index Rebuilt",
+                    f"Search index rebuilt from {Path(db.jsonl_path).name}.\n"
+                    f"{n} opinion(s) indexed.",
+                )
+            )
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # ------------------------------------------------------------------
     # Open Brief — load a brief and highlight every citation in it
     # ------------------------------------------------------------------
 
@@ -2956,8 +3134,26 @@ class CourtListenerGUI:
             )
             return None
         if self._scholar is None:
-            self._scholar = GoogleScholarFetcher()
+            self._scholar = GoogleScholarFetcher(db=self._get_opinion_db())
         return self._scholar
+
+    def _get_opinion_db(self):
+        """The searchable opinion database (lazily opened).  Returns the
+        ``OpinionDB`` or ``None`` if it can't be opened — the app still runs,
+        just without the database (opinions then come straight from Scholar)."""
+        if self._opinion_db is None and not self._opinion_db_failed:
+            try:
+                import opinion_db
+                self._opinion_db = opinion_db.OpinionDB()
+                print(
+                    f"[db] opinion database ready "
+                    f"({self._opinion_db.count()} opinions) "
+                    f"at {self._opinion_db.jsonl_path}"
+                )
+            except Exception as exc:
+                print(f"[db] opinion database unavailable: {exc}")
+                self._opinion_db_failed = True
+        return self._opinion_db
 
     def _on_scholar_search_results(self, results: list) -> None:
         self._scholar_results = results
@@ -3477,6 +3673,62 @@ class _CourtPickerDialog:
     def _apply(self) -> None:
         self._on_apply(set(self._checked))
         self._win.destroy()
+
+
+class _DbMatchDialog:
+    """Pick one opinion when a database search matches several — the same name
+    or reporter page can belong to more than one case, so the user chooses."""
+
+    def __init__(self, parent: tk.Misc, app: "CourtListenerGUI", candidates: list[dict]) -> None:
+        self._app = app
+        self._candidates = candidates
+        win = tk.Toplevel(parent)
+        self._win = win
+        win.title("Select an Opinion")
+        win.geometry("660x340")
+        win.minsize(420, 220)
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text=f"{len(candidates)} opinions match — choose one:",
+        ).pack(anchor="w")
+        cols = ("name", "cite", "court", "year")
+        tree = ttk.Treeview(
+            frame, columns=cols, show="headings", selectmode="browse", height=10,
+        )
+        for col, title, width in (
+            ("name", "Case", 320), ("cite", "Citation", 150),
+            ("court", "Court", 90), ("year", "Year", 60),
+        ):
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor="w")
+        for i, h in enumerate(candidates):
+            tree.insert(
+                "", "end", iid=str(i),
+                values=(h.get("name") or "(unknown)", h.get("cite", ""),
+                        h.get("court", ""), h.get("year", "")),
+            )
+        tree.pack(fill="both", expand=True, pady=(6, 6))
+        self._tree = tree
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Open", command=self._open).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(
+            side="right", padx=(0, 6)
+        )
+        tree.bind("<Double-1>", lambda _e: self._open())
+        if candidates:
+            tree.selection_set("0")
+            tree.focus_set()
+
+    def _open(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        h = self._candidates[int(sel[0])]
+        self._win.destroy()
+        self._app._open_db_record(h["scholar_id"])
 
 
 _OP_ID_RE = re.compile(r"/opinions/(\d+)/?")

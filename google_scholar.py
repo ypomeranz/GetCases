@@ -692,9 +692,14 @@ class GoogleScholarFetcher:
         self,
         cache_path: Path = _CACHE_PATH,
         delay: float = _DEFAULT_DELAY,
+        db=None,
     ) -> None:
         self._delay = delay
         self._last_request: float = 0.0
+        # Optional opinion_db.OpinionDB: the durable, searchable store.  When
+        # set, every fetched opinion is recorded there, and an opinion already
+        # present is served from there instead of being re-fetched.
+        self._opinion_db = db
 
         self._session = requests.Session()
         self._session.headers.update(_HEADERS)
@@ -739,6 +744,13 @@ class GoogleScholarFetcher:
             print(f"[scholar] cache hit for {key!r}")
             return cached
 
+        # Search the database before Google Scholar: a unique opinion bearing
+        # this citation is served from there, no network.  (An ambiguous match
+        # falls through so Scholar can disambiguate.)
+        db_one = self._db_single(citation)
+        if db_one:
+            return db_one
+
         # Wrap the citation in double quotes so Scholar treats it as an exact
         # phrase. (repr() here produced *single* quotes, which Scholar does not
         # treat as a phrase operator -- that returned arbitrary cases from the
@@ -758,6 +770,13 @@ class GoogleScholarFetcher:
         if not case_url:
             print("[scholar] no scholar_case link found in results page")
             return None
+
+        # Even after searching Scholar, prefer the database copy if we already
+        # have this exact opinion (skip re-downloading the case page).
+        db_hit = self._db_by_url(case_url)
+        if db_hit:
+            self._cache_put(key, *db_hit)
+            return db_hit
 
         result = self._fetch_case_page(case_url)
         if result:
@@ -779,6 +798,12 @@ class GoogleScholarFetcher:
             print(f"[scholar] cache hit for {key!r}")
             return cached
 
+        # Search the database before Google Scholar (by party name): a unique
+        # match is served from there without a network call.
+        db_one = self._db_single(case_name)
+        if db_one:
+            return db_one
+
         search_url = f"{SCHOLAR_BASE}/scholar?q={quote_plus(q)}&as_sdt=4"
         print(f"[scholar] searching {search_url}")
         try:
@@ -791,6 +816,11 @@ class GoogleScholarFetcher:
         if not case_url:
             print("[scholar] no scholar_case link found in results page")
             return None
+
+        db_hit = self._db_by_url(case_url)
+        if db_hit:
+            self._cache_put(key, *db_hit)
+            return db_hit
 
         result = self._fetch_case_page(case_url)
         if result:
@@ -875,6 +905,10 @@ class GoogleScholarFetcher:
 
         Returns (scholar_url, opinion_html) or None.
         """
+        db_hit = self._db_by_url(url)
+        if db_hit:
+            return db_hit
+
         key = f"url:{url}"
         cached = self._cache_get(key)
         if cached:
@@ -889,6 +923,53 @@ class GoogleScholarFetcher:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Opinion database (durable, searchable store; optional)
+    # ------------------------------------------------------------------
+
+    def _db_by_url(self, url: str) -> Optional[tuple[str, str]]:
+        """(url, html) for this case from the opinion DB (matched on the Scholar
+        ``case=`` id), or None — so an opinion already collected is served from
+        the DB instead of being fetched again."""
+        if self._opinion_db is None:
+            return None
+        try:
+            rec = self._opinion_db.get_by_url(url)
+            if rec and rec.get("html"):
+                print(f"[scholar] opinion-DB hit for {rec.get('scholar_id')}")
+                return (rec.get("url") or url, rec["html"])
+        except Exception as exc:
+            print(f"[scholar] opinion-DB lookup failed: {exc}")
+        return None
+
+    def _db_single(self, query: str) -> Optional[tuple[str, str]]:
+        """(url, html) when the opinion DB holds **exactly one** opinion for
+        this query (a citation or a party name), else None.  A unique hit is
+        served straight from the DB without touching Scholar; an ambiguous one
+        (two cases sharing a name or a reporter page) falls through so Scholar
+        can disambiguate."""
+        if self._opinion_db is None or not query:
+            return None
+        try:
+            hits = self._opinion_db.find(query)
+            if len(hits) == 1:
+                rec = self._opinion_db.get_by_scholar_id(hits[0]["scholar_id"])
+                if rec and rec.get("html"):
+                    print(f"[scholar] opinion-DB unique hit for {query!r}")
+                    return (rec.get("url") or "", rec["html"])
+        except Exception as exc:
+            print(f"[scholar] opinion-DB search failed: {exc}")
+        return None
+
+    def _store_opinion(self, url: str, html: str) -> None:
+        if self._opinion_db is None:
+            return
+        try:
+            if self._opinion_db.add_opinion(url, html):
+                print("[scholar] stored opinion in database")
+        except Exception as exc:
+            print(f"[scholar] opinion-DB store failed: {exc}")
 
     def _throttle(self) -> None:
         elapsed = time.monotonic() - self._last_request
@@ -934,6 +1015,7 @@ class GoogleScholarFetcher:
 
         html = str(opinion_div)
         print(f"[scholar] extracted {len(html):,} chars of opinion HTML")
+        self._store_opinion(url, html)
         return (url, html)
 
     # ------------------------------------------------------------------
