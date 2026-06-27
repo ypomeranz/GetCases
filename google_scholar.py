@@ -186,6 +186,11 @@ def parse_opinion_blocks(html: str) -> list[Block]:
     class ``gsl_pagenum`` become page-marker spans, and anchors pointing
     at other scholar_case pages become citation-link spans.
     """
+    # CourtListener's combined opinion (reused here for its Google-Scholar-like
+    # star pagination) can arrive as an XML document; drop the declaration so it
+    # isn't parsed as stray text and bs4 doesn't warn.  Scholar HTML is
+    # unaffected (it has no such declaration).
+    html = re.sub(r"^\s*<\?xml[^>]*\?>", "", html or "")
     soup = BeautifulSoup(html, "html.parser")
     root = soup.find(id="gs_opinion") or soup
     for bad in root.find_all(["script", "style"]):
@@ -250,6 +255,17 @@ def parse_opinion_blocks(html: str) -> list[Block]:
             blocks.append(Block(kind=kind, spans=cur))
         cur = []
 
+    def last_pagenum() -> Optional[str]:
+        """Page number of the most recent page marker still in the current
+        block (skipping trailing whitespace), or None — lets us drop a star
+        marker emitted twice in a row (CourtListener does this)."""
+        for s in reversed(cur):
+            if s.pagenum:
+                return s.text.lstrip("*").strip()
+            if s.text.strip():
+                return None
+        return None
+
     def walk(node: Tag, fmt: dict, kind: str, link: str = "") -> None:
         for child in node.children:
             if isinstance(child, Comment):
@@ -303,6 +319,19 @@ def parse_opinion_blocks(html: str) -> list[Block]:
                     continue
                 walk(child, fmt, kind, link=link)  # footnote anchors etc.
                 continue
+            if name == "span":
+                classes = [c.lower() for c in (child.get("class") or [])]
+                if "star-pagination" in classes:
+                    # CourtListener marks a reporter page break with
+                    # <span class="star-pagination">*1005</span>.  Emit it as a
+                    # page marker exactly like Scholar's, so the page gutter and
+                    # pin cites work; CL sometimes repeats the same marker twice
+                    # in a row, so drop an immediate duplicate.
+                    t = _WS_RE.sub(" ", child.get_text()).strip().lstrip("*").strip()
+                    if t and last_pagenum() != t:
+                        emit("*" + t, fmt, pagenum=True)
+                    continue
+                # any other span falls through to a generic walk of its children
             if name in _BLOCK_TAGS:
                 flush(kind)
                 child_fmt = fmt
@@ -1038,3 +1067,54 @@ class GoogleScholarFetcher:
             (key, url, text, html, time.time()),
         )
         self._db.commit()
+
+
+if __name__ == "__main__":  # pragma: no cover - offline smoke test
+    import sys
+
+    failures: list[str] = []
+
+    def check(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+        print(("ok   " if cond else "FAIL ") + msg)
+
+    # CourtListener marks reporter page breaks with
+    # <span class="star-pagination">*N</span>, sometimes twice in a row.
+    # parse_opinion_blocks should turn those into page markers (de-duped) so a
+    # combined CourtListener opinion reads like a Google Scholar one.
+    cl_html = (
+        "<div><center>505 U.S. 1003</center>"
+        '<p><span class="star-pagination">*1005</span> '
+        '<span class="star-pagination">*1005</span> '
+        "Scalia, J., delivered the opinion of the Court.</p>"
+        '<p>Coastal land at issue, <span class="star-pagination">*1007</span> '
+        "in South Carolina.</p></div>"
+    )
+    blocks = parse_opinion_blocks(cl_html)
+    pages = [s.text for b in blocks for s in b.spans if s.pagenum]
+    check(pages == ["*1005", "*1007"],
+          f"star-pagination -> page markers, de-duped: {pages}")
+    # The markers are flagged pagenum (rendered into the gutter); the body
+    # prose — the spans the main text flow uses — is intact without them.
+    prose = "".join(
+        s.text for b in blocks for s in b.spans if not s.pagenum
+    )
+    check("*1005" not in prose and "*1007" not in prose,
+          "page markers are page spans, separate from the prose flow")
+    check("Scalia, J., delivered the opinion of the Court." in prose,
+          "surrounding prose preserved")
+
+    # Scholar's own gsl_pagenum markers must still work (no regression).
+    sch_html = (
+        '<div id="gs_opinion"><p>Before '
+        '<a class="gsl_pagenum2" href="#">*152</a> after.</p></div>'
+    )
+    spages = [s.text for b in parse_opinion_blocks(sch_html)
+              for s in b.spans if s.pagenum]
+    check(spages == ["*152"], f"Scholar gsl_pagenum still works: {spages}")
+
+    if failures:
+        print(f"\n{len(failures)} FAILED")
+        sys.exit(1)
+    print("\nOK: google_scholar smoke test passed")

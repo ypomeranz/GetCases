@@ -720,6 +720,24 @@ _CL_TYPE_KIND: dict[str, str] = {
 }
 
 
+def _pick_combined_opinion(opinions: list[dict]) -> Optional[dict]:
+    """The CourtListener "combined" opinion — the whole case as one
+    star-paginated document (structurally a Google Scholar opinion) — when the
+    cluster has one.  Identified by the ``combined`` opinion type carrying
+    reporter page markers; falls back to a lone star-paginated sub-opinion.
+    Returns None when no such nicely-formatted full text is present, so the
+    caller assembles the separate sub-opinions as before."""
+    def starred(op: dict) -> bool:
+        return "star-pagination" in (
+            op.get("html_with_citations") or op.get("html") or ""
+        )
+    for op in opinions:
+        if "combined" in (op.get("type") or "") and starred(op):
+            return op
+    hits = [op for op in opinions if starred(op)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def _assemble_case_parts(
     client, item: dict
 ) -> "tuple[list[OpinionPart], list[Block], str, dict]":
@@ -728,7 +746,10 @@ def _assemble_case_parts(
     Returns (parts, all_blocks, plain_text, cluster_metadata).
     """
     try:
-        from google_scholar import Block, OpinionPart, Span, blocks_to_text
+        from google_scholar import (
+            Block, OpinionPart, Span, blocks_to_text,
+            parse_opinion_blocks, segment_blocks,
+        )
     except ImportError:
         return [], [], "", {}
 
@@ -811,6 +832,31 @@ def _assemble_case_parts(
     opinions.sort(key=lambda o: (
         o.get("ordering_key") is None, o.get("ordering_key") or 0,
     ))
+
+    # When CourtListener carries a star-paginated "combined" opinion — the whole
+    # case as one nicely-formatted document, the way Google Scholar serves it —
+    # show only that, parsed through the Scholar pipeline so reporter page
+    # numbers and pin cites work and the opinion splits into its parts.  This
+    # avoids rendering the same text twice (the separate sub-opinions and then
+    # the combined version) and reads like a Scholar opinion.
+    combined = _pick_combined_opinion(opinions)
+    if combined is not None:
+        html_text = (
+            combined.get("html_with_citations") or combined.get("html") or ""
+        )
+        try:
+            cblocks = parse_opinion_blocks(html_text)
+            cparts = segment_blocks(cblocks)
+        except Exception as exc:
+            print(f"[cl-parts] combined-opinion parse failed: {exc}")
+            cparts = []
+        if cparts:
+            body = [b for p in cparts for b in p.blocks]
+            try:
+                plain = blocks_to_text(body)
+            except Exception:
+                plain = ""
+            return cparts, body, plain, cluster
 
     all_blocks: list[Block] = list(header_blocks)
 
