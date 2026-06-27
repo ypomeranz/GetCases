@@ -785,14 +785,23 @@ def _norm_entity_token(tok: str) -> str:
 def _drop_redundant_entity(name: str) -> str:
     """Apply rule 10.2.1(h): if the party name contains a firm marker
     ('Co.', 'Corp.', 'Ass'n', 'Bros.'), drop any redundant entity suffix
-    ('Inc.', 'LLC', 'Ltd.', …) and tidy the comma it left behind."""
+    ('Inc.', 'LLC', 'Ltd.', …) and tidy the comma it left behind.
+
+    Only a designator that *trails* the firm marker is dropped: redundant
+    corporate forms are suffixes, so a token earlier in the name is part of
+    the name proper.  This keeps a leading geographic abbreviation that
+    happens to collide with an entity term — "Pa." (Pennsylvania) normalizes
+    to "pa", which also denotes a Professional Association — so
+    "Pa. Coal Co." is not mangled into "Coal Co."."""
     words = name.split()
     norm = [_norm_entity_token(w) for w in words]
-    if not any(n in _FIRM_MARKERS for n in norm):
+    firm_idxs = [i for i, n in enumerate(norm) if n in _FIRM_MARKERS]
+    if not firm_idxs:
         return name
+    first_firm = firm_idxs[0]
     kept: list[str] = []
-    for w, n in zip(words, norm):
-        if n in _REDUNDANT_ENTITY_TERMS:
+    for i, (w, n) in enumerate(zip(words, norm)):
+        if i > first_firm and n in _REDUNDANT_ENTITY_TERMS:
             if kept and kept[-1].endswith(","):
                 kept[-1] = kept[-1][:-1]
             continue
@@ -840,6 +849,14 @@ if __name__ == "__main__":
          "Doctor's Assocs., Inc. v. Casarotto"),
         ("West Virginia v. Environmental Protection Agency",
          "West Virginia v. EPA"),
+        # A leading geographic abbreviation must survive rule 10.2.1(h): "Pa."
+        # (Pennsylvania) collides with the "P.A." entity term but is part of the
+        # name, not a trailing corporate suffix.
+        ("Pennsylvania Coal Co. v. Mahon", "Pa. Coal Co. v. Mahon"),
+        ("Pennsylvania Coal Company v. Mahon et al.", "Pa. Coal Co. v. Mahon"),
+        # A redundant designator that *does* trail the firm marker is still
+        # dropped.
+        ("Acme Coal Corp., Inc. v. Smith", "Acme Coal Corp. v. Smith"),
         # Anonymized party by initials: periods, no spaces (rule 10.2.1(b)).
         ("The Florida Star v. B. J. F.", "Fla. Star v. B.J.F."),
         ("DL v. Huebner", "D.L. v. Huebner"),
