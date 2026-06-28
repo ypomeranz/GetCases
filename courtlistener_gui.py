@@ -1865,36 +1865,37 @@ class CourtListenerGUI:
                 court_id = _scholar_source_to_court_id(r.source)
                 year = _scholar_source_year(r.source)
                 # The case's own reporter citation sits in the source byline.
-                cite = _scholar_source_cite(r.source)
-                if not cite:
-                    m = _TEXT_CITE_RE.search(r.title + " " + r.snippet)
-                    if m:
-                        cite = re.sub(r"\s+", " ", m.group(0))
+                cite = _scholar_result_cite(r)
 
-                def make_opener(sr=r):
+                def make_opener(sr=r, cite=cite):
                     def open_it():
                         f = self._get_scholar()
                         if f is None:
                             return
+
                         def run():
                             try:
                                 res = f.fetch_by_url(sr.url)
                             except Exception as exc:
-                                def fail(e=exc):
-                                    messagebox.showerror(
-                                        "Google Scholar Error",
-                                        f'Could not load "{sr.title}".\n\n{e}',
-                                    )
-                                self._post_root(fail)
-                                return
+                                print(f"[scholar] open {sr.url!r} failed: {exc}")
+                                res = None
                             if res:
                                 url, html = res
-                                def show():
-                                    _ScholarTextWindow(
-                                        self.root, self, url, html,
-                                        item=None,
-                                    )
+
+                                def show(u=url, h=html):
+                                    try:
+                                        _ScholarTextWindow(
+                                            self.root, self, u, h, item=None,
+                                        )
+                                    except tk.TclError:
+                                        pass
                                 self._post_root(show)
+                            else:
+                                # Opinion page didn't load — show CourtListener
+                                # and retry Scholar in the background.
+                                self._post_root(
+                                    self._scholar_case_fallback, sr.url, cite,
+                                )
                         threading.Thread(target=run, daemon=True).start()
                     return open_it
 
@@ -3290,23 +3291,113 @@ class CourtListenerGUI:
     def _open_selected_scholar_result(self) -> None:
         r = self._selected_scholar_result()
         if r is not None:
-            self._open_scholar_url(r.url)
+            self._open_scholar_url(r.url, _scholar_result_cite(r))
 
-    def _open_scholar_url(self, url: str) -> None:
-        """Open a Scholar case page (from the Scholar results column)."""
+    def _open_scholar_url(self, url: str, cite: str = "") -> None:
+        """Open a Scholar case page (from the Scholar results column).  If the
+        opinion page won't load, fall back to CourtListener via ``cite`` and
+        retry Scholar in the background."""
         fetcher = self._get_scholar()
         if fetcher is None:
             return
         self._status_var.set("Fetching opinion from Google Scholar…")
 
         def run() -> None:
-            result = fetcher.fetch_by_url(url)
-            self.root.after(
-                0, self._on_scholar_result, result, None, None,
-                "opened from Scholar search",
-            )
+            try:
+                result = fetcher.fetch_by_url(url)
+            except Exception as exc:
+                print(f"[scholar] open {url!r} failed: {exc}")
+                result = None
+            if result:
+                self.root.after(
+                    0, self._on_scholar_result, result, None, None,
+                    "opened from Scholar search",
+                )
+            else:
+                self.root.after(0, self._scholar_case_fallback, url, cite)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _scholar_case_fallback(
+        self, url: str, cite: str, pin: str = "", prefetch_pdf: bool = True,
+    ) -> None:
+        """A Google Scholar opinion page failed to load (Google is flaky).  Show
+        the CourtListener view located by the case's reporter citation and retry
+        the Scholar opinion in the background — the "Google Scholar Text" button
+        lights up if it comes through.  With no citation to locate the case on
+        CourtListener, just retry Scholar and open it if it returns."""
+        client = self._get_client() if self._token_var.get().strip() else None
+        fetcher = self._get_scholar()
+        cite = (cite or "").strip()
+
+        if cite and client is not None:
+            self._status_var.set(
+                f"Google Scholar busy — loading {cite} from CourtListener…"
+            )
+
+            def run() -> None:
+                try:
+                    target = _cl_item_for_citation(client, cite)
+                    if not target:
+                        self._post_root(
+                            lambda: self._status_var.set(
+                                f"No CourtListener match for {cite}."
+                            )
+                        )
+                        return
+                    parts, blocks, plain, cluster = _assemble_case_parts(
+                        client, target,
+                    )
+
+                    def open_cl() -> None:
+                        try:
+                            w = _ScholarTextWindow(
+                                self.root, self, "", "", item=target,
+                                cl_text=plain, cl_parts=parts, cl_blocks=blocks,
+                                prefetch_pdf=prefetch_pdf,
+                            )
+                            w._retry_scholar_link(cite, pin, url)
+                        except tk.TclError:
+                            pass
+
+                    self._post_root(open_cl)
+                except Exception as exc:
+                    self._post_root(
+                        lambda e=exc: self._status_var.set(f"CourtListener: {e}")
+                    )
+
+            threading.Thread(target=run, daemon=True).start()
+            return
+
+        if fetcher is None:
+            self._status_var.set("Could not load this case from Google Scholar.")
+            return
+
+        # No citation to locate the case on CourtListener — retry Scholar alone.
+        self._status_var.set("Google Scholar busy — retrying…")
+
+        def retry() -> None:
+            for _ in range(3):
+                time.sleep(4.0)
+                try:
+                    result = fetcher.fetch_by_url(url)
+                except Exception:
+                    result = None
+                if result:
+                    r_url, html = result
+                    self._post_root(
+                        lambda u=r_url, h=html: _ScholarTextWindow(
+                            self.root, self, u, h, item=None,
+                        )
+                    )
+                    return
+            self._post_root(
+                lambda: self._status_var.set(
+                    "Google Scholar still unavailable for this case."
+                )
+            )
+
+        threading.Thread(target=retry, daemon=True).start()
 
     def _fetch_scholar_text(self) -> None:
         # A row in the Scholar results column: open it directly, unverified.
@@ -4199,6 +4290,20 @@ def _scholar_source_cite(source: str) -> str:
         if re.match(r"^\d+\s+.+\s+\d+$", norm):
             cites.append(norm)
     return _pick_citation(cites) if cites else ""
+
+
+def _scholar_result_cite(r) -> str:
+    """A reporter citation for a Scholar search result — from its byline, or
+    failing that its title/snippet.  Used to locate the case on CourtListener
+    when Scholar's opinion page won't load."""
+    cite = _scholar_source_cite(getattr(r, "source", "") or "")
+    if not cite:
+        m = _TEXT_CITE_RE.search(
+            f"{getattr(r, 'title', '')} {getattr(r, 'snippet', '')}"
+        )
+        if m:
+            cite = re.sub(r"\s+", " ", m.group(0))
+    return cite or ""
 
 
 def _rtf_escape(s: str) -> str:
