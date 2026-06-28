@@ -5448,6 +5448,12 @@ class _ScholarTextWindow:
         self._pdf_btn = ttk.Button(
             btn_frame, text="View PDF", command=self._view_pdf, state="disabled"
         )
+        # The Scholar text view's switch back to the CourtListener opinion (the
+        # mirror of CL's "Google Scholar Text" button).  Packed in
+        # _render_scholar, hidden in the CL and PDF views.
+        self._cl_btn = ttk.Button(
+            btn_frame, text="CourtListener Text", command=self._toggle_source
+        )
 
         # Size controls: text size in the reader, PDF zoom in the PDF view
         # (also Ctrl +/−/0 and Ctrl+mouse wheel).
@@ -6066,6 +6072,7 @@ class _ScholarTextWindow:
         self._toggle_btn.config(text="View PDF", command=self._view_pdf,
                                 state="normal")
         self._hide_pdf_button()  # Scholar view uses the toggle for the PDF
+        self._show_cl_button()   # …and offers a switch to the CourtListener text
         self._export_btn.config(text="Export RTF…", command=self._export_rtf)
         self._print_btn.pack_forget()  # text view: no Print button
         self._zoom_out_btn.config(text="A−")
@@ -6391,6 +6398,7 @@ class _ScholarTextWindow:
         self._status_var.set(
             f"{char_count:,} characters | CourtListener version"
         )
+        self._hide_cl_button()  # CL view uses the toggle for "Google Scholar Text"
         self._show_pdf_button()
         self._finder.refresh()
         self._schedule_gutter_redraw()
@@ -6408,6 +6416,7 @@ class _ScholarTextWindow:
         self._source_var.set("CourtListener (assembled from the REST API)")
         self._toggle_btn.config(text="Google Scholar Text",
                                 command=self._toggle_source, state="normal")
+        self._hide_cl_button()
         self._part_combo.config(state="disabled")
         self._view_label_var.set("CourtListener text")
         self._view_label.config(foreground="black")
@@ -7752,6 +7761,33 @@ class _ScholarTextWindow:
         if btn is not None and btn.winfo_ismapped():
             btn.pack_forget()
 
+    def _can_show_courtlistener(self) -> bool:
+        """Whether a CourtListener view is reachable from this Scholar window —
+        the original CL opinion it opened from, or a cluster/reporter citation
+        to fetch the equivalent."""
+        return bool(
+            self._cl_parts or self._cl_text is not None
+            or self._item.get("cluster_id") or self._item.get("id")
+            or (self._bb.get("cite") if getattr(self, "_bb", None) else "")
+        )
+
+    def _show_cl_button(self) -> None:
+        """Reveal the 'CourtListener Text' button in the Scholar view when a
+        CourtListener view can be reached (the mirror of _show_pdf_button)."""
+        btn = getattr(self, "_cl_btn", None)
+        if btn is None:
+            return
+        if self._can_show_courtlistener():
+            if not btn.winfo_ismapped():
+                btn.pack(side="right", padx=4)
+        elif btn.winfo_ismapped():
+            btn.pack_forget()
+
+    def _hide_cl_button(self) -> None:
+        btn = getattr(self, "_cl_btn", None)
+        if btn is not None and btn.winfo_ismapped():
+            btn.pack_forget()
+
     def _refresh_pdf_button(self) -> None:
         btn = getattr(self, "_pdf_btn", None)
         if btn is None:
@@ -7951,6 +7987,7 @@ class _ScholarTextWindow:
                           else "normal")
         self._toggle_btn.config(
             text=back_label, command=self._back_from_pdf, state=back_state)
+        self._hide_cl_button()
         # In PDF view, the RTF export becomes a "Download PDF" action, a Print
         # button appears, and the text-size buttons zoom the page.
         self._export_btn.config(text="Download PDF", command=self._download_pdf)
