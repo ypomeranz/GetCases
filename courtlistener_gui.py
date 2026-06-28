@@ -315,6 +315,21 @@ def _pick_citation(citations) -> str:
     return pool[0] if pool else ""
 
 
+def _is_paginable_cite(c: str) -> bool:
+    """True for a print reporter citation whose pages a star pagination can
+    follow.  Excludes neutral/electronic cites — a year-volume cite (e.g.
+    ``2011 N.J. LEXIS 87``) or a LEXIS/Westlaw reporter — whose numbers are
+    unrelated to a print reporter's pages, so they're never matched against the
+    star pagination."""
+    m = _CITE_PARSE_RE.match(c or "")
+    if not m:
+        return False
+    vol, rep = m.group(1), m.group(2)
+    if re.fullmatch(r"(?:1[6-9]|20)\d{2}", vol):  # year-volume = neutral cite
+        return False
+    return not re.search(r"\b(?:LEXIS|WL|Westlaw)\b", rep, re.IGNORECASE)
+
+
 
 # Strip reporter series designators ("2d", "4th") and volume/page digits
 # before comparing reporter words against a court abbreviation.
@@ -6307,31 +6322,53 @@ class _ScholarTextWindow:
         # resolver can try them all before giving up (not just the one chosen
         # for the Bluebook citation below).
         self._header_cites = [c for c, _p in cands]
+        # The star pagination may follow a reporter that isn't printed in the
+        # opinion's own header — CourtListener's combined opinions carry no
+        # parallel-cite header at all.  Fold in the cluster's parallel citations
+        # so the reporter the pages actually follow can be matched; otherwise
+        # the pin cite is computed against the wrong reporter (e.g. an A.3d
+        # first page when the stars are really N.J. Reports pages).
+        match_cands = list(cands)
+        seen = {re.sub(r"\s+", "", c).lower() for c, _p in match_cands}
+        for c in item.get("citation", []) or []:
+            c = re.sub(r"\s+", " ", str(c)).strip()
+            cm = _CITE_PARSE_RE.match(c)
+            if not (cm and _is_paginable_cite(c)):
+                continue
+            key = re.sub(r"\s+", "", c).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                match_cands.append((c, int(cm.group(3))))
+            except ValueError:
+                pass
         cite = ""
-        if cands:
-            first_star: Optional[int] = None
-            for b in self._blocks:
-                for s in b.spans:
-                    if s.pagenum:
-                        mm = re.search(r"\d+", s.text)
-                        if mm:
-                            first_star = int(mm.group(0))
-                            break
-                if first_star is not None:
-                    break
+        first_star: Optional[int] = None
+        for b in self._blocks:
+            for s in b.spans:
+                if s.pagenum:
+                    mm = re.search(r"\d+", s.text)
+                    if mm:
+                        first_star = int(mm.group(0))
+                        break
             if first_star is not None:
-                fits = [
-                    (first_star - p, c)
-                    for c, p in cands
-                    if 0 <= first_star - p <= 400
-                ]
-                if fits:
-                    cite = min(fits)[1]
-            if not cite:
-                cite = next(
-                    (c for c, _p in cands if _TEXT_CITE_RE.fullmatch(c)),
-                    cands[0][0],
-                )
+                break
+        if match_cands and first_star is not None:
+            # The reporter whose first page the stars fall just past (within a
+            # volume's worth of pages) is the one being paginated.
+            fits = [
+                (first_star - p, c)
+                for c, p in match_cands
+                if 0 <= first_star - p <= 400
+            ]
+            if fits:
+                cite = min(fits)[1]
+        if not cite and cands:
+            cite = next(
+                (c for c, _p in cands if _TEXT_CITE_RE.fullmatch(c)),
+                cands[0][0],
+            )
         if not cite:
             header_norm = re.sub(r"\bU\.\s+S\.", "U.S.", header)
             header_norm = re.sub(
