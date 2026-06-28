@@ -186,6 +186,11 @@ def parse_opinion_blocks(html: str) -> list[Block]:
     class ``gsl_pagenum`` become page-marker spans, and anchors pointing
     at other scholar_case pages become citation-link spans.
     """
+    # CourtListener's combined opinion (reused here for its Google-Scholar-like
+    # star pagination) can arrive as an XML document; drop the declaration so it
+    # isn't parsed as stray text and bs4 doesn't warn.  Scholar HTML is
+    # unaffected (it has no such declaration).
+    html = re.sub(r"^\s*<\?xml[^>]*\?>", "", html or "")
     soup = BeautifulSoup(html, "html.parser")
     root = soup.find(id="gs_opinion") or soup
     for bad in root.find_all(["script", "style"]):
@@ -250,6 +255,17 @@ def parse_opinion_blocks(html: str) -> list[Block]:
             blocks.append(Block(kind=kind, spans=cur))
         cur = []
 
+    def last_pagenum() -> Optional[str]:
+        """Page number of the most recent page marker still in the current
+        block (skipping trailing whitespace), or None — lets us drop a star
+        marker emitted twice in a row (CourtListener does this)."""
+        for s in reversed(cur):
+            if s.pagenum:
+                return s.text.lstrip("*").strip()
+            if s.text.strip():
+                return None
+        return None
+
     def walk(node: Tag, fmt: dict, kind: str, link: str = "") -> None:
         for child in node.children:
             if isinstance(child, Comment):
@@ -303,6 +319,19 @@ def parse_opinion_blocks(html: str) -> list[Block]:
                     continue
                 walk(child, fmt, kind, link=link)  # footnote anchors etc.
                 continue
+            if name == "span":
+                classes = [c.lower() for c in (child.get("class") or [])]
+                if "star-pagination" in classes:
+                    # CourtListener marks a reporter page break with
+                    # <span class="star-pagination">*1005</span>.  Emit it as a
+                    # page marker exactly like Scholar's, so the page gutter and
+                    # pin cites work; CL sometimes repeats the same marker twice
+                    # in a row, so drop an immediate duplicate.
+                    t = _WS_RE.sub(" ", child.get_text()).strip().lstrip("*").strip()
+                    if t and last_pagenum() != t:
+                        emit("*" + t, fmt, pagenum=True)
+                    continue
+                # any other span falls through to a generic walk of its children
             if name in _BLOCK_TAGS:
                 flush(kind)
                 child_fmt = fmt
@@ -676,6 +705,54 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     return parts
 
 
+def link_footnotes_by_marker(parts: list[OpinionPart]) -> None:
+    """Give footnotes ref↔body links when an opinion uses the plain ``[N]``
+    style — a ``<sup>[N]</sup>`` reference and a ``[N]``-led body paragraph —
+    rather than Scholar's ``gsl_hash`` anchors.  CourtListener's combined
+    opinion is in this style; without anchors ``parse_opinion_blocks`` can't set
+    ``fnref``/``fndef``, so the viewer wouldn't make the markers clickable.
+
+    In each part an in-text marker is paired with the body bearing the same
+    number, both get a matching synthetic anchor id, and the body's leading
+    ``[N]`` is split into its own marker span — so the viewer links them and
+    shows hover tips exactly as for a Scholar page.  A no-op where the anchors
+    already exist (the gsl_hash case)."""
+    for pi, part in enumerate(parts):
+        refs: dict[str, Span] = {}  # marker -> in-text reference span
+        for b in part.blocks:
+            for s in b.spans:
+                if s.sup and not s.fnref and not s.fndef:
+                    m = _FN_REF_RE.match(s.text.strip())
+                    if m:
+                        refs.setdefault(m.group(1), s)
+        if not refs:
+            continue
+        out: list[Block] = []
+        for fb in part.footnotes:
+            idx = next(
+                (i for i, s in enumerate(fb.spans)
+                 if s.text.strip() and not s.pagenum and not s.fndef),
+                None,
+            )
+            if idx is not None:
+                head = fb.spans[idx]
+                mm = _FN_MARK_RE.match(head.text)
+                marker = (mm.group(1) or mm.group(2)) if mm else None
+                if marker and marker in refs and not refs[marker].fndef:
+                    fid = f"m{pi}_{marker}"
+                    refs[marker].fnref = fid
+                    cut = mm.end()
+                    new_spans = [replace(head, text=head.text[:cut], fndef=fid)]
+                    if head.text[cut:]:
+                        new_spans.append(replace(head, text=head.text[cut:]))
+                    fb = Block(
+                        kind=fb.kind,
+                        spans=fb.spans[:idx] + new_spans + fb.spans[idx + 1:],
+                    )
+            out.append(fb)
+        part.footnotes = out
+
+
 class GoogleScholarFetcher:
     """
     Fetch and cache US case law text from Google Scholar.
@@ -692,9 +769,14 @@ class GoogleScholarFetcher:
         self,
         cache_path: Path = _CACHE_PATH,
         delay: float = _DEFAULT_DELAY,
+        db=None,
     ) -> None:
         self._delay = delay
         self._last_request: float = 0.0
+        # Optional opinion_db.OpinionDB: the durable, searchable store.  When
+        # set, every fetched opinion is recorded there, and an opinion already
+        # present is served from there instead of being re-fetched.
+        self._opinion_db = db
 
         self._session = requests.Session()
         self._session.headers.update(_HEADERS)
@@ -739,6 +821,13 @@ class GoogleScholarFetcher:
             print(f"[scholar] cache hit for {key!r}")
             return cached
 
+        # Search the database before Google Scholar: a unique opinion bearing
+        # this citation is served from there, no network.  (An ambiguous match
+        # falls through so Scholar can disambiguate.)
+        db_one = self._db_single(citation)
+        if db_one:
+            return db_one
+
         # Wrap the citation in double quotes so Scholar treats it as an exact
         # phrase. (repr() here produced *single* quotes, which Scholar does not
         # treat as a phrase operator -- that returned arbitrary cases from the
@@ -758,6 +847,13 @@ class GoogleScholarFetcher:
         if not case_url:
             print("[scholar] no scholar_case link found in results page")
             return None
+
+        # Even after searching Scholar, prefer the database copy if we already
+        # have this exact opinion (skip re-downloading the case page).
+        db_hit = self._db_by_url(case_url)
+        if db_hit:
+            self._cache_put(key, *db_hit)
+            return db_hit
 
         result = self._fetch_case_page(case_url)
         if result:
@@ -779,6 +875,12 @@ class GoogleScholarFetcher:
             print(f"[scholar] cache hit for {key!r}")
             return cached
 
+        # Search the database before Google Scholar (by party name): a unique
+        # match is served from there without a network call.
+        db_one = self._db_single(case_name)
+        if db_one:
+            return db_one
+
         search_url = f"{SCHOLAR_BASE}/scholar?q={quote_plus(q)}&as_sdt=4"
         print(f"[scholar] searching {search_url}")
         try:
@@ -791,6 +893,11 @@ class GoogleScholarFetcher:
         if not case_url:
             print("[scholar] no scholar_case link found in results page")
             return None
+
+        db_hit = self._db_by_url(case_url)
+        if db_hit:
+            self._cache_put(key, *db_hit)
+            return db_hit
 
         result = self._fetch_case_page(case_url)
         if result:
@@ -875,6 +982,10 @@ class GoogleScholarFetcher:
 
         Returns (scholar_url, opinion_html) or None.
         """
+        db_hit = self._db_by_url(url)
+        if db_hit:
+            return db_hit
+
         key = f"url:{url}"
         cached = self._cache_get(key)
         if cached:
@@ -889,6 +1000,53 @@ class GoogleScholarFetcher:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Opinion database (durable, searchable store; optional)
+    # ------------------------------------------------------------------
+
+    def _db_by_url(self, url: str) -> Optional[tuple[str, str]]:
+        """(url, html) for this case from the opinion DB (matched on the Scholar
+        ``case=`` id), or None — so an opinion already collected is served from
+        the DB instead of being fetched again."""
+        if self._opinion_db is None:
+            return None
+        try:
+            rec = self._opinion_db.get_by_url(url)
+            if rec and rec.get("html"):
+                print(f"[scholar] opinion-DB hit for {rec.get('scholar_id')}")
+                return (rec.get("url") or url, rec["html"])
+        except Exception as exc:
+            print(f"[scholar] opinion-DB lookup failed: {exc}")
+        return None
+
+    def _db_single(self, query: str) -> Optional[tuple[str, str]]:
+        """(url, html) when the opinion DB holds **exactly one** opinion for
+        this query (a citation or a party name), else None.  A unique hit is
+        served straight from the DB without touching Scholar; an ambiguous one
+        (two cases sharing a name or a reporter page) falls through so Scholar
+        can disambiguate."""
+        if self._opinion_db is None or not query:
+            return None
+        try:
+            hits = self._opinion_db.find(query)
+            if len(hits) == 1:
+                rec = self._opinion_db.get_by_scholar_id(hits[0]["scholar_id"])
+                if rec and rec.get("html"):
+                    print(f"[scholar] opinion-DB unique hit for {query!r}")
+                    return (rec.get("url") or "", rec["html"])
+        except Exception as exc:
+            print(f"[scholar] opinion-DB search failed: {exc}")
+        return None
+
+    def _store_opinion(self, url: str, html: str) -> None:
+        if self._opinion_db is None:
+            return
+        try:
+            if self._opinion_db.add_opinion(url, html):
+                print("[scholar] stored opinion in database")
+        except Exception as exc:
+            print(f"[scholar] opinion-DB store failed: {exc}")
 
     def _throttle(self) -> None:
         elapsed = time.monotonic() - self._last_request
@@ -934,6 +1092,7 @@ class GoogleScholarFetcher:
 
         html = str(opinion_div)
         print(f"[scholar] extracted {len(html):,} chars of opinion HTML")
+        self._store_opinion(url, html)
         return (url, html)
 
     # ------------------------------------------------------------------
@@ -956,3 +1115,82 @@ class GoogleScholarFetcher:
             (key, url, text, html, time.time()),
         )
         self._db.commit()
+
+
+if __name__ == "__main__":  # pragma: no cover - offline smoke test
+    import sys
+
+    failures: list[str] = []
+
+    def check(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+        print(("ok   " if cond else "FAIL ") + msg)
+
+    # CourtListener marks reporter page breaks with
+    # <span class="star-pagination">*N</span>, sometimes twice in a row.
+    # parse_opinion_blocks should turn those into page markers (de-duped) so a
+    # combined CourtListener opinion reads like a Google Scholar one.
+    cl_html = (
+        "<div><center>505 U.S. 1003</center>"
+        '<p><span class="star-pagination">*1005</span> '
+        '<span class="star-pagination">*1005</span> '
+        "Scalia, J., delivered the opinion of the Court.</p>"
+        '<p>Coastal land at issue, <span class="star-pagination">*1007</span> '
+        "in South Carolina.</p></div>"
+    )
+    blocks = parse_opinion_blocks(cl_html)
+    pages = [s.text for b in blocks for s in b.spans if s.pagenum]
+    check(pages == ["*1005", "*1007"],
+          f"star-pagination -> page markers, de-duped: {pages}")
+    # The markers are flagged pagenum (rendered into the gutter); the body
+    # prose — the spans the main text flow uses — is intact without them.
+    prose = "".join(
+        s.text for b in blocks for s in b.spans if not s.pagenum
+    )
+    check("*1005" not in prose and "*1007" not in prose,
+          "page markers are page spans, separate from the prose flow")
+    check("Scalia, J., delivered the opinion of the Court." in prose,
+          "surrounding prose preserved")
+
+    # Scholar's own gsl_pagenum markers must still work (no regression).
+    sch_html = (
+        '<div id="gs_opinion"><p>Before '
+        '<a class="gsl_pagenum2" href="#">*152</a> after.</p></div>'
+    )
+    spages = [s.text for b in parse_opinion_blocks(sch_html)
+              for s in b.spans if s.pagenum]
+    check(spages == ["*152"], f"Scholar gsl_pagenum still works: {spages}")
+
+    # link_footnotes_by_marker: a <sup>[N]</sup> reference and a [N]-led body
+    # (CourtListener's combined-opinion style) get matching anchor ids so the
+    # viewer links them like a Scholar page.
+    fn_html = (
+        "<div><center>1 U.S. 1</center>"
+        "<p>Smith, J., delivered the opinion of the Court.</p>"
+        "<p>Some reasoning<sup>[1]</sup> and more<sup>[2]</sup>.</p>"
+        "<p>[1] First note.</p><p>[2] Second note, longer.</p></div>"
+    )
+    fparts = segment_blocks(parse_opinion_blocks(fn_html))
+    link_footnotes_by_marker(fparts)
+    fnrefs = sorted(s.fnref for p in fparts for b in p.blocks
+                    for s in b.spans if s.fnref)
+    fndefs = sorted(s.fndef for p in fparts for fb in p.footnotes
+                    for s in fb.spans if s.fndef)
+    check(len(fnrefs) == 2 and fnrefs == fndefs,
+          f"[N] footnotes linked: refs={fnrefs} defs={fndefs}")
+    # the body marker is split into its own "[N]" span (so only it is clickable)
+    marker_spans = [fb.spans[0].text for p in fparts for fb in p.footnotes
+                    if fb.spans and fb.spans[0].fndef]
+    check(all(re.fullmatch(r"\[.+\]", t) for t in marker_spans) and marker_spans,
+          f"body marker split to its own span: {marker_spans}")
+    # idempotent: a second pass doesn't double-link or change ids
+    link_footnotes_by_marker(fparts)
+    fnrefs2 = sorted(s.fnref for p in fparts for b in p.blocks
+                     for s in b.spans if s.fnref)
+    check(fnrefs2 == fnrefs, "link_footnotes_by_marker is idempotent")
+
+    if failures:
+        print(f"\n{len(failures)} FAILED")
+        sys.exit(1)
+    print("\nOK: google_scholar smoke test passed")

@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import urllib.parse
 import webbrowser
@@ -676,6 +677,48 @@ def _item_from_cluster(cluster: dict) -> dict:
     return item
 
 
+def _cl_item_for_citation(client, cite: str) -> Optional[dict]:
+    """Resolve a reporter citation to the CourtListener cluster that actually
+    bears it, as a search-result-shaped item (or ``None``).
+
+    CourtListener's full-text search ranks by relevance and very often returns
+    the wrong case first for a bare citation — ``citation:(410 U.S. 113)``
+    surfaces a case that merely *cites* Roe, not Roe itself.  So resolve through
+    the citation-lookup endpoint (exact), and fall back to full-text search only
+    if that finds nothing — and even then accept a result only when its own
+    citations include the requested one, rather than blindly taking the first.
+    Returning ``None`` (so the caller reports "not found") is preferable to
+    opening the wrong case."""
+    cite = (cite or "").split("@", 1)[0].strip()
+    if not cite:
+        return None
+    want = re.sub(r"\s+", "", cite).lower()
+
+    # 1) Exact resolution via the citation-lookup endpoint.
+    try:
+        for entry in client.lookup_citation(cite):
+            if entry.get("status") != 200:
+                continue
+            for cl in entry.get("clusters") or []:
+                item = _item_from_cluster(cl)
+                if item.get("cluster_id"):
+                    return item
+    except Exception as exc:
+        print(f"[cl-cite] citation-lookup failed for {cite!r}: {exc}")
+
+    # 2) Fall back to full-text search, trusting only a real citation match.
+    for q in (f"citation:({cite})", f'"{cite}"'):
+        try:
+            results = client.search(q, type="o", page_size=5).get("results") or []
+        except Exception:
+            continue
+        for it in results:
+            if any(re.sub(r"\s+", "", str(c)).lower() == want
+                   for c in (it.get("citation") or [])):
+                return it
+    return None
+
+
 _OPINION_TYPE_LABELS: dict[str, str] = {
     "010combined": "Opinion",
     "015unamimous": "Unanimous Opinion",
@@ -720,6 +763,24 @@ _CL_TYPE_KIND: dict[str, str] = {
 }
 
 
+def _pick_combined_opinion(opinions: list[dict]) -> Optional[dict]:
+    """The CourtListener "combined" opinion — the whole case as one
+    star-paginated document (structurally a Google Scholar opinion) — when the
+    cluster has one.  Identified by the ``combined`` opinion type carrying
+    reporter page markers; falls back to a lone star-paginated sub-opinion.
+    Returns None when no such nicely-formatted full text is present, so the
+    caller assembles the separate sub-opinions as before."""
+    def starred(op: dict) -> bool:
+        return "star-pagination" in (
+            op.get("html_with_citations") or op.get("html") or ""
+        )
+    for op in opinions:
+        if "combined" in (op.get("type") or "") and starred(op):
+            return op
+    hits = [op for op in opinions if starred(op)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def _assemble_case_parts(
     client, item: dict
 ) -> "tuple[list[OpinionPart], list[Block], str, dict]":
@@ -728,7 +789,10 @@ def _assemble_case_parts(
     Returns (parts, all_blocks, plain_text, cluster_metadata).
     """
     try:
-        from google_scholar import Block, OpinionPart, Span, blocks_to_text
+        from google_scholar import (
+            Block, OpinionPart, Span, blocks_to_text,
+            link_footnotes_by_marker, parse_opinion_blocks, segment_blocks,
+        )
     except ImportError:
         return [], [], "", {}
 
@@ -811,6 +875,32 @@ def _assemble_case_parts(
     opinions.sort(key=lambda o: (
         o.get("ordering_key") is None, o.get("ordering_key") or 0,
     ))
+
+    # When CourtListener carries a star-paginated "combined" opinion — the whole
+    # case as one nicely-formatted document, the way Google Scholar serves it —
+    # show only that, parsed through the Scholar pipeline so reporter page
+    # numbers and pin cites work and the opinion splits into its parts.  This
+    # avoids rendering the same text twice (the separate sub-opinions and then
+    # the combined version) and reads like a Scholar opinion.
+    combined = _pick_combined_opinion(opinions)
+    if combined is not None:
+        html_text = (
+            combined.get("html_with_citations") or combined.get("html") or ""
+        )
+        try:
+            cblocks = parse_opinion_blocks(html_text)
+            cparts = segment_blocks(cblocks)
+            link_footnotes_by_marker(cparts)  # make [N] footnotes clickable
+        except Exception as exc:
+            print(f"[cl-parts] combined-opinion parse failed: {exc}")
+            cparts = []
+        if cparts:
+            body = [b for p in cparts for b in p.blocks]
+            try:
+                plain = blocks_to_text(body)
+            except Exception:
+                plain = ""
+            return cparts, body, plain, cluster
 
     all_blocks: list[Block] = list(header_blocks)
 
@@ -1007,6 +1097,8 @@ class CourtListenerGUI:
         self._selected_courts: set[str] = set()  # empty = all courts
         self._search_thread: Optional[threading.Thread] = None
         self._scholar: Optional["GoogleScholarFetcher"] = None
+        self._opinion_db = None          # opinion_db.OpinionDB (lazy)
+        self._opinion_db_failed = False  # don't retry a broken DB every call
 
         self._preview_cache: dict[int, str] = {}  # result index → snippet text
         self._sort_state: dict[int, tuple[str, bool]] = {}  # tree id → (col, reverse)
@@ -1056,6 +1148,18 @@ class CourtListenerGUI:
         brief_menu.add_command(
             label="Open Brief (highlight citations)…", accelerator="Ctrl+B",
             command=self._open_brief,
+        )
+        db_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Database", menu=db_menu)
+        db_menu.add_command(
+            label="Find Opinion in Database…", command=self._show_db_find,
+        )
+        db_menu.add_separator()
+        db_menu.add_command(
+            label="Merge In Database File…", command=self._merge_db_file,
+        )
+        db_menu.add_command(
+            label="Rebuild Search Index", command=self._rebuild_db_index,
         )
         self.root.bind("<Control-l>", lambda _e: self._show_statute_lookup())
         self.root.bind("<Control-s>", lambda _e: self._show_quick_lookup())
@@ -2053,15 +2157,8 @@ class CourtListenerGUI:
                 return True
         if client is not None:
             try:
-                data = client.search(f"citation:({cite})", type="o",
-                                     page_size=1)
-                results = data.get("results") or []
-                if not results:
-                    data = client.search(f'"{cite}"', type="o",
-                                         page_size=1)
-                    results = data.get("results") or []
-                if results:
-                    target = results[0]
+                target = _cl_item_for_citation(client, cite)
+                if target:
                     parts, blocks, plain, cluster = _assemble_case_parts(
                         client, target,
                     )
@@ -2309,6 +2406,170 @@ class CourtListenerGUI:
         ttk.Button(frame, text="Look Up", command=go).grid(row=0, column=2)
         entry.bind("<Return>", go)
         frame.columnconfigure(1, weight=1)
+
+    # ------------------------------------------------------------------
+    # Opinion database — find / open / merge / rebuild
+    # ------------------------------------------------------------------
+
+    def _open_db_record(self, scholar_id: str) -> None:
+        """Open an opinion stored in the database, by its Scholar id."""
+        db = self._get_opinion_db()
+        if db is None:
+            return
+        rec = db.get_by_scholar_id(scholar_id)
+        if not rec or not rec.get("html"):
+            messagebox.showwarning(
+                "Not in Database",
+                "That opinion is no longer in the database.",
+            )
+            return
+        self._open_scholar_window(
+            rec.get("url", ""), rec["html"], None, None, "from database", True,
+        )
+
+    def _show_db_find(self) -> None:
+        """Search the local opinion database by party name, reporter citation,
+        or Google Scholar number — without touching the network."""
+        db = self._get_opinion_db()
+        if db is None:
+            messagebox.showwarning(
+                "Database Unavailable",
+                "The opinion database could not be opened.",
+            )
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Find Opinion in Database")
+        dlg.resizable(False, False)
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Search:").grid(row=0, column=0, sticky="w")
+        query_var = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=query_var, width=46)
+        entry.grid(row=0, column=1, padx=6, sticky="we")
+        entry.focus_set()
+        status_var = tk.StringVar(
+            value=f"{db.count()} opinions stored   ·   "
+                  "e.g.  Roe v. Wade   ·   410 U.S. 113   ·   <Scholar number>"
+        )
+        ttk.Label(frame, textvariable=status_var, foreground="gray").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+        frame.columnconfigure(1, weight=1)
+
+        def go(_e=None) -> None:
+            q = query_var.get().strip()
+            if not q:
+                return
+            try:
+                hits = db.find(q)
+            except Exception as exc:
+                status_var.set(f"Search error: {exc}")
+                return
+            if not hits:
+                status_var.set(f"No opinion in the database for {q!r}.")
+                return
+            if len(hits) == 1:
+                dlg.destroy()
+                self._open_db_record(hits[0]["scholar_id"])
+                return
+            dlg.destroy()
+            _DbMatchDialog(self.root, self, hits)
+
+        ttk.Button(frame, text="Find", command=go).grid(row=0, column=2)
+        entry.bind("<Return>", go)
+
+    def _merge_db_file(self) -> None:
+        """Merge another ``opinions.jsonl`` into this one (e.g. one pulled from
+        GitHub or shared by a colleague).  De-duped by Scholar number."""
+        db = self._get_opinion_db()
+        if db is None:
+            messagebox.showwarning(
+                "Database Unavailable",
+                "The opinion database could not be opened.",
+            )
+            return
+        path = filedialog.askopenfilename(
+            title="Choose an opinions.jsonl to merge in",
+            filetypes=[("Opinion database", "*.jsonl"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            same = Path(path).resolve() == Path(db.jsonl_path).resolve()
+        except Exception:
+            same = False
+        if same:
+            messagebox.showinfo(
+                "Merge", "That is already the current database file."
+            )
+            return
+        self._status_var.set("Merging database file…")
+
+        def run() -> None:
+            try:
+                stats = db.merge_from(path)
+            except Exception as exc:
+                self._post_root(
+                    lambda e=exc: messagebox.showerror("Merge Failed", str(e))
+                )
+                self._post_root(lambda: self._status_var.set("Merge failed."))
+                return
+
+            def done() -> None:
+                self._status_var.set(
+                    f"Merged: +{stats['added']} new, "
+                    f"{stats['skipped']} already present."
+                )
+                msg = (
+                    f"Added {stats['added']} new opinion(s).\n"
+                    f"Skipped {stats['skipped']} already in the database."
+                )
+                if stats["errors"]:
+                    msg += f"\n{stats['errors']} line(s) could not be read."
+                if stats["added"]:
+                    msg += (
+                        f"\n\nRemember to commit {Path(db.jsonl_path).name} "
+                        "to Git to sync the change."
+                    )
+                messagebox.showinfo("Merge Complete", msg)
+
+            self._post_root(done)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _rebuild_db_index(self) -> None:
+        """Rebuild the local SQLite search index from ``opinions.jsonl`` (use
+        after editing it by hand or resolving a Git merge)."""
+        db = self._get_opinion_db()
+        if db is None:
+            messagebox.showwarning(
+                "Database Unavailable",
+                "The opinion database could not be opened.",
+            )
+            return
+        self._status_var.set("Rebuilding search index…")
+
+        def run() -> None:
+            try:
+                db.rebuild_index()
+                n = db.count()
+            except Exception as exc:
+                self._post_root(
+                    lambda e=exc: messagebox.showerror("Rebuild Failed", str(e))
+                )
+                return
+            self._post_root(
+                lambda: self._status_var.set(f"Search index rebuilt — {n} opinions.")
+            )
+            self._post_root(
+                lambda: messagebox.showinfo(
+                    "Index Rebuilt",
+                    f"Search index rebuilt from {Path(db.jsonl_path).name}.\n"
+                    f"{n} opinion(s) indexed.",
+                )
+            )
+
+        threading.Thread(target=run, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Open Brief — load a brief and highlight every citation in it
@@ -2956,8 +3217,26 @@ class CourtListenerGUI:
             )
             return None
         if self._scholar is None:
-            self._scholar = GoogleScholarFetcher()
+            self._scholar = GoogleScholarFetcher(db=self._get_opinion_db())
         return self._scholar
+
+    def _get_opinion_db(self):
+        """The searchable opinion database (lazily opened).  Returns the
+        ``OpinionDB`` or ``None`` if it can't be opened — the app still runs,
+        just without the database (opinions then come straight from Scholar)."""
+        if self._opinion_db is None and not self._opinion_db_failed:
+            try:
+                import opinion_db
+                self._opinion_db = opinion_db.OpinionDB()
+                print(
+                    f"[db] opinion database ready "
+                    f"({self._opinion_db.count()} opinions) "
+                    f"at {self._opinion_db.jsonl_path}"
+                )
+            except Exception as exc:
+                print(f"[db] opinion database unavailable: {exc}")
+                self._opinion_db_failed = True
+        return self._opinion_db
 
     def _on_scholar_search_results(self, results: list) -> None:
         self._scholar_results = results
@@ -3477,6 +3756,62 @@ class _CourtPickerDialog:
     def _apply(self) -> None:
         self._on_apply(set(self._checked))
         self._win.destroy()
+
+
+class _DbMatchDialog:
+    """Pick one opinion when a database search matches several — the same name
+    or reporter page can belong to more than one case, so the user chooses."""
+
+    def __init__(self, parent: tk.Misc, app: "CourtListenerGUI", candidates: list[dict]) -> None:
+        self._app = app
+        self._candidates = candidates
+        win = tk.Toplevel(parent)
+        self._win = win
+        win.title("Select an Opinion")
+        win.geometry("660x340")
+        win.minsize(420, 220)
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text=f"{len(candidates)} opinions match — choose one:",
+        ).pack(anchor="w")
+        cols = ("name", "cite", "court", "year")
+        tree = ttk.Treeview(
+            frame, columns=cols, show="headings", selectmode="browse", height=10,
+        )
+        for col, title, width in (
+            ("name", "Case", 320), ("cite", "Citation", 150),
+            ("court", "Court", 90), ("year", "Year", 60),
+        ):
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor="w")
+        for i, h in enumerate(candidates):
+            tree.insert(
+                "", "end", iid=str(i),
+                values=(h.get("name") or "(unknown)", h.get("cite", ""),
+                        h.get("court", ""), h.get("year", "")),
+            )
+        tree.pack(fill="both", expand=True, pady=(6, 6))
+        self._tree = tree
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Open", command=self._open).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(
+            side="right", padx=(0, 6)
+        )
+        tree.bind("<Double-1>", lambda _e: self._open())
+        if candidates:
+            tree.selection_set("0")
+            tree.focus_set()
+
+    def _open(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        h = self._candidates[int(sel[0])]
+        self._win.destroy()
+        self._app._open_db_record(h["scholar_id"])
 
 
 _OP_ID_RE = re.compile(r"/opinions/(\d+)/?")
@@ -4755,6 +5090,11 @@ class _ScholarTextWindow:
                         m = re.search(r"\d+", s.text)
                         if m:
                             page = int(m.group(0))
+        # Whether the rendered opinion carries reporter page markers (star
+        # pagination): true for Scholar text and for CourtListener's combined
+        # opinion, both of which pin-cite by page.  Gates pin cites / writer
+        # parentheticals on Copy + Cite even in CourtListener mode.
+        self._has_pages = page is not None
         self._cl_text: Optional[str] = cl_text
         self._mode = "courtlistener" if self._cl_primary else "scholar"
         self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
@@ -5208,8 +5548,14 @@ class _ScholarTextWindow:
                     txt.insert("end", span.text, tuple(tags))
                     return
             # Carry any pincite so the opened case jumps to it (Scholar's own
-            # hyperlink otherwise opens the case at the top).
-            value = f"{span.link}\tpin={pin}" if pin else span.link
+            # hyperlink otherwise opens the case at the top), and any reporter
+            # cite from the link text so that — if Google's flaky servers fail
+            # the fetch — we can still locate the case on CourtListener.
+            value = span.link
+            if pin:
+                value += f"\tpin={pin}"
+            if ref:
+                value += f"\tcite={ref}"
             tags += ["citelink", self._new_link(("url", value))]
             txt.insert("end", span.text, tuple(tags))
             return
@@ -6295,13 +6641,17 @@ class _ScholarTextWindow:
         except tk.TclError:
             start, end = "1.0", "end-1c"
             selected = False
+        # The combined CourtListener opinion renders like a Scholar one (star
+        # pagination + segmented parts), so it pin-cites and takes a writer
+        # parenthetical the same way even though the mode is "courtlistener".
+        scholar_like = self._mode == "scholar" or self._has_pages
         pin = (
             self._pin_with_footnotes(start, end)
-            if (selected and self._mode == "scholar")
+            if (selected and scholar_like)
             else None
         )
         writer = ""
-        if self._mode == "scholar" and self._parts:
+        if scholar_like and self._parts:
             pi = self._current_part
             if pi is None and selected:
                 for rs, rend, p in self._part_regions:
@@ -6551,17 +6901,10 @@ class _ScholarTextWindow:
                     if not cid:
                         if not cite:
                             raise RuntimeError("no citation to locate the case")
-                        data = client.search(f"citation:({cite})", type="o",
-                                             page_size=1)
-                        results = data.get("results") or []
-                        if not results:
-                            data = client.search(f'"{cite}"', type="o",
-                                                 page_size=1)
-                            results = data.get("results") or []
-                        if not results:
+                        target = _cl_item_for_citation(client, cite)
+                        if not target:
                             raise RuntimeError("case not found on CourtListener")
-                        cid = (results[0].get("cluster_id")
-                               or results[0].get("id"))
+                        cid = target.get("cluster_id")
                     cluster = client.get_cluster(
                         int(cid), fields="judges,sub_opinions")
                     ops = []
@@ -6788,8 +7131,15 @@ class _ScholarTextWindow:
         # A Scholar case URL may carry a pincite ("<url>\tpin=565") so the
         # opened case jumps to that page (Scholar's own hyperlink doesn't).
         if kind == "url":
-            url_val, _, pin = value.partition("\tpin=")
+            pieces = value.split("\t")
+            url_val = pieces[0]
+            pin = ""
             cite = ""
+            for piece in pieces[1:]:
+                if piece.startswith("pin="):
+                    pin = piece[4:]
+                elif piece.startswith("cite="):
+                    cite = piece[5:]
         elif kind == "cite":
             cite, _, pin = value.partition("@")
             url_val = ""
@@ -6826,7 +7176,7 @@ class _ScholarTextWindow:
                 result = fetcher.fetch_by_url(url_val)
             else:
                 result = fetcher.fetch_by_citation(cite)
-            self._post(self._on_link_ready, result, cite, pin)
+            self._post(self._on_link_ready, result, cite, pin, url_val)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -6862,57 +7212,86 @@ class _ScholarTextWindow:
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _on_cl_link_ready(self, parts, blocks, plain, item) -> None:
+    def _on_cl_link_ready(self, parts, blocks, plain, item, retry=None) -> None:
         self._status_var.set("Cited case loaded from CourtListener.")
-        _ScholarTextWindow(
+        win = _ScholarTextWindow(
             self._win, self._app, "", "",
             item=item, cl_text=plain,
             cl_parts=parts, cl_blocks=blocks,
         )
+        if retry:
+            # A Google Scholar link failed; keep retrying it and light up the
+            # new window's "Google Scholar Text" button if it comes through.
+            win._retry_scholar_link(*retry)
 
     def _on_cl_link_error(self, msg: str) -> None:
         self._status_var.set(f"CourtListener: {msg}")
 
-    def _follow_cite_via_cl(self, cite: str, pin: str = "") -> None:
-        """Follow a citation link using CourtListener when Scholar is unavailable."""
+    def _follow_cite_via_cl(self, cite: str, pin: str = "", retry=None) -> None:
+        """Follow a citation link using CourtListener when Scholar is
+        unavailable.  ``retry`` (cite, pin, url) keeps trying Google Scholar in
+        the background after the CourtListener view opens (used when a Scholar
+        link failed rather than Scholar being absent)."""
         client = self._app._get_client()
         if client is None:
             return
-        self._status_var.set(f"Fetching {cite} from CourtListener…")
+        self._status_var.set(
+            f"Google Scholar busy — loading {cite} from CourtListener…"
+            if retry else f"Fetching {cite} from CourtListener…"
+        )
 
         def run() -> None:
             try:
-                data = client.search(f'"{cite}"', type="o", page_size=1)
-                results = data.get("results") or []
-                if not results:
-                    self._post(self._on_cl_link_error, f"No match for {cite!r}.")
+                target = _cl_item_for_citation(client, cite)
+                if not target:
+                    if retry:
+                        # CourtListener doesn't have it either — keep retrying
+                        # Google Scholar and open it if it comes through.
+                        self._post(self._retry_scholar_only, *retry)
+                    else:
+                        self._post(self._on_cl_link_error, f"No match for {cite!r}.")
                     return
-                target = results[0]
                 parts, blocks, plain, cluster = _assemble_case_parts(
                     client, target,
                 )
-                self._post(self._on_cl_link_ready, parts, blocks, plain, target)
+                self._post(
+                    self._on_cl_link_ready, parts, blocks, plain, target, retry,
+                )
             except Exception as exc:
                 self._post(self._on_cl_link_error, str(exc))
 
         threading.Thread(target=run, daemon=True).start()
 
     def _on_link_ready(self, result: Optional[tuple[str, str]],
-                       cite: str = "", pin: str = "") -> None:
+                       cite: str = "", pin: str = "", url_val: str = "") -> None:
         if not result:
-            # Scholar failed — try CourtListener as fallback
-            if cite:
-                self._follow_cite_via_cl(cite, pin)
-            else:
-                self._status_var.set(
-                    "Google Scholar: cited case not found (or blocked)."
-                )
+            self._link_scholar_failed(cite, pin, url_val)
             return
         url, html = result
         self._status_var.set("Cited case loaded.")
         win = _ScholarTextWindow(self._win, self._app, url, html, item=None)
         if pin:  # cite or Scholar-URL pincite — jump once the window lays out
             win.jump_to_cite_page(cite, pin)
+
+    def _link_scholar_failed(self, cite: str, pin: str, url_val: str) -> None:
+        """A Google Scholar opinion link failed (Google's servers are finicky).
+        Show the CourtListener view now if the case can be located by citation,
+        and keep retrying Google Scholar in the background; if it comes through,
+        the window's "Google Scholar Text" button lights up so the reader can
+        switch to it."""
+        client = self._app._get_client()
+        fetcher = self._app._get_scholar()
+        if cite and client is not None:
+            # Open CourtListener now; retry Scholar and attach it to that window.
+            self._follow_cite_via_cl(cite, pin, retry=(cite, pin, url_val))
+        elif fetcher is not None and (url_val or cite):
+            # No citation to locate the case on CourtListener — just keep
+            # retrying Google Scholar, and open it if it comes through.
+            self._retry_scholar_only(cite, pin, url_val)
+        else:
+            self._status_var.set(
+                "Google Scholar: cited case not found (or blocked)."
+            )
 
     def jump_to_cite_page(self, cite: str, pin: str) -> None:
         """Scroll to and briefly flash the star-pagination marker for the pin
@@ -6975,14 +7354,9 @@ class _ScholarTextWindow:
                         raise RuntimeError(
                             "No citation available to locate this case on CourtListener."
                         )
-                    data = client.search(f"citation:({cite})", type="o", page_size=1)
-                    results = data.get("results") or []
-                    if not results:
-                        data = client.search(f'"{cite}"', type="o", page_size=1)
-                        results = data.get("results") or []
-                    if not results:
+                    target = _cl_item_for_citation(client, cite)
+                    if not target:
                         raise RuntimeError(f"No CourtListener match for {cite!r}.")
-                    target = results[0]
                 parts, blocks, plain, cluster = _assemble_case_parts(
                     client, target,
                 )
@@ -7093,6 +7467,67 @@ class _ScholarTextWindow:
                 )
             except tk.TclError:
                 pass
+
+    def _retry_scholar_link(
+        self, cite: str, pin: str, url_val: str,
+        attempts: int = 3, delay: float = 4.0,
+    ) -> None:
+        """This window opened on the CourtListener text because a Google Scholar
+        link failed.  Retry the Scholar fetch ``attempts`` more times,
+        ``delay`` seconds apart; if it comes through, wire it in and light up
+        the "Google Scholar Text" button (via ``_attach_scholar_version``)."""
+        fetcher = self._app._get_scholar()
+        if fetcher is None or not (url_val or cite):
+            return
+
+        def run() -> None:
+            for _ in range(attempts):
+                time.sleep(delay)
+                try:
+                    result = (fetcher.fetch_by_url(url_val) if url_val
+                              else fetcher.fetch_by_citation(cite))
+                except Exception:
+                    result = None
+                if result:
+                    url, html = result
+                    self._post(
+                        self._attach_scholar_version, url, html,
+                        "matching Google Scholar version found",
+                    )
+                    return
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _retry_scholar_only(
+        self, cite: str, pin: str, url_val: str,
+        attempts: int = 3, delay: float = 4.0,
+    ) -> None:
+        """No CourtListener fallback is possible for this link (a Google Scholar
+        URL with no citation to locate the case), so just retry Google Scholar
+        a few times and open the opinion if it comes through."""
+        fetcher = self._app._get_scholar()
+        if fetcher is None:
+            self._status_var.set("Google Scholar: cited case not found.")
+            return
+        self._status_var.set("Google Scholar busy — retrying this link…")
+
+        def run() -> None:
+            for _ in range(attempts):
+                time.sleep(delay)
+                try:
+                    result = (fetcher.fetch_by_url(url_val) if url_val
+                              else fetcher.fetch_by_citation(cite))
+                except Exception:
+                    result = None
+                if result:
+                    self._post(self._on_link_ready, result, cite, pin, url_val)
+                    return
+            self._post(
+                self._status_var.set,
+                "Google Scholar still unavailable for this link.",
+            )
+
+        threading.Thread(target=run, daemon=True).start()
 
     # ------------------------------------------------------------------
     # PDF view (official opinion PDF, shown in-app)
