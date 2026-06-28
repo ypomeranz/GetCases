@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import urllib.parse
 import webbrowser
@@ -5547,8 +5548,14 @@ class _ScholarTextWindow:
                     txt.insert("end", span.text, tuple(tags))
                     return
             # Carry any pincite so the opened case jumps to it (Scholar's own
-            # hyperlink otherwise opens the case at the top).
-            value = f"{span.link}\tpin={pin}" if pin else span.link
+            # hyperlink otherwise opens the case at the top), and any reporter
+            # cite from the link text so that — if Google's flaky servers fail
+            # the fetch — we can still locate the case on CourtListener.
+            value = span.link
+            if pin:
+                value += f"\tpin={pin}"
+            if ref:
+                value += f"\tcite={ref}"
             tags += ["citelink", self._new_link(("url", value))]
             txt.insert("end", span.text, tuple(tags))
             return
@@ -7124,8 +7131,15 @@ class _ScholarTextWindow:
         # A Scholar case URL may carry a pincite ("<url>\tpin=565") so the
         # opened case jumps to that page (Scholar's own hyperlink doesn't).
         if kind == "url":
-            url_val, _, pin = value.partition("\tpin=")
+            pieces = value.split("\t")
+            url_val = pieces[0]
+            pin = ""
             cite = ""
+            for piece in pieces[1:]:
+                if piece.startswith("pin="):
+                    pin = piece[4:]
+                elif piece.startswith("cite="):
+                    cite = piece[5:]
         elif kind == "cite":
             cite, _, pin = value.partition("@")
             url_val = ""
@@ -7162,7 +7176,7 @@ class _ScholarTextWindow:
                 result = fetcher.fetch_by_url(url_val)
             else:
                 result = fetcher.fetch_by_citation(cite)
-            self._post(self._on_link_ready, result, cite, pin)
+            self._post(self._on_link_ready, result, cite, pin, url_val)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -7198,55 +7212,86 @@ class _ScholarTextWindow:
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _on_cl_link_ready(self, parts, blocks, plain, item) -> None:
+    def _on_cl_link_ready(self, parts, blocks, plain, item, retry=None) -> None:
         self._status_var.set("Cited case loaded from CourtListener.")
-        _ScholarTextWindow(
+        win = _ScholarTextWindow(
             self._win, self._app, "", "",
             item=item, cl_text=plain,
             cl_parts=parts, cl_blocks=blocks,
         )
+        if retry:
+            # A Google Scholar link failed; keep retrying it and light up the
+            # new window's "Google Scholar Text" button if it comes through.
+            win._retry_scholar_link(*retry)
 
     def _on_cl_link_error(self, msg: str) -> None:
         self._status_var.set(f"CourtListener: {msg}")
 
-    def _follow_cite_via_cl(self, cite: str, pin: str = "") -> None:
-        """Follow a citation link using CourtListener when Scholar is unavailable."""
+    def _follow_cite_via_cl(self, cite: str, pin: str = "", retry=None) -> None:
+        """Follow a citation link using CourtListener when Scholar is
+        unavailable.  ``retry`` (cite, pin, url) keeps trying Google Scholar in
+        the background after the CourtListener view opens (used when a Scholar
+        link failed rather than Scholar being absent)."""
         client = self._app._get_client()
         if client is None:
             return
-        self._status_var.set(f"Fetching {cite} from CourtListener…")
+        self._status_var.set(
+            f"Google Scholar busy — loading {cite} from CourtListener…"
+            if retry else f"Fetching {cite} from CourtListener…"
+        )
 
         def run() -> None:
             try:
                 target = _cl_item_for_citation(client, cite)
                 if not target:
-                    self._post(self._on_cl_link_error, f"No match for {cite!r}.")
+                    if retry:
+                        # CourtListener doesn't have it either — keep retrying
+                        # Google Scholar and open it if it comes through.
+                        self._post(self._retry_scholar_only, *retry)
+                    else:
+                        self._post(self._on_cl_link_error, f"No match for {cite!r}.")
                     return
                 parts, blocks, plain, cluster = _assemble_case_parts(
                     client, target,
                 )
-                self._post(self._on_cl_link_ready, parts, blocks, plain, target)
+                self._post(
+                    self._on_cl_link_ready, parts, blocks, plain, target, retry,
+                )
             except Exception as exc:
                 self._post(self._on_cl_link_error, str(exc))
 
         threading.Thread(target=run, daemon=True).start()
 
     def _on_link_ready(self, result: Optional[tuple[str, str]],
-                       cite: str = "", pin: str = "") -> None:
+                       cite: str = "", pin: str = "", url_val: str = "") -> None:
         if not result:
-            # Scholar failed — try CourtListener as fallback
-            if cite:
-                self._follow_cite_via_cl(cite, pin)
-            else:
-                self._status_var.set(
-                    "Google Scholar: cited case not found (or blocked)."
-                )
+            self._link_scholar_failed(cite, pin, url_val)
             return
         url, html = result
         self._status_var.set("Cited case loaded.")
         win = _ScholarTextWindow(self._win, self._app, url, html, item=None)
         if pin:  # cite or Scholar-URL pincite — jump once the window lays out
             win.jump_to_cite_page(cite, pin)
+
+    def _link_scholar_failed(self, cite: str, pin: str, url_val: str) -> None:
+        """A Google Scholar opinion link failed (Google's servers are finicky).
+        Show the CourtListener view now if the case can be located by citation,
+        and keep retrying Google Scholar in the background; if it comes through,
+        the window's "Google Scholar Text" button lights up so the reader can
+        switch to it."""
+        client = self._app._get_client()
+        fetcher = self._app._get_scholar()
+        if cite and client is not None:
+            # Open CourtListener now; retry Scholar and attach it to that window.
+            self._follow_cite_via_cl(cite, pin, retry=(cite, pin, url_val))
+        elif fetcher is not None and (url_val or cite):
+            # No citation to locate the case on CourtListener — just keep
+            # retrying Google Scholar, and open it if it comes through.
+            self._retry_scholar_only(cite, pin, url_val)
+        else:
+            self._status_var.set(
+                "Google Scholar: cited case not found (or blocked)."
+            )
 
     def jump_to_cite_page(self, cite: str, pin: str) -> None:
         """Scroll to and briefly flash the star-pagination marker for the pin
@@ -7422,6 +7467,67 @@ class _ScholarTextWindow:
                 )
             except tk.TclError:
                 pass
+
+    def _retry_scholar_link(
+        self, cite: str, pin: str, url_val: str,
+        attempts: int = 3, delay: float = 4.0,
+    ) -> None:
+        """This window opened on the CourtListener text because a Google Scholar
+        link failed.  Retry the Scholar fetch ``attempts`` more times,
+        ``delay`` seconds apart; if it comes through, wire it in and light up
+        the "Google Scholar Text" button (via ``_attach_scholar_version``)."""
+        fetcher = self._app._get_scholar()
+        if fetcher is None or not (url_val or cite):
+            return
+
+        def run() -> None:
+            for _ in range(attempts):
+                time.sleep(delay)
+                try:
+                    result = (fetcher.fetch_by_url(url_val) if url_val
+                              else fetcher.fetch_by_citation(cite))
+                except Exception:
+                    result = None
+                if result:
+                    url, html = result
+                    self._post(
+                        self._attach_scholar_version, url, html,
+                        "matching Google Scholar version found",
+                    )
+                    return
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _retry_scholar_only(
+        self, cite: str, pin: str, url_val: str,
+        attempts: int = 3, delay: float = 4.0,
+    ) -> None:
+        """No CourtListener fallback is possible for this link (a Google Scholar
+        URL with no citation to locate the case), so just retry Google Scholar
+        a few times and open the opinion if it comes through."""
+        fetcher = self._app._get_scholar()
+        if fetcher is None:
+            self._status_var.set("Google Scholar: cited case not found.")
+            return
+        self._status_var.set("Google Scholar busy — retrying this link…")
+
+        def run() -> None:
+            for _ in range(attempts):
+                time.sleep(delay)
+                try:
+                    result = (fetcher.fetch_by_url(url_val) if url_val
+                              else fetcher.fetch_by_citation(cite))
+                except Exception:
+                    result = None
+                if result:
+                    self._post(self._on_link_ready, result, cite, pin, url_val)
+                    return
+            self._post(
+                self._status_var.set,
+                "Google Scholar still unavailable for this link.",
+            )
+
+        threading.Thread(target=run, daemon=True).start()
 
     # ------------------------------------------------------------------
     # PDF view (official opinion PDF, shown in-app)
