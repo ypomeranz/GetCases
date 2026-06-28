@@ -804,6 +804,12 @@ class GoogleScholarFetcher:
         # session is the case worth optimizing).
         self._search_cache: dict[str, list[ScholarResult]] = {}
 
+        # The scholar_case URL found on the results page when the opinion page
+        # then failed to load (search succeeded, case page didn't) — consumed
+        # by take_post_search_failure() so a caller can fall back to
+        # CourtListener and retry this exact opinion in the background.
+        self._post_search_failure: Optional[str] = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -815,6 +821,7 @@ class GoogleScholarFetcher:
         Returns (scholar_url, opinion_html) or None if not found / blocked.
         Result is cached permanently on success.
         """
+        self._post_search_failure = None
         key = f"cite:{citation.strip()}"
         cached = self._cache_get(key)
         if cached:
@@ -858,7 +865,12 @@ class GoogleScholarFetcher:
         result = self._fetch_case_page(case_url)
         if result:
             self._cache_put(key, *result)
-        return result
+            return result
+        # The search found the case but the opinion page didn't load (Google is
+        # flaky) — record it so the caller can show CourtListener now and retry
+        # this exact opinion in the background.
+        self._post_search_failure = case_url
+        return None
 
     def fetch_by_name(
         self, case_name: str, year: Optional[str] = None
@@ -868,6 +880,7 @@ class GoogleScholarFetcher:
 
         Returns (scholar_url, opinion_html) or None.
         """
+        self._post_search_failure = None
         q = f"{case_name} {year}".strip() if year else case_name
         key = f"name:{q}"
         cached = self._cache_get(key)
@@ -902,7 +915,19 @@ class GoogleScholarFetcher:
         result = self._fetch_case_page(case_url)
         if result:
             self._cache_put(key, *result)
-        return result
+            return result
+        self._post_search_failure = case_url
+        return None
+
+    def take_post_search_failure(self) -> Optional[str]:
+        """The scholar_case URL found on the results page when the opinion page
+        then failed to load (the search succeeded but the case page didn't),
+        returned once and cleared.  ``None`` when the last fetch succeeded or
+        failed at the search stage.  Lets a caller fall back to CourtListener
+        and retry that exact Scholar opinion in the background."""
+        url = self._post_search_failure
+        self._post_search_failure = None
+        return url
 
     def search_cases(self, query: str, limit: int = 10) -> list["ScholarResult"]:
         """

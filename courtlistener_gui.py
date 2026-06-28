@@ -2183,6 +2183,15 @@ class CourtListenerGUI:
 
                 self._post_root(open_scholar)
                 return True
+        # Google Scholar found the case on its results page but the opinion
+        # page didn't load — fall back to CourtListener now and retry this exact
+        # Scholar opinion in the background (the toggle lights up if it comes).
+        retry_url = ""
+        if fetcher is not None:
+            try:
+                retry_url = fetcher.take_post_search_failure() or ""
+            except Exception:
+                retry_url = ""
         if client is not None:
             try:
                 target = _cl_item_for_citation(client, cite)
@@ -2193,12 +2202,14 @@ class CourtListenerGUI:
                     if parts or plain:
                         def open_cl() -> None:
                             try:
-                                _ScholarTextWindow(
+                                w = _ScholarTextWindow(
                                     self.root, self, "", "",
                                     item=target, cl_text=plain,
                                     cl_parts=parts, cl_blocks=blocks,
                                     prefetch_pdf=prefetch_pdf,
                                 )
+                                if retry_url:
+                                    w._retry_scholar_link(cite, pin, retry_url)
                             except tk.TclError:
                                 pass
 
