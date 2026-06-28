@@ -5341,6 +5341,11 @@ class _ScholarTextWindow:
                 # the PDF (Scholar rarely has the opinion text for them).
                 if self._fed_appx:
                     self._win.after(0, self._view_pdf)
+        # Fill in whatever the opinion text can't give us for a proper Bluebook
+        # citation — chiefly the federal-district / lower-court parenthetical and
+        # a missing year — from CourtListener in the background, then refresh the
+        # title.  The window opens immediately on the best-effort citation.
+        self._enrich_citation()
 
     # ------------------------------------------------------------------
     # UI
@@ -6559,6 +6564,9 @@ class _ScholarTextWindow:
             name = re.split(r",\s*\d{1,4}\s", first)[0].strip().rstrip(",")[:120]
 
         court_id = str(item.get("court_id") or "").strip().lower()
+        # Whether the court came from CourtListener (authoritative) or had to be
+        # guessed from the opinion text — the enrichment pings CL when guessed.
+        self._court_from_cl = bool(court_id)
         if not court_id:
             court_id = _scholar_court_id(self._blocks)
         is_scotus = "scotus" in court_id or bool(
@@ -6729,6 +6737,88 @@ class _ScholarTextWindow:
         if title and paren:
             title += f" ({paren})"
         return title
+
+    def _enrich_citation(self) -> None:
+        """Ping CourtListener in the background for the authoritative court and
+        year and update the title's Bluebook citation.  The court parenthetical
+        for federal-district and lower courts (e.g. "(S.D.N.Y. 2014)" for an
+        ``F. Supp.`` case) can't be derived from the opinion text, and the year
+        is sometimes missing — so we ask CourtListener.  Skipped when the court
+        already came from CourtListener and the year is known (nothing to add)."""
+        if not _SCHOLAR_AVAILABLE:
+            return
+        bb = self._bb
+        if not bb.get("cite"):
+            return
+        need_year = not bb.get("year")
+        # SCOTUS takes no court parenthetical; otherwise we need a reliable
+        # court, which we only have when CourtListener supplied the court id.
+        need_court = (not self._is_scotus) and not getattr(
+            self, "_court_from_cl", False
+        )
+        if not (need_year or need_court):
+            return
+        if not self._app._token_var.get().strip():
+            return  # no CourtListener token to ask
+        cite = bb["cite"]
+        item = dict(self._item)
+
+        def run() -> None:
+            client = self._app._get_client()
+            if client is None:
+                return
+            try:
+                court_id, year = self._cl_court_and_year(client, cite, item)
+            except Exception as exc:
+                print(f"[bb-enrich] CourtListener lookup failed: {exc}")
+                return
+            new_court = bb.get("court", "")
+            if need_court and court_id:
+                new_court = _court_for_paren(
+                    cite, court_id.strip().lower(), new_court
+                )
+            new_year = year or bb.get("year", "")
+            if new_court != bb.get("court", "") or new_year != bb.get("year", ""):
+                self._post(self._apply_enriched_citation, new_court, new_year)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _cl_court_and_year(client, cite: str, item: dict) -> tuple[str, str]:
+        """(court_id, year) for the case from CourtListener — the cluster's
+        date and its docket's court — locating the cluster by id or, failing
+        that, by the reporter citation."""
+        cluster_id = item.get("cluster_id") or item.get("id")
+        if not cluster_id:
+            t = _cl_item_for_citation(client, cite)
+            cluster_id = (t or {}).get("cluster_id")
+        if not cluster_id:
+            return "", ""
+        cl = client.get_cluster(int(cluster_id), fields="date_filed,docket")
+        year = (cl.get("date_filed") or "")[:4]
+        court_id = ""
+        docket_url = cl.get("docket")
+        if docket_url:
+            try:
+                court_id = (
+                    client._get_url(docket_url, {"fields": "court_id"}).get(
+                        "court_id"
+                    )
+                    or ""
+                )
+            except Exception as exc:
+                print(f"[bb-enrich] docket lookup failed: {exc}")
+        return court_id, year
+
+    def _apply_enriched_citation(self, court: str, year: str) -> None:
+        self._bb["court"] = court
+        self._bb["year"] = year
+        try:
+            title = self._title_citation()
+            if title and self._win.winfo_exists():
+                self._win.title(title)
+        except tk.TclError:
+            pass
 
     def _bluebook_citation(
         self, pin: Optional[str], writer: str = ""
