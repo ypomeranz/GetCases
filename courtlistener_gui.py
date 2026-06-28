@@ -5261,11 +5261,6 @@ class _ScholarTextWindow:
                         m = re.search(r"\d+", s.text)
                         if m:
                             page = int(m.group(0))
-        # Whether the rendered opinion carries reporter page markers (star
-        # pagination): true for Scholar text and for CourtListener's combined
-        # opinion, both of which pin-cite by page.  Gates pin cites / writer
-        # parentheticals on Copy + Cite even in CourtListener mode.
-        self._has_pages = page is not None
         self._cl_text: Optional[str] = cl_text
         self._mode = "courtlistener" if self._cl_primary else "scholar"
         self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
@@ -6979,10 +6974,15 @@ class _ScholarTextWindow:
         except tk.TclError:
             start, end = "1.0", "end-1c"
             selected = False
-        # The combined CourtListener opinion renders like a Scholar one (star
-        # pagination + segmented parts), so it pin-cites and takes a writer
-        # parenthetical the same way even though the mode is "courtlistener".
-        scholar_like = self._mode == "scholar" or self._has_pages
+        # Pin cites and the writer parenthetical apply whenever the opinion on
+        # screen actually carries reporter page markers — the Google Scholar
+        # view and any CourtListener opinion assembled with page numbers (REST
+        # API included) — regardless of how the window was opened.  Check the
+        # live text, not a flag fixed at open time (which goes stale across a
+        # source toggle or a late Scholar match).
+        scholar_like = (
+            self._mode == "scholar" or bool(self._text.tag_ranges("pagenum"))
+        )
         pin = (
             self._pin_with_footnotes(start, end)
             if (selected and scholar_like)
