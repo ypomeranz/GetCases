@@ -748,7 +748,7 @@ def _assemble_case_parts(
     try:
         from google_scholar import (
             Block, OpinionPart, Span, blocks_to_text,
-            parse_opinion_blocks, segment_blocks,
+            link_footnotes_by_marker, parse_opinion_blocks, segment_blocks,
         )
     except ImportError:
         return [], [], "", {}
@@ -847,6 +847,7 @@ def _assemble_case_parts(
         try:
             cblocks = parse_opinion_blocks(html_text)
             cparts = segment_blocks(cblocks)
+            link_footnotes_by_marker(cparts)  # make [N] footnotes clickable
         except Exception as exc:
             print(f"[cl-parts] combined-opinion parse failed: {exc}")
             cparts = []
@@ -5053,6 +5054,11 @@ class _ScholarTextWindow:
                         m = re.search(r"\d+", s.text)
                         if m:
                             page = int(m.group(0))
+        # Whether the rendered opinion carries reporter page markers (star
+        # pagination): true for Scholar text and for CourtListener's combined
+        # opinion, both of which pin-cite by page.  Gates pin cites / writer
+        # parentheticals on Copy + Cite even in CourtListener mode.
+        self._has_pages = page is not None
         self._cl_text: Optional[str] = cl_text
         self._mode = "courtlistener" if self._cl_primary else "scholar"
         self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
@@ -6593,13 +6599,17 @@ class _ScholarTextWindow:
         except tk.TclError:
             start, end = "1.0", "end-1c"
             selected = False
+        # The combined CourtListener opinion renders like a Scholar one (star
+        # pagination + segmented parts), so it pin-cites and takes a writer
+        # parenthetical the same way even though the mode is "courtlistener".
+        scholar_like = self._mode == "scholar" or self._has_pages
         pin = (
             self._pin_with_footnotes(start, end)
-            if (selected and self._mode == "scholar")
+            if (selected and scholar_like)
             else None
         )
         writer = ""
-        if self._mode == "scholar" and self._parts:
+        if scholar_like and self._parts:
             pi = self._current_part
             if pi is None and selected:
                 for rs, rend, p in self._part_regions:

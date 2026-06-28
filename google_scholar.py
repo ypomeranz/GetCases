@@ -705,6 +705,54 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     return parts
 
 
+def link_footnotes_by_marker(parts: list[OpinionPart]) -> None:
+    """Give footnotes ref↔body links when an opinion uses the plain ``[N]``
+    style — a ``<sup>[N]</sup>`` reference and a ``[N]``-led body paragraph —
+    rather than Scholar's ``gsl_hash`` anchors.  CourtListener's combined
+    opinion is in this style; without anchors ``parse_opinion_blocks`` can't set
+    ``fnref``/``fndef``, so the viewer wouldn't make the markers clickable.
+
+    In each part an in-text marker is paired with the body bearing the same
+    number, both get a matching synthetic anchor id, and the body's leading
+    ``[N]`` is split into its own marker span — so the viewer links them and
+    shows hover tips exactly as for a Scholar page.  A no-op where the anchors
+    already exist (the gsl_hash case)."""
+    for pi, part in enumerate(parts):
+        refs: dict[str, Span] = {}  # marker -> in-text reference span
+        for b in part.blocks:
+            for s in b.spans:
+                if s.sup and not s.fnref and not s.fndef:
+                    m = _FN_REF_RE.match(s.text.strip())
+                    if m:
+                        refs.setdefault(m.group(1), s)
+        if not refs:
+            continue
+        out: list[Block] = []
+        for fb in part.footnotes:
+            idx = next(
+                (i for i, s in enumerate(fb.spans)
+                 if s.text.strip() and not s.pagenum and not s.fndef),
+                None,
+            )
+            if idx is not None:
+                head = fb.spans[idx]
+                mm = _FN_MARK_RE.match(head.text)
+                marker = (mm.group(1) or mm.group(2)) if mm else None
+                if marker and marker in refs and not refs[marker].fndef:
+                    fid = f"m{pi}_{marker}"
+                    refs[marker].fnref = fid
+                    cut = mm.end()
+                    new_spans = [replace(head, text=head.text[:cut], fndef=fid)]
+                    if head.text[cut:]:
+                        new_spans.append(replace(head, text=head.text[cut:]))
+                    fb = Block(
+                        kind=fb.kind,
+                        spans=fb.spans[:idx] + new_spans + fb.spans[idx + 1:],
+                    )
+            out.append(fb)
+        part.footnotes = out
+
+
 class GoogleScholarFetcher:
     """
     Fetch and cache US case law text from Google Scholar.
@@ -1113,6 +1161,34 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     spages = [s.text for b in parse_opinion_blocks(sch_html)
               for s in b.spans if s.pagenum]
     check(spages == ["*152"], f"Scholar gsl_pagenum still works: {spages}")
+
+    # link_footnotes_by_marker: a <sup>[N]</sup> reference and a [N]-led body
+    # (CourtListener's combined-opinion style) get matching anchor ids so the
+    # viewer links them like a Scholar page.
+    fn_html = (
+        "<div><center>1 U.S. 1</center>"
+        "<p>Smith, J., delivered the opinion of the Court.</p>"
+        "<p>Some reasoning<sup>[1]</sup> and more<sup>[2]</sup>.</p>"
+        "<p>[1] First note.</p><p>[2] Second note, longer.</p></div>"
+    )
+    fparts = segment_blocks(parse_opinion_blocks(fn_html))
+    link_footnotes_by_marker(fparts)
+    fnrefs = sorted(s.fnref for p in fparts for b in p.blocks
+                    for s in b.spans if s.fnref)
+    fndefs = sorted(s.fndef for p in fparts for fb in p.footnotes
+                    for s in fb.spans if s.fndef)
+    check(len(fnrefs) == 2 and fnrefs == fndefs,
+          f"[N] footnotes linked: refs={fnrefs} defs={fndefs}")
+    # the body marker is split into its own "[N]" span (so only it is clickable)
+    marker_spans = [fb.spans[0].text for p in fparts for fb in p.footnotes
+                    if fb.spans and fb.spans[0].fndef]
+    check(all(re.fullmatch(r"\[.+\]", t) for t in marker_spans) and marker_spans,
+          f"body marker split to its own span: {marker_spans}")
+    # idempotent: a second pass doesn't double-link or change ids
+    link_footnotes_by_marker(fparts)
+    fnrefs2 = sorted(s.fnref for p in fparts for b in p.blocks
+                     for s in b.spans if s.fnref)
+    check(fnrefs2 == fnrefs, "link_footnotes_by_marker is idempotent")
 
     if failures:
         print(f"\n{len(failures)} FAILED")
