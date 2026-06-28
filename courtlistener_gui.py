@@ -818,6 +818,19 @@ def _assemble_case_parts(
                "sub_opinions,date_filed,docket",
     )
 
+    # The Bluebook date parenthetical needs the court, but citation-lookup
+    # items don't carry it (the court lives on the docket).  Fill it in when
+    # missing so e.g. "85 F. 271" cites as "(6th Cir. 1898)".
+    if not str(item.get("court_id") or item.get("court") or "").strip():
+        docket_url = cluster.get("docket")
+        if docket_url:
+            try:
+                dk = client._get_url(docket_url, {"fields": "court_id"})
+                if dk.get("court_id"):
+                    item["court_id"] = dk["court_id"]
+            except Exception as exc:
+                print(f"[cl-parts] docket court lookup failed: {exc}")
+
     # --- Build header part from metadata ---
     header_blocks: list[Block] = []
     case_name = re.sub(

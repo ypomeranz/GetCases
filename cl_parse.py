@@ -87,6 +87,7 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
         last = cur[-1] if cur else None
         if (
             last is not None and not fnref and not last.fnref
+            and not last.pagenum  # never fold body text into a page marker
             and link == last.link and last.sup == issup
             and all(getattr(last, k) == fmt.get(k, False)
                     for k in ("italic", "bold", "underline", "small"))
@@ -108,6 +109,18 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
             cur[-1].text = cur[-1].text.rstrip()
             blocks.append(Block(kind=kind, spans=cur))
         cur = []
+
+    def emit_pagenum(page: str) -> None:
+        """Emit a reporter page marker ("*279") as a page span — rendered in
+        the gutter, not inline — de-duping a marker repeated back-to-back."""
+        for s in reversed(cur):
+            if s.pagenum:
+                if s.text.lstrip("*").strip() == page:
+                    return
+                break
+            if s.text.strip():
+                break
+        cur.append(Span(text="*" + page, pagenum=True))
 
     def footnote_div(div) -> None:
         """Turn a <div class="footnote" id="fnN" label="N"> into a footnote
@@ -205,6 +218,20 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
                     walk(child, fmt, kind, link=href)
                     continue
                 walk(child, fmt, kind, link=link)
+                continue
+            if name == "page-number" or (
+                name == "span" and "star-pagination" in cls
+            ):
+                # Reporter page break — Harvard CAP's
+                # <page-number label="279">*279</page-number> or lawbox's
+                # <span class="star-pagination">*279</span>.  Show it in the
+                # gutter (like Scholar) and feed pin cites, instead of letting
+                # "*279" fall through as inline body text.
+                page = (child.get("label") or "").strip() or _WS.sub(
+                    " ", child.get_text()
+                ).strip().lstrip("*").strip()
+                if page:
+                    emit_pagenum(page)
                 continue
             if name in _BLOCK_TAGS:
                 flush(kind)
