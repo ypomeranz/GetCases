@@ -676,6 +676,48 @@ def _item_from_cluster(cluster: dict) -> dict:
     return item
 
 
+def _cl_item_for_citation(client, cite: str) -> Optional[dict]:
+    """Resolve a reporter citation to the CourtListener cluster that actually
+    bears it, as a search-result-shaped item (or ``None``).
+
+    CourtListener's full-text search ranks by relevance and very often returns
+    the wrong case first for a bare citation — ``citation:(410 U.S. 113)``
+    surfaces a case that merely *cites* Roe, not Roe itself.  So resolve through
+    the citation-lookup endpoint (exact), and fall back to full-text search only
+    if that finds nothing — and even then accept a result only when its own
+    citations include the requested one, rather than blindly taking the first.
+    Returning ``None`` (so the caller reports "not found") is preferable to
+    opening the wrong case."""
+    cite = (cite or "").split("@", 1)[0].strip()
+    if not cite:
+        return None
+    want = re.sub(r"\s+", "", cite).lower()
+
+    # 1) Exact resolution via the citation-lookup endpoint.
+    try:
+        for entry in client.lookup_citation(cite):
+            if entry.get("status") != 200:
+                continue
+            for cl in entry.get("clusters") or []:
+                item = _item_from_cluster(cl)
+                if item.get("cluster_id"):
+                    return item
+    except Exception as exc:
+        print(f"[cl-cite] citation-lookup failed for {cite!r}: {exc}")
+
+    # 2) Fall back to full-text search, trusting only a real citation match.
+    for q in (f"citation:({cite})", f'"{cite}"'):
+        try:
+            results = client.search(q, type="o", page_size=5).get("results") or []
+        except Exception:
+            continue
+        for it in results:
+            if any(re.sub(r"\s+", "", str(c)).lower() == want
+                   for c in (it.get("citation") or [])):
+                return it
+    return None
+
+
 _OPINION_TYPE_LABELS: dict[str, str] = {
     "010combined": "Opinion",
     "015unamimous": "Unanimous Opinion",
@@ -2114,15 +2156,8 @@ class CourtListenerGUI:
                 return True
         if client is not None:
             try:
-                data = client.search(f"citation:({cite})", type="o",
-                                     page_size=1)
-                results = data.get("results") or []
-                if not results:
-                    data = client.search(f'"{cite}"', type="o",
-                                         page_size=1)
-                    results = data.get("results") or []
-                if results:
-                    target = results[0]
+                target = _cl_item_for_citation(client, cite)
+                if target:
                     parts, blocks, plain, cluster = _assemble_case_parts(
                         client, target,
                     )
@@ -6859,17 +6894,10 @@ class _ScholarTextWindow:
                     if not cid:
                         if not cite:
                             raise RuntimeError("no citation to locate the case")
-                        data = client.search(f"citation:({cite})", type="o",
-                                             page_size=1)
-                        results = data.get("results") or []
-                        if not results:
-                            data = client.search(f'"{cite}"', type="o",
-                                                 page_size=1)
-                            results = data.get("results") or []
-                        if not results:
+                        target = _cl_item_for_citation(client, cite)
+                        if not target:
                             raise RuntimeError("case not found on CourtListener")
-                        cid = (results[0].get("cluster_id")
-                               or results[0].get("id"))
+                        cid = target.get("cluster_id")
                     cluster = client.get_cluster(
                         int(cid), fields="judges,sub_opinions")
                     ops = []
@@ -7190,12 +7218,10 @@ class _ScholarTextWindow:
 
         def run() -> None:
             try:
-                data = client.search(f'"{cite}"', type="o", page_size=1)
-                results = data.get("results") or []
-                if not results:
+                target = _cl_item_for_citation(client, cite)
+                if not target:
                     self._post(self._on_cl_link_error, f"No match for {cite!r}.")
                     return
-                target = results[0]
                 parts, blocks, plain, cluster = _assemble_case_parts(
                     client, target,
                 )
@@ -7283,14 +7309,9 @@ class _ScholarTextWindow:
                         raise RuntimeError(
                             "No citation available to locate this case on CourtListener."
                         )
-                    data = client.search(f"citation:({cite})", type="o", page_size=1)
-                    results = data.get("results") or []
-                    if not results:
-                        data = client.search(f'"{cite}"', type="o", page_size=1)
-                        results = data.get("results") or []
-                    if not results:
+                    target = _cl_item_for_citation(client, cite)
+                    if not target:
                         raise RuntimeError(f"No CourtListener match for {cite!r}.")
-                    target = results[0]
                 parts, blocks, plain, cluster = _assemble_case_parts(
                     client, target,
                 )
