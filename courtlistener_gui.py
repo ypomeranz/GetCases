@@ -288,6 +288,33 @@ _CITE_PRIORITY = [
 
 _NOISE_CITE_RE = re.compile(r"lexis|westlaw|\bwl\b", re.IGNORECASE)
 
+# Annotation / specialty / looseleaf series dropped from the title's parallel
+# cites — the title lists only standard reporters (U.S./S. Ct./L. Ed., the
+# official state reporters, and the regional reporters).
+_NONSTANDARD_CITE_RE = re.compile(
+    r"\bA\.\s?L\.\s?R\."           # American Law Reports (A.L.R., A.L.R.2d, …)
+    r"|\bL\.\s?R\.\s?A\."          # Lawyers' Reports Annotated
+    r"|\bU\.\s?S\.\s?L\.\s?W\."    # United States Law Week
+    r"|\bOhio\s+Op\."             # Ohio Opinions (unofficial)
+    r"|\bMedia\s+L\."            # Media Law Reporter
+    r"|\((?:BNA|CCH|P-?H)\)",      # looseleaf services — (BNA), (CCH), (P-H)
+    re.IGNORECASE,
+)
+
+# Reporter order for the window-title citation: the major national reporters
+# first (Bluebook order), everything else after, in the order it was seen.
+_TITLE_CITE_RANK = [
+    re.compile(r" U\.S\. "),
+    re.compile(r" S\. ?Ct\. "),
+    re.compile(r" L\. ?Ed\."),
+    re.compile(r" F\.4th "),
+    re.compile(r" F\.3d "),
+    re.compile(r" F\.2d "),
+    re.compile(r" F\. \d"),
+    re.compile(r" F\. Supp\."),
+    re.compile(r" B\.R\. "),
+]
+
 
 def _pick_citation(citations) -> str:
     """
@@ -5287,7 +5314,7 @@ class _ScholarTextWindow:
 
         self._win = tk.Toplevel(parent)
         self._win.title(
-            self._bb["name"] or (
+            self._title_citation() or (
                 "CourtListener Opinion Text" if self._cl_primary
                 else "Google Scholar Opinion Text"
             )
@@ -6656,6 +6683,52 @@ class _ScholarTextWindow:
         if signal == "per curiam" or author == "per curiam":
             author = "Per Curiam"
         maj.label = f"{base} ({author})" if author else base
+
+    def _title_citation(self) -> str:
+        """The window-title citation: the case name followed by every parallel
+        *printed* reporter cite (the chosen reporter first, then the parallels
+        from the Scholar header and the CourtListener citation list), then the
+        court-year parenthetical — e.g. "Roe v. Wade, 410 U.S. 113, 93 S. Ct.
+        705, 35 L. Ed. 2d 147 (1973)".  Lexis/Westlaw and neutral (year-volume)
+        cites are dropped (``_is_paginable_cite``)."""
+        bb = self._bb
+        name = bb.get("name", "")
+        seen: set = set()
+        cites: list[str] = []
+        for c in ([bb.get("cite", "")] + list(self._header_cites)
+                  + list((self._item or {}).get("citation", []) or [])):
+            c = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(c))).strip()
+            if (not c or not _is_paginable_cite(c)
+                    or _NONSTANDARD_CITE_RE.search(c)):
+                continue
+            # Re-space standard reporters ("S.Ct." -> "S. Ct."), but leave a
+            # reporter with a parenthetical qualifier ("Media L. Rep. (BNA)")
+            # alone — re-spacing would drop the parentheses.
+            if "(" not in c:
+                c = _respace_reporter_in_cite(c)
+            key = re.sub(r"\s+", "", c).lower()
+            if key not in seen:
+                seen.add(key)
+                cites.append(c)
+        # The chosen reporter stays first; order the parallels Bluebook-style
+        # (major national reporters first), keeping ties in the order seen.
+        if len(cites) > 1:
+            tail = cites[1:]
+            tail.sort(key=lambda c: next(
+                (i for i, p in enumerate(_TITLE_CITE_RANK) if p.search(f" {c} ")),
+                len(_TITLE_CITE_RANK),
+            ))
+            cites = [cites[0]] + tail
+        paren = " ".join(p for p in (bb.get("court", ""), bb.get("year", "")) if p)
+        if name and cites:
+            title = f"{name}, {', '.join(cites)}"
+        elif cites:
+            title = ", ".join(cites)
+        else:
+            title = name
+        if title and paren:
+            title += f" ({paren})"
+        return title
 
     def _bluebook_citation(
         self, pin: Optional[str], writer: str = ""
