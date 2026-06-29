@@ -197,6 +197,35 @@ _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 # Examples: "410 F.2d 1234", "12 F. Supp. 2d 567", "100 Cal. 400"
 _CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+)\s+(\d+)")
 
+# An "Id., at N" cite links to the case last cited only when N is plausibly a
+# page of that reporter — within this many pages of its start.  A small record
+# page ("Id., at 45" pointing into the trial record, not the reporter) falls
+# outside the window and is left as plain text.
+_ID_PIN_WINDOW = 100
+
+
+def _cite_start_page(cite: str) -> Optional[int]:
+    """The reporter start page of a citation ("3 Dall. 386" → 386), ignoring any
+    "@pin" suffix; None when it doesn't parse."""
+    base = re.sub(r"<[^>]+>", "", (cite or "").split("@", 1)[0]).strip()
+    m = _CITE_PARSE_RE.match(base)
+    try:
+        return int(m.group(3)) if m else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _id_pin_in_range(base_cite: str, pin) -> bool:
+    """True when an "Id., at *pin*" page falls within ``_ID_PIN_WINDOW`` pages of
+    *base_cite*'s start page — i.e. a page of that reporter, not a record page."""
+    start = _cite_start_page(base_cite)
+    try:
+        n = int(pin)
+    except (TypeError, ValueError):
+        return False
+    return start is not None and start <= n <= start + _ID_PIN_WINDOW
+
+
 _CLUSTER_ID_RE = re.compile(r"/clusters/(\d+)/?")
 _COURT_ID_RE = re.compile(r"/courts/([^/]+)/?")
 
@@ -2079,7 +2108,10 @@ class CourtListenerGUI:
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-        self._tree.bind("<Double-1>", lambda _e: self._download_selected())
+        # Double-click opens the Google Scholar text (falling back to the
+        # CourtListener text, then a case.law PDF) — the reading view, not a
+        # download.  "Download PDF" remains on the button below.
+        self._tree.bind("<Double-1>", lambda _e: self._fetch_scholar_text())
         self._tree.bind("<<TreeviewSelect>>", lambda _e: self._on_row_select(self._tree))
         self._tree.bind("<Button-3>", lambda e: self._on_right_click(e, self._tree))
 
@@ -2104,7 +2136,7 @@ class CourtListenerGUI:
         self._orders_tree.configure(yscrollcommand=vsb2.set)
         self._orders_tree.pack(side="left", fill="x", expand=True)
         vsb2.pack(side="right", fill="y")
-        self._orders_tree.bind("<Double-1>", lambda _e: self._download_selected())
+        self._orders_tree.bind("<Double-1>", lambda _e: self._fetch_scholar_text())
         self._orders_tree.bind(
             "<<TreeviewSelect>>", lambda _e: self._on_row_select(self._orders_tree)
         )
@@ -6559,15 +6591,19 @@ class _ScholarTextWindow:
         txt = self._text
         # A bare "Id." in the previous span may have its pin ("at N") here —
         # Scholar italicizes "Id." into its own span, splitting it from the
-        # page.  Attach the pin to that link and fold "at N" into it.
+        # page.  Link "Id. … at N" (the already-rendered "Id." retroactively,
+        # plus the pin here) only when N is a page of that reporter, not a
+        # record page (see _id_pin_in_range); otherwise leave it as plain text.
         pend = self._pending_id
         self._pending_id = None
         if pend:
+            id_start, id_end, ref = pend
             mp = re.match(r"\s*,?\s*at\s+(\d{1,5})\b", text)
-            if mp:
-                tag, ref = pend
-                self._link_actions[tag] = ("cite", f"{ref}@{mp.group(1)}")
-                txt.insert("end", text[:mp.end()], tags + ("citelink", tag))
+            if mp and _id_pin_in_range(ref, mp.group(1)):
+                link_tag = self._new_link(("cite", f"{ref}@{mp.group(1)}"))
+                txt.tag_add("citelink", id_start, id_end)
+                txt.tag_add(link_tag, id_start, id_end)
+                txt.insert("end", text[:mp.end()], tags + ("citelink", link_tag))
                 text = text[mp.end():]
                 if not text:
                     return
@@ -6640,16 +6676,21 @@ class _ScholarTextWindow:
                 action = ("cite", m)  # m is the pre-built "vol rep page@pin"
                 cite_base = m.split("@")[0]
             elif kind == "idcite":
-                # "Id. at N" → whatever was cited last, be it a case or a
-                # statute, pinned to N when it's a case.
+                # "Id., at N" → the case last cited, pinned to N — but only when
+                # N is plausibly a page of that reporter (within _ID_PIN_WINDOW
+                # of its start), so an "Id., at 45" into the trial record isn't
+                # linked to the wrong page.  A bare "Id." with no page is never
+                # linked here; when its "at N" sits in the next span (Scholar
+                # splits them), it's resolved by the _pending_id path above.
                 la = self._last_cite_action
-                if not la:
-                    action = None  # nothing to point at — leave it as plain text
+                pin = m.group(1)
+                if pin is None or not la:
+                    action = None
                 elif la[0] == "cite":
-                    pin = m.group(1)
-                    action = ("cite", la[1] + (f"@{pin}" if pin else ""))
+                    action = (("cite", f"{la[1]}@{pin}")
+                              if _id_pin_in_range(la[1], pin) else None)
                 else:
-                    action = la  # statute/regulation/rule/constitution → reopen
+                    action = la  # statute/regulation/rule → reopen (no pin page)
             elif kind == "statestat":
                 # In-app for priority states (once a parser exists), else a
                 # browser link-out.  `m` here is a state_statutes.Cite record.
@@ -6664,26 +6705,26 @@ class _ScholarTextWindow:
             else:
                 action = ("cfr", ecfr.cite_spec(m))
             if action is None:
-                txt.insert("end", text[start:end], tags)  # unresolved Id. cite
-                self._pending_id = None
+                id_start = txt.index("end-1c")
+                txt.insert("end", text[start:end], tags)  # plain text
+                la = self._last_cite_action
+                if (kind == "idcite" and m.group(1) is None
+                        and la and la[0] == "cite"):
+                    # A bare "Id." pointing at a case: render it plain for now
+                    # and remember where, so it's linked from here only if its
+                    # "at N" (in the next span) is in range (see _pending_id).
+                    self._pending_id = (id_start, txt.index("end-1c"), la[1])
+                else:
+                    self._pending_id = None
             else:
                 link_tag = self._new_link(action)
                 txt.insert("end", text[start:end], tags + ("citelink", link_tag))
-                if kind == "idcite":
-                    # A pin-less "Id." pointing at a case may take its pin from
-                    # the next span (Scholar splits "Id." off from "at N").
-                    la = self._last_cite_action
-                    if m.group(1) is None and la and la[0] == "cite":
-                        self._pending_id = (link_tag, la[1])
-                    else:
-                        self._pending_id = None
-                else:
-                    self._pending_id = None
-                    # Remember this citation so a following "Id." points to it.
-                    if kind in ("cite", "shortcite"):
-                        self._last_cite_action = ("cite", cite_base)
-                    else:
-                        self._last_cite_action = action
+                self._pending_id = None
+                # Remember this citation so a following "Id." points to it.
+                if kind in ("cite", "shortcite"):
+                    self._last_cite_action = ("cite", cite_base)
+                elif kind != "idcite":
+                    self._last_cite_action = action
             pos = end
         if pos < len(text):
             tail = text[pos:]
@@ -6765,9 +6806,38 @@ class _ScholarTextWindow:
         if link_ranges:
             self._insert_spans_with_links(block, block_tags, neutral, link_ranges)
         else:
-            for span in block.spans:
-                self._insert_span(span, block_tags, neutral=neutral)
+            self._insert_spans_grouped(block.spans, block_tags, neutral)
         self._text.insert("end", "\n\n", block_tags)
+
+    def _insert_spans_grouped(self, spans, block_tags: tuple,
+                              neutral: bool) -> None:
+        """Render a block's spans, giving every span of one Google Scholar case
+        hyperlink — which Scholar often splits across italic/roman runs ("<i>
+        Calder</i> v. <i>Bull,</i> 3 Dall. 386") — a single shared click action
+        computed from the whole link text, so clicking the case name, the
+        reporter, or anywhere in the link follows it and falls back identically.
+        Non-link spans render one at a time as before."""
+        def is_case_link(s) -> bool:
+            return bool(s.link) and not (s.pagenum or s.fnref or s.fndef)
+
+        i, n = 0, len(spans)
+        while i < n:
+            if is_case_link(spans[i]):
+                href = spans[i].link
+                j = i + 1
+                while j < n and is_case_link(spans[j]) and spans[j].link == href:
+                    j += 1
+                full_text = "".join(s.text for s in spans[i:j])
+                link_tag = self._new_link(
+                    self._scholar_link_action(full_text, href)
+                )
+                for s in spans[i:j]:
+                    self._insert_span(s, block_tags, neutral=neutral,
+                                      link_tag=link_tag)
+                i = j
+            else:
+                self._insert_span(spans[i], block_tags, neutral=neutral)
+                i += 1
 
     def _insert_spans_with_links(self, block, block_tags: tuple,
                                  neutral: bool, ranges: list) -> None:
