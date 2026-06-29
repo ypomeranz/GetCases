@@ -17,6 +17,7 @@ Token lookup order:
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -133,7 +134,9 @@ from citations import (
 )
 from court_catalog import (
     CATALOG as _COURT_CATALOG,
+    CIRCUIT_COURTS as _CIRCUIT_COURTS,
     COURT_BLUEBOOK as _COURT_BLUEBOOK,
+    DISTRICT_COURTS as _DISTRICT_COURTS,
     STATE_COURTS as _STATE_COURTS,
     all_court_ids as _all_court_ids,
 )
@@ -193,6 +196,35 @@ _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 # Regex to parse a standard legal citation: "volume reporter page"
 # Examples: "410 F.2d 1234", "12 F. Supp. 2d 567", "100 Cal. 400"
 _CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+)\s+(\d+)")
+
+# An "Id., at N" cite links to the case last cited only when N is plausibly a
+# page of that reporter — within this many pages of its start.  A small record
+# page ("Id., at 45" pointing into the trial record, not the reporter) falls
+# outside the window and is left as plain text.
+_ID_PIN_WINDOW = 100
+
+
+def _cite_start_page(cite: str) -> Optional[int]:
+    """The reporter start page of a citation ("3 Dall. 386" → 386), ignoring any
+    "@pin" suffix; None when it doesn't parse."""
+    base = re.sub(r"<[^>]+>", "", (cite or "").split("@", 1)[0]).strip()
+    m = _CITE_PARSE_RE.match(base)
+    try:
+        return int(m.group(3)) if m else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _id_pin_in_range(base_cite: str, pin) -> bool:
+    """True when an "Id., at *pin*" page falls within ``_ID_PIN_WINDOW`` pages of
+    *base_cite*'s start page — i.e. a page of that reporter, not a record page."""
+    start = _cite_start_page(base_cite)
+    try:
+        n = int(pin)
+    except (TypeError, ValueError):
+        return False
+    return start is not None and start <= n <= start + _ID_PIN_WINDOW
+
 
 _CLUSTER_ID_RE = re.compile(r"/clusters/(\d+)/?")
 _COURT_ID_RE = re.compile(r"/courts/([^/]+)/?")
@@ -555,6 +587,103 @@ def _static_case_law_url(citation: str) -> Optional[str]:
     return f"https://static.case.law/{slug}/{vol}/case-pdfs/{int(page):04d}-01.pdf"
 
 
+# --- Early-SCOTUS "nominative" reporters -------------------------------------
+# Before 1875 the U.S. Reports were cited by the Reporter of Decisions' name
+# ("3 Dall. 386", "1 Cranch 137").  Google Scholar prints these old SCOTUS cites
+# in nominative form, which the standard citation parser doesn't recognize and
+# static.case.law doesn't slug — yet CourtListener resolves them and case.law
+# files the opinion under the modern "U.S." volume.  Each reporter maps to the
+# offset from its volume to the U.S.-Reports volume (the page is unchanged):
+# Dallas 1-4 → U.S. 1-4, Cranch 1-9 → U.S. 5-13, Wheaton 1-12 → U.S. 14-25,
+# Peters 1-16 → U.S. 26-41, Howard 1-24 → U.S. 42-65, Black 1-2 → U.S. 66-67,
+# Wallace 1-23 → U.S. 68-90.
+_NOMINATIVE_US_OFFSET = {
+    "dall": 0, "dallas": 0, "cranch": 4, "wheat": 13, "wheaton": 13,
+    "pet": 25, "peters": 25, "how": 41, "howard": 41, "black": 65,
+    "wall": 67, "wallace": 67,
+}
+_NOMINATIVE_CANON = {
+    "dall": "Dall.", "dallas": "Dall.", "cranch": "Cranch", "wheat": "Wheat.",
+    "wheaton": "Wheat.", "pet": "Pet.", "peters": "Pet.", "how": "How.",
+    "howard": "How.", "black": "Black", "wall": "Wall.", "wallace": "Wall.",
+}
+# Case-sensitive on purpose: a reporter abbreviation is capitalized in a real
+# cite, so the digits-around requirement plus the capital keeps common words
+# ("how", "black", "wall") in prose from being mistaken for a citation.
+_NOMINATIVE_CITE_RE = re.compile(
+    r"\b(\d{1,2})\s+(Dall|Dallas|Cranch|Wheat|Wheaton|Pet|Peters|How|Howard|"
+    r"Black|Wall|Wallace)\.?\s+(\d{1,4})\b"
+)
+
+
+def _us_reports_cite(cite: str) -> str:
+    """A nominative early-SCOTUS citation in its modern "U.S." form
+    ("3 Dall. 386" → "3 U.S. 386", "1 Cranch 137" → "5 U.S. 137"), which
+    CourtListener and static.case.law index under; "" when *cite* names no
+    nominative reporter."""
+    m = _NOMINATIVE_CITE_RE.search(cite or "")
+    if not m:
+        return ""
+    off = _NOMINATIVE_US_OFFSET.get(m.group(2).lower())
+    return f"{int(m.group(1)) + off} U.S. {m.group(3)}" if off is not None else ""
+
+
+def _link_cite(text: str, short_cite_index) -> tuple[str, str]:
+    """(reporter cite, pincite) for a cited-case hyperlink's text, recognizing
+    the old nominative SCOTUS reporters the standard parser misses ("Calder v.
+    Bull, 3 Dall. 386, 388" → ("3 Dall. 386", "388")) so a Scholar link Google
+    can't open can still be located on CourtListener or static.case.law."""
+    cite, pin = _cite_target_from_text(text, short_cite_index)
+    if cite:
+        return cite, pin
+    plain = re.sub(r"<[^>]+>", "", text or "")
+    m = _NOMINATIVE_CITE_RE.search(plain)
+    if m:
+        rep = _NOMINATIVE_CANON.get(m.group(2).lower(), m.group(2))
+        cite = f"{m.group(1)} {rep} {m.group(3)}"
+        pm = re.match(r"[\s,]+(\d{1,5})\b", plain[m.end():])
+        return cite, (pm.group(1) if pm else "")
+    return "", ""
+
+
+def _case_law_pdf_for_cite(cite: str) -> Optional[str]:
+    """A static.case.law PDF URL that actually exists (HEAD 200) for *cite* —
+    trying the citation as printed and then its modern U.S.-Reports form for an
+    old nominative SCOTUS cite — or None when case.law has neither."""
+    seen: set[str] = set()
+    for c in (cite, _us_reports_cite(cite)):
+        url = _static_case_law_url(c) if c else None
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        try:
+            if _anon_session.head(
+                url, timeout=10, allow_redirects=True
+            ).status_code == 200:
+                return url
+        except Exception as exc:
+            print(f"[case.law] HEAD check failed for {url}: {exc}")
+    return None
+
+
+def _link_name(text: str) -> str:
+    """The case name in a cited-case hyperlink's text ("Calder v. Bull, 3 Dall.
+    386, 388 (1798)" → "Calder v. Bull"), or "" — used to locate the case on
+    CourtListener by name when its citation can't be parsed (so a blocked
+    Scholar link still falls back).  Only a two-party caption or an "In re" /
+    "Ex parte" form is returned, never a bare prose fragment."""
+    t = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", text or "")).strip()
+    m = re.search(r",?\s+\d{1,4}\s+[A-Za-z]", t)  # cut at the reporter citation
+    if m:
+        t = t[:m.start()]
+    t = t.strip(" ,;.")
+    if re.search(r"\bvs?\.?\b", t, re.IGNORECASE) or re.match(
+        r"(?i)(?:in\s+re|ex\s+parte)\b", t
+    ):
+        return t
+    return ""
+
+
 def _gather_all_citations(client, item: dict) -> list[str]:
     """Every citation known for a case: the search-result cite(s) plus the
     cluster record's parallel cites (de-duplicated, HTML-stripped).
@@ -759,6 +888,651 @@ def _cl_item_for_citation(client, cite: str) -> Optional[dict]:
                    for c in (it.get("citation") or [])):
                 return it
     return None
+
+
+def _cl_item_for_name(client, name: str) -> Optional[dict]:
+    """Resolve a case *name* to the best-matching CourtListener cluster as a
+    search-result-shaped item (or None).  The fallback for locating a cited case
+    when its citation can't be parsed or resolved — e.g. a Scholar hyperlink
+    whose text is just the case name, followed when Google Scholar is blocked.
+    Uses the same name ranker as the quick search, so only a strong match
+    (two-party, or a distinctive party) is returned."""
+    name = re.sub(r"<[^>]+>", "", name or "").strip()
+    if not name:
+        return None
+    try:
+        ranked = _cl_name_ranked_search(client, name)
+    except Exception as exc:
+        print(f"[cl-name] lookup failed for {name!r}: {exc}")
+        return None
+    return ranked[0][1] if ranked else None
+
+
+# ======================================================================
+# Spotlight name-ranked case search
+# ======================================================================
+# CourtListener's full-text search ranks by relevance and gives the case
+# *name* no special weight over the body text, so a quick search for a case
+# by name (e.g. "Pennoyer v. Neff") can bury the case itself under opinions
+# that merely discuss it.  When the query is a name rather than a reporter
+# citation, these helpers instead restrict the search to the caseName field,
+# rank hits by how closely their names match the query, and surface the most
+# authoritative close matches first — ordering by citation count (how often a
+# case is cited), which stands in for court level as the authority signal, and
+# adding a dedicated Supreme Court pass so a recent, as-yet-uncited SCOTUS
+# decision isn't buried by that citation-count ordering.
+
+_SCOTUS_COURT_ID = "scotus"
+
+# A close name match must clear this score (see _name_match_score): a query
+# whose single party fully matches a candidate party scores exactly 0.5, so
+# "match one or both of the parties" is the floor for "reasonably close".
+_NAME_MATCH_MIN = 0.5
+
+# Articles, conjunctions, the "v.", and corporate/procedural boilerplate are
+# dropped before comparing names so they don't dominate the token overlap.
+_NAME_STOPWORDS = {
+    "the", "of", "and", "a", "an", "in", "on", "for", "re", "ex", "parte",
+    "matter", "v", "vs", "et", "al", "co", "cos", "corp", "inc", "ltd",
+    "llc", "llp", "lp", "lllp", "plc", "company", "companies",
+    "incorporated", "corporation", "no", "nos",
+}
+
+_NAME_PARTY_SPLIT_RE = re.compile(r"\s+v(?:s)?\.?\s+", re.IGNORECASE)
+
+# A party that is *only* the United States abbreviation, in any spelling
+# ("US", "U.S.", "U. S.", "USA", "U.S.A.").  Such a side stands for the United
+# States as a party, so it is mapped to the spelled-out tokens and "U.S. v.
+# Texas" matches "United States v. Texas".  Matched against the whole side, so
+# an embedded "Chevron U.S.A. Inc." is left alone.
+_US_PARTY_RE = re.compile(r"^\s*u\.?\s*s\.?\s*a?\.?\s*$", re.IGNORECASE)
+
+
+def _name_tokens(name: str) -> list[str]:
+    """Significant lowercased word tokens of a case (or party) name, with
+    HTML, punctuation, articles, bare numbers and one-letter tokens removed."""
+    name = re.sub(r"<[^>]+>", " ", name or "")
+    name = re.sub(r"[^\w\s]", " ", name.lower())
+    return [
+        t for t in name.split()
+        if len(t) > 1 and not t.isdigit() and t not in _NAME_STOPWORDS
+    ]
+
+
+def _name_parties(name: str) -> list[set[str]]:
+    """Token sets for each side of a case name ("A v. B" → [{a}, {b}]).  A side
+    that is just the United States abbreviation becomes {united, states} (see
+    :data:`_US_PARTY_RE`)."""
+    out: list[set[str]] = []
+    for side in _NAME_PARTY_SPLIT_RE.split(name or "", maxsplit=1):
+        toks = {"united", "states"} if _US_PARTY_RE.match(side) else set(_name_tokens(side))
+        if toks:
+            out.append(toks)
+    return out
+
+
+def _token_close(a: str, b: str) -> bool:
+    """Two name tokens match when equal, one is a prefix of the other, or
+    they are near-identical spellings (handles plurals and minor variants)."""
+    if a == b:
+        return True
+    if len(a) >= 4 and len(b) >= 4 and (a.startswith(b) or b.startswith(a)):
+        return True
+    if len(a) >= 5 and len(b) >= 5:
+        return difflib.SequenceMatcher(None, a, b).ratio() >= 0.85
+    return False
+
+
+def _is_acronym_of(acro: set[str], words: set[str]) -> bool:
+    """True if a one-token party *acro* is the initialism of multi-word party
+    *words*: "nrdc" ↔ {natural, resources, defense, council}, "fec" ↔ {federal,
+    election, commission}, "cfpb" ↔ {consumer, financial, protection, bureau}.
+
+    Lets an agency acronym match its spelled-out name.  The initials are
+    compared as a sorted multiset (party word order is already lost to the set),
+    so it also matches when the words are listed in another order; the exact
+    letter-count match keeps an ordinary short word from matching a party with a
+    different number of words."""
+    if len(acro) != 1 or not (2 <= len(words) <= 6):
+        return False
+    (a,) = acro
+    return 2 <= len(a) <= 6 and sorted(a) == sorted(w[0] for w in words)
+
+
+def _party_overlap(query_party: set[str], cand_party: set[str]) -> float:
+    """Fraction of a query party's tokens found (token-close) in a candidate
+    party — how completely that side of the query name is present."""
+    if not query_party:
+        return 0.0
+    # An agency-style acronym and its spelled-out name are a full match.
+    if (_is_acronym_of(query_party, cand_party)
+            or _is_acronym_of(cand_party, query_party)):
+        return 1.0
+    hit = sum(1 for t in query_party
+              if any(_token_close(t, c) for c in cand_party))
+    return hit / len(query_party)
+
+
+# Frequent party names — every state, "United States", and the generic
+# government plaintiffs — that are too common to identify a case on their own.
+# A match on such a name *alone* (one side of the query) is the weakest kind of
+# hit and is shown only when nothing better turns up; as one side of a genuine
+# two-party match it still counts, so "U.S. v. Texas" matches "United States v.
+# Texas".  Keyed by the party's token set so "New York" → {new, york} is
+# recognized while a distinctive name that merely contains a state word
+# ("Texas Instruments" → {texas, instruments}) is not.
+_COMMON_PARTY_NAMES: set[frozenset[str]] = {
+    frozenset(_name_tokens(_n)) for _n in (
+        [_state for _state, _courts in _STATE_COURTS]
+        + ["United States", "United States of America",
+           "People", "State", "Commonwealth"]
+    )
+}
+_COMMON_PARTY_NAMES.discard(frozenset())
+
+
+def _is_common_party(party: set[str]) -> bool:
+    """True when *party* is a frequent name (a state, "United States", or a
+    generic government plaintiff) — see :data:`_COMMON_PARTY_NAMES`."""
+    return frozenset(party) in _COMMON_PARTY_NAMES
+
+
+# A real party name is short.  A consolidated caption merges dozens of parties
+# into one side ("Foltz, Consumer Action, United Policyholders, Texas Watch … v.
+# State Farm, …"); such a giant blob contains so many tokens it matches almost
+# any query, so a side longer than this is not treated as a clean party.
+_MAX_CLEAN_PARTY = 8
+
+# A reverse-caption match (parties on swapped sides — tier 2) is normally
+# outranked by the case as typed (tier 3) and dropped when a tier-3 match
+# exists.  But a reverse-caption case cited at least this often is a major
+# precedent in its own right and is shown alongside the tier-3 match.
+_REVERSED_PARTY_MIN_CITES = 1000
+
+
+def _name_match_score(query: str, candidate: str) -> float:
+    """Closeness (0..1) of a candidate case name to the query name, scored on
+    how well the query's parties match the candidate's.  Matching one party
+    well scores ~0.5; matching both scores near 1.0."""
+    q_parties = _name_parties(query)
+    c_parties = _name_parties(candidate)
+    if not q_parties or not c_parties:
+        # One-sided name ("In re Gault"), or an unparseable caption: compare
+        # the whole token sets directly.
+        q = set(_name_tokens(query))
+        c = set(_name_tokens(candidate))
+        return _party_overlap(q, c) if q else 0.0
+    per_side = [max(_party_overlap(qp, cp) for cp in c_parties)
+                for qp in q_parties]
+    avg = sum(per_side) / len(per_side)
+    # Reward a both-sides hit so an exact "A v. B" outranks a one-party match.
+    bonus = 0.15 if sum(1 for s in per_side if s >= 0.6) >= 2 else 0.0
+    # Require at least one party to match solidly, so two weak half-matches
+    # don't masquerade as a close hit.
+    if max(per_side) < 0.6:
+        return 0.0
+    return min(1.0, avg + bonus)
+
+
+def _match_tier(query: str, candidate: str) -> int:
+    """How strongly *candidate*'s name matches *query*, as a coarse priority
+    tier (higher wins); only the best tier present is shown — see
+    :func:`_filter_to_best_tier`:
+
+      3 — both parties match on the *same* sides as the query ("Roe v. Wade" →
+          "Roe v. Wade"): the case as captioned; frequent names count here, so
+          "U.S. v. Texas" matches "United States v. Texas".
+      2 — both parties match but on *swapped* sides ("Roe v. Wade" → "Wade v.
+          Roe"): usually a related or reverse-caption case.
+      1 — exactly one party matches and it is distinctive.
+      0 — the only matching party is a frequent name (a state, "United States",
+          a generic government plaintiff), which alone is too weak to mean much
+          — shown only when nothing better was found.
+
+    Returns -1 when the names don't match (the 0.6 per-side floor mirrors
+    :func:`_name_match_score`)."""
+    q_parties = _name_parties(query)
+    c_parties = _name_parties(candidate)
+    if not q_parties or not c_parties:
+        # One-sided name ("In re Gault") or unparseable caption: a whole-set
+        # overlap stands in, treated as a distinctive one-party hit.
+        q = set(_name_tokens(query))
+        c = set(_name_tokens(candidate))
+        return 1 if q and _party_overlap(q, c) >= 0.6 else -1
+
+    def m(qp: set[str], cp: set[str]) -> bool:
+        return len(cp) <= _MAX_CLEAN_PARTY and _party_overlap(qp, cp) >= 0.6
+
+    # Two-party match: the parties must land on *different* candidate sides
+    # (requiring opposite sides stops both matching inside one long name —
+    # "United States Dist. Court for W. Texas" is not "U.S. v. Texas").  Same
+    # orientation as the query (tier 3) beats the swapped caption (tier 2).
+    if len(q_parties) == 2 and len(c_parties) == 2:
+        (qa, qb), (ca, cb) = q_parties, c_parties
+        if m(qa, ca) and m(qb, cb):
+            return 3
+        if m(qa, cb) and m(qb, ca):
+            return 2
+
+    matched = [qp for qp in q_parties if any(m(qp, cp) for cp in c_parties)]
+    if not matched:
+        return -1
+    # One side matched (or both, but on the same candidate party): distinctive
+    # unless every matched party is a frequent name.
+    return 0 if all(_is_common_party(qp) for qp in matched) else 1
+
+
+def _filter_to_best_tier(query: str,
+                         tagged: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+    """Across all sources, keep only the best match tier present (see
+    :func:`_match_tier`): the case as captioned if found, else the swapped
+    caption, else distinctive one-party matches, else frequent-name ones.
+    Applied to the combined results so a strong hit found by *any* pass
+    suppresses the weaker fillers of *every* pass — otherwise the Supreme Court
+    pass, searching by relevance, pads a clean query with one-sided state-name
+    matches ("Smith v. Arizona" for "Miranda v. Arizona").
+
+    One exception: when the best tier is the as-captioned match (3), a
+    swapped-caption match (2) that is itself heavily cited
+    (:data:`_REVERSED_PARTY_MIN_CITES`) is kept alongside it — a major
+    precedent shouldn't vanish just because its caption runs the other way."""
+    rated = [
+        (_match_tier(query, re.sub(
+            r"<[^>]+>", "",
+            it.get("caseName") or it.get("case_name") or "").strip()),
+         bucket, it)
+        for bucket, it in tagged
+    ]
+    best = max((t for t, _b, _it in rated), default=-1)
+    out: list[tuple[str, dict]] = []
+    for t, bucket, it in rated:
+        if t == best:
+            out.append((bucket, it))
+        elif (best == 3 and t == 2
+              and (it.get("citeCount") or 0) >= _REVERSED_PARTY_MIN_CITES):
+            # Re-tag the heavily-cited swapped-caption match into its own bucket
+            # so the as-captioned matches don't crowd it out of the display.
+            out.append(("reversed", it))
+    return out
+
+
+def _case_fingerprints(name: str, cite: str, year: str,
+                       *, include_name: bool = True) -> set[str]:
+    """Identity keys for a case, used to recognize the same case across
+    sources (Google Scholar, CourtListener, English Reports).  Two results are
+    the same case when any fingerprint matches, so each result carries both a
+    citation key (when it has a reporter cite) and a name key — a Scholar hit
+    with only a name still de-duplicates against a CourtListener hit that has
+    both.  Reporter spelling is normalized so "410 U.S. 113" and "410 US 113"
+    collapse to one key.
+
+    The name key is an order-insensitive token set, so "A v. B" and "B v. A"
+    share it and collapse to one row.  Pass ``include_name=False`` for a
+    deliberately-shown reverse-caption match so it de-duplicates only by
+    citation and can sit beside the as-captioned case rather than being eaten
+    by it."""
+    fps: set[str] = set()
+    m = _CITE_PARSE_RE.match(re.sub(r"<[^>]+>", "", cite or "").strip())
+    if m:
+        vol = m.group(1)
+        rep = re.sub(r"[^a-z0-9]", "", m.group(2).lower())
+        page = m.group(3)
+        if rep:
+            fps.add(f"c:{vol}:{rep}:{page}")
+    if include_name:
+        toks = _name_tokens(name)
+        if toks:
+            fps.add("n:" + " ".join(sorted(set(toks))))
+    return fps
+
+
+# How many *distinct* cases each spotlight source/court-tier may display.  A
+# source over-fetches a couple of spare candidates beyond its cap so that, when
+# one of its results duplicates a case already shown by another source, the
+# next-best result takes the slot and the source still shows its full quota.
+_BUCKET_CAPS: dict[str, int] = {
+    "scholar": 2,     # Google Scholar
+    "exact": 3,       # strict AND match of two distinctive parties
+    "ranked": 4,      # CourtListener name matches, ranked by citation count
+    "reversed": 2,    # heavily-cited swapped-caption ("Texas v. United States")
+    "scotus": 3,      # dedicated Supreme Court pass (catches recent/uncited)
+    "juris": 3,       # a single jurisdiction named in the query
+    "cl": 3,          # CourtListener citation-lookup results
+    "engrep": 1,      # English Reports
+}
+
+
+def _dedup_accept(fps: set[str], bucket: str,
+                  seen: set[str], bucket_counts: dict[str, int]) -> bool:
+    """Decide whether to display a result with fingerprints *fps* from
+    *bucket*, given the cases already shown (*seen*) and how many each bucket
+    has shown (*bucket_counts*).  On acceptance, records the fingerprints and
+    bumps the bucket count.  Rejects a case already shown (a cross-source
+    duplicate) or one that would exceed the bucket's display cap."""
+    if fps & seen:
+        return False
+    if bucket and bucket_counts.get(bucket, 0) >= _BUCKET_CAPS.get(bucket, 99):
+        return False
+    seen.update(fps)
+    if bucket:
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+    return True
+
+
+def _is_scotus_order_item(item: dict) -> bool:
+    """True for a SCOTUS "order" entry — a docket/order with no real opinion —
+    which the main search routes out of the primary results and the spotlight
+    likewise drops.  A genuine opinion is recognized by either having been
+    cited by other cases (the top-level ``citeCount``) or citing cases itself
+    (its main opinion's outbound ``cites``); an order does neither.
+
+    The inbound ``citeCount`` check is essential: CourtListener leaves the
+    outbound ``cites`` array empty in *search* payloads even for foundational
+    opinions (Marbury v. Madison, cited ~6000 times, comes back with
+    ``cites == []``), so keying on outbound cites alone wrongly discards them —
+    which made name searches for such cases return nothing at all."""
+    court_val = str(item.get("court_id") or item.get("court") or "")
+    if "scotus" not in court_val.lower():
+        return False
+    if (item.get("citeCount") or 0) > 0:
+        return False
+    opinions = item.get("opinions") or []
+    main_op = max(opinions, key=lambda o: len(o.get("cites") or []),
+                  default=None)
+    cites_count = len(main_op.get("cites") or []) if main_op else 0
+    return cites_count <= 2
+
+
+# --- Jurisdiction hint parsing ----------------------------------------------
+# A query may pin the court itself — "Doe v. Roe (7th Cir. 2009)" — in which
+# case the search is aimed straight at that jurisdiction.  Only a court hint
+# set off from the name (a trailing parenthetical, a trailing clause after a
+# comma, or a bare trailing "Nth Cir.") is recognized, so an ordinary party
+# name is never mistaken for a jurisdiction.
+
+_CIRCUIT_ORDINAL_IDS = {
+    "1st": "ca1", "2d": "ca2", "2nd": "ca2", "3d": "ca3", "3rd": "ca3",
+    "4th": "ca4", "5th": "ca5", "6th": "ca6", "7th": "ca7", "8th": "ca8",
+    "9th": "ca9", "10th": "ca10", "11th": "ca11",
+    "first": "ca1", "second": "ca2", "third": "ca3", "fourth": "ca4",
+    "fifth": "ca5", "sixth": "ca6", "seventh": "ca7", "eighth": "ca8",
+    "ninth": "ca9", "tenth": "ca10", "eleventh": "ca11",
+}
+
+# Reverse lookup of a federal district court's Bluebook abbreviation, with
+# periods/spaces removed ("S.D.N.Y." → "sdny", "N.D. Cal." → "ndcal").
+_DISTRICT_ABBR_IDS = {
+    abbr.replace(".", "").replace(" ", "").lower(): cid
+    for cid, abbr in _DISTRICT_COURTS.items()
+}
+
+# State name → that state's court list, and every state court's Bluebook
+# abbreviation (all levels) → its CourtListener court id, for resolving a
+# state court hint ("Cal." → cal, "Cal. Ct. App." → calctapp).
+_STATE_NAME_COURTS = {state.lower(): courts for state, courts in _STATE_COURTS}
+_STATE_COURT_ABBR_IDS = {
+    abbr.replace(".", "").replace(" ", "").lower(): cid
+    for _state, courts in _STATE_COURTS for cid, abbr, _label in courts
+}
+
+_CIRCUIT_HINT_RE = re.compile(
+    r"(?P<ord>\d{1,2}(?:st|nd|rd|d|th)|first|second|third|fourth|fifth|"
+    r"sixth|seventh|eighth|ninth|tenth|eleventh)\s+cir(?:cuit)?\.?",
+    re.IGNORECASE,
+)
+_DC_CIRCUIT_HINT_RE = re.compile(r"\bd\.?\s*c\.?\s+cir(?:cuit)?\.?", re.IGNORECASE)
+_FED_CIRCUIT_HINT_RE = re.compile(r"\bfed(?:eral)?\.?\s+cir(?:cuit)?\.?",
+                                  re.IGNORECASE)
+_SCOTUS_HINT_RE = re.compile(
+    r"\b(?:scotus|u\.?\s*s\.?\s+supreme\s+court|united\s+states\s+supreme\s+"
+    r"court|supreme\s+court\s+of\s+the\s+united\s+states)\b",
+    re.IGNORECASE,
+)
+_YEAR_TAIL_RE = re.compile(r"[\s,]*(?:19|20)\d{2}\s*$")
+
+
+def _classify_court_hint(hint: str) -> Optional[tuple[str, str]]:
+    """Resolve a court-hint string ("7th Cir.", "S.D.N.Y.", "Cal.") to
+    (space-separated court ids, label), or None when it names no known court."""
+    h = _YEAR_TAIL_RE.sub("", (hint or "").strip()).strip(" ,.;()[]")
+    if not h:
+        return None
+    low = h.lower()
+
+    if _SCOTUS_HINT_RE.search(low):
+        return _SCOTUS_COURT_ID, "U.S. Supreme Court"
+    m = _CIRCUIT_HINT_RE.search(low)
+    if m:
+        cid = _CIRCUIT_ORDINAL_IDS.get(m.group("ord").lower())
+        if cid:
+            return cid, _CIRCUIT_COURTS.get(cid, cid)
+    if _DC_CIRCUIT_HINT_RE.search(low):
+        return "cadc", _CIRCUIT_COURTS["cadc"]
+    if _FED_CIRCUIT_HINT_RE.search(low):
+        return "cafc", _CIRCUIT_COURTS["cafc"]
+
+    # Federal district court, by its Bluebook abbreviation.
+    key = low.replace(".", "").replace(" ", "")
+    cid = _DISTRICT_ABBR_IDS.get(key)
+    if cid:
+        return cid, _DISTRICT_COURTS[cid]
+
+    # State court by its Bluebook abbreviation, any level ("Cal." → cal,
+    # "Cal. Ct. App." → calctapp, "Tex. App." → texapp).
+    cid = _STATE_COURT_ABBR_IDS.get(key)
+    if cid:
+        return cid, _COURT_BLUEBOOK.get(cid, cid)
+
+    # State named in full ("California", "California Court of Appeal"):
+    # identify the state, then classify the specific court it names.
+    for state_low, courts in _STATE_NAME_COURTS.items():
+        if low == state_low or low.startswith(state_low + " "):
+            cid = _classify_state_court(low, courts)
+            return cid, _COURT_BLUEBOOK.get(cid, cid)
+    return None
+
+
+def _detect_jurisdiction(query: str) -> Optional[tuple[str, str, str]]:
+    """If *query* pins a court — "Doe v. Roe (7th Cir. 2009)", "Smith, 9th
+    Cir." — return (court_ids, name_without_hint, label).  None otherwise."""
+    q = (query or "").strip()
+
+    # 1. A trailing parenthetical: "... (7th Cir. 2009)".
+    m = re.search(r"[(\[]([^)\]]*)[)\]]\s*$", q)
+    if m:
+        hit = _classify_court_hint(m.group(1))
+        if hit:
+            name = q[:m.start()].strip(" ,;-–—")
+            return hit[0], name, hit[1]
+
+    # 2. A trailing clause after the last comma: "..., 9th Cir.".
+    if "," in q:
+        head, tail = q.rsplit(",", 1)
+        if tail.strip() and len(tail.split()) <= 4:
+            hit = _classify_court_hint(tail)
+            if hit:
+                return hit[0], head.strip(" ,;-–—"), hit[1]
+
+    # 3. A bare trailing circuit, with no delimiter: "... 7th Cir.".
+    for rx in (_CIRCUIT_HINT_RE, _DC_CIRCUIT_HINT_RE, _FED_CIRCUIT_HINT_RE):
+        m = rx.search(q)
+        if m and _YEAR_TAIL_RE.sub("", q[m.end():]).strip() == "":
+            hit = _classify_court_hint(q[m.start():])
+            if hit:
+                return hit[0], q[:m.start()].strip(" ,;-–—"), hit[1]
+    return None
+
+
+# --- Name-restricted CourtListener search -----------------------------------
+
+def _cl_casename_query(name: str, *, strict: bool = False) -> str:
+    """A flexible ``caseName`` query that retrieves a candidate when a
+    *distinctive* party of an "A v. B" name is present.
+
+    CourtListener's ``caseName`` field is AND-by-default, so the obvious
+    ``caseName:(chevron nrdc)`` finds *nothing* for "Chevron v. NRDC": the
+    stored caption is "Chevron U.S.A. Inc. v. Natural Resources Defense
+    Council, Inc.", which contains "chevron" but not the abbreviation "nrdc".
+    Instead each distinctive party's tokens are AND'd within their own
+    ``caseName`` group and the groups are OR'd, so an opinion matching one side
+    is still retrieved; ranking then sorts the genuinely relevant ones up.
+
+    A frequent party (a state, "United States" — see
+    :data:`_COMMON_PARTY_NAMES`) is deliberately left out of the OR: it is a
+    party in an unmanageable number of cases ("United States v. …" alone is
+    hundreds of thousands), so OR-ing it would crowd the actual case off the
+    page.  Its presence is confirmed afterwards by :func:`_match_tier`.  Only
+    when *every* party is a frequent name ("U.S. v. Texas") are all parties
+    AND'd together — their combination is specific enough to find the case.
+
+    With ``strict``, the distinctive parties are AND'd into a single group
+    rather than OR'd — a precise query that pins the exact two-party case even
+    when it is too lightly cited to surface among the broad OR results, and
+    that leans on CourtListener's own acronym expansion ("FEC v. Cruz" →
+    ``caseName:(cruz fec)`` finds "Ted Cruz for Senate v. Federal Election
+    Commission")."""
+    parties = _name_parties(name)
+    distinctive = [p for p in parties if not _is_common_party(p)]
+    if distinctive and not strict:
+        return " OR ".join(
+            f"caseName:({' '.join(sorted(p))})" for p in distinctive
+        )
+    pool = distinctive or parties
+    if pool:
+        return f"caseName:({' '.join(sorted(set().union(*pool)))})"
+    toks = _name_tokens(name)
+    return f"caseName:({' '.join(toks)})" if toks else (name or "").strip()
+
+
+def _cl_name_search(client, name: str, court_ids: Optional[str], *,
+                    page_size: int = 20, limit: int = 3, spare: int = 0,
+                    drop_scotus_orders: bool = False,
+                    order_by_citecount: bool = False,
+                    strict: bool = False) -> list[dict]:
+    """Search a (set of) court(s) for a case *name*, restricting the query to
+    the caseName field (matching either party — see :func:`_cl_casename_query`),
+    then return the items whose names are reasonably close to *name*, best
+    first.  Up to ``limit + spare`` are returned: the caller displays ``limit``
+    of them and keeps the spares to replace any that turn out to duplicate a
+    case already shown by another source.
+
+    ``order_by_citecount`` controls which candidates are *fetched* (the API
+    returns one page): when set, the most-cited matches are retrieved, which is
+    essential for the either-party search — the canonical case (e.g. Chevron)
+    often matches only one party and would otherwise fall outside the page,
+    while its huge citation count pulls it in.  When unset (the Supreme Court
+    pass), the API's relevance order is used so a recent, as-yet-uncited
+    decision is still fetched.  ``strict`` AND's the distinctive parties into
+    one precise query (see :func:`_cl_casename_query`) to pin a lightly-cited
+    exact case."""
+    q = _cl_casename_query(name, strict=strict)
+    if not q:
+        return []
+    extra = {"order_by": "citeCount desc"} if order_by_citecount else None
+    try:
+        data = client.search(q, type="o", court=court_ids or None,
+                             page_size=page_size, extra=extra)
+        results = data.get("results") or []
+    except Exception as exc:
+        print(f"[cl-name] search failed for court={court_ids!r}: {exc}")
+        return []
+    if drop_scotus_orders:
+        results = [it for it in results if not _is_scotus_order_item(it)]
+
+    scored: list[tuple[int, float, int, dict]] = []
+    for it in results:
+        cand = re.sub(
+            r"<[^>]+>", "",
+            it.get("caseName") or it.get("case_name") or "",
+        ).strip()
+        score = _name_match_score(name, cand)
+        if score >= _NAME_MATCH_MIN:
+            scored.append((_match_tier(name, cand),
+                           score, it.get("citeCount") or 0, it))
+    # Sort by match tier first (as-captioned over swapped over one-party over
+    # frequent-name — see _match_tier), so a stronger match is never crowded out
+    # of the page by a more-cited but weaker one; then by closeness, then by
+    # citation count (the authority signal that stands in for walking the court
+    # hierarchy, so "Brown v. Board of Education", cited thousands of times,
+    # outranks a one-off "Board of Education v. Brown").  The caller's
+    # _filter_to_best_tier then drops the lower tiers once every source's
+    # results are pooled.
+    scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    kept = scored[:limit + spare]
+    # Carry through any heavily-cited swapped-caption (tier 2) match the page cap
+    # cut, so a major reverse-caption precedent reaches _filter_to_best_tier even
+    # when the as-captioned matches fill the page (e.g. six "United States v. …
+    # Texas" cases ahead of "Texas v. United States").
+    kept += [t for t in scored[limit + spare:]
+             if t[0] == 2 and t[2] >= _REVERSED_PARTY_MIN_CITES]
+    return [it for _tier, _score, _cites, it in kept]
+
+
+def _cl_name_ranked_search(client, query: str) -> list[tuple[str, dict]]:
+    """Name-ranked CourtListener results for a quick-search *query* that is a
+    case name (not a reporter citation), as ``(bucket, item)`` pairs whose
+    bucket carries each result's display cap (see ``_BUCKET_CAPS``).
+
+    When the query pins a jurisdiction ("... (7th Cir. 2009)"), the best name
+    matches in that court are returned.  Otherwise these passes run in parallel:
+
+    * ``exact`` — only when the query names two distinctive parties: an AND of
+      both, which pins the exact case even when it is too lightly cited to
+      surface in the broad passes ("FEC v. Cruz", "NRDC v. EPA").
+    * ``ranked`` — across all courts, retrieving the most-cited name matches
+      and ordering them by closeness then citation count.  Citation count is
+      the authority signal that replaces walking the court hierarchy, and it
+      lets a case that matches only one party (e.g. Chevron) still surface.
+    * ``scotus`` — the Supreme Court alone, by relevance, so a recent,
+      as-yet-uncited SCOTUS decision (which the citation-count ordering would
+      bury) is still shown.
+
+    The groups are concatenated exact-, then ranked-, then scotus-first, and
+    cross-source de-duplication keeps each later pass to the cases the earlier
+    ones didn't already surface.  Each pass over-fetches a couple of spares so
+    duplicates dropped during display can be replaced.  Finally the pooled
+    results are reduced to their best match tier (see
+    :func:`_filter_to_best_tier`), so one-party fillers are dropped whenever a
+    genuine two-party match was found by any pass."""
+    juris = _detect_jurisdiction(query)
+    if juris:
+        court_ids, name, _label = juris
+        items = _cl_name_search(
+            client, name or query, court_ids, limit=3, spare=2,
+            drop_scotus_orders=(court_ids == _SCOTUS_COURT_ID),
+        )
+        return _filter_to_best_tier(name or query,
+                                    [("juris", it) for it in items])
+
+    # (bucket, court ids, how many to show, drop SCOTUS orders, citeCount, strict)
+    passes = [
+        ("ranked", None, 4, False, True, False),
+        ("scotus", _SCOTUS_COURT_ID, 3, True, False, False),
+    ]
+    # A two-distinctive-party query also gets a strict AND pass that pins the
+    # exact case when it is too lightly cited for the broad passes to reach.
+    if len([p for p in _name_parties(query) if not _is_common_party(p)]) >= 2:
+        passes.insert(0, ("exact", None, 3, False, True, True))
+    groups: list[list[tuple[str, dict]]] = [[] for _ in passes]
+
+    def run_pass(i: int) -> None:
+        bucket, court_ids, lim, drop, by_cites, strict = passes[i]
+        groups[i] = [
+            (bucket, it) for it in _cl_name_search(
+                client, query, court_ids, limit=lim, spare=2,
+                drop_scotus_orders=drop, order_by_citecount=by_cites,
+                strict=strict,
+            )
+        ]
+
+    # Run the passes in parallel, then concatenate exact-/ranked-first.
+    with ThreadPoolExecutor(max_workers=len(passes)) as ex:
+        for _ in as_completed([ex.submit(run_pass, i) for i in range(len(passes))]):
+            pass
+    out: list[tuple[str, dict]] = []
+    for group in groups:
+        out.extend(group)
+    return _filter_to_best_tier(query, out)
 
 
 _OPINION_TYPE_LABELS: dict[str, str] = {
@@ -1334,7 +2108,10 @@ class CourtListenerGUI:
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-        self._tree.bind("<Double-1>", lambda _e: self._download_selected())
+        # Double-click opens the Google Scholar text (falling back to the
+        # CourtListener text, then a case.law PDF) — the reading view, not a
+        # download.  "Download PDF" remains on the button below.
+        self._tree.bind("<Double-1>", lambda _e: self._fetch_scholar_text())
         self._tree.bind("<<TreeviewSelect>>", lambda _e: self._on_row_select(self._tree))
         self._tree.bind("<Button-3>", lambda e: self._on_right_click(e, self._tree))
 
@@ -1359,7 +2136,7 @@ class CourtListenerGUI:
         self._orders_tree.configure(yscrollcommand=vsb2.set)
         self._orders_tree.pack(side="left", fill="x", expand=True)
         vsb2.pack(side="right", fill="y")
-        self._orders_tree.bind("<Double-1>", lambda _e: self._download_selected())
+        self._orders_tree.bind("<Double-1>", lambda _e: self._fetch_scholar_text())
         self._orders_tree.bind(
             "<<TreeviewSelect>>", lambda _e: self._on_row_select(self._orders_tree)
         )
@@ -1669,42 +2446,48 @@ class CourtListenerGUI:
             except tk.TclError:
                 pass
 
-        # Resize popup to accommodate results
+        # The dropdown grows to fit its results.  The court hierarchy can now
+        # return more than the old fixed six rows — up to three Supreme Court
+        # matches, two courts-of-appeals, and two state-high-court matches,
+        # plus the two Google Scholar matches and an English Reports row — so
+        # the popup starts just tall enough for the "Searching…" line and is
+        # resized as each result row streams in (up to max_rows).
         pw = 580
         row_h = 52
-        max_rows = 6
+        row_gap = 2
+        max_rows = 10
         header_h = 48
-        # extra for the per-slot gap and the status label pinned at the bottom
-        dropdown_h = max_rows * (row_h + 2) + 36
+        status_h = 26
         sx = popup.winfo_screenwidth()
         sy = popup.winfo_screenheight()
-        popup.geometry(
-            f"{pw}x{header_h + dropdown_h}"
-            f"+{(sx - pw) // 2}+{sy // 3}"
-        )
+        pos_x = (sx - pw) // 2
+        pos_y = sy // 3
+
+        def _resize_to(n_rows: int) -> None:
+            n = max(0, min(n_rows, max_rows))
+            body_h = n * (row_h + row_gap) + status_h + 6
+            try:
+                popup.geometry(f"{pw}x{header_h + body_h}+{pos_x}+{pos_y}")
+            except tk.TclError:
+                pass
+
+        _resize_to(0)
 
         # Results frame below the search bar
         results_frame = tk.Frame(border, bg="#f0f0f0")
         results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
         self._spotlight_results_frame = results_frame
 
-        # Pre-place fixed-height result slots so streaming results land in stable
-        # positions: a result that comes back first never shifts when later ones
-        # fill the slots below it.  Empty slots match the dropdown background, so
-        # they stay invisible until filled.
-        slots: list[tk.Frame] = []
-        for _ in range(max_rows):
-            slot = tk.Frame(results_frame, bg="#f0f0f0", height=row_h)
-            slot.pack(side="top", fill="x", padx=4, pady=(2, 0))
-            slot.pack_propagate(False)  # keep the slot's height fixed
-            slots.append(slot)
-
         # Tracking state
         result_rows: list[dict] = []
         selected_idx = [-1]  # mutable via closure
+        # Cross-source de-duplication: fingerprints of the cases already shown,
+        # and how many each source/court-tier has shown.
+        seen_cases: set[str] = set()
+        bucket_counts: dict[str, int] = {}
 
-        def _add_result(court_id: str, name: str, cite: str, year: str,
-                        source_label: str, open_fn) -> None:
+        def _add_result(bucket: str, court_id: str, name: str, cite: str,
+                        year: str, source_label: str, open_fn) -> None:
             # Ignore results streaming in from a superseded search.
             if my_gen != self._spotlight_generation:
                 return
@@ -1718,10 +2501,23 @@ class CourtListenerGUI:
             if idx >= max_rows:
                 return
 
-            # Fill the pre-placed slot in situ (no new pack → no reflow, so the
-            # rows already on screen keep their exact position).
-            row = slots[idx]
-            row.config(bg="#ffffff", cursor="hand2")
+            # Skip a case already shown by another source (and respect the
+            # source's per-tier display cap); the source's next-best result
+            # then takes this slot instead.  A reverse-caption match is shown on
+            # purpose beside the as-captioned case, so it de-duplicates only by
+            # citation (its name key would collide with the case it sits next to).
+            fps = _case_fingerprints(name, cite, year,
+                                     include_name=(bucket != "reversed"))
+            if not _dedup_accept(fps, bucket, seen_cases, bucket_counts):
+                return
+
+            # Append a fresh row at the bottom.  Rows are added in arrival order
+            # and never moved, so a result already on screen keeps its position
+            # while the dropdown grows downward to fit the new one.
+            row = tk.Frame(results_frame, bg="#ffffff", height=row_h,
+                           cursor="hand2")
+            row.pack(side="top", fill="x", padx=4, pady=(row_gap, 0))
+            row.pack_propagate(False)  # keep the row's height fixed
 
             court_abbr = _COURT_BLUEBOOK.get(
                 court_id, court_id.upper() if court_id else "?"
@@ -1775,6 +2571,9 @@ class CourtListenerGUI:
             for child in text_frame.winfo_children():
                 child.bind("<Button-1>", on_click)
 
+            # Grow the dropdown to fit the row just added.
+            _resize_to(len(result_rows))
+
         def _highlight(idx: int) -> None:
             for i, r in enumerate(result_rows):
                 bg = "#d0e0f0" if i == idx else "#ffffff"
@@ -1826,7 +2625,7 @@ class CourtListenerGUI:
                 self._open_main_from_spotlight(popup)
         entry.bind("<Return>", _entry_return)
 
-        # Status label, pinned at the bottom so the result slots above it stay
+        # Status label, pinned at the bottom so the result rows above it stay
         # put as results stream in.
         status_lbl = tk.Label(
             results_frame, text="Searching…", bg="#f0f0f0", fg="#999999",
@@ -1866,7 +2665,7 @@ class CourtListenerGUI:
                 _PdfWindow(self.root, u, t, self._status_var.set)
 
             self.root.after(
-                0, _add_result, "", f"{cite_label} — Federal Appendix",
+                0, _add_result, "appx", "", f"{cite_label} — Federal Appendix",
                 cite_label, "", "case.law PDF", _open_appx,
             )
             search_done[0] = total_searches  # nothing else runs for an F. App'x cite
@@ -1885,10 +2684,27 @@ class CourtListenerGUI:
                 self.root.after(0, _update_status)
                 return
             try:
-                results = fetcher.search_cases(query, limit=3)
+                results = fetcher.search_cases(query, limit=10)
             except Exception:
                 results = []
-            for r in results[:3]:
+            if _LINE_CITE_RE.search(query):
+                # A reporter citation in the query pins the case, so keep
+                # Google Scholar's own relevance order (top few).
+                results = results[:3]
+            else:
+                # Just a name: Google Scholar, like CourtListener, ranks on the
+                # whole opinion text, so re-rank its hits by how closely their
+                # title (the case name) matches the query and show the best two.
+                # A couple of spares are kept past the two shown so a duplicate
+                # of a case another source already listed can be replaced.
+                scored = [
+                    (_name_match_score(query, getattr(r, "title", "") or ""), r)
+                    for r in results
+                ]
+                scored = [(s, r) for s, r in scored if s >= _NAME_MATCH_MIN]
+                scored.sort(key=lambda x: x[0], reverse=True)
+                results = [r for _s, r in scored[:4]]
+            for r in results:
                 court_id = _scholar_source_to_court_id(r.source)
                 year = _scholar_source_year(r.source)
                 # The case's own reporter citation sits in the source byline.
@@ -1927,7 +2743,7 @@ class CourtListenerGUI:
                     return open_it
 
                 self.root.after(
-                    0, _add_result, court_id, r.title, cite, year,
+                    0, _add_result, "scholar", court_id, r.title, cite, year,
                     "Scholar", make_opener(),
                 )
             search_done[0] += 1
@@ -1942,11 +2758,14 @@ class CourtListenerGUI:
                 search_done[0] += 1
                 self.root.after(0, _update_status)
                 return
-            results = []
-            # When the query is a bare reporter citation ("514 F. App'x 210"),
-            # resolve it precisely via citation-lookup first — full-text search
-            # often mismatches such citations to the wrong case.
+
             if _LINE_CITE_RE.search(query):
+                # A reporter citation ("514 F. App'x 210"): resolve it precisely
+                # via citation-lookup first — full-text search often mismatches
+                # a bare citation — and fall back to a plain search only if that
+                # finds nothing, dropping SCOTUS "order" entries as the main
+                # search does.
+                results: list[dict] = []
                 try:
                     for entry in client.lookup_citation(query):
                         if entry.get("status") != 200:
@@ -1955,31 +2774,26 @@ class CourtListenerGUI:
                             results.append(_item_from_cluster(cl))
                 except Exception:
                     pass
-            if not results:
-                try:
-                    # Over-fetch so we can still fill 3 rows after dropping
-                    # SCOTUS "order" entries (≤ 2 outbound citations), the same
-                    # ones the main search routes out of the primary results.
-                    data = client.search(query, type="o", page_size=10)
-                    results = data.get("results") or []
-                except Exception:
-                    results = []
+                if not results:
+                    try:
+                        data = client.search(query, type="o", page_size=10)
+                        results = data.get("results") or []
+                    except Exception:
+                        results = []
+                    results = [it for it in results
+                               if not _is_scotus_order_item(it)][:3]
+                tagged = [("cl", it) for it in results]
+            else:
+                # Just words (a case name): CourtListener gives the name no
+                # weight over the body text, so rank by case-name closeness
+                # across the court hierarchy — Supreme Court (up to 3), federal
+                # courts of appeals (up to 2), state courts of last resort (up
+                # to 2) — or a single named jurisdiction when the query gives
+                # one ("... (7th Cir. 2009)").  Each result is tagged with the
+                # court tier that caps how many of it are shown.
+                tagged = _cl_name_ranked_search(client, query)
 
-            def _is_scotus_order(it: dict) -> bool:
-                court_val = str(it.get("court_id") or it.get("court") or "")
-                if "scotus" not in court_val.lower():
-                    return False
-                opinions = it.get("opinions") or []
-                main_op = max(
-                    opinions,
-                    key=lambda o: len(o.get("cites") or []),
-                    default=None,
-                )
-                cites_count = len(main_op.get("cites") or []) if main_op else 0
-                return cites_count <= 2
-
-            results = [it for it in results if not _is_scotus_order(it)]
-            for item in results[:3]:
+            for bucket, item in tagged:
                 case_name = re.sub(
                     r"<[^>]+>", "",
                     item.get("caseName") or item.get("case_name") or "",
@@ -2015,8 +2829,8 @@ class CourtListenerGUI:
                     return open_it
 
                 self.root.after(
-                    0, _add_result, court_id, case_name, cite_str, year,
-                    "CourtListener", make_opener(),
+                    0, _add_result, bucket, court_id, case_name, cite_str,
+                    year, "CourtListener", make_opener(),
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
@@ -2044,8 +2858,8 @@ class CourtListenerGUI:
                 # "[1799] EngR 236" but was decided 1765).  The E.R. citation
                 # already identifies the case, so show it without a wrong year.
                 self.root.after(
-                    0, _add_result, "engrep", case.name, case.er_cite,
-                    "", "English Reports", make_opener(),
+                    0, _add_result, "engrep", "engrep", case.name,
+                    case.er_cite, "", "English Reports", make_opener(),
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
@@ -5656,7 +6470,8 @@ class _ScholarTextWindow:
             self._fn_tip.destroy()
             self._fn_tip = None
 
-    def _insert_span(self, span, block_tags: tuple, neutral: bool = False) -> None:
+    def _insert_span(self, span, block_tags: tuple, neutral: bool = False,
+                     link_tag: Optional[str] = None) -> None:
         txt = self._text
         tags = list(block_tags)
         if span.pagenum:
@@ -5692,52 +6507,65 @@ class _ScholarTextWindow:
             txt.insert("end", span.text, tuple(tags))
             return
         if span.link:
-            # Scholar pre-hyperlinks cited cases, so they never pass through
-            # _insert_plain_with_links — capture any reporter cite in the link
-            # text here too, so a following "Id." resolves to THIS case rather
-            # than the last plain-text cite (often the opinion's own caption).
-            # The cite may be a short form ("Quinn, 8 F.4th at 565"); resolve
-            # it back to the case's full cite via the document index.
-            ref, pin = _cite_target_from_text(span.text, self._short_cite_index)
-            if ref:
-                self._last_cite_action = ("cite", ref)
-            # Federal Appendix cite Scholar hyperlinked (often to the wrong
-            # scholar_case page) — route it through our cite handler, which opens
-            # the official static.case.law PDF instead of Scholar's text.
-            if ref and _FED_APPX_RE.search(ref):
-                action = ("cite", ref + (f"@{pin}" if pin else ""))
-                self._last_cite_action = ("cite", ref)
-                tags += ["citelink", self._new_link(action)]
-                txt.insert("end", span.text, tuple(tags))
-                return
-            # If Scholar's hyperlink covers an English Reports citation we have
-            # in our own index ("156 Eng. Rep. 145"), point it at our CommonLII
-            # scan instead — Scholar's own copy of these old English cases is
-            # usually missing or a poor scan.  Only override on a real index
-            # match, so unknown E.R. cites keep Scholar's link.
-            er_m = eng_rep.ER_CITE_RE.search(span.text)
-            if er_m:
-                er_spec = eng_rep.cite_spec(er_m)
-                if eng_rep.resolve(er_spec):
-                    action = ("engrep", er_spec)
-                    self._last_cite_action = action
-                    tags += ["citelink", self._new_link(action)]
-                    txt.insert("end", span.text, tuple(tags))
-                    return
-            # Carry any pincite so the opened case jumps to it (Scholar's own
-            # hyperlink otherwise opens the case at the top), and any reporter
-            # cite from the link text so that — if Google's flaky servers fail
-            # the fetch — we can still locate the case on CourtListener.
-            value = span.link
-            if pin:
-                value += f"\tpin={pin}"
-            if ref:
-                value += f"\tcite={ref}"
-            tags += ["citelink", self._new_link(("url", value))]
+            # A Google Scholar case hyperlink.  Its click action is computed
+            # from the *whole* reference (see _scholar_link_action); when the
+            # link is split across several styled spans (italic case name, roman
+            # reporter cite, …), _insert_block hands every span the one shared
+            # *link_tag* so clicking the case name, the reporter, the year — any
+            # part — does the same thing and the same CourtListener / case.law
+            # fallback applies if Google Scholar fails.
+            if link_tag is None:
+                link_tag = self._new_link(
+                    self._scholar_link_action(span.text, span.link)
+                )
+            tags += ["citelink", link_tag]
             txt.insert("end", span.text, tuple(tags))
             return
         # Plain text: make recognizable citations clickable
         self._insert_plain_with_links(span.text, tuple(tags))
+
+    def _scholar_link_action(self, full_text: str, href: str) -> tuple[str, str]:
+        """The click action for a Google Scholar case hyperlink whose text is
+        *full_text* (the whole reference — case name through reporter cite).
+
+        Reading the cite and case name from the full text (not a styled
+        fragment) means a link split across spans still resolves, and lets a
+        Federal Appendix or English Reports cite be rerouted to its own better
+        source.  Records this as the last cited case so a following "Id."
+        resolves to it.  A short form ("Quinn, 8 F.4th at 565") is resolved back
+        to the full cite via the document index; old nominative SCOTUS cites
+        ("3 Dall. 386") are captured too, so a link Google can't open still
+        falls back to CourtListener / case.law instead of dead-ending."""
+        ref, pin = _link_cite(full_text, self._short_cite_index)
+        if ref:
+            self._last_cite_action = ("cite", ref)
+        # Federal Appendix cite Scholar hyperlinked (often to the wrong
+        # scholar_case page) — open the official static.case.law PDF instead.
+        if ref and _FED_APPX_RE.search(ref):
+            self._last_cite_action = ("cite", ref)
+            return ("cite", ref + (f"@{pin}" if pin else ""))
+        # An English Reports cite we hold → our CommonLII scan (Scholar's copy
+        # of these old English cases is usually missing or a poor scan).  Only
+        # override on a real index match, so unknown E.R. cites keep the link.
+        er_m = eng_rep.ER_CITE_RE.search(full_text)
+        if er_m:
+            er_spec = eng_rep.cite_spec(er_m)
+            if eng_rep.resolve(er_spec):
+                self._last_cite_action = ("engrep", er_spec)
+                return ("engrep", er_spec)
+        # Open the Scholar opinion, carrying the pincite (so it jumps to the
+        # right page), the reporter cite, and the case name so a failed/blocked
+        # fetch still locates the case on CourtListener (by cite, or by name
+        # when no cite parses) / case.law.
+        value = href
+        if pin:
+            value += f"\tpin={pin}"
+        if ref:
+            value += f"\tcite={ref}"
+        link_name = _link_name(full_text)
+        if link_name:
+            value += f"\tname={link_name}"
+        return ("url", value)
 
     def _const_link_action(self, spec: str, matched_text: str):
         """Action for a U.S. Constitution citation, or None to leave it as plain
@@ -5763,15 +6591,19 @@ class _ScholarTextWindow:
         txt = self._text
         # A bare "Id." in the previous span may have its pin ("at N") here —
         # Scholar italicizes "Id." into its own span, splitting it from the
-        # page.  Attach the pin to that link and fold "at N" into it.
+        # page.  Link "Id. … at N" (the already-rendered "Id." retroactively,
+        # plus the pin here) only when N is a page of that reporter, not a
+        # record page (see _id_pin_in_range); otherwise leave it as plain text.
         pend = self._pending_id
         self._pending_id = None
         if pend:
+            id_start, id_end, ref = pend
             mp = re.match(r"\s*,?\s*at\s+(\d{1,5})\b", text)
-            if mp:
-                tag, ref = pend
-                self._link_actions[tag] = ("cite", f"{ref}@{mp.group(1)}")
-                txt.insert("end", text[:mp.end()], tags + ("citelink", tag))
+            if mp and _id_pin_in_range(ref, mp.group(1)):
+                link_tag = self._new_link(("cite", f"{ref}@{mp.group(1)}"))
+                txt.tag_add("citelink", id_start, id_end)
+                txt.tag_add(link_tag, id_start, id_end)
+                txt.insert("end", text[:mp.end()], tags + ("citelink", link_tag))
                 text = text[mp.end():]
                 if not text:
                     return
@@ -5844,16 +6676,21 @@ class _ScholarTextWindow:
                 action = ("cite", m)  # m is the pre-built "vol rep page@pin"
                 cite_base = m.split("@")[0]
             elif kind == "idcite":
-                # "Id. at N" → whatever was cited last, be it a case or a
-                # statute, pinned to N when it's a case.
+                # "Id., at N" → the case last cited, pinned to N — but only when
+                # N is plausibly a page of that reporter (within _ID_PIN_WINDOW
+                # of its start), so an "Id., at 45" into the trial record isn't
+                # linked to the wrong page.  A bare "Id." with no page is never
+                # linked here; when its "at N" sits in the next span (Scholar
+                # splits them), it's resolved by the _pending_id path above.
                 la = self._last_cite_action
-                if not la:
-                    action = None  # nothing to point at — leave it as plain text
+                pin = m.group(1)
+                if pin is None or not la:
+                    action = None
                 elif la[0] == "cite":
-                    pin = m.group(1)
-                    action = ("cite", la[1] + (f"@{pin}" if pin else ""))
+                    action = (("cite", f"{la[1]}@{pin}")
+                              if _id_pin_in_range(la[1], pin) else None)
                 else:
-                    action = la  # statute/regulation/rule/constitution → reopen
+                    action = la  # statute/regulation/rule → reopen (no pin page)
             elif kind == "statestat":
                 # In-app for priority states (once a parser exists), else a
                 # browser link-out.  `m` here is a state_statutes.Cite record.
@@ -5868,26 +6705,26 @@ class _ScholarTextWindow:
             else:
                 action = ("cfr", ecfr.cite_spec(m))
             if action is None:
-                txt.insert("end", text[start:end], tags)  # unresolved Id. cite
-                self._pending_id = None
+                id_start = txt.index("end-1c")
+                txt.insert("end", text[start:end], tags)  # plain text
+                la = self._last_cite_action
+                if (kind == "idcite" and m.group(1) is None
+                        and la and la[0] == "cite"):
+                    # A bare "Id." pointing at a case: render it plain for now
+                    # and remember where, so it's linked from here only if its
+                    # "at N" (in the next span) is in range (see _pending_id).
+                    self._pending_id = (id_start, txt.index("end-1c"), la[1])
+                else:
+                    self._pending_id = None
             else:
                 link_tag = self._new_link(action)
                 txt.insert("end", text[start:end], tags + ("citelink", link_tag))
-                if kind == "idcite":
-                    # A pin-less "Id." pointing at a case may take its pin from
-                    # the next span (Scholar splits "Id." off from "at N").
-                    la = self._last_cite_action
-                    if m.group(1) is None and la and la[0] == "cite":
-                        self._pending_id = (link_tag, la[1])
-                    else:
-                        self._pending_id = None
-                else:
-                    self._pending_id = None
-                    # Remember this citation so a following "Id." points to it.
-                    if kind in ("cite", "shortcite"):
-                        self._last_cite_action = ("cite", cite_base)
-                    else:
-                        self._last_cite_action = action
+                self._pending_id = None
+                # Remember this citation so a following "Id." points to it.
+                if kind in ("cite", "shortcite"):
+                    self._last_cite_action = ("cite", cite_base)
+                elif kind != "idcite":
+                    self._last_cite_action = action
             pos = end
         if pos < len(text):
             tail = text[pos:]
@@ -5969,9 +6806,38 @@ class _ScholarTextWindow:
         if link_ranges:
             self._insert_spans_with_links(block, block_tags, neutral, link_ranges)
         else:
-            for span in block.spans:
-                self._insert_span(span, block_tags, neutral=neutral)
+            self._insert_spans_grouped(block.spans, block_tags, neutral)
         self._text.insert("end", "\n\n", block_tags)
+
+    def _insert_spans_grouped(self, spans, block_tags: tuple,
+                              neutral: bool) -> None:
+        """Render a block's spans, giving every span of one Google Scholar case
+        hyperlink — which Scholar often splits across italic/roman runs ("<i>
+        Calder</i> v. <i>Bull,</i> 3 Dall. 386") — a single shared click action
+        computed from the whole link text, so clicking the case name, the
+        reporter, or anywhere in the link follows it and falls back identically.
+        Non-link spans render one at a time as before."""
+        def is_case_link(s) -> bool:
+            return bool(s.link) and not (s.pagenum or s.fnref or s.fndef)
+
+        i, n = 0, len(spans)
+        while i < n:
+            if is_case_link(spans[i]):
+                href = spans[i].link
+                j = i + 1
+                while j < n and is_case_link(spans[j]) and spans[j].link == href:
+                    j += 1
+                full_text = "".join(s.text for s in spans[i:j])
+                link_tag = self._new_link(
+                    self._scholar_link_action(full_text, href)
+                )
+                for s in spans[i:j]:
+                    self._insert_span(s, block_tags, neutral=neutral,
+                                      link_tag=link_tag)
+                i = j
+            else:
+                self._insert_span(spans[i], block_tags, neutral=neutral)
+                i += 1
 
     def _insert_spans_with_links(self, block, block_tags: tuple,
                                  neutral: bool, ranges: list) -> None:
@@ -7436,6 +8302,17 @@ class _ScholarTextWindow:
             1400, lambda: txt.tag_remove("jumpflash", "1.0", "end")
         )
 
+    def _flash_range(self, start: str, end: str) -> None:
+        """Scroll to *start* and briefly highlight everything in ``[start,
+        end)`` — used to flash a whole pin-cited page, not just its line."""
+        txt = self._text
+        txt.see(start)
+        txt.tag_remove("jumpflash", "1.0", "end")
+        txt.tag_add("jumpflash", start, end)
+        self._win.after(
+            1400, lambda: txt.tag_remove("jumpflash", "1.0", "end")
+        )
+
     def _follow_link(self, tag: str) -> None:
         action = self._link_actions.get(tag)
         if not action:
@@ -7466,8 +8343,10 @@ class _ScholarTextWindow:
         if kind == "engrep":
             _open_eng_rep(self._win, value, self._status_var.set)
             return
-        # A Scholar case URL may carry a pincite ("<url>\tpin=565") so the
-        # opened case jumps to that page (Scholar's own hyperlink doesn't).
+        # A Scholar case URL may carry a pincite, a reporter cite, and the case
+        # name ("<url>\tpin=565\tcite=…\tname=…") so a failed/blocked fetch can
+        # still be located on CourtListener.
+        name = ""
         if kind == "url":
             pieces = value.split("\t")
             url_val = pieces[0]
@@ -7478,6 +8357,8 @@ class _ScholarTextWindow:
                     pin = piece[4:]
                 elif piece.startswith("cite="):
                     cite = piece[5:]
+                elif piece.startswith("name="):
+                    name = piece[5:]
         elif kind == "cite":
             cite, _, pin = value.partition("@")
             url_val = ""
@@ -7502,19 +8383,28 @@ class _ScholarTextWindow:
         fetcher = self._app._get_scholar()
         label = cite if kind == "cite" else "cited case"
         if fetcher is None:
-            if kind == "cite":
-                self._follow_cite_via_cl(cite, pin)
+            # No Google Scholar — go straight to CourtListener / case.law if we
+            # have anything to locate the case with.
+            if cite or name:
+                self._follow_cite_via_cl(cite, pin, name=name)
             else:
                 self._status_var.set("Google Scholar is not available.")
             return
         self._status_var.set(f"Fetching {label} from Google Scholar…")
 
         def run() -> None:
-            if kind == "url":
-                result = fetcher.fetch_by_url(url_val)
-            else:
-                result = fetcher.fetch_by_citation(cite)
-            self._post(self._on_link_ready, result, cite, pin, url_val)
+            # Any Google Scholar failure — a None result *or* an exception from
+            # a blocked/erroring request — routes to the same CourtListener /
+            # case.law fallback via _on_link_ready.
+            try:
+                if kind == "url":
+                    result = fetcher.fetch_by_url(url_val)
+                else:
+                    result = fetcher.fetch_by_citation(cite)
+            except Exception as exc:
+                print(f"[scholar] link fetch failed: {exc}")
+                result = None
+            self._post(self._on_link_ready, result, cite, pin, url_val, name)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -7565,29 +8455,47 @@ class _ScholarTextWindow:
     def _on_cl_link_error(self, msg: str) -> None:
         self._status_var.set(f"CourtListener: {msg}")
 
-    def _follow_cite_via_cl(self, cite: str, pin: str = "", retry=None) -> None:
-        """Follow a citation link using CourtListener when Scholar is
-        unavailable.  ``retry`` (cite, pin, url) keeps trying Google Scholar in
-        the background after the CourtListener view opens (used when a Scholar
-        link failed rather than Scholar being absent)."""
+    def _follow_cite_via_cl(self, cite: str, pin: str = "", name: str = "",
+                            retry=None) -> None:
+        """Follow a cited-case link Google Scholar can't supply — whether it is
+        missing, flaky, or blocking: locate the case on CourtListener (by
+        citation, then by name) and fall back to its static.case.law PDF.
+
+        ``retry`` (cite, pin, url, name) keeps trying Google Scholar in the
+        background after the CourtListener view opens (used when a Scholar link
+        failed rather than Scholar being absent)."""
         client = self._app._get_client()
         if client is None:
             return
+        label = name or cite or "cited case"
         self._status_var.set(
-            f"Google Scholar busy — loading {cite} from CourtListener…"
-            if retry else f"Fetching {cite} from CourtListener…"
+            f"Google Scholar busy — loading {label} from CourtListener…"
+            if retry else f"Fetching {label} from CourtListener…"
         )
 
         def run() -> None:
             try:
-                target = _cl_item_for_citation(client, cite)
+                # CourtListener by the cite as printed and — for an old
+                # nominative SCOTUS cite — by its modern "U.S." form; then, when
+                # no usable cite resolves, by the case name.
+                target = _cl_item_for_citation(client, cite) if cite else None
+                if target is None and cite:
+                    alt = _us_reports_cite(cite)
+                    if alt:
+                        target = _cl_item_for_citation(client, alt)
+                if target is None and name:
+                    target = _cl_item_for_name(client, name)
                 if not target:
-                    if retry:
-                        # CourtListener doesn't have it either — keep retrying
-                        # Google Scholar and open it if it comes through.
+                    # Not on CourtListener — try the official case.law PDF.
+                    pdf = _case_law_pdf_for_cite(cite) if cite else None
+                    if pdf:
+                        self._post(self._open_cited_case_pdf, pdf, cite, pin)
+                    elif retry:
+                        # Nothing anywhere — keep retrying Google Scholar and
+                        # open it if it comes through.
                         self._post(self._retry_scholar_only, *retry)
                     else:
-                        self._post(self._on_cl_link_error, f"No match for {cite!r}.")
+                        self._post(self._on_cl_link_error, f"No match for {label}.")
                     return
                 parts, blocks, plain, cluster = _assemble_case_parts(
                     client, target,
@@ -7600,10 +8508,20 @@ class _ScholarTextWindow:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _open_cited_case_pdf(self, url: str, cite: str, pin: str = "") -> None:
+        """Open a cited case's static.case.law PDF (the fallback when neither
+        Google Scholar nor CourtListener has the opinion)."""
+        self._status_var.set(f"Opening {cite} (case.law PDF)…")
+        _PdfWindow(
+            self._win, url, cite + (f" at {pin}" if pin else ""),
+            self._status_var.set,
+        )
+
     def _on_link_ready(self, result: Optional[tuple[str, str]],
-                       cite: str = "", pin: str = "", url_val: str = "") -> None:
+                       cite: str = "", pin: str = "", url_val: str = "",
+                       name: str = "") -> None:
         if not result:
-            self._link_scholar_failed(cite, pin, url_val)
+            self._link_scholar_failed(cite, pin, url_val, name)
             return
         url, html = result
         self._status_var.set("Cited case loaded.")
@@ -7611,29 +8529,34 @@ class _ScholarTextWindow:
         if pin:  # cite or Scholar-URL pincite — jump once the window lays out
             win.jump_to_cite_page(cite, pin)
 
-    def _link_scholar_failed(self, cite: str, pin: str, url_val: str) -> None:
-        """A Google Scholar opinion link failed (Google's servers are finicky).
-        Show the CourtListener view now if the case can be located by citation,
-        and keep retrying Google Scholar in the background; if it comes through,
-        the window's "Google Scholar Text" button lights up so the reader can
-        switch to it."""
+    def _link_scholar_failed(self, cite: str, pin: str, url_val: str,
+                             name: str = "") -> None:
+        """A Google Scholar opinion link failed — missing, flaky, or blocking.
+        Show the CourtListener view now if the case can be located by citation
+        or by name (else its case.law PDF), and keep retrying Google Scholar in
+        the background; if it comes through, the window's "Google Scholar Text"
+        button lights up so the reader can switch to it."""
         client = self._app._get_client()
         fetcher = self._app._get_scholar()
-        if cite and client is not None:
-            # Open CourtListener now; retry Scholar and attach it to that window.
-            self._follow_cite_via_cl(cite, pin, retry=(cite, pin, url_val))
+        if (cite or name) and client is not None:
+            # Open CourtListener / case.law now; retry Scholar in the background.
+            self._follow_cite_via_cl(
+                cite, pin, name=name, retry=(cite, pin, url_val, name),
+            )
         elif fetcher is not None and (url_val or cite):
-            # No citation to locate the case on CourtListener — just keep
-            # retrying Google Scholar, and open it if it comes through.
-            self._retry_scholar_only(cite, pin, url_val)
+            # Nothing to locate the case with — just keep retrying Google
+            # Scholar, and open it if it comes through.
+            self._retry_scholar_only(cite, pin, url_val, name)
         else:
             self._status_var.set(
                 "Google Scholar: cited case not found (or blocked)."
             )
 
     def jump_to_cite_page(self, cite: str, pin: str) -> None:
-        """Scroll to and briefly flash the star-pagination marker for the pin
-        page in this freshly opened opinion.  Deferred until the window has laid
+        """Scroll to the pin page and briefly flash the *whole* page — from its
+        star-pagination marker to the next page's marker (or, on the last page,
+        to the footnotes / end of the opinion) — so the cited passage stands out
+        rather than just the marker's line.  Deferred until the window has laid
         out (an immediate ``see`` on an unmapped widget does nothing), with one
         retry while the text is still rendering."""
         m_page = re.match(r"\d+", pin or "")
@@ -7647,7 +8570,18 @@ class _ScholarTextWindow:
             except tk.TclError:
                 return
             if pos:
-                self._jump_to(pos)
+                txt = self._text
+                # End of the flash: the nearest later star-page marker, else
+                # the start of the footnotes, else the end of the text.
+                later = [txt.index(p) for p in self._page_pos.values()
+                         if txt.compare(p, ">", pos)]
+                if later:
+                    end = min(later,
+                              key=lambda ix: tuple(map(int, ix.split("."))))
+                else:
+                    fn = txt.tag_nextrange("fnhead", pos)
+                    end = fn[0] if fn else "end-1c"
+                self._flash_range(pos, end)
                 self._status_var.set(f"Jumped to page *{page}.")
             elif attempt < 2:
                 self._win.after(250, lambda: do(attempt + 1))
@@ -7807,13 +8741,16 @@ class _ScholarTextWindow:
                 pass
 
     def _retry_scholar_link(
-        self, cite: str, pin: str, url_val: str,
+        self, cite: str, pin: str, url_val: str, name: str = "",
         attempts: int = 3, delay: float = 4.0,
     ) -> None:
         """This window opened on the CourtListener text because a Google Scholar
         link failed.  Retry the Scholar fetch ``attempts`` more times,
         ``delay`` seconds apart; if it comes through, wire it in and light up
-        the "Google Scholar Text" button (via ``_attach_scholar_version``)."""
+        the "Google Scholar Text" button (via ``_attach_scholar_version``).
+
+        (``name`` is unused — it's accepted so the shared ``retry`` tuple
+        ``(cite, pin, url, name)`` unpacks cleanly.)"""
         fetcher = self._app._get_scholar()
         if fetcher is None or not (url_val or cite):
             return
@@ -7837,12 +8774,13 @@ class _ScholarTextWindow:
         threading.Thread(target=run, daemon=True).start()
 
     def _retry_scholar_only(
-        self, cite: str, pin: str, url_val: str,
+        self, cite: str, pin: str, url_val: str, name: str = "",
         attempts: int = 3, delay: float = 4.0,
     ) -> None:
-        """No CourtListener fallback is possible for this link (a Google Scholar
-        URL with no citation to locate the case), so just retry Google Scholar
-        a few times and open the opinion if it comes through."""
+        """The last resort for a link nothing else could locate (a Google
+        Scholar URL with no citation or name, or one CourtListener and case.law
+        both lacked): retry Google Scholar a few times and open the opinion if
+        it comes through."""
         fetcher = self._app._get_scholar()
         if fetcher is None:
             self._status_var.set("Google Scholar: cited case not found.")
@@ -7858,7 +8796,9 @@ class _ScholarTextWindow:
                 except Exception:
                     result = None
                 if result:
-                    self._post(self._on_link_ready, result, cite, pin, url_val)
+                    self._post(
+                        self._on_link_ready, result, cite, pin, url_val, name,
+                    )
                     return
             self._post(
                 self._status_var.set,
