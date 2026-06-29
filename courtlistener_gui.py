@@ -772,19 +772,13 @@ def _cl_item_for_citation(client, cite: str) -> Optional[dict]:
 # by name (e.g. "Pennoyer v. Neff") can bury the case itself under opinions
 # that merely discuss it.  When the query is a name rather than a reporter
 # citation, these helpers instead restrict the search to the caseName field,
-# rank hits by how closely their names match the query, and walk the court
-# hierarchy — the Supreme Court first, then the federal courts of appeals,
-# then the state courts of last resort — so the most authoritative close
-# matches surface first.
+# rank hits by how closely their names match the query, and surface the most
+# authoritative close matches first — ordering by citation count (how often a
+# case is cited), which stands in for court level as the authority signal, and
+# adding a dedicated Supreme Court pass so a recent, as-yet-uncited SCOTUS
+# decision isn't buried by that citation-count ordering.
 
 _SCOTUS_COURT_ID = "scotus"
-
-# The federal courts of appeals and the state courts of last resort, each as
-# a single space-separated CourtListener ``court`` filter value.
-_FED_APPEALS_COURT_IDS = " ".join(_CIRCUIT_COURTS)
-_STATE_SUPREME_COURT_IDS = " ".join(
-    courts[0][0] for _state, courts in _STATE_COURTS if courts
-)
 
 # A close name match must clear this score (see _name_match_score): a query
 # whose single party fully matches a candidate party scores exactly 0.5, so
@@ -802,6 +796,13 @@ _NAME_STOPWORDS = {
 
 _NAME_PARTY_SPLIT_RE = re.compile(r"\s+v(?:s)?\.?\s+", re.IGNORECASE)
 
+# A party that is *only* the United States abbreviation, in any spelling
+# ("US", "U.S.", "U. S.", "USA", "U.S.A.").  Such a side stands for the United
+# States as a party, so it is mapped to the spelled-out tokens and "U.S. v.
+# Texas" matches "United States v. Texas".  Matched against the whole side, so
+# an embedded "Chevron U.S.A. Inc." is left alone.
+_US_PARTY_RE = re.compile(r"^\s*u\.?\s*s\.?\s*a?\.?\s*$", re.IGNORECASE)
+
 
 def _name_tokens(name: str) -> list[str]:
     """Significant lowercased word tokens of a case (or party) name, with
@@ -815,9 +816,15 @@ def _name_tokens(name: str) -> list[str]:
 
 
 def _name_parties(name: str) -> list[set[str]]:
-    """Token sets for each side of a case name ("A v. B" → [{a}, {b}])."""
-    sides = _NAME_PARTY_SPLIT_RE.split(name or "", maxsplit=1)
-    return [toks for toks in (set(_name_tokens(s)) for s in sides) if toks]
+    """Token sets for each side of a case name ("A v. B" → [{a}, {b}]).  A side
+    that is just the United States abbreviation becomes {united, states} (see
+    :data:`_US_PARTY_RE`)."""
+    out: list[set[str]] = []
+    for side in _NAME_PARTY_SPLIT_RE.split(name or "", maxsplit=1):
+        toks = {"united", "states"} if _US_PARTY_RE.match(side) else set(_name_tokens(side))
+        if toks:
+            out.append(toks)
+    return out
 
 
 def _token_close(a: str, b: str) -> bool:
@@ -832,14 +839,71 @@ def _token_close(a: str, b: str) -> bool:
     return False
 
 
+def _is_acronym_of(acro: set[str], words: set[str]) -> bool:
+    """True if a one-token party *acro* is the initialism of multi-word party
+    *words*: "nrdc" ↔ {natural, resources, defense, council}, "fec" ↔ {federal,
+    election, commission}, "cfpb" ↔ {consumer, financial, protection, bureau}.
+
+    Lets an agency acronym match its spelled-out name.  The initials are
+    compared as a sorted multiset (party word order is already lost to the set),
+    so it also matches when the words are listed in another order; the exact
+    letter-count match keeps an ordinary short word from matching a party with a
+    different number of words."""
+    if len(acro) != 1 or not (2 <= len(words) <= 6):
+        return False
+    (a,) = acro
+    return 2 <= len(a) <= 6 and sorted(a) == sorted(w[0] for w in words)
+
+
 def _party_overlap(query_party: set[str], cand_party: set[str]) -> float:
     """Fraction of a query party's tokens found (token-close) in a candidate
     party — how completely that side of the query name is present."""
     if not query_party:
         return 0.0
+    # An agency-style acronym and its spelled-out name are a full match.
+    if (_is_acronym_of(query_party, cand_party)
+            or _is_acronym_of(cand_party, query_party)):
+        return 1.0
     hit = sum(1 for t in query_party
               if any(_token_close(t, c) for c in cand_party))
     return hit / len(query_party)
+
+
+# Frequent party names — every state, "United States", and the generic
+# government plaintiffs — that are too common to identify a case on their own.
+# A match on such a name *alone* (one side of the query) is the weakest kind of
+# hit and is shown only when nothing better turns up; as one side of a genuine
+# two-party match it still counts, so "U.S. v. Texas" matches "United States v.
+# Texas".  Keyed by the party's token set so "New York" → {new, york} is
+# recognized while a distinctive name that merely contains a state word
+# ("Texas Instruments" → {texas, instruments}) is not.
+_COMMON_PARTY_NAMES: set[frozenset[str]] = {
+    frozenset(_name_tokens(_n)) for _n in (
+        [_state for _state, _courts in _STATE_COURTS]
+        + ["United States", "United States of America",
+           "People", "State", "Commonwealth"]
+    )
+}
+_COMMON_PARTY_NAMES.discard(frozenset())
+
+
+def _is_common_party(party: set[str]) -> bool:
+    """True when *party* is a frequent name (a state, "United States", or a
+    generic government plaintiff) — see :data:`_COMMON_PARTY_NAMES`."""
+    return frozenset(party) in _COMMON_PARTY_NAMES
+
+
+# A real party name is short.  A consolidated caption merges dozens of parties
+# into one side ("Foltz, Consumer Action, United Policyholders, Texas Watch … v.
+# State Farm, …"); such a giant blob contains so many tokens it matches almost
+# any query, so a side longer than this is not treated as a clean party.
+_MAX_CLEAN_PARTY = 8
+
+# A reverse-caption match (parties on swapped sides — tier 2) is normally
+# outranked by the case as typed (tier 3) and dropped when a tier-3 match
+# exists.  But a reverse-caption case cited at least this often is a major
+# precedent in its own right and is shown alongside the tier-3 match.
+_REVERSED_PARTY_MIN_CITES = 1000
 
 
 def _name_match_score(query: str, candidate: str) -> float:
@@ -866,14 +930,103 @@ def _name_match_score(query: str, candidate: str) -> float:
     return min(1.0, avg + bonus)
 
 
-def _case_fingerprints(name: str, cite: str, year: str) -> set[str]:
+def _match_tier(query: str, candidate: str) -> int:
+    """How strongly *candidate*'s name matches *query*, as a coarse priority
+    tier (higher wins); only the best tier present is shown — see
+    :func:`_filter_to_best_tier`:
+
+      3 — both parties match on the *same* sides as the query ("Roe v. Wade" →
+          "Roe v. Wade"): the case as captioned; frequent names count here, so
+          "U.S. v. Texas" matches "United States v. Texas".
+      2 — both parties match but on *swapped* sides ("Roe v. Wade" → "Wade v.
+          Roe"): usually a related or reverse-caption case.
+      1 — exactly one party matches and it is distinctive.
+      0 — the only matching party is a frequent name (a state, "United States",
+          a generic government plaintiff), which alone is too weak to mean much
+          — shown only when nothing better was found.
+
+    Returns -1 when the names don't match (the 0.6 per-side floor mirrors
+    :func:`_name_match_score`)."""
+    q_parties = _name_parties(query)
+    c_parties = _name_parties(candidate)
+    if not q_parties or not c_parties:
+        # One-sided name ("In re Gault") or unparseable caption: a whole-set
+        # overlap stands in, treated as a distinctive one-party hit.
+        q = set(_name_tokens(query))
+        c = set(_name_tokens(candidate))
+        return 1 if q and _party_overlap(q, c) >= 0.6 else -1
+
+    def m(qp: set[str], cp: set[str]) -> bool:
+        return len(cp) <= _MAX_CLEAN_PARTY and _party_overlap(qp, cp) >= 0.6
+
+    # Two-party match: the parties must land on *different* candidate sides
+    # (requiring opposite sides stops both matching inside one long name —
+    # "United States Dist. Court for W. Texas" is not "U.S. v. Texas").  Same
+    # orientation as the query (tier 3) beats the swapped caption (tier 2).
+    if len(q_parties) == 2 and len(c_parties) == 2:
+        (qa, qb), (ca, cb) = q_parties, c_parties
+        if m(qa, ca) and m(qb, cb):
+            return 3
+        if m(qa, cb) and m(qb, ca):
+            return 2
+
+    matched = [qp for qp in q_parties if any(m(qp, cp) for cp in c_parties)]
+    if not matched:
+        return -1
+    # One side matched (or both, but on the same candidate party): distinctive
+    # unless every matched party is a frequent name.
+    return 0 if all(_is_common_party(qp) for qp in matched) else 1
+
+
+def _filter_to_best_tier(query: str,
+                         tagged: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+    """Across all sources, keep only the best match tier present (see
+    :func:`_match_tier`): the case as captioned if found, else the swapped
+    caption, else distinctive one-party matches, else frequent-name ones.
+    Applied to the combined results so a strong hit found by *any* pass
+    suppresses the weaker fillers of *every* pass — otherwise the Supreme Court
+    pass, searching by relevance, pads a clean query with one-sided state-name
+    matches ("Smith v. Arizona" for "Miranda v. Arizona").
+
+    One exception: when the best tier is the as-captioned match (3), a
+    swapped-caption match (2) that is itself heavily cited
+    (:data:`_REVERSED_PARTY_MIN_CITES`) is kept alongside it — a major
+    precedent shouldn't vanish just because its caption runs the other way."""
+    rated = [
+        (_match_tier(query, re.sub(
+            r"<[^>]+>", "",
+            it.get("caseName") or it.get("case_name") or "").strip()),
+         bucket, it)
+        for bucket, it in tagged
+    ]
+    best = max((t for t, _b, _it in rated), default=-1)
+    out: list[tuple[str, dict]] = []
+    for t, bucket, it in rated:
+        if t == best:
+            out.append((bucket, it))
+        elif (best == 3 and t == 2
+              and (it.get("citeCount") or 0) >= _REVERSED_PARTY_MIN_CITES):
+            # Re-tag the heavily-cited swapped-caption match into its own bucket
+            # so the as-captioned matches don't crowd it out of the display.
+            out.append(("reversed", it))
+    return out
+
+
+def _case_fingerprints(name: str, cite: str, year: str,
+                       *, include_name: bool = True) -> set[str]:
     """Identity keys for a case, used to recognize the same case across
     sources (Google Scholar, CourtListener, English Reports).  Two results are
     the same case when any fingerprint matches, so each result carries both a
     citation key (when it has a reporter cite) and a name key — a Scholar hit
     with only a name still de-duplicates against a CourtListener hit that has
     both.  Reporter spelling is normalized so "410 U.S. 113" and "410 US 113"
-    collapse to one key."""
+    collapse to one key.
+
+    The name key is an order-insensitive token set, so "A v. B" and "B v. A"
+    share it and collapse to one row.  Pass ``include_name=False`` for a
+    deliberately-shown reverse-caption match so it de-duplicates only by
+    citation and can sit beside the as-captioned case rather than being eaten
+    by it."""
     fps: set[str] = set()
     m = _CITE_PARSE_RE.match(re.sub(r"<[^>]+>", "", cite or "").strip())
     if m:
@@ -882,9 +1035,10 @@ def _case_fingerprints(name: str, cite: str, year: str) -> set[str]:
         page = m.group(3)
         if rep:
             fps.add(f"c:{vol}:{rep}:{page}")
-    toks = _name_tokens(name)
-    if toks:
-        fps.add("n:" + " ".join(sorted(set(toks))))
+    if include_name:
+        toks = _name_tokens(name)
+        if toks:
+            fps.add("n:" + " ".join(sorted(set(toks))))
     return fps
 
 
@@ -894,9 +1048,10 @@ def _case_fingerprints(name: str, cite: str, year: str) -> set[str]:
 # next-best result takes the slot and the source still shows its full quota.
 _BUCKET_CAPS: dict[str, int] = {
     "scholar": 2,     # Google Scholar
-    "scotus": 3,      # Supreme Court
-    "appeals": 2,     # federal courts of appeals
-    "state": 2,       # state courts of last resort
+    "exact": 3,       # strict AND match of two distinctive parties
+    "ranked": 4,      # CourtListener name matches, ranked by citation count
+    "reversed": 2,    # heavily-cited swapped-caption ("Texas v. United States")
+    "scotus": 3,      # dedicated Supreme Court pass (catches recent/uncited)
     "juris": 3,       # a single jurisdiction named in the query
     "cl": 3,          # CourtListener citation-lookup results
     "engrep": 1,      # English Reports
@@ -921,11 +1076,21 @@ def _dedup_accept(fps: set[str], bucket: str,
 
 
 def _is_scotus_order_item(item: dict) -> bool:
-    """True for a SCOTUS "order" entry — a docket/order with no real opinion
-    (≤ 2 outbound citations) — which the main search routes out of the primary
-    results and the spotlight likewise drops."""
+    """True for a SCOTUS "order" entry — a docket/order with no real opinion —
+    which the main search routes out of the primary results and the spotlight
+    likewise drops.  A genuine opinion is recognized by either having been
+    cited by other cases (the top-level ``citeCount``) or citing cases itself
+    (its main opinion's outbound ``cites``); an order does neither.
+
+    The inbound ``citeCount`` check is essential: CourtListener leaves the
+    outbound ``cites`` array empty in *search* payloads even for foundational
+    opinions (Marbury v. Madison, cited ~6000 times, comes back with
+    ``cites == []``), so keying on outbound cites alone wrongly discards them —
+    which made name searches for such cases return nothing at all."""
     court_val = str(item.get("court_id") or item.get("court") or "")
     if "scotus" not in court_val.lower():
+        return False
+    if (item.get("citeCount") or 0) > 0:
         return False
     opinions = item.get("opinions") or []
     main_op = max(opinions, key=lambda o: len(o.get("cites") or []),
@@ -1056,21 +1221,73 @@ def _detect_jurisdiction(query: str) -> Optional[tuple[str, str, str]]:
 
 # --- Name-restricted CourtListener search -----------------------------------
 
+def _cl_casename_query(name: str, *, strict: bool = False) -> str:
+    """A flexible ``caseName`` query that retrieves a candidate when a
+    *distinctive* party of an "A v. B" name is present.
+
+    CourtListener's ``caseName`` field is AND-by-default, so the obvious
+    ``caseName:(chevron nrdc)`` finds *nothing* for "Chevron v. NRDC": the
+    stored caption is "Chevron U.S.A. Inc. v. Natural Resources Defense
+    Council, Inc.", which contains "chevron" but not the abbreviation "nrdc".
+    Instead each distinctive party's tokens are AND'd within their own
+    ``caseName`` group and the groups are OR'd, so an opinion matching one side
+    is still retrieved; ranking then sorts the genuinely relevant ones up.
+
+    A frequent party (a state, "United States" — see
+    :data:`_COMMON_PARTY_NAMES`) is deliberately left out of the OR: it is a
+    party in an unmanageable number of cases ("United States v. …" alone is
+    hundreds of thousands), so OR-ing it would crowd the actual case off the
+    page.  Its presence is confirmed afterwards by :func:`_match_tier`.  Only
+    when *every* party is a frequent name ("U.S. v. Texas") are all parties
+    AND'd together — their combination is specific enough to find the case.
+
+    With ``strict``, the distinctive parties are AND'd into a single group
+    rather than OR'd — a precise query that pins the exact two-party case even
+    when it is too lightly cited to surface among the broad OR results, and
+    that leans on CourtListener's own acronym expansion ("FEC v. Cruz" →
+    ``caseName:(cruz fec)`` finds "Ted Cruz for Senate v. Federal Election
+    Commission")."""
+    parties = _name_parties(name)
+    distinctive = [p for p in parties if not _is_common_party(p)]
+    if distinctive and not strict:
+        return " OR ".join(
+            f"caseName:({' '.join(sorted(p))})" for p in distinctive
+        )
+    pool = distinctive or parties
+    if pool:
+        return f"caseName:({' '.join(sorted(set().union(*pool)))})"
+    toks = _name_tokens(name)
+    return f"caseName:({' '.join(toks)})" if toks else (name or "").strip()
+
+
 def _cl_name_search(client, name: str, court_ids: Optional[str], *,
                     page_size: int = 20, limit: int = 3, spare: int = 0,
-                    drop_scotus_orders: bool = False) -> list[dict]:
+                    drop_scotus_orders: bool = False,
+                    order_by_citecount: bool = False,
+                    strict: bool = False) -> list[dict]:
     """Search a (set of) court(s) for a case *name*, restricting the query to
-    the caseName field, then return the items whose names are reasonably close
-    to *name*, best first.  Up to ``limit + spare`` are returned: the caller
-    displays ``limit`` of them and keeps the spares to replace any that turn
-    out to duplicate a case already shown by another source."""
-    toks = _name_tokens(name)
-    q = f"caseName:({' '.join(toks)})" if toks else (name or "").strip()
+    the caseName field (matching either party — see :func:`_cl_casename_query`),
+    then return the items whose names are reasonably close to *name*, best
+    first.  Up to ``limit + spare`` are returned: the caller displays ``limit``
+    of them and keeps the spares to replace any that turn out to duplicate a
+    case already shown by another source.
+
+    ``order_by_citecount`` controls which candidates are *fetched* (the API
+    returns one page): when set, the most-cited matches are retrieved, which is
+    essential for the either-party search — the canonical case (e.g. Chevron)
+    often matches only one party and would otherwise fall outside the page,
+    while its huge citation count pulls it in.  When unset (the Supreme Court
+    pass), the API's relevance order is used so a recent, as-yet-uncited
+    decision is still fetched.  ``strict`` AND's the distinctive parties into
+    one precise query (see :func:`_cl_casename_query`) to pin a lightly-cited
+    exact case."""
+    q = _cl_casename_query(name, strict=strict)
     if not q:
         return []
+    extra = {"order_by": "citeCount desc"} if order_by_citecount else None
     try:
         data = client.search(q, type="o", court=court_ids or None,
-                             page_size=page_size)
+                             page_size=page_size, extra=extra)
         results = data.get("results") or []
     except Exception as exc:
         print(f"[cl-name] search failed for court={court_ids!r}: {exc}")
@@ -1078,7 +1295,7 @@ def _cl_name_search(client, name: str, court_ids: Optional[str], *,
     if drop_scotus_orders:
         results = [it for it in results if not _is_scotus_order_item(it)]
 
-    scored: list[tuple[float, dict]] = []
+    scored: list[tuple[int, float, int, dict]] = []
     for it in results:
         cand = re.sub(
             r"<[^>]+>", "",
@@ -1086,9 +1303,25 @@ def _cl_name_search(client, name: str, court_ids: Optional[str], *,
         ).strip()
         score = _name_match_score(name, cand)
         if score >= _NAME_MATCH_MIN:
-            scored.append((score, it))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [it for _score, it in scored[:limit + spare]]
+            scored.append((_match_tier(name, cand),
+                           score, it.get("citeCount") or 0, it))
+    # Sort by match tier first (as-captioned over swapped over one-party over
+    # frequent-name — see _match_tier), so a stronger match is never crowded out
+    # of the page by a more-cited but weaker one; then by closeness, then by
+    # citation count (the authority signal that stands in for walking the court
+    # hierarchy, so "Brown v. Board of Education", cited thousands of times,
+    # outranks a one-off "Board of Education v. Brown").  The caller's
+    # _filter_to_best_tier then drops the lower tiers once every source's
+    # results are pooled.
+    scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    kept = scored[:limit + spare]
+    # Carry through any heavily-cited swapped-caption (tier 2) match the page cap
+    # cut, so a major reverse-caption precedent reaches _filter_to_best_tier even
+    # when the as-captioned matches fill the page (e.g. six "United States v. …
+    # Texas" cases ahead of "Texas v. United States").
+    kept += [t for t in scored[limit + spare:]
+             if t[0] == 2 and t[2] >= _REVERSED_PARTY_MIN_CITES]
+    return [it for _tier, _score, _cites, it in kept]
 
 
 def _cl_name_ranked_search(client, query: str) -> list[tuple[str, dict]]:
@@ -1097,11 +1330,26 @@ def _cl_name_ranked_search(client, query: str) -> list[tuple[str, dict]]:
     bucket carries each result's display cap (see ``_BUCKET_CAPS``).
 
     When the query pins a jurisdiction ("... (7th Cir. 2009)"), the best name
-    matches in that court are returned.  Otherwise the court hierarchy is
-    walked — Supreme Court (up to 3), federal courts of appeals (up to 2), and
-    state courts of last resort (up to 2) — and the groups are concatenated in
-    that order of authority.  A couple of spare candidates beyond each cap are
-    included so duplicates dropped during display can be replaced."""
+    matches in that court are returned.  Otherwise these passes run in parallel:
+
+    * ``exact`` — only when the query names two distinctive parties: an AND of
+      both, which pins the exact case even when it is too lightly cited to
+      surface in the broad passes ("FEC v. Cruz", "NRDC v. EPA").
+    * ``ranked`` — across all courts, retrieving the most-cited name matches
+      and ordering them by closeness then citation count.  Citation count is
+      the authority signal that replaces walking the court hierarchy, and it
+      lets a case that matches only one party (e.g. Chevron) still surface.
+    * ``scotus`` — the Supreme Court alone, by relevance, so a recent,
+      as-yet-uncited SCOTUS decision (which the citation-count ordering would
+      bury) is still shown.
+
+    The groups are concatenated exact-, then ranked-, then scotus-first, and
+    cross-source de-duplication keeps each later pass to the cases the earlier
+    ones didn't already surface.  Each pass over-fetches a couple of spares so
+    duplicates dropped during display can be replaced.  Finally the pooled
+    results are reduced to their best match tier (see
+    :func:`_filter_to_best_tier`), so one-party fillers are dropped whenever a
+    genuine two-party match was found by any pass."""
     juris = _detect_jurisdiction(query)
     if juris:
         court_ids, name, _label = juris
@@ -1109,33 +1357,38 @@ def _cl_name_ranked_search(client, query: str) -> list[tuple[str, dict]]:
             client, name or query, court_ids, limit=3, spare=2,
             drop_scotus_orders=(court_ids == _SCOTUS_COURT_ID),
         )
-        return [("juris", it) for it in items]
+        return _filter_to_best_tier(name or query,
+                                    [("juris", it) for it in items])
 
-    # (bucket, court ids, how many to show, whether to drop SCOTUS orders)
-    tiers = [
-        ("scotus", _SCOTUS_COURT_ID, 3, True),
-        ("appeals", _FED_APPEALS_COURT_IDS, 2, False),
-        ("state", _STATE_SUPREME_COURT_IDS, 2, False),
+    # (bucket, court ids, how many to show, drop SCOTUS orders, citeCount, strict)
+    passes = [
+        ("ranked", None, 4, False, True, False),
+        ("scotus", _SCOTUS_COURT_ID, 3, True, False, False),
     ]
-    groups: list[list[tuple[str, dict]]] = [[] for _ in tiers]
+    # A two-distinctive-party query also gets a strict AND pass that pins the
+    # exact case when it is too lightly cited for the broad passes to reach.
+    if len([p for p in _name_parties(query) if not _is_common_party(p)]) >= 2:
+        passes.insert(0, ("exact", None, 3, False, True, True))
+    groups: list[list[tuple[str, dict]]] = [[] for _ in passes]
 
-    def run_tier(i: int) -> None:
-        bucket, court_ids, lim, drop = tiers[i]
+    def run_pass(i: int) -> None:
+        bucket, court_ids, lim, drop, by_cites, strict = passes[i]
         groups[i] = [
             (bucket, it) for it in _cl_name_search(
                 client, query, court_ids, limit=lim, spare=2,
-                drop_scotus_orders=drop,
+                drop_scotus_orders=drop, order_by_citecount=by_cites,
+                strict=strict,
             )
         ]
 
-    # Hit the three tiers in parallel, then concatenate them in priority order.
-    with ThreadPoolExecutor(max_workers=len(tiers)) as ex:
-        for _ in as_completed([ex.submit(run_tier, i) for i in range(len(tiers))]):
+    # Run the passes in parallel, then concatenate exact-/ranked-first.
+    with ThreadPoolExecutor(max_workers=len(passes)) as ex:
+        for _ in as_completed([ex.submit(run_pass, i) for i in range(len(passes))]):
             pass
     out: list[tuple[str, dict]] = []
     for group in groups:
         out.extend(group)
-    return out
+    return _filter_to_best_tier(query, out)
 
 
 _OPINION_TYPE_LABELS: dict[str, str] = {
@@ -2103,9 +2356,12 @@ class CourtListenerGUI:
 
             # Skip a case already shown by another source (and respect the
             # source's per-tier display cap); the source's next-best result
-            # then takes this slot instead.
-            if not _dedup_accept(_case_fingerprints(name, cite, year), bucket,
-                                 seen_cases, bucket_counts):
+            # then takes this slot instead.  A reverse-caption match is shown on
+            # purpose beside the as-captioned case, so it de-duplicates only by
+            # citation (its name key would collide with the case it sits next to).
+            fps = _case_fingerprints(name, cite, year,
+                                     include_name=(bucket != "reversed"))
+            if not _dedup_accept(fps, bucket, seen_cases, bucket_counts):
                 return
 
             # Append a fresh row at the bottom.  Rows are added in arrival order
