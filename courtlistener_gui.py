@@ -288,6 +288,33 @@ _CITE_PRIORITY = [
 
 _NOISE_CITE_RE = re.compile(r"lexis|westlaw|\bwl\b", re.IGNORECASE)
 
+# Annotation / specialty / looseleaf series dropped from the title's parallel
+# cites — the title lists only standard reporters (U.S./S. Ct./L. Ed., the
+# official state reporters, and the regional reporters).
+_NONSTANDARD_CITE_RE = re.compile(
+    r"\bA\.\s?L\.\s?R\."           # American Law Reports (A.L.R., A.L.R.2d, …)
+    r"|\bL\.\s?R\.\s?A\."          # Lawyers' Reports Annotated
+    r"|\bU\.\s?S\.\s?L\.\s?W\."    # United States Law Week
+    r"|\bOhio\s+Op\."             # Ohio Opinions (unofficial)
+    r"|\bMedia\s+L\."            # Media Law Reporter
+    r"|\((?:BNA|CCH|P-?H)\)",      # looseleaf services — (BNA), (CCH), (P-H)
+    re.IGNORECASE,
+)
+
+# Reporter order for the window-title citation: the major national reporters
+# first (Bluebook order), everything else after, in the order it was seen.
+_TITLE_CITE_RANK = [
+    re.compile(r" U\.S\. "),
+    re.compile(r" S\. ?Ct\. "),
+    re.compile(r" L\. ?Ed\."),
+    re.compile(r" F\.4th "),
+    re.compile(r" F\.3d "),
+    re.compile(r" F\.2d "),
+    re.compile(r" F\. \d"),
+    re.compile(r" F\. Supp\."),
+    re.compile(r" B\.R\. "),
+]
+
 
 def _pick_citation(citations) -> str:
     """
@@ -313,6 +340,21 @@ def _pick_citation(citations) -> str:
             return hit
 
     return pool[0] if pool else ""
+
+
+def _is_paginable_cite(c: str) -> bool:
+    """True for a print reporter citation whose pages a star pagination can
+    follow.  Excludes neutral/electronic cites — a year-volume cite (e.g.
+    ``2011 N.J. LEXIS 87``) or a LEXIS/Westlaw reporter — whose numbers are
+    unrelated to a print reporter's pages, so they're never matched against the
+    star pagination."""
+    m = _CITE_PARSE_RE.match(c or "")
+    if not m:
+        return False
+    vol, rep = m.group(1), m.group(2)
+    if re.fullmatch(r"(?:1[6-9]|20)\d{2}", vol):  # year-volume = neutral cite
+        return False
+    return not re.search(r"\b(?:LEXIS|WL|Westlaw)\b", rep, re.IGNORECASE)
 
 
 
@@ -802,6 +844,19 @@ def _assemble_case_parts(
         fields="case_name,citations,judges,attorneys,syllabus,headnotes,"
                "sub_opinions,date_filed,docket",
     )
+
+    # The Bluebook date parenthetical needs the court, but citation-lookup
+    # items don't carry it (the court lives on the docket).  Fill it in when
+    # missing so e.g. "85 F. 271" cites as "(6th Cir. 1898)".
+    if not str(item.get("court_id") or item.get("court") or "").strip():
+        docket_url = cluster.get("docket")
+        if docket_url:
+            try:
+                dk = client._get_url(docket_url, {"fields": "court_id"})
+                if dk.get("court_id"):
+                    item["court_id"] = dk["court_id"]
+            except Exception as exc:
+                print(f"[cl-parts] docket court lookup failed: {exc}")
 
     # --- Build header part from metadata ---
     header_blocks: list[Block] = []
@@ -1837,36 +1892,37 @@ class CourtListenerGUI:
                 court_id = _scholar_source_to_court_id(r.source)
                 year = _scholar_source_year(r.source)
                 # The case's own reporter citation sits in the source byline.
-                cite = _scholar_source_cite(r.source)
-                if not cite:
-                    m = _TEXT_CITE_RE.search(r.title + " " + r.snippet)
-                    if m:
-                        cite = re.sub(r"\s+", " ", m.group(0))
+                cite = _scholar_result_cite(r)
 
-                def make_opener(sr=r):
+                def make_opener(sr=r, cite=cite):
                     def open_it():
                         f = self._get_scholar()
                         if f is None:
                             return
+
                         def run():
                             try:
                                 res = f.fetch_by_url(sr.url)
                             except Exception as exc:
-                                def fail(e=exc):
-                                    messagebox.showerror(
-                                        "Google Scholar Error",
-                                        f'Could not load "{sr.title}".\n\n{e}',
-                                    )
-                                self._post_root(fail)
-                                return
+                                print(f"[scholar] open {sr.url!r} failed: {exc}")
+                                res = None
                             if res:
                                 url, html = res
-                                def show():
-                                    _ScholarTextWindow(
-                                        self.root, self, url, html,
-                                        item=None,
-                                    )
+
+                                def show(u=url, h=html):
+                                    try:
+                                        _ScholarTextWindow(
+                                            self.root, self, u, h, item=None,
+                                        )
+                                    except tk.TclError:
+                                        pass
                                 self._post_root(show)
+                            else:
+                                # Opinion page didn't load — show CourtListener
+                                # and retry Scholar in the background.
+                                self._post_root(
+                                    self._scholar_case_fallback, sr.url, cite,
+                                )
                         threading.Thread(target=run, daemon=True).start()
                     return open_it
 
@@ -2155,6 +2211,15 @@ class CourtListenerGUI:
 
                 self._post_root(open_scholar)
                 return True
+        # Google Scholar found the case on its results page but the opinion
+        # page didn't load — fall back to CourtListener now and retry this exact
+        # Scholar opinion in the background (the toggle lights up if it comes).
+        retry_url = ""
+        if fetcher is not None:
+            try:
+                retry_url = fetcher.take_post_search_failure() or ""
+            except Exception:
+                retry_url = ""
         if client is not None:
             try:
                 target = _cl_item_for_citation(client, cite)
@@ -2165,12 +2230,14 @@ class CourtListenerGUI:
                     if parts or plain:
                         def open_cl() -> None:
                             try:
-                                _ScholarTextWindow(
+                                w = _ScholarTextWindow(
                                     self.root, self, "", "",
                                     item=target, cl_text=plain,
                                     cl_parts=parts, cl_blocks=blocks,
                                     prefetch_pdf=prefetch_pdf,
                                 )
+                                if retry_url:
+                                    w._retry_scholar_link(cite, pin, retry_url)
                             except tk.TclError:
                                 pass
 
@@ -3251,23 +3318,113 @@ class CourtListenerGUI:
     def _open_selected_scholar_result(self) -> None:
         r = self._selected_scholar_result()
         if r is not None:
-            self._open_scholar_url(r.url)
+            self._open_scholar_url(r.url, _scholar_result_cite(r))
 
-    def _open_scholar_url(self, url: str) -> None:
-        """Open a Scholar case page (from the Scholar results column)."""
+    def _open_scholar_url(self, url: str, cite: str = "") -> None:
+        """Open a Scholar case page (from the Scholar results column).  If the
+        opinion page won't load, fall back to CourtListener via ``cite`` and
+        retry Scholar in the background."""
         fetcher = self._get_scholar()
         if fetcher is None:
             return
         self._status_var.set("Fetching opinion from Google Scholar…")
 
         def run() -> None:
-            result = fetcher.fetch_by_url(url)
-            self.root.after(
-                0, self._on_scholar_result, result, None, None,
-                "opened from Scholar search",
-            )
+            try:
+                result = fetcher.fetch_by_url(url)
+            except Exception as exc:
+                print(f"[scholar] open {url!r} failed: {exc}")
+                result = None
+            if result:
+                self.root.after(
+                    0, self._on_scholar_result, result, None, None,
+                    "opened from Scholar search",
+                )
+            else:
+                self.root.after(0, self._scholar_case_fallback, url, cite)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _scholar_case_fallback(
+        self, url: str, cite: str, pin: str = "", prefetch_pdf: bool = True,
+    ) -> None:
+        """A Google Scholar opinion page failed to load (Google is flaky).  Show
+        the CourtListener view located by the case's reporter citation and retry
+        the Scholar opinion in the background — the "Google Scholar Text" button
+        lights up if it comes through.  With no citation to locate the case on
+        CourtListener, just retry Scholar and open it if it returns."""
+        client = self._get_client() if self._token_var.get().strip() else None
+        fetcher = self._get_scholar()
+        cite = (cite or "").strip()
+
+        if cite and client is not None:
+            self._status_var.set(
+                f"Google Scholar busy — loading {cite} from CourtListener…"
+            )
+
+            def run() -> None:
+                try:
+                    target = _cl_item_for_citation(client, cite)
+                    if not target:
+                        self._post_root(
+                            lambda: self._status_var.set(
+                                f"No CourtListener match for {cite}."
+                            )
+                        )
+                        return
+                    parts, blocks, plain, cluster = _assemble_case_parts(
+                        client, target,
+                    )
+
+                    def open_cl() -> None:
+                        try:
+                            w = _ScholarTextWindow(
+                                self.root, self, "", "", item=target,
+                                cl_text=plain, cl_parts=parts, cl_blocks=blocks,
+                                prefetch_pdf=prefetch_pdf,
+                            )
+                            w._retry_scholar_link(cite, pin, url)
+                        except tk.TclError:
+                            pass
+
+                    self._post_root(open_cl)
+                except Exception as exc:
+                    self._post_root(
+                        lambda e=exc: self._status_var.set(f"CourtListener: {e}")
+                    )
+
+            threading.Thread(target=run, daemon=True).start()
+            return
+
+        if fetcher is None:
+            self._status_var.set("Could not load this case from Google Scholar.")
+            return
+
+        # No citation to locate the case on CourtListener — retry Scholar alone.
+        self._status_var.set("Google Scholar busy — retrying…")
+
+        def retry() -> None:
+            for _ in range(3):
+                time.sleep(4.0)
+                try:
+                    result = fetcher.fetch_by_url(url)
+                except Exception:
+                    result = None
+                if result:
+                    r_url, html = result
+                    self._post_root(
+                        lambda u=r_url, h=html: _ScholarTextWindow(
+                            self.root, self, u, h, item=None,
+                        )
+                    )
+                    return
+            self._post_root(
+                lambda: self._status_var.set(
+                    "Google Scholar still unavailable for this case."
+                )
+            )
+
+        threading.Thread(target=retry, daemon=True).start()
 
     def _fetch_scholar_text(self) -> None:
         # A row in the Scholar results column: open it directly, unverified.
@@ -4160,6 +4317,20 @@ def _scholar_source_cite(source: str) -> str:
         if re.match(r"^\d+\s+.+\s+\d+$", norm):
             cites.append(norm)
     return _pick_citation(cites) if cites else ""
+
+
+def _scholar_result_cite(r) -> str:
+    """A reporter citation for a Scholar search result — from its byline, or
+    failing that its title/snippet.  Used to locate the case on CourtListener
+    when Scholar's opinion page won't load."""
+    cite = _scholar_source_cite(getattr(r, "source", "") or "")
+    if not cite:
+        m = _TEXT_CITE_RE.search(
+            f"{getattr(r, 'title', '')} {getattr(r, 'snippet', '')}"
+        )
+        if m:
+            cite = re.sub(r"\s+", " ", m.group(0))
+    return cite or ""
 
 
 def _rtf_escape(s: str) -> str:
@@ -5090,11 +5261,6 @@ class _ScholarTextWindow:
                         m = re.search(r"\d+", s.text)
                         if m:
                             page = int(m.group(0))
-        # Whether the rendered opinion carries reporter page markers (star
-        # pagination): true for Scholar text and for CourtListener's combined
-        # opinion, both of which pin-cite by page.  Gates pin cites / writer
-        # parentheticals on Copy + Cite even in CourtListener mode.
-        self._has_pages = page is not None
         self._cl_text: Optional[str] = cl_text
         self._mode = "courtlistener" if self._cl_primary else "scholar"
         self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
@@ -5143,7 +5309,7 @@ class _ScholarTextWindow:
 
         self._win = tk.Toplevel(parent)
         self._win.title(
-            self._bb["name"] or (
+            self._title_citation() or (
                 "CourtListener Opinion Text" if self._cl_primary
                 else "Google Scholar Opinion Text"
             )
@@ -5170,6 +5336,11 @@ class _ScholarTextWindow:
                 # the PDF (Scholar rarely has the opinion text for them).
                 if self._fed_appx:
                     self._win.after(0, self._view_pdf)
+        # Fill in whatever the opinion text can't give us for a proper Bluebook
+        # citation — chiefly the federal-district / lower-court parenthetical and
+        # a missing year — from CourtListener in the background, then refresh the
+        # title.  The window opens immediately on the best-effort citation.
+        self._enrich_citation()
 
     # ------------------------------------------------------------------
     # UI
@@ -5303,6 +5474,12 @@ class _ScholarTextWindow:
         # / _show_courtlistener, hidden elsewhere; enabled once a PDF is located.
         self._pdf_btn = ttk.Button(
             btn_frame, text="View PDF", command=self._view_pdf, state="disabled"
+        )
+        # The Scholar text view's switch back to the CourtListener opinion (the
+        # mirror of CL's "Google Scholar Text" button).  Packed in
+        # _render_scholar, hidden in the CL and PDF views.
+        self._cl_btn = ttk.Button(
+            btn_frame, text="CourtListener Text", command=self._toggle_source
         )
 
         # Size controls: text size in the reader, PDF zoom in the PDF view
@@ -5922,6 +6099,7 @@ class _ScholarTextWindow:
         self._toggle_btn.config(text="View PDF", command=self._view_pdf,
                                 state="normal")
         self._hide_pdf_button()  # Scholar view uses the toggle for the PDF
+        self._show_cl_button()   # …and offers a switch to the CourtListener text
         self._export_btn.config(text="Export RTF…", command=self._export_rtf)
         self._print_btn.pack_forget()  # text view: no Print button
         self._zoom_out_btn.config(text="A−")
@@ -6247,6 +6425,7 @@ class _ScholarTextWindow:
         self._status_var.set(
             f"{char_count:,} characters | CourtListener version"
         )
+        self._hide_cl_button()  # CL view uses the toggle for "Google Scholar Text"
         self._show_pdf_button()
         self._finder.refresh()
         self._schedule_gutter_redraw()
@@ -6264,6 +6443,7 @@ class _ScholarTextWindow:
         self._source_var.set("CourtListener (assembled from the REST API)")
         self._toggle_btn.config(text="Google Scholar Text",
                                 command=self._toggle_source, state="normal")
+        self._hide_cl_button()
         self._part_combo.config(state="disabled")
         self._view_label_var.set("CourtListener text")
         self._view_label.config(foreground="black")
@@ -6307,31 +6487,53 @@ class _ScholarTextWindow:
         # resolver can try them all before giving up (not just the one chosen
         # for the Bluebook citation below).
         self._header_cites = [c for c, _p in cands]
+        # The star pagination may follow a reporter that isn't printed in the
+        # opinion's own header — CourtListener's combined opinions carry no
+        # parallel-cite header at all.  Fold in the cluster's parallel citations
+        # so the reporter the pages actually follow can be matched; otherwise
+        # the pin cite is computed against the wrong reporter (e.g. an A.3d
+        # first page when the stars are really N.J. Reports pages).
+        match_cands = list(cands)
+        seen = {re.sub(r"\s+", "", c).lower() for c, _p in match_cands}
+        for c in item.get("citation", []) or []:
+            c = re.sub(r"\s+", " ", str(c)).strip()
+            cm = _CITE_PARSE_RE.match(c)
+            if not (cm and _is_paginable_cite(c)):
+                continue
+            key = re.sub(r"\s+", "", c).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                match_cands.append((c, int(cm.group(3))))
+            except ValueError:
+                pass
         cite = ""
-        if cands:
-            first_star: Optional[int] = None
-            for b in self._blocks:
-                for s in b.spans:
-                    if s.pagenum:
-                        mm = re.search(r"\d+", s.text)
-                        if mm:
-                            first_star = int(mm.group(0))
-                            break
-                if first_star is not None:
-                    break
+        first_star: Optional[int] = None
+        for b in self._blocks:
+            for s in b.spans:
+                if s.pagenum:
+                    mm = re.search(r"\d+", s.text)
+                    if mm:
+                        first_star = int(mm.group(0))
+                        break
             if first_star is not None:
-                fits = [
-                    (first_star - p, c)
-                    for c, p in cands
-                    if 0 <= first_star - p <= 400
-                ]
-                if fits:
-                    cite = min(fits)[1]
-            if not cite:
-                cite = next(
-                    (c for c, _p in cands if _TEXT_CITE_RE.fullmatch(c)),
-                    cands[0][0],
-                )
+                break
+        if match_cands and first_star is not None:
+            # The reporter whose first page the stars fall just past (within a
+            # volume's worth of pages) is the one being paginated.
+            fits = [
+                (first_star - p, c)
+                for c, p in match_cands
+                if 0 <= first_star - p <= 400
+            ]
+            if fits:
+                cite = min(fits)[1]
+        if not cite and cands:
+            cite = next(
+                (c for c, _p in cands if _TEXT_CITE_RE.fullmatch(c)),
+                cands[0][0],
+            )
         if not cite:
             header_norm = re.sub(r"\bU\.\s+S\.", "U.S.", header)
             header_norm = re.sub(
@@ -6357,6 +6559,9 @@ class _ScholarTextWindow:
             name = re.split(r",\s*\d{1,4}\s", first)[0].strip().rstrip(",")[:120]
 
         court_id = str(item.get("court_id") or "").strip().lower()
+        # Whether the court came from CourtListener (authoritative) or had to be
+        # guessed from the opinion text — the enrichment pings CL when guessed.
+        self._court_from_cl = bool(court_id)
         if not court_id:
             court_id = _scholar_court_id(self._blocks)
         is_scotus = "scotus" in court_id or bool(
@@ -6481,6 +6686,134 @@ class _ScholarTextWindow:
         if signal == "per curiam" or author == "per curiam":
             author = "Per Curiam"
         maj.label = f"{base} ({author})" if author else base
+
+    def _title_citation(self) -> str:
+        """The window-title citation: the case name followed by every parallel
+        *printed* reporter cite (the chosen reporter first, then the parallels
+        from the Scholar header and the CourtListener citation list), then the
+        court-year parenthetical — e.g. "Roe v. Wade, 410 U.S. 113, 93 S. Ct.
+        705, 35 L. Ed. 2d 147 (1973)".  Lexis/Westlaw and neutral (year-volume)
+        cites are dropped (``_is_paginable_cite``)."""
+        bb = self._bb
+        name = bb.get("name", "")
+        seen: set = set()
+        cites: list[str] = []
+        for c in ([bb.get("cite", "")] + list(self._header_cites)
+                  + list((self._item or {}).get("citation", []) or [])):
+            c = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(c))).strip()
+            if (not c or not _is_paginable_cite(c)
+                    or _NONSTANDARD_CITE_RE.search(c)):
+                continue
+            # Re-space standard reporters ("S.Ct." -> "S. Ct."), but leave a
+            # reporter with a parenthetical qualifier ("Media L. Rep. (BNA)")
+            # alone — re-spacing would drop the parentheses.
+            if "(" not in c:
+                c = _respace_reporter_in_cite(c)
+            key = re.sub(r"\s+", "", c).lower()
+            if key not in seen:
+                seen.add(key)
+                cites.append(c)
+        # The chosen reporter stays first; order the parallels Bluebook-style
+        # (major national reporters first), keeping ties in the order seen.
+        if len(cites) > 1:
+            tail = cites[1:]
+            tail.sort(key=lambda c: next(
+                (i for i, p in enumerate(_TITLE_CITE_RANK) if p.search(f" {c} ")),
+                len(_TITLE_CITE_RANK),
+            ))
+            cites = [cites[0]] + tail
+        paren = " ".join(p for p in (bb.get("court", ""), bb.get("year", "")) if p)
+        if name and cites:
+            title = f"{name}, {', '.join(cites)}"
+        elif cites:
+            title = ", ".join(cites)
+        else:
+            title = name
+        if title and paren:
+            title += f" ({paren})"
+        return title
+
+    def _enrich_citation(self) -> None:
+        """Ping CourtListener in the background for the authoritative court and
+        year and update the title's Bluebook citation.  The court parenthetical
+        for federal-district and lower courts (e.g. "(S.D.N.Y. 2014)" for an
+        ``F. Supp.`` case) can't be derived from the opinion text, and the year
+        is sometimes missing — so we ask CourtListener.  Skipped when the court
+        already came from CourtListener and the year is known (nothing to add)."""
+        if not _SCHOLAR_AVAILABLE:
+            return
+        bb = self._bb
+        if not bb.get("cite"):
+            return
+        need_year = not bb.get("year")
+        # SCOTUS takes no court parenthetical; otherwise we need a reliable
+        # court, which we only have when CourtListener supplied the court id.
+        need_court = (not self._is_scotus) and not getattr(
+            self, "_court_from_cl", False
+        )
+        if not (need_year or need_court):
+            return
+        if not self._app._token_var.get().strip():
+            return  # no CourtListener token to ask
+        cite = bb["cite"]
+        item = dict(self._item)
+
+        def run() -> None:
+            client = self._app._get_client()
+            if client is None:
+                return
+            try:
+                court_id, year = self._cl_court_and_year(client, cite, item)
+            except Exception as exc:
+                print(f"[bb-enrich] CourtListener lookup failed: {exc}")
+                return
+            new_court = bb.get("court", "")
+            if need_court and court_id:
+                new_court = _court_for_paren(
+                    cite, court_id.strip().lower(), new_court
+                )
+            new_year = year or bb.get("year", "")
+            if new_court != bb.get("court", "") or new_year != bb.get("year", ""):
+                self._post(self._apply_enriched_citation, new_court, new_year)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _cl_court_and_year(client, cite: str, item: dict) -> tuple[str, str]:
+        """(court_id, year) for the case from CourtListener — the cluster's
+        date and its docket's court — locating the cluster by id or, failing
+        that, by the reporter citation."""
+        cluster_id = item.get("cluster_id") or item.get("id")
+        if not cluster_id:
+            t = _cl_item_for_citation(client, cite)
+            cluster_id = (t or {}).get("cluster_id")
+        if not cluster_id:
+            return "", ""
+        cl = client.get_cluster(int(cluster_id), fields="date_filed,docket")
+        year = (cl.get("date_filed") or "")[:4]
+        court_id = ""
+        docket_url = cl.get("docket")
+        if docket_url:
+            try:
+                court_id = (
+                    client._get_url(docket_url, {"fields": "court_id"}).get(
+                        "court_id"
+                    )
+                    or ""
+                )
+            except Exception as exc:
+                print(f"[bb-enrich] docket lookup failed: {exc}")
+        return court_id, year
+
+    def _apply_enriched_citation(self, court: str, year: str) -> None:
+        self._bb["court"] = court
+        self._bb["year"] = year
+        try:
+            title = self._title_citation()
+            if title and self._win.winfo_exists():
+                self._win.title(title)
+        except tk.TclError:
+            pass
 
     def _bluebook_citation(
         self, pin: Optional[str], writer: str = ""
@@ -6641,10 +6974,15 @@ class _ScholarTextWindow:
         except tk.TclError:
             start, end = "1.0", "end-1c"
             selected = False
-        # The combined CourtListener opinion renders like a Scholar one (star
-        # pagination + segmented parts), so it pin-cites and takes a writer
-        # parenthetical the same way even though the mode is "courtlistener".
-        scholar_like = self._mode == "scholar" or self._has_pages
+        # Pin cites and the writer parenthetical apply whenever the opinion on
+        # screen actually carries reporter page markers — the Google Scholar
+        # view and any CourtListener opinion assembled with page numbers (REST
+        # API included) — regardless of how the window was opened.  Check the
+        # live text, not a flag fixed at open time (which goes stale across a
+        # source toggle or a late Scholar match).
+        scholar_like = (
+            self._mode == "scholar" or bool(self._text.tag_ranges("pagenum"))
+        )
         pin = (
             self._pin_with_footnotes(start, end)
             if (selected and scholar_like)
@@ -7586,6 +7924,33 @@ class _ScholarTextWindow:
         if btn is not None and btn.winfo_ismapped():
             btn.pack_forget()
 
+    def _can_show_courtlistener(self) -> bool:
+        """Whether a CourtListener view is reachable from this Scholar window —
+        the original CL opinion it opened from, or a cluster/reporter citation
+        to fetch the equivalent."""
+        return bool(
+            self._cl_parts or self._cl_text is not None
+            or self._item.get("cluster_id") or self._item.get("id")
+            or (self._bb.get("cite") if getattr(self, "_bb", None) else "")
+        )
+
+    def _show_cl_button(self) -> None:
+        """Reveal the 'CourtListener Text' button in the Scholar view when a
+        CourtListener view can be reached (the mirror of _show_pdf_button)."""
+        btn = getattr(self, "_cl_btn", None)
+        if btn is None:
+            return
+        if self._can_show_courtlistener():
+            if not btn.winfo_ismapped():
+                btn.pack(side="right", padx=4)
+        elif btn.winfo_ismapped():
+            btn.pack_forget()
+
+    def _hide_cl_button(self) -> None:
+        btn = getattr(self, "_cl_btn", None)
+        if btn is not None and btn.winfo_ismapped():
+            btn.pack_forget()
+
     def _refresh_pdf_button(self) -> None:
         btn = getattr(self, "_pdf_btn", None)
         if btn is None:
@@ -7785,6 +8150,7 @@ class _ScholarTextWindow:
                           else "normal")
         self._toggle_btn.config(
             text=back_label, command=self._back_from_pdf, state=back_state)
+        self._hide_cl_button()
         # In PDF view, the RTF export becomes a "Download PDF" action, a Print
         # button appears, and the text-size buttons zoom the page.
         self._export_btn.config(text="Download PDF", command=self._download_pdf)

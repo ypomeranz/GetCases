@@ -30,6 +30,7 @@ anchors, matching how ``google_scholar.parse_opinion_blocks`` feeds the viewer.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 # A whole paragraph that is just a section marker — a roman numeral ("I",
 # "IV"), a single capital letter ("A"), or a number ("1", "12"), optionally
@@ -87,6 +88,7 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
         last = cur[-1] if cur else None
         if (
             last is not None and not fnref and not last.fnref
+            and not last.pagenum  # never fold body text into a page marker
             and link == last.link and last.sup == issup
             and all(getattr(last, k) == fmt.get(k, False)
                     for k in ("italic", "bold", "underline", "small"))
@@ -108,6 +110,18 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
             cur[-1].text = cur[-1].text.rstrip()
             blocks.append(Block(kind=kind, spans=cur))
         cur = []
+
+    def emit_pagenum(page: str) -> None:
+        """Emit a reporter page marker ("*279") as a page span — rendered in
+        the gutter, not inline — de-duping a marker repeated back-to-back."""
+        for s in reversed(cur):
+            if s.pagenum:
+                if s.text.lstrip("*").strip() == page:
+                    return
+                break
+            if s.text.strip():
+                break
+        cur.append(Span(text="*" + page, pagenum=True))
 
     def footnote_div(div) -> None:
         """Turn a <div class="footnote" id="fnN" label="N"> into a footnote
@@ -206,6 +220,20 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
                     continue
                 walk(child, fmt, kind, link=link)
                 continue
+            if name == "page-number" or (
+                name == "span" and "star-pagination" in cls
+            ):
+                # Reporter page break — Harvard CAP's
+                # <page-number label="279">*279</page-number> or lawbox's
+                # <span class="star-pagination">*279</span>.  Show it in the
+                # gutter (like Scholar) and feed pin cites, instead of letting
+                # "*279" fall through as inline body text.
+                page = (child.get("label") or "").strip() or _WS.sub(
+                    " ", child.get_text()
+                ).strip().lstrip("*").strip()
+                if page:
+                    emit_pagenum(page)
+                continue
             if name in _BLOCK_TAGS:
                 flush(kind)
                 child_fmt = fmt
@@ -236,6 +264,42 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
 
     walk(soup, {}, "para")
     flush("para")
+
+    # Fallback star pagination: some CourtListener opinions render their page
+    # anchors as bare "*N" text (e.g. <a id="p474">*474</a>) rather than the
+    # <page-number>/star-pagination markup, often glued to the next word.  Only
+    # when nothing else produced a page marker, look for single-star "*N"
+    # numbers (a parallel reporter's "**"/"***" form is excluded by the
+    # look-behind).  Treat them as pagination only when at least three of them
+    # run consecutively (474, 475, 476): a consecutive sequence is what marks
+    # them as page numbers rather than a stray asterisk.  Each marker is split
+    # out of its span into its own page span, with spaces, so the viewer shows
+    # and colours it in the gutter.
+    if not any(s.pagenum for b in blocks for s in b.spans):
+        star = re.compile(r"(?<!\*)\*(\d+)")
+        nums = {int(m.group(1)) for b in blocks for s in b.spans
+                if not s.pagenum and s.text for m in star.finditer(s.text)}
+        if any((n + 1) in nums and (n + 2) in nums for n in nums):
+            for block in blocks:
+                out: list = []
+                for s in block.spans:
+                    if s.pagenum or not s.text or not star.search(s.text):
+                        out.append(s)
+                        continue
+                    pos, text = 0, s.text
+                    for m in star.finditer(text):
+                        before = text[pos:m.start()]
+                        if before:
+                            if before[-1] not in " \t\n":  # gap before the marker
+                                before += " "
+                            out.append(replace(s, text=before))
+                        out.append(Span(text="*" + m.group(1), pagenum=True))
+                        out.append(Span(text=" "))  # gap after the page number
+                        pos = m.end()
+                    rest = text[pos:].lstrip(" ")
+                    if rest:
+                        out.append(replace(s, text=rest))
+                block.spans = out
 
     # Reclassify bare section markers as headings (Scholar styles them so).
     for block in blocks:
@@ -309,5 +373,39 @@ if __name__ == "__main__":
           "inline emphasis preserved inside a footnote")
     # ref id and def id match so the viewer can link them
     check(refs[0].fnref == fns[0].spans[0].fndef, "ref id == def id (linkable)")
+
+    # Fallback star pagination: page anchors that render as bare *N text (some
+    # CourtListener opinions, e.g. Christman v. Clause).  Single-star numbers
+    # become page spans only when at least three run consecutively; a parallel
+    # reporter's *** form is excluded.
+    star_sample = (
+        '<opinion type="majority">'
+        '<p><a id="p474" href="#p474">*474</a><strong>Body</strong> text '
+        'continues <a id="p475" href="#p475">*475</a>more, then '
+        '<a id="p476" href="#p476">*476</a>still more.</p>'
+        '<p><a id="p145" href="#p145">***145</a>parallel reporter.</p>'
+        '</opinion>'
+    )
+    sb, _ = parse_cl_html(star_sample)
+    pages = [s.text for b in sb for s in b.spans if s.pagenum]
+    check(pages == ["*474", "*475", "*476"],
+          f"consecutive single-star markers -> pages: {pages}")
+    flat = "".join(s.text for b in sb for s in b.spans)
+    check("*474Body" not in flat and "*475more" not in flat,
+          "markers separated from glued text by a space")
+    check("***145" in flat and not any(s.pagenum and "145" in s.text
+                                        for b in sb for s in b.spans),
+          "parallel reporter's *** marker left as text, not a page")
+
+    # No three-in-a-row run -> not treated as pagination (avoids stray
+    # asterisks); digit count is irrelevant, the consecutive sequence is.
+    nostar = (
+        '<opinion type="majority">'
+        '<p>A 5-star rating <a id="p5" href="#p5">*5</a> and a note '
+        '<a id="p200" href="#p200">*200</a> here.</p></opinion>'
+    )
+    nb, _ = parse_cl_html(nostar)
+    check(not any(s.pagenum for b in nb for s in b.spans),
+          "scattered *N (no 3-in-a-row) left as text, not pages")
 
     raise SystemExit(1 if failed else 0)

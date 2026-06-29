@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -804,6 +805,61 @@ class GoogleScholarFetcher:
         # session is the case worth optimizing).
         self._search_cache: dict[str, list[ScholarResult]] = {}
 
+        # The scholar_case URL found on the results page when the opinion page
+        # then failed to load (search succeeded, case page didn't) — consumed
+        # by take_post_search_failure() so a caller can fall back to
+        # CourtListener and retry this exact opinion in the background.
+        self._post_search_failure: Optional[str] = None
+
+        # Back up any opinions that were cached before they were stored in the
+        # opinion database (e.g. served from the query cache, which short-circuits
+        # before storage).  Runs once in the background; add_opinion de-dupes.
+        self._backfill_opinion_db()
+
+    def _backfill_opinion_db(self) -> None:
+        """Copy every cached opinion (old query cache) into the opinion database
+        in the background, so opinions loaded before the database existed — or
+        served from the cache without being stored — are backed up.  Incremental
+        and cheap on re-runs: a scholar id already in the database is skipped
+        without re-parsing its HTML."""
+        if self._opinion_db is None:
+            return
+
+        def run() -> None:
+            try:
+                from opinion_db import scholar_id_from_url
+                # URLs only first (cheap) — the HTML is fetched on demand below
+                # just for the opinions still missing, so the cache's bulk never
+                # loads into memory at once.
+                urls = [
+                    r[0] for r in self._db.execute(
+                        "SELECT DISTINCT case_url FROM opinions "
+                        "WHERE html IS NOT NULL AND html != ''"
+                    ).fetchall()
+                ]
+            except Exception as exc:
+                print(f"[scholar] opinion-DB backfill skipped: {exc}")
+                return
+            added = 0
+            for url in urls:
+                sid = scholar_id_from_url(url or "")
+                if not sid or self._opinion_db.get_by_scholar_id(sid) is not None:
+                    continue  # no id, or already backed up — no HTML parse
+                try:
+                    row = self._db.execute(
+                        "SELECT html FROM opinions WHERE case_url=? "
+                        "AND html IS NOT NULL AND html != '' LIMIT 1",
+                        (url,),
+                    ).fetchone()
+                    if row and row[0] and self._opinion_db.add_opinion(url, row[0]):
+                        added += 1
+                except Exception:
+                    continue
+            if added:
+                print(f"[scholar] backed up {added} cached opinions into the database")
+
+        threading.Thread(target=run, daemon=True).start()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -815,10 +871,12 @@ class GoogleScholarFetcher:
         Returns (scholar_url, opinion_html) or None if not found / blocked.
         Result is cached permanently on success.
         """
+        self._post_search_failure = None
         key = f"cite:{citation.strip()}"
         cached = self._cache_get(key)
         if cached:
             print(f"[scholar] cache hit for {key!r}")
+            self._store_opinion(*cached)  # back the cached opinion up in the DB
             return cached
 
         # Search the database before Google Scholar: a unique opinion bearing
@@ -858,7 +916,12 @@ class GoogleScholarFetcher:
         result = self._fetch_case_page(case_url)
         if result:
             self._cache_put(key, *result)
-        return result
+            return result
+        # The search found the case but the opinion page didn't load (Google is
+        # flaky) — record it so the caller can show CourtListener now and retry
+        # this exact opinion in the background.
+        self._post_search_failure = case_url
+        return None
 
     def fetch_by_name(
         self, case_name: str, year: Optional[str] = None
@@ -868,11 +931,13 @@ class GoogleScholarFetcher:
 
         Returns (scholar_url, opinion_html) or None.
         """
+        self._post_search_failure = None
         q = f"{case_name} {year}".strip() if year else case_name
         key = f"name:{q}"
         cached = self._cache_get(key)
         if cached:
             print(f"[scholar] cache hit for {key!r}")
+            self._store_opinion(*cached)  # back the cached opinion up in the DB
             return cached
 
         # Search the database before Google Scholar (by party name): a unique
@@ -902,7 +967,19 @@ class GoogleScholarFetcher:
         result = self._fetch_case_page(case_url)
         if result:
             self._cache_put(key, *result)
-        return result
+            return result
+        self._post_search_failure = case_url
+        return None
+
+    def take_post_search_failure(self) -> Optional[str]:
+        """The scholar_case URL found on the results page when the opinion page
+        then failed to load (the search succeeded but the case page didn't),
+        returned once and cleared.  ``None`` when the last fetch succeeded or
+        failed at the search stage.  Lets a caller fall back to CourtListener
+        and retry that exact Scholar opinion in the background."""
+        url = self._post_search_failure
+        self._post_search_failure = None
+        return url
 
     def search_cases(self, query: str, limit: int = 10) -> list["ScholarResult"]:
         """
@@ -990,6 +1067,7 @@ class GoogleScholarFetcher:
         cached = self._cache_get(key)
         if cached:
             print(f"[scholar] cache hit for {key!r}")
+            self._store_opinion(*cached)  # back the cached opinion up in the DB
             return cached
 
         result = self._fetch_case_page(url)
