@@ -6313,6 +6313,12 @@ class _ScholarTextWindow:
             btn_frame, text="Case details", variable=self._details_var,
             command=self._toggle_details,
         ).pack(side="left", padx=(0, 8))
+        # When checked (default), Ctrl-C appends the Bluebook citation (with the
+        # pin cite) to the copied text; unchecked, it copies the selection alone.
+        self._copy_with_cite = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            btn_frame, text="Copy with citation", variable=self._copy_with_cite,
+        ).pack(side="left", padx=(0, 8))
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
             win.bind(seq, lambda _e: self._zoom(+1))
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
@@ -6324,8 +6330,9 @@ class _ScholarTextWindow:
         )
         txt.bind("<Control-Button-4>", lambda _e: self._zoom(+1) or "break")
         txt.bind("<Control-Button-5>", lambda _e: self._zoom(-1) or "break")
-        # Ctrl-C copies with the Bluebook citation appended (the plain
-        # default copy is suppressed); the find bar's entry keeps native
+        # Ctrl-C copies with the Bluebook citation appended when the "Copy with
+        # citation" box is checked, else the selection alone (the plain default
+        # copy is suppressed either way); the find bar's entry keeps native
         # copy since this is bound to the text widget only.
         for seq in ("<Control-c>", "<Command-c>"):
             try:
@@ -7840,37 +7847,48 @@ class _ScholarTextWindow:
         except tk.TclError:
             start, end = "1.0", "end-1c"
             selected = False
-        # Pin cites and the writer parenthetical apply whenever the opinion on
-        # screen actually carries reporter page markers — the Google Scholar
-        # view and any CourtListener opinion assembled with page numbers (REST
-        # API included) — regardless of how the window was opened.  Check the
-        # live text, not a flag fixed at open time (which goes stale across a
-        # source toggle or a late Scholar match).
-        scholar_like = (
-            self._mode == "scholar" or bool(self._text.tag_ranges("pagenum"))
-        )
-        pin = (
-            self._pin_with_footnotes(start, end)
-            if (selected and scholar_like)
-            else None
-        )
-        writer = ""
-        if scholar_like and self._parts:
-            pi = self._current_part
-            if pi is None and selected:
-                for rs, rend, p in self._part_regions:
-                    if txt.compare(start, ">=", rs) and txt.compare(start, "<", rend):
-                        pi = p
-                        break
-            if pi is not None:
-                writer = self._writer_parenthetical(self._parts[pi])
-        plain_cite, rtf_cite = self._bluebook_citation(pin, writer)
+        # The "Copy with citation" box (checked by default) gates whether the
+        # Bluebook citation is appended; unchecked, the selection is copied on
+        # its own (still richly, just without the citation).
+        with_cite = self._copy_with_cite.get()
+        plain_cite, rtf_cite = "", ""
+        if with_cite:
+            # Pin cites and the writer parenthetical apply whenever the opinion
+            # on screen actually carries reporter page markers — the Google
+            # Scholar view and any CourtListener opinion assembled with page
+            # numbers (REST API included) — regardless of how the window was
+            # opened.  Check the live text, not a flag fixed at open time (which
+            # goes stale across a source toggle or a late Scholar match).
+            scholar_like = (
+                self._mode == "scholar" or bool(self._text.tag_ranges("pagenum"))
+            )
+            pin = (
+                self._pin_with_footnotes(start, end)
+                if (selected and scholar_like)
+                else None
+            )
+            writer = ""
+            if scholar_like and self._parts:
+                pi = self._current_part
+                if pi is None and selected:
+                    for rs, rend, p in self._part_regions:
+                        if txt.compare(start, ">=", rs) and txt.compare(start, "<", rend):
+                            pi = p
+                            break
+                if pi is not None:
+                    writer = self._writer_parenthetical(self._parts[pi])
+            plain_cite, rtf_cite = self._bluebook_citation(pin, writer)
         body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map())
         rtf = _rtf_document(body + rtf_cite)
-        plain = txt.get(start, end).rstrip() + "\n\n" + plain_cite + "\n"
+        plain = txt.get(start, end).rstrip()
+        if plain_cite:
+            plain += "\n\n" + plain_cite + "\n"
         how = _copy_rich_clipboard(self._win, rtf, plain)
         what = "selection" if selected else "full text"
-        self._status_var.set(f"Copied {what} as {how}; citation appended.")
+        self._status_var.set(
+            f"Copied {what} as {how}"
+            + ("; citation appended." if with_cite else ".")
+        )
 
     def _fn_link_map(self) -> dict[str, tuple[str, str]]:
         """Link tags that anchor footnote jumps, for RTF bookmarks."""
