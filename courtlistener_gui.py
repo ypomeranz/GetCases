@@ -17,6 +17,7 @@ Token lookup order:
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -133,7 +134,9 @@ from citations import (
 )
 from court_catalog import (
     CATALOG as _COURT_CATALOG,
+    CIRCUIT_COURTS as _CIRCUIT_COURTS,
     COURT_BLUEBOOK as _COURT_BLUEBOOK,
+    DISTRICT_COURTS as _DISTRICT_COURTS,
     STATE_COURTS as _STATE_COURTS,
     all_court_ids as _all_court_ids,
 )
@@ -759,6 +762,380 @@ def _cl_item_for_citation(client, cite: str) -> Optional[dict]:
                    for c in (it.get("citation") or [])):
                 return it
     return None
+
+
+# ======================================================================
+# Spotlight name-ranked case search
+# ======================================================================
+# CourtListener's full-text search ranks by relevance and gives the case
+# *name* no special weight over the body text, so a quick search for a case
+# by name (e.g. "Pennoyer v. Neff") can bury the case itself under opinions
+# that merely discuss it.  When the query is a name rather than a reporter
+# citation, these helpers instead restrict the search to the caseName field,
+# rank hits by how closely their names match the query, and walk the court
+# hierarchy — the Supreme Court first, then the federal courts of appeals,
+# then the state courts of last resort — so the most authoritative close
+# matches surface first.
+
+_SCOTUS_COURT_ID = "scotus"
+
+# The federal courts of appeals and the state courts of last resort, each as
+# a single space-separated CourtListener ``court`` filter value.
+_FED_APPEALS_COURT_IDS = " ".join(_CIRCUIT_COURTS)
+_STATE_SUPREME_COURT_IDS = " ".join(
+    courts[0][0] for _state, courts in _STATE_COURTS if courts
+)
+
+# A close name match must clear this score (see _name_match_score): a query
+# whose single party fully matches a candidate party scores exactly 0.5, so
+# "match one or both of the parties" is the floor for "reasonably close".
+_NAME_MATCH_MIN = 0.5
+
+# Articles, conjunctions, the "v.", and corporate/procedural boilerplate are
+# dropped before comparing names so they don't dominate the token overlap.
+_NAME_STOPWORDS = {
+    "the", "of", "and", "a", "an", "in", "on", "for", "re", "ex", "parte",
+    "matter", "v", "vs", "et", "al", "co", "cos", "corp", "inc", "ltd",
+    "llc", "llp", "lp", "lllp", "plc", "company", "companies",
+    "incorporated", "corporation", "no", "nos",
+}
+
+_NAME_PARTY_SPLIT_RE = re.compile(r"\s+v(?:s)?\.?\s+", re.IGNORECASE)
+
+
+def _name_tokens(name: str) -> list[str]:
+    """Significant lowercased word tokens of a case (or party) name, with
+    HTML, punctuation, articles, bare numbers and one-letter tokens removed."""
+    name = re.sub(r"<[^>]+>", " ", name or "")
+    name = re.sub(r"[^\w\s]", " ", name.lower())
+    return [
+        t for t in name.split()
+        if len(t) > 1 and not t.isdigit() and t not in _NAME_STOPWORDS
+    ]
+
+
+def _name_parties(name: str) -> list[set[str]]:
+    """Token sets for each side of a case name ("A v. B" → [{a}, {b}])."""
+    sides = _NAME_PARTY_SPLIT_RE.split(name or "", maxsplit=1)
+    return [toks for toks in (set(_name_tokens(s)) for s in sides) if toks]
+
+
+def _token_close(a: str, b: str) -> bool:
+    """Two name tokens match when equal, one is a prefix of the other, or
+    they are near-identical spellings (handles plurals and minor variants)."""
+    if a == b:
+        return True
+    if len(a) >= 4 and len(b) >= 4 and (a.startswith(b) or b.startswith(a)):
+        return True
+    if len(a) >= 5 and len(b) >= 5:
+        return difflib.SequenceMatcher(None, a, b).ratio() >= 0.85
+    return False
+
+
+def _party_overlap(query_party: set[str], cand_party: set[str]) -> float:
+    """Fraction of a query party's tokens found (token-close) in a candidate
+    party — how completely that side of the query name is present."""
+    if not query_party:
+        return 0.0
+    hit = sum(1 for t in query_party
+              if any(_token_close(t, c) for c in cand_party))
+    return hit / len(query_party)
+
+
+def _name_match_score(query: str, candidate: str) -> float:
+    """Closeness (0..1) of a candidate case name to the query name, scored on
+    how well the query's parties match the candidate's.  Matching one party
+    well scores ~0.5; matching both scores near 1.0."""
+    q_parties = _name_parties(query)
+    c_parties = _name_parties(candidate)
+    if not q_parties or not c_parties:
+        # One-sided name ("In re Gault"), or an unparseable caption: compare
+        # the whole token sets directly.
+        q = set(_name_tokens(query))
+        c = set(_name_tokens(candidate))
+        return _party_overlap(q, c) if q else 0.0
+    per_side = [max(_party_overlap(qp, cp) for cp in c_parties)
+                for qp in q_parties]
+    avg = sum(per_side) / len(per_side)
+    # Reward a both-sides hit so an exact "A v. B" outranks a one-party match.
+    bonus = 0.15 if sum(1 for s in per_side if s >= 0.6) >= 2 else 0.0
+    # Require at least one party to match solidly, so two weak half-matches
+    # don't masquerade as a close hit.
+    if max(per_side) < 0.6:
+        return 0.0
+    return min(1.0, avg + bonus)
+
+
+def _case_fingerprints(name: str, cite: str, year: str) -> set[str]:
+    """Identity keys for a case, used to recognize the same case across
+    sources (Google Scholar, CourtListener, English Reports).  Two results are
+    the same case when any fingerprint matches, so each result carries both a
+    citation key (when it has a reporter cite) and a name key — a Scholar hit
+    with only a name still de-duplicates against a CourtListener hit that has
+    both.  Reporter spelling is normalized so "410 U.S. 113" and "410 US 113"
+    collapse to one key."""
+    fps: set[str] = set()
+    m = _CITE_PARSE_RE.match(re.sub(r"<[^>]+>", "", cite or "").strip())
+    if m:
+        vol = m.group(1)
+        rep = re.sub(r"[^a-z0-9]", "", m.group(2).lower())
+        page = m.group(3)
+        if rep:
+            fps.add(f"c:{vol}:{rep}:{page}")
+    toks = _name_tokens(name)
+    if toks:
+        fps.add("n:" + " ".join(sorted(set(toks))))
+    return fps
+
+
+# How many *distinct* cases each spotlight source/court-tier may display.  A
+# source over-fetches a couple of spare candidates beyond its cap so that, when
+# one of its results duplicates a case already shown by another source, the
+# next-best result takes the slot and the source still shows its full quota.
+_BUCKET_CAPS: dict[str, int] = {
+    "scholar": 2,     # Google Scholar
+    "scotus": 3,      # Supreme Court
+    "appeals": 2,     # federal courts of appeals
+    "state": 2,       # state courts of last resort
+    "juris": 3,       # a single jurisdiction named in the query
+    "cl": 3,          # CourtListener citation-lookup results
+    "engrep": 1,      # English Reports
+}
+
+
+def _dedup_accept(fps: set[str], bucket: str,
+                  seen: set[str], bucket_counts: dict[str, int]) -> bool:
+    """Decide whether to display a result with fingerprints *fps* from
+    *bucket*, given the cases already shown (*seen*) and how many each bucket
+    has shown (*bucket_counts*).  On acceptance, records the fingerprints and
+    bumps the bucket count.  Rejects a case already shown (a cross-source
+    duplicate) or one that would exceed the bucket's display cap."""
+    if fps & seen:
+        return False
+    if bucket and bucket_counts.get(bucket, 0) >= _BUCKET_CAPS.get(bucket, 99):
+        return False
+    seen.update(fps)
+    if bucket:
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+    return True
+
+
+def _is_scotus_order_item(item: dict) -> bool:
+    """True for a SCOTUS "order" entry — a docket/order with no real opinion
+    (≤ 2 outbound citations) — which the main search routes out of the primary
+    results and the spotlight likewise drops."""
+    court_val = str(item.get("court_id") or item.get("court") or "")
+    if "scotus" not in court_val.lower():
+        return False
+    opinions = item.get("opinions") or []
+    main_op = max(opinions, key=lambda o: len(o.get("cites") or []),
+                  default=None)
+    cites_count = len(main_op.get("cites") or []) if main_op else 0
+    return cites_count <= 2
+
+
+# --- Jurisdiction hint parsing ----------------------------------------------
+# A query may pin the court itself — "Doe v. Roe (7th Cir. 2009)" — in which
+# case the search is aimed straight at that jurisdiction.  Only a court hint
+# set off from the name (a trailing parenthetical, a trailing clause after a
+# comma, or a bare trailing "Nth Cir.") is recognized, so an ordinary party
+# name is never mistaken for a jurisdiction.
+
+_CIRCUIT_ORDINAL_IDS = {
+    "1st": "ca1", "2d": "ca2", "2nd": "ca2", "3d": "ca3", "3rd": "ca3",
+    "4th": "ca4", "5th": "ca5", "6th": "ca6", "7th": "ca7", "8th": "ca8",
+    "9th": "ca9", "10th": "ca10", "11th": "ca11",
+    "first": "ca1", "second": "ca2", "third": "ca3", "fourth": "ca4",
+    "fifth": "ca5", "sixth": "ca6", "seventh": "ca7", "eighth": "ca8",
+    "ninth": "ca9", "tenth": "ca10", "eleventh": "ca11",
+}
+
+# Reverse lookup of a federal district court's Bluebook abbreviation, with
+# periods/spaces removed ("S.D.N.Y." → "sdny", "N.D. Cal." → "ndcal").
+_DISTRICT_ABBR_IDS = {
+    abbr.replace(".", "").replace(" ", "").lower(): cid
+    for cid, abbr in _DISTRICT_COURTS.items()
+}
+
+# State name → that state's court list, and every state court's Bluebook
+# abbreviation (all levels) → its CourtListener court id, for resolving a
+# state court hint ("Cal." → cal, "Cal. Ct. App." → calctapp).
+_STATE_NAME_COURTS = {state.lower(): courts for state, courts in _STATE_COURTS}
+_STATE_COURT_ABBR_IDS = {
+    abbr.replace(".", "").replace(" ", "").lower(): cid
+    for _state, courts in _STATE_COURTS for cid, abbr, _label in courts
+}
+
+_CIRCUIT_HINT_RE = re.compile(
+    r"(?P<ord>\d{1,2}(?:st|nd|rd|d|th)|first|second|third|fourth|fifth|"
+    r"sixth|seventh|eighth|ninth|tenth|eleventh)\s+cir(?:cuit)?\.?",
+    re.IGNORECASE,
+)
+_DC_CIRCUIT_HINT_RE = re.compile(r"\bd\.?\s*c\.?\s+cir(?:cuit)?\.?", re.IGNORECASE)
+_FED_CIRCUIT_HINT_RE = re.compile(r"\bfed(?:eral)?\.?\s+cir(?:cuit)?\.?",
+                                  re.IGNORECASE)
+_SCOTUS_HINT_RE = re.compile(
+    r"\b(?:scotus|u\.?\s*s\.?\s+supreme\s+court|united\s+states\s+supreme\s+"
+    r"court|supreme\s+court\s+of\s+the\s+united\s+states)\b",
+    re.IGNORECASE,
+)
+_YEAR_TAIL_RE = re.compile(r"[\s,]*(?:19|20)\d{2}\s*$")
+
+
+def _classify_court_hint(hint: str) -> Optional[tuple[str, str]]:
+    """Resolve a court-hint string ("7th Cir.", "S.D.N.Y.", "Cal.") to
+    (space-separated court ids, label), or None when it names no known court."""
+    h = _YEAR_TAIL_RE.sub("", (hint or "").strip()).strip(" ,.;()[]")
+    if not h:
+        return None
+    low = h.lower()
+
+    if _SCOTUS_HINT_RE.search(low):
+        return _SCOTUS_COURT_ID, "U.S. Supreme Court"
+    m = _CIRCUIT_HINT_RE.search(low)
+    if m:
+        cid = _CIRCUIT_ORDINAL_IDS.get(m.group("ord").lower())
+        if cid:
+            return cid, _CIRCUIT_COURTS.get(cid, cid)
+    if _DC_CIRCUIT_HINT_RE.search(low):
+        return "cadc", _CIRCUIT_COURTS["cadc"]
+    if _FED_CIRCUIT_HINT_RE.search(low):
+        return "cafc", _CIRCUIT_COURTS["cafc"]
+
+    # Federal district court, by its Bluebook abbreviation.
+    key = low.replace(".", "").replace(" ", "")
+    cid = _DISTRICT_ABBR_IDS.get(key)
+    if cid:
+        return cid, _DISTRICT_COURTS[cid]
+
+    # State court by its Bluebook abbreviation, any level ("Cal." → cal,
+    # "Cal. Ct. App." → calctapp, "Tex. App." → texapp).
+    cid = _STATE_COURT_ABBR_IDS.get(key)
+    if cid:
+        return cid, _COURT_BLUEBOOK.get(cid, cid)
+
+    # State named in full ("California", "California Court of Appeal"):
+    # identify the state, then classify the specific court it names.
+    for state_low, courts in _STATE_NAME_COURTS.items():
+        if low == state_low or low.startswith(state_low + " "):
+            cid = _classify_state_court(low, courts)
+            return cid, _COURT_BLUEBOOK.get(cid, cid)
+    return None
+
+
+def _detect_jurisdiction(query: str) -> Optional[tuple[str, str, str]]:
+    """If *query* pins a court — "Doe v. Roe (7th Cir. 2009)", "Smith, 9th
+    Cir." — return (court_ids, name_without_hint, label).  None otherwise."""
+    q = (query or "").strip()
+
+    # 1. A trailing parenthetical: "... (7th Cir. 2009)".
+    m = re.search(r"[(\[]([^)\]]*)[)\]]\s*$", q)
+    if m:
+        hit = _classify_court_hint(m.group(1))
+        if hit:
+            name = q[:m.start()].strip(" ,;-–—")
+            return hit[0], name, hit[1]
+
+    # 2. A trailing clause after the last comma: "..., 9th Cir.".
+    if "," in q:
+        head, tail = q.rsplit(",", 1)
+        if tail.strip() and len(tail.split()) <= 4:
+            hit = _classify_court_hint(tail)
+            if hit:
+                return hit[0], head.strip(" ,;-–—"), hit[1]
+
+    # 3. A bare trailing circuit, with no delimiter: "... 7th Cir.".
+    for rx in (_CIRCUIT_HINT_RE, _DC_CIRCUIT_HINT_RE, _FED_CIRCUIT_HINT_RE):
+        m = rx.search(q)
+        if m and _YEAR_TAIL_RE.sub("", q[m.end():]).strip() == "":
+            hit = _classify_court_hint(q[m.start():])
+            if hit:
+                return hit[0], q[:m.start()].strip(" ,;-–—"), hit[1]
+    return None
+
+
+# --- Name-restricted CourtListener search -----------------------------------
+
+def _cl_name_search(client, name: str, court_ids: Optional[str], *,
+                    page_size: int = 20, limit: int = 3, spare: int = 0,
+                    drop_scotus_orders: bool = False) -> list[dict]:
+    """Search a (set of) court(s) for a case *name*, restricting the query to
+    the caseName field, then return the items whose names are reasonably close
+    to *name*, best first.  Up to ``limit + spare`` are returned: the caller
+    displays ``limit`` of them and keeps the spares to replace any that turn
+    out to duplicate a case already shown by another source."""
+    toks = _name_tokens(name)
+    q = f"caseName:({' '.join(toks)})" if toks else (name or "").strip()
+    if not q:
+        return []
+    try:
+        data = client.search(q, type="o", court=court_ids or None,
+                             page_size=page_size)
+        results = data.get("results") or []
+    except Exception as exc:
+        print(f"[cl-name] search failed for court={court_ids!r}: {exc}")
+        return []
+    if drop_scotus_orders:
+        results = [it for it in results if not _is_scotus_order_item(it)]
+
+    scored: list[tuple[float, dict]] = []
+    for it in results:
+        cand = re.sub(
+            r"<[^>]+>", "",
+            it.get("caseName") or it.get("case_name") or "",
+        ).strip()
+        score = _name_match_score(name, cand)
+        if score >= _NAME_MATCH_MIN:
+            scored.append((score, it))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [it for _score, it in scored[:limit + spare]]
+
+
+def _cl_name_ranked_search(client, query: str) -> list[tuple[str, dict]]:
+    """Name-ranked CourtListener results for a quick-search *query* that is a
+    case name (not a reporter citation), as ``(bucket, item)`` pairs whose
+    bucket carries each result's display cap (see ``_BUCKET_CAPS``).
+
+    When the query pins a jurisdiction ("... (7th Cir. 2009)"), the best name
+    matches in that court are returned.  Otherwise the court hierarchy is
+    walked — Supreme Court (up to 3), federal courts of appeals (up to 2), and
+    state courts of last resort (up to 2) — and the groups are concatenated in
+    that order of authority.  A couple of spare candidates beyond each cap are
+    included so duplicates dropped during display can be replaced."""
+    juris = _detect_jurisdiction(query)
+    if juris:
+        court_ids, name, _label = juris
+        items = _cl_name_search(
+            client, name or query, court_ids, limit=3, spare=2,
+            drop_scotus_orders=(court_ids == _SCOTUS_COURT_ID),
+        )
+        return [("juris", it) for it in items]
+
+    # (bucket, court ids, how many to show, whether to drop SCOTUS orders)
+    tiers = [
+        ("scotus", _SCOTUS_COURT_ID, 3, True),
+        ("appeals", _FED_APPEALS_COURT_IDS, 2, False),
+        ("state", _STATE_SUPREME_COURT_IDS, 2, False),
+    ]
+    groups: list[list[tuple[str, dict]]] = [[] for _ in tiers]
+
+    def run_tier(i: int) -> None:
+        bucket, court_ids, lim, drop = tiers[i]
+        groups[i] = [
+            (bucket, it) for it in _cl_name_search(
+                client, query, court_ids, limit=lim, spare=2,
+                drop_scotus_orders=drop,
+            )
+        ]
+
+    # Hit the three tiers in parallel, then concatenate them in priority order.
+    with ThreadPoolExecutor(max_workers=len(tiers)) as ex:
+        for _ in as_completed([ex.submit(run_tier, i) for i in range(len(tiers))]):
+            pass
+    out: list[tuple[str, dict]] = []
+    for group in groups:
+        out.extend(group)
+    return out
 
 
 _OPINION_TYPE_LABELS: dict[str, str] = {
@@ -1669,42 +2046,48 @@ class CourtListenerGUI:
             except tk.TclError:
                 pass
 
-        # Resize popup to accommodate results
+        # The dropdown grows to fit its results.  The court hierarchy can now
+        # return more than the old fixed six rows — up to three Supreme Court
+        # matches, two courts-of-appeals, and two state-high-court matches,
+        # plus the two Google Scholar matches and an English Reports row — so
+        # the popup starts just tall enough for the "Searching…" line and is
+        # resized as each result row streams in (up to max_rows).
         pw = 580
         row_h = 52
-        max_rows = 6
+        row_gap = 2
+        max_rows = 10
         header_h = 48
-        # extra for the per-slot gap and the status label pinned at the bottom
-        dropdown_h = max_rows * (row_h + 2) + 36
+        status_h = 26
         sx = popup.winfo_screenwidth()
         sy = popup.winfo_screenheight()
-        popup.geometry(
-            f"{pw}x{header_h + dropdown_h}"
-            f"+{(sx - pw) // 2}+{sy // 3}"
-        )
+        pos_x = (sx - pw) // 2
+        pos_y = sy // 3
+
+        def _resize_to(n_rows: int) -> None:
+            n = max(0, min(n_rows, max_rows))
+            body_h = n * (row_h + row_gap) + status_h + 6
+            try:
+                popup.geometry(f"{pw}x{header_h + body_h}+{pos_x}+{pos_y}")
+            except tk.TclError:
+                pass
+
+        _resize_to(0)
 
         # Results frame below the search bar
         results_frame = tk.Frame(border, bg="#f0f0f0")
         results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
         self._spotlight_results_frame = results_frame
 
-        # Pre-place fixed-height result slots so streaming results land in stable
-        # positions: a result that comes back first never shifts when later ones
-        # fill the slots below it.  Empty slots match the dropdown background, so
-        # they stay invisible until filled.
-        slots: list[tk.Frame] = []
-        for _ in range(max_rows):
-            slot = tk.Frame(results_frame, bg="#f0f0f0", height=row_h)
-            slot.pack(side="top", fill="x", padx=4, pady=(2, 0))
-            slot.pack_propagate(False)  # keep the slot's height fixed
-            slots.append(slot)
-
         # Tracking state
         result_rows: list[dict] = []
         selected_idx = [-1]  # mutable via closure
+        # Cross-source de-duplication: fingerprints of the cases already shown,
+        # and how many each source/court-tier has shown.
+        seen_cases: set[str] = set()
+        bucket_counts: dict[str, int] = {}
 
-        def _add_result(court_id: str, name: str, cite: str, year: str,
-                        source_label: str, open_fn) -> None:
+        def _add_result(bucket: str, court_id: str, name: str, cite: str,
+                        year: str, source_label: str, open_fn) -> None:
             # Ignore results streaming in from a superseded search.
             if my_gen != self._spotlight_generation:
                 return
@@ -1718,10 +2101,20 @@ class CourtListenerGUI:
             if idx >= max_rows:
                 return
 
-            # Fill the pre-placed slot in situ (no new pack → no reflow, so the
-            # rows already on screen keep their exact position).
-            row = slots[idx]
-            row.config(bg="#ffffff", cursor="hand2")
+            # Skip a case already shown by another source (and respect the
+            # source's per-tier display cap); the source's next-best result
+            # then takes this slot instead.
+            if not _dedup_accept(_case_fingerprints(name, cite, year), bucket,
+                                 seen_cases, bucket_counts):
+                return
+
+            # Append a fresh row at the bottom.  Rows are added in arrival order
+            # and never moved, so a result already on screen keeps its position
+            # while the dropdown grows downward to fit the new one.
+            row = tk.Frame(results_frame, bg="#ffffff", height=row_h,
+                           cursor="hand2")
+            row.pack(side="top", fill="x", padx=4, pady=(row_gap, 0))
+            row.pack_propagate(False)  # keep the row's height fixed
 
             court_abbr = _COURT_BLUEBOOK.get(
                 court_id, court_id.upper() if court_id else "?"
@@ -1775,6 +2168,9 @@ class CourtListenerGUI:
             for child in text_frame.winfo_children():
                 child.bind("<Button-1>", on_click)
 
+            # Grow the dropdown to fit the row just added.
+            _resize_to(len(result_rows))
+
         def _highlight(idx: int) -> None:
             for i, r in enumerate(result_rows):
                 bg = "#d0e0f0" if i == idx else "#ffffff"
@@ -1826,7 +2222,7 @@ class CourtListenerGUI:
                 self._open_main_from_spotlight(popup)
         entry.bind("<Return>", _entry_return)
 
-        # Status label, pinned at the bottom so the result slots above it stay
+        # Status label, pinned at the bottom so the result rows above it stay
         # put as results stream in.
         status_lbl = tk.Label(
             results_frame, text="Searching…", bg="#f0f0f0", fg="#999999",
@@ -1866,7 +2262,7 @@ class CourtListenerGUI:
                 _PdfWindow(self.root, u, t, self._status_var.set)
 
             self.root.after(
-                0, _add_result, "", f"{cite_label} — Federal Appendix",
+                0, _add_result, "appx", "", f"{cite_label} — Federal Appendix",
                 cite_label, "", "case.law PDF", _open_appx,
             )
             search_done[0] = total_searches  # nothing else runs for an F. App'x cite
@@ -1885,10 +2281,27 @@ class CourtListenerGUI:
                 self.root.after(0, _update_status)
                 return
             try:
-                results = fetcher.search_cases(query, limit=3)
+                results = fetcher.search_cases(query, limit=10)
             except Exception:
                 results = []
-            for r in results[:3]:
+            if _LINE_CITE_RE.search(query):
+                # A reporter citation in the query pins the case, so keep
+                # Google Scholar's own relevance order (top few).
+                results = results[:3]
+            else:
+                # Just a name: Google Scholar, like CourtListener, ranks on the
+                # whole opinion text, so re-rank its hits by how closely their
+                # title (the case name) matches the query and show the best two.
+                # A couple of spares are kept past the two shown so a duplicate
+                # of a case another source already listed can be replaced.
+                scored = [
+                    (_name_match_score(query, getattr(r, "title", "") or ""), r)
+                    for r in results
+                ]
+                scored = [(s, r) for s, r in scored if s >= _NAME_MATCH_MIN]
+                scored.sort(key=lambda x: x[0], reverse=True)
+                results = [r for _s, r in scored[:4]]
+            for r in results:
                 court_id = _scholar_source_to_court_id(r.source)
                 year = _scholar_source_year(r.source)
                 # The case's own reporter citation sits in the source byline.
@@ -1927,7 +2340,7 @@ class CourtListenerGUI:
                     return open_it
 
                 self.root.after(
-                    0, _add_result, court_id, r.title, cite, year,
+                    0, _add_result, "scholar", court_id, r.title, cite, year,
                     "Scholar", make_opener(),
                 )
             search_done[0] += 1
@@ -1942,11 +2355,14 @@ class CourtListenerGUI:
                 search_done[0] += 1
                 self.root.after(0, _update_status)
                 return
-            results = []
-            # When the query is a bare reporter citation ("514 F. App'x 210"),
-            # resolve it precisely via citation-lookup first — full-text search
-            # often mismatches such citations to the wrong case.
+
             if _LINE_CITE_RE.search(query):
+                # A reporter citation ("514 F. App'x 210"): resolve it precisely
+                # via citation-lookup first — full-text search often mismatches
+                # a bare citation — and fall back to a plain search only if that
+                # finds nothing, dropping SCOTUS "order" entries as the main
+                # search does.
+                results: list[dict] = []
                 try:
                     for entry in client.lookup_citation(query):
                         if entry.get("status") != 200:
@@ -1955,31 +2371,26 @@ class CourtListenerGUI:
                             results.append(_item_from_cluster(cl))
                 except Exception:
                     pass
-            if not results:
-                try:
-                    # Over-fetch so we can still fill 3 rows after dropping
-                    # SCOTUS "order" entries (≤ 2 outbound citations), the same
-                    # ones the main search routes out of the primary results.
-                    data = client.search(query, type="o", page_size=10)
-                    results = data.get("results") or []
-                except Exception:
-                    results = []
+                if not results:
+                    try:
+                        data = client.search(query, type="o", page_size=10)
+                        results = data.get("results") or []
+                    except Exception:
+                        results = []
+                    results = [it for it in results
+                               if not _is_scotus_order_item(it)][:3]
+                tagged = [("cl", it) for it in results]
+            else:
+                # Just words (a case name): CourtListener gives the name no
+                # weight over the body text, so rank by case-name closeness
+                # across the court hierarchy — Supreme Court (up to 3), federal
+                # courts of appeals (up to 2), state courts of last resort (up
+                # to 2) — or a single named jurisdiction when the query gives
+                # one ("... (7th Cir. 2009)").  Each result is tagged with the
+                # court tier that caps how many of it are shown.
+                tagged = _cl_name_ranked_search(client, query)
 
-            def _is_scotus_order(it: dict) -> bool:
-                court_val = str(it.get("court_id") or it.get("court") or "")
-                if "scotus" not in court_val.lower():
-                    return False
-                opinions = it.get("opinions") or []
-                main_op = max(
-                    opinions,
-                    key=lambda o: len(o.get("cites") or []),
-                    default=None,
-                )
-                cites_count = len(main_op.get("cites") or []) if main_op else 0
-                return cites_count <= 2
-
-            results = [it for it in results if not _is_scotus_order(it)]
-            for item in results[:3]:
+            for bucket, item in tagged:
                 case_name = re.sub(
                     r"<[^>]+>", "",
                     item.get("caseName") or item.get("case_name") or "",
@@ -2015,8 +2426,8 @@ class CourtListenerGUI:
                     return open_it
 
                 self.root.after(
-                    0, _add_result, court_id, case_name, cite_str, year,
-                    "CourtListener", make_opener(),
+                    0, _add_result, bucket, court_id, case_name, cite_str,
+                    year, "CourtListener", make_opener(),
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
@@ -2044,8 +2455,8 @@ class CourtListenerGUI:
                 # "[1799] EngR 236" but was decided 1765).  The E.R. citation
                 # already identifies the case, so show it without a wrong year.
                 self.root.after(
-                    0, _add_result, "engrep", case.name, case.er_cite,
-                    "", "English Reports", make_opener(),
+                    0, _add_result, "engrep", "engrep", case.name,
+                    case.er_cite, "", "English Reports", make_opener(),
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
