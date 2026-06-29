@@ -558,6 +558,85 @@ def _static_case_law_url(citation: str) -> Optional[str]:
     return f"https://static.case.law/{slug}/{vol}/case-pdfs/{int(page):04d}-01.pdf"
 
 
+# --- Early-SCOTUS "nominative" reporters -------------------------------------
+# Before 1875 the U.S. Reports were cited by the Reporter of Decisions' name
+# ("3 Dall. 386", "1 Cranch 137").  Google Scholar prints these old SCOTUS cites
+# in nominative form, which the standard citation parser doesn't recognize and
+# static.case.law doesn't slug — yet CourtListener resolves them and case.law
+# files the opinion under the modern "U.S." volume.  Each reporter maps to the
+# offset from its volume to the U.S.-Reports volume (the page is unchanged):
+# Dallas 1-4 → U.S. 1-4, Cranch 1-9 → U.S. 5-13, Wheaton 1-12 → U.S. 14-25,
+# Peters 1-16 → U.S. 26-41, Howard 1-24 → U.S. 42-65, Black 1-2 → U.S. 66-67,
+# Wallace 1-23 → U.S. 68-90.
+_NOMINATIVE_US_OFFSET = {
+    "dall": 0, "dallas": 0, "cranch": 4, "wheat": 13, "wheaton": 13,
+    "pet": 25, "peters": 25, "how": 41, "howard": 41, "black": 65,
+    "wall": 67, "wallace": 67,
+}
+_NOMINATIVE_CANON = {
+    "dall": "Dall.", "dallas": "Dall.", "cranch": "Cranch", "wheat": "Wheat.",
+    "wheaton": "Wheat.", "pet": "Pet.", "peters": "Pet.", "how": "How.",
+    "howard": "How.", "black": "Black", "wall": "Wall.", "wallace": "Wall.",
+}
+# Case-sensitive on purpose: a reporter abbreviation is capitalized in a real
+# cite, so the digits-around requirement plus the capital keeps common words
+# ("how", "black", "wall") in prose from being mistaken for a citation.
+_NOMINATIVE_CITE_RE = re.compile(
+    r"\b(\d{1,2})\s+(Dall|Dallas|Cranch|Wheat|Wheaton|Pet|Peters|How|Howard|"
+    r"Black|Wall|Wallace)\.?\s+(\d{1,4})\b"
+)
+
+
+def _us_reports_cite(cite: str) -> str:
+    """A nominative early-SCOTUS citation in its modern "U.S." form
+    ("3 Dall. 386" → "3 U.S. 386", "1 Cranch 137" → "5 U.S. 137"), which
+    CourtListener and static.case.law index under; "" when *cite* names no
+    nominative reporter."""
+    m = _NOMINATIVE_CITE_RE.search(cite or "")
+    if not m:
+        return ""
+    off = _NOMINATIVE_US_OFFSET.get(m.group(2).lower())
+    return f"{int(m.group(1)) + off} U.S. {m.group(3)}" if off is not None else ""
+
+
+def _link_cite(text: str, short_cite_index) -> tuple[str, str]:
+    """(reporter cite, pincite) for a cited-case hyperlink's text, recognizing
+    the old nominative SCOTUS reporters the standard parser misses ("Calder v.
+    Bull, 3 Dall. 386, 388" → ("3 Dall. 386", "388")) so a Scholar link Google
+    can't open can still be located on CourtListener or static.case.law."""
+    cite, pin = _cite_target_from_text(text, short_cite_index)
+    if cite:
+        return cite, pin
+    plain = re.sub(r"<[^>]+>", "", text or "")
+    m = _NOMINATIVE_CITE_RE.search(plain)
+    if m:
+        rep = _NOMINATIVE_CANON.get(m.group(2).lower(), m.group(2))
+        cite = f"{m.group(1)} {rep} {m.group(3)}"
+        pm = re.match(r"[\s,]+(\d{1,5})\b", plain[m.end():])
+        return cite, (pm.group(1) if pm else "")
+    return "", ""
+
+
+def _case_law_pdf_for_cite(cite: str) -> Optional[str]:
+    """A static.case.law PDF URL that actually exists (HEAD 200) for *cite* —
+    trying the citation as printed and then its modern U.S.-Reports form for an
+    old nominative SCOTUS cite — or None when case.law has neither."""
+    seen: set[str] = set()
+    for c in (cite, _us_reports_cite(cite)):
+        url = _static_case_law_url(c) if c else None
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        try:
+            if _anon_session.head(
+                url, timeout=10, allow_redirects=True
+            ).status_code == 200:
+                return url
+        except Exception as exc:
+            print(f"[case.law] HEAD check failed for {url}: {exc}")
+    return None
+
+
 def _gather_all_citations(client, item: dict) -> list[str]:
     """Every citation known for a case: the search-result cite(s) plus the
     cluster record's parallel cites (de-duplicated, HTML-stripped).
@@ -6364,8 +6443,11 @@ class _ScholarTextWindow:
             # text here too, so a following "Id." resolves to THIS case rather
             # than the last plain-text cite (often the opinion's own caption).
             # The cite may be a short form ("Quinn, 8 F.4th at 565"); resolve
-            # it back to the case's full cite via the document index.
-            ref, pin = _cite_target_from_text(span.text, self._short_cite_index)
+            # it back to the case's full cite via the document index.  Old
+            # nominative SCOTUS cites ("3 Dall. 386") are captured too, so a
+            # Scholar link Google can't open still falls back to CourtListener /
+            # case.law instead of dead-ending at Scholar.
+            ref, pin = _link_cite(span.text, self._short_cite_index)
             if ref:
                 self._last_cite_action = ("cite", ref)
             # Federal Appendix cite Scholar hyperlinked (often to the wrong
@@ -8233,10 +8315,12 @@ class _ScholarTextWindow:
         self._status_var.set(f"CourtListener: {msg}")
 
     def _follow_cite_via_cl(self, cite: str, pin: str = "", retry=None) -> None:
-        """Follow a citation link using CourtListener when Scholar is
-        unavailable.  ``retry`` (cite, pin, url) keeps trying Google Scholar in
-        the background after the CourtListener view opens (used when a Scholar
-        link failed rather than Scholar being absent)."""
+        """Follow a citation link that Google Scholar can't supply: locate the
+        case on CourtListener, falling back to its static.case.law PDF.
+
+        ``retry`` (cite, pin, url) keeps trying Google Scholar in the background
+        after the CourtListener view opens (used when a Scholar link failed
+        rather than Scholar being absent)."""
         client = self._app._get_client()
         if client is None:
             return
@@ -8247,11 +8331,21 @@ class _ScholarTextWindow:
 
         def run() -> None:
             try:
+                # CourtListener, by the cite as printed and — for an old
+                # nominative SCOTUS cite — by its modern "U.S." form.
                 target = _cl_item_for_citation(client, cite)
                 if not target:
-                    if retry:
-                        # CourtListener doesn't have it either — keep retrying
-                        # Google Scholar and open it if it comes through.
+                    alt = _us_reports_cite(cite)
+                    if alt:
+                        target = _cl_item_for_citation(client, alt)
+                if not target:
+                    # Not on CourtListener — try the official case.law PDF.
+                    pdf = _case_law_pdf_for_cite(cite)
+                    if pdf:
+                        self._post(self._open_cited_case_pdf, pdf, cite, pin)
+                    elif retry:
+                        # Nothing anywhere — keep retrying Google Scholar and
+                        # open it if it comes through.
                         self._post(self._retry_scholar_only, *retry)
                     else:
                         self._post(self._on_cl_link_error, f"No match for {cite!r}.")
@@ -8264,6 +8358,15 @@ class _ScholarTextWindow:
                 )
             except Exception as exc:
                 self._post(self._on_cl_link_error, str(exc))
+
+    def _open_cited_case_pdf(self, url: str, cite: str, pin: str = "") -> None:
+        """Open a cited case's static.case.law PDF (the fallback when neither
+        Google Scholar nor CourtListener has the opinion)."""
+        self._status_var.set(f"Opening {cite} (case.law PDF)…")
+        _PdfWindow(
+            self._win, url, cite + (f" at {pin}" if pin else ""),
+            self._status_var.set,
+        )
 
         threading.Thread(target=run, daemon=True).start()
 
