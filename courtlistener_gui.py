@@ -8640,13 +8640,16 @@ class _ScholarTextWindow:
                 pass
 
     def _retry_scholar_link(
-        self, cite: str, pin: str, url_val: str,
+        self, cite: str, pin: str, url_val: str, name: str = "",
         attempts: int = 3, delay: float = 4.0,
     ) -> None:
         """This window opened on the CourtListener text because a Google Scholar
         link failed.  Retry the Scholar fetch ``attempts`` more times,
         ``delay`` seconds apart; if it comes through, wire it in and light up
-        the "Google Scholar Text" button (via ``_attach_scholar_version``)."""
+        the "Google Scholar Text" button (via ``_attach_scholar_version``).
+
+        (``name`` is unused — it's accepted so the shared ``retry`` tuple
+        ``(cite, pin, url, name)`` unpacks cleanly.)"""
         fetcher = self._app._get_scholar()
         if fetcher is None or not (url_val or cite):
             return
