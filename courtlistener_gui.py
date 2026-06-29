@@ -8302,6 +8302,17 @@ class _ScholarTextWindow:
             1400, lambda: txt.tag_remove("jumpflash", "1.0", "end")
         )
 
+    def _flash_range(self, start: str, end: str) -> None:
+        """Scroll to *start* and briefly highlight everything in ``[start,
+        end)`` — used to flash a whole pin-cited page, not just its line."""
+        txt = self._text
+        txt.see(start)
+        txt.tag_remove("jumpflash", "1.0", "end")
+        txt.tag_add("jumpflash", start, end)
+        self._win.after(
+            1400, lambda: txt.tag_remove("jumpflash", "1.0", "end")
+        )
+
     def _follow_link(self, tag: str) -> None:
         action = self._link_actions.get(tag)
         if not action:
@@ -8542,8 +8553,10 @@ class _ScholarTextWindow:
             )
 
     def jump_to_cite_page(self, cite: str, pin: str) -> None:
-        """Scroll to and briefly flash the star-pagination marker for the pin
-        page in this freshly opened opinion.  Deferred until the window has laid
+        """Scroll to the pin page and briefly flash the *whole* page — from its
+        star-pagination marker to the next page's marker (or, on the last page,
+        to the footnotes / end of the opinion) — so the cited passage stands out
+        rather than just the marker's line.  Deferred until the window has laid
         out (an immediate ``see`` on an unmapped widget does nothing), with one
         retry while the text is still rendering."""
         m_page = re.match(r"\d+", pin or "")
@@ -8557,7 +8570,18 @@ class _ScholarTextWindow:
             except tk.TclError:
                 return
             if pos:
-                self._jump_to(pos)
+                txt = self._text
+                # End of the flash: the nearest later star-page marker, else
+                # the start of the footnotes, else the end of the text.
+                later = [txt.index(p) for p in self._page_pos.values()
+                         if txt.compare(p, ">", pos)]
+                if later:
+                    end = min(later,
+                              key=lambda ix: tuple(map(int, ix.split("."))))
+                else:
+                    fn = txt.tag_nextrange("fnhead", pos)
+                    end = fn[0] if fn else "end-1c"
+                self._flash_range(pos, end)
                 self._status_var.set(f"Jumped to page *{page}.")
             elif attempt < 2:
                 self._win.after(250, lambda: do(attempt + 1))
