@@ -6438,7 +6438,8 @@ class _ScholarTextWindow:
             self._fn_tip.destroy()
             self._fn_tip = None
 
-    def _insert_span(self, span, block_tags: tuple, neutral: bool = False) -> None:
+    def _insert_span(self, span, block_tags: tuple, neutral: bool = False,
+                     link_tag: Optional[str] = None) -> None:
         txt = self._text
         tags = list(block_tags)
         if span.pagenum:
@@ -6474,59 +6475,65 @@ class _ScholarTextWindow:
             txt.insert("end", span.text, tuple(tags))
             return
         if span.link:
-            # Scholar pre-hyperlinks cited cases, so they never pass through
-            # _insert_plain_with_links — capture any reporter cite in the link
-            # text here too, so a following "Id." resolves to THIS case rather
-            # than the last plain-text cite (often the opinion's own caption).
-            # The cite may be a short form ("Quinn, 8 F.4th at 565"); resolve
-            # it back to the case's full cite via the document index.  Old
-            # nominative SCOTUS cites ("3 Dall. 386") are captured too, so a
-            # Scholar link Google can't open still falls back to CourtListener /
-            # case.law instead of dead-ending at Scholar.
-            ref, pin = _link_cite(span.text, self._short_cite_index)
-            if ref:
-                self._last_cite_action = ("cite", ref)
-            # Federal Appendix cite Scholar hyperlinked (often to the wrong
-            # scholar_case page) — route it through our cite handler, which opens
-            # the official static.case.law PDF instead of Scholar's text.
-            if ref and _FED_APPX_RE.search(ref):
-                action = ("cite", ref + (f"@{pin}" if pin else ""))
-                self._last_cite_action = ("cite", ref)
-                tags += ["citelink", self._new_link(action)]
-                txt.insert("end", span.text, tuple(tags))
-                return
-            # If Scholar's hyperlink covers an English Reports citation we have
-            # in our own index ("156 Eng. Rep. 145"), point it at our CommonLII
-            # scan instead — Scholar's own copy of these old English cases is
-            # usually missing or a poor scan.  Only override on a real index
-            # match, so unknown E.R. cites keep Scholar's link.
-            er_m = eng_rep.ER_CITE_RE.search(span.text)
-            if er_m:
-                er_spec = eng_rep.cite_spec(er_m)
-                if eng_rep.resolve(er_spec):
-                    action = ("engrep", er_spec)
-                    self._last_cite_action = action
-                    tags += ["citelink", self._new_link(action)]
-                    txt.insert("end", span.text, tuple(tags))
-                    return
-            # Carry any pincite so the opened case jumps to it (Scholar's own
-            # hyperlink otherwise opens the case at the top), plus the reporter
-            # cite and the case name from the link text so that — if Google's
-            # flaky servers fail or block the fetch — we can still locate the
-            # case on CourtListener (by cite, or by name when no cite parses).
-            value = span.link
-            if pin:
-                value += f"\tpin={pin}"
-            if ref:
-                value += f"\tcite={ref}"
-            link_name = _link_name(span.text)
-            if link_name:
-                value += f"\tname={link_name}"
-            tags += ["citelink", self._new_link(("url", value))]
+            # A Google Scholar case hyperlink.  Its click action is computed
+            # from the *whole* reference (see _scholar_link_action); when the
+            # link is split across several styled spans (italic case name, roman
+            # reporter cite, …), _insert_block hands every span the one shared
+            # *link_tag* so clicking the case name, the reporter, the year — any
+            # part — does the same thing and the same CourtListener / case.law
+            # fallback applies if Google Scholar fails.
+            if link_tag is None:
+                link_tag = self._new_link(
+                    self._scholar_link_action(span.text, span.link)
+                )
+            tags += ["citelink", link_tag]
             txt.insert("end", span.text, tuple(tags))
             return
         # Plain text: make recognizable citations clickable
         self._insert_plain_with_links(span.text, tuple(tags))
+
+    def _scholar_link_action(self, full_text: str, href: str) -> tuple[str, str]:
+        """The click action for a Google Scholar case hyperlink whose text is
+        *full_text* (the whole reference — case name through reporter cite).
+
+        Reading the cite and case name from the full text (not a styled
+        fragment) means a link split across spans still resolves, and lets a
+        Federal Appendix or English Reports cite be rerouted to its own better
+        source.  Records this as the last cited case so a following "Id."
+        resolves to it.  A short form ("Quinn, 8 F.4th at 565") is resolved back
+        to the full cite via the document index; old nominative SCOTUS cites
+        ("3 Dall. 386") are captured too, so a link Google can't open still
+        falls back to CourtListener / case.law instead of dead-ending."""
+        ref, pin = _link_cite(full_text, self._short_cite_index)
+        if ref:
+            self._last_cite_action = ("cite", ref)
+        # Federal Appendix cite Scholar hyperlinked (often to the wrong
+        # scholar_case page) — open the official static.case.law PDF instead.
+        if ref and _FED_APPX_RE.search(ref):
+            self._last_cite_action = ("cite", ref)
+            return ("cite", ref + (f"@{pin}" if pin else ""))
+        # An English Reports cite we hold → our CommonLII scan (Scholar's copy
+        # of these old English cases is usually missing or a poor scan).  Only
+        # override on a real index match, so unknown E.R. cites keep the link.
+        er_m = eng_rep.ER_CITE_RE.search(full_text)
+        if er_m:
+            er_spec = eng_rep.cite_spec(er_m)
+            if eng_rep.resolve(er_spec):
+                self._last_cite_action = ("engrep", er_spec)
+                return ("engrep", er_spec)
+        # Open the Scholar opinion, carrying the pincite (so it jumps to the
+        # right page), the reporter cite, and the case name so a failed/blocked
+        # fetch still locates the case on CourtListener (by cite, or by name
+        # when no cite parses) / case.law.
+        value = href
+        if pin:
+            value += f"\tpin={pin}"
+        if ref:
+            value += f"\tcite={ref}"
+        link_name = _link_name(full_text)
+        if link_name:
+            value += f"\tname={link_name}"
+        return ("url", value)
 
     def _const_link_action(self, spec: str, matched_text: str):
         """Action for a U.S. Constitution citation, or None to leave it as plain
