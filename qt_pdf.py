@@ -28,6 +28,15 @@ class LinkHandlingPage(QWebEnginePage):
 
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):  # noqa: N802
         if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
+            current = self.url()
+            if (
+                url.hasFragment()
+                and url.scheme() == current.scheme()
+                and url.host() == current.host()
+                and url.path() == current.path()
+                and url.query() == current.query()
+            ):
+                return True
             self.link_activated.emit(url.toString())
             return False
         return super().acceptNavigationRequest(url, nav_type, is_main_frame)
@@ -114,6 +123,66 @@ def html_document(title: str, body: str, base_url: str = "") -> str:
     .indent-4 {{ margin-left: 5.6rem; }}
     .indent-5 {{ margin-left: 7rem; }}
     .indent-6, .indent-7, .indent-8 {{ margin-left: 8.4rem; }}
+    .opinion-meta {{
+      margin: -6px 0 22px;
+      color: var(--muted);
+    }}
+    .opinion-part {{
+      margin: 0 0 28px;
+    }}
+    .opinion-part.dissent {{
+      border-left: 4px solid #d76666;
+      padding-left: 18px;
+    }}
+    .opinion-part.concurrence {{
+      border-left: 4px solid #57a773;
+      padding-left: 18px;
+    }}
+    .part-label {{
+      margin: 28px 0 16px;
+      color: #243b53;
+      font-size: 1.08rem;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 8px;
+    }}
+    .opinion-block {{
+      margin: 0 0 0.9rem;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 1.04rem;
+      line-height: 1.62;
+    }}
+    .opinion-block.center {{
+      text-align: center;
+    }}
+    .opinion-block.heading {{
+      font-family: "Segoe UI", system-ui, sans-serif;
+      font-size: 1rem;
+      margin-top: 1rem;
+    }}
+    .opinion-block.blockquote {{
+      margin-left: 2rem;
+      margin-right: 1rem;
+    }}
+    .pagenum {{
+      color: #8b5cf6;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      font-weight: 700;
+      font-size: 0.88rem;
+      padding: 0 3px;
+    }}
+    .footnotes {{
+      margin-top: 22px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+    }}
+    .footnotes h3 {{
+      font-size: 1rem;
+      color: var(--muted);
+    }}
+    .opinion-block.footnote {{
+      font-size: 0.94rem;
+      color: #374151;
+    }}
     pre {{
       white-space: pre-wrap;
       font: inherit;

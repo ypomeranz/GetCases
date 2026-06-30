@@ -62,6 +62,7 @@ from citations import detect_links
 from courtlistener import CourtListenerClient, CourtListenerError
 from getcases_config import load_token, save_token
 from pdf_resolver import fetch_pdf_bytes, resolve_pdf_url
+from qt_opinions import render_scholar_opinion_body
 from qt_pdf import ChromiumPdfWindow, LinkHandlingPage, html_document
 from qt_sources import (
     english_reports_url,
@@ -646,8 +647,8 @@ class GetCasesQt(QMainWindow):
             QMessageBox.warning(self, "Scholar Text", "No matching opinion text was found.")
             return
         url, opinion_html = result
-        body = f"<h1>{html.escape(title)}</h1>{opinion_html}"
-        window = HtmlWindow(title, body, base_url=url)
+        body = render_scholar_opinion_body(title, url, opinion_html)
+        window = HtmlWindow(title, body, base_url=url, link_callback=self._handle_link)
         self._show_window(window)
 
     def view_selected_pdf(self) -> None:
@@ -773,6 +774,13 @@ class GetCasesQt(QMainWindow):
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "getcases":
             QDesktopServices.openUrl(QUrl(url))
+            return
+        if parsed.netloc == "scholar":
+            params = urllib.parse.parse_qs(parsed.query)
+            target = (params.get("url") or [""])[0]
+            title = (params.get("title") or ["Cited case"])[0] or "Cited case"
+            if target:
+                self._fetch_scholar_url(target, title)
             return
         params = urllib.parse.parse_qs(parsed.query)
         kind = (params.get("kind") or [""])[0]
