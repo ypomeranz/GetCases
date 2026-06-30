@@ -4098,7 +4098,14 @@ class CourtListenerGUI:
             )
             return None
         if self._scholar is None:
-            self._scholar = GoogleScholarFetcher(db=self._get_opinion_db())
+            # Hand the fetcher the same name matcher used to rank
+            # CourtListener/Scholar results, so a blocked search ranks local
+            # database candidates the same way (see search_cases' fallback).
+            self._scholar = GoogleScholarFetcher(
+                db=self._get_opinion_db(),
+                name_scorer=_name_match_score,
+                name_min=_NAME_MATCH_MIN,
+            )
         return self._scholar
 
     def _get_opinion_db(self):

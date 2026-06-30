@@ -666,6 +666,31 @@ class OpinionDB:
             ).fetchall()
         return [self._summary(r) for r in rows]
 
+    def search_names(self, query: str, limit: int = 40) -> list[dict]:
+        """Candidate opinions sharing *any* significant party token with
+        ``query``, ranked by how many distinct query tokens they match (most
+        first).  Unlike :meth:`find_by_party` — which requires *every* token —
+        this casts a wide net so a fuzzy name matcher can judge the candidates:
+        it surfaces "Brown v. Board of Ed." for "Brown v. Board of Education",
+        which the all-tokens match would miss on the abbreviated word.  The
+        ranking only orders the candidate pool; the caller does the real
+        name-closeness scoring."""
+        toks = _party_tokens(query)
+        if not toks:
+            return []
+        placeholders = ",".join("?" * len(toks))
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT o.*, COUNT(DISTINCT p.token) AS _n "
+                f"FROM parties p JOIN opinions o ON o.scholar_id=p.scholar_id "
+                f"WHERE p.token IN ({placeholders}) "
+                f"GROUP BY o.scholar_id "
+                f"ORDER BY _n DESC, o.year, o.name "
+                f"LIMIT ?",
+                (*toks, int(limit)),
+            ).fetchall()
+        return [self._summary(r) for r in rows]
+
     def find(self, query: str) -> list[dict]:
         """Search the database, dispatching on the shape of ``query``: an
         all-digit run is a Scholar id; a reporter citation is matched as such;
@@ -837,6 +862,17 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
         stats2 = db2.merge_from(other)
         check(stats2["added"] == 0 and stats2["skipped"] == 1, f"re-merge: {stats2}")
         check(db2.count() == 3, "count after merge")
+
+        # search_names casts a wider net than find_by_party: it returns every
+        # opinion sharing *any* party token (so a fuzzy matcher can rank them),
+        # ordered by how many distinct query tokens each matches.
+        names = [h["name"] for h in db2.search_names("roe wade")]
+        check("Roe v. Wade" in names and "Doe v. Roe" in names,
+              f"search_names returns any-token matches: {names}")
+        check(names and names[0] == "Roe v. Wade",
+              f"search_names ranks the fuller token match first: {names}")
+        check(db2.search_names("xyzzy nonesuch") == [],
+              "search_names with no shared token -> empty")
         db2.close()
 
     if failures:

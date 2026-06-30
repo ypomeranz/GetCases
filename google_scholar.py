@@ -764,6 +764,15 @@ class GoogleScholarFetcher:
         Path to the SQLite cache file (created on first use).
     delay:
         Minimum seconds to wait between HTTP requests.
+    db:
+        Optional ``opinion_db.OpinionDB`` — the durable, searchable store.
+    name_scorer:
+        Optional ``(query, candidate_name) -> float`` in [0, 1] used to rank
+        the local database's name candidates when Scholar is blocked (the
+        offline fallback in :meth:`search_cases`).  Injected so the same
+        name-matching used for CourtListener/Scholar results applies here
+        without this module depending on the GUI.  ``name_min`` is the score a
+        candidate must clear to be kept.
     """
 
     def __init__(
@@ -771,6 +780,8 @@ class GoogleScholarFetcher:
         cache_path: Path = _CACHE_PATH,
         delay: float = _DEFAULT_DELAY,
         db=None,
+        name_scorer=None,
+        name_min: float = 0.5,
     ) -> None:
         self._delay = delay
         self._last_request: float = 0.0
@@ -778,6 +789,8 @@ class GoogleScholarFetcher:
         # set, every fetched opinion is recorded there, and an opinion already
         # present is served from there instead of being re-fetched.
         self._opinion_db = db
+        self._name_scorer = name_scorer
+        self._name_min = name_min
 
         self._session = requests.Session()
         self._session.headers.update(_HEADERS)
@@ -1036,22 +1049,66 @@ class GoogleScholarFetcher:
             return f"{left} - {right}"
         return left or right
 
+    @staticmethod
+    def _is_name_query(query: str) -> bool:
+        """True when ``query`` is a party-name search rather than a Scholar id
+        or a reporter citation — the case that benefits from fuzzy name
+        ranking.  Mirrors :meth:`OpinionDB.find`'s own dispatch."""
+        q = (query or "").strip()
+        if not q or q.isdigit():
+            return False
+        try:
+            import citations
+            return citations.CITE_CAPTURE_RE.search(q) is None
+        except Exception:
+            return True
+
+    def _db_name_hits(self, query: str, limit: int) -> Optional[list[dict]]:
+        """Database name candidates re-ranked by the injected name matcher, or
+        ``None`` when no scorer is set / the query is not a name search (so the
+        caller falls back to the exact :meth:`OpinionDB.find` dispatch).
+
+        Casts a wide net with :meth:`OpinionDB.search_names` (any shared party
+        token) and keeps those clearing ``self._name_min``, best first — the
+        same name-closeness used to rank CourtListener/Scholar results, so a
+        near-miss caption still surfaces from the local store."""
+        if self._name_scorer is None or not self._is_name_query(query):
+            return None
+        try:
+            cands = self._opinion_db.search_names(query, max(limit * 4, limit))
+        except Exception as exc:
+            print(f"[scholar] opinion-DB name search failed: {exc}")
+            return None
+        scored: list[tuple[float, dict]] = []
+        for c in cands:
+            try:
+                s = self._name_scorer(query, c.get("name") or "")
+            except Exception:
+                s = 0.0
+            if s >= self._name_min:
+                scored.append((s, c))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [c for _s, c in scored]
+
     def _db_search_results(self, query: str, limit: int) -> list["ScholarResult"]:
         """Search the local opinion database and adapt its hits into
         ``ScholarResult`` rows (the offline fallback for :meth:`search_cases`).
 
-        The database dispatches on the query shape — a Scholar id, a reporter
-        citation, or party names — exactly as the "Find Opinion in Database"
-        dialog does.  Each hit's ``url`` is a real ``scholar_case`` URL, so the
-        caller's open path (``fetch_by_url``) serves the opinion straight from
-        the database without a network round-trip."""
+        Name queries are ranked with the injected name matcher (see
+        :meth:`_db_name_hits`); Scholar-id and citation queries use the exact
+        dispatch the "Find Opinion in Database" dialog uses.  Each hit's ``url``
+        is a real ``scholar_case`` URL, so the caller's open path
+        (``fetch_by_url``) serves the opinion straight from the database without
+        a network round-trip."""
         if self._opinion_db is None:
             return []
-        try:
-            hits = self._opinion_db.find(query)
-        except Exception as exc:
-            print(f"[scholar] opinion-DB search failed: {exc}")
-            return []
+        hits = self._db_name_hits(query, limit)
+        if hits is None:
+            try:
+                hits = self._opinion_db.find(query)
+            except Exception as exc:
+                print(f"[scholar] opinion-DB search failed: {exc}")
+                return []
         out: list[ScholarResult] = []
         for hit in hits[:limit]:
             sid = hit.get("scholar_id") or ""
@@ -1339,7 +1396,14 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     # tiny stub stands in for opinion_db.OpinionDB.find() so this stays offline.
     import tempfile as _tempfile
 
+    def _toks(s):  # crude party tokeniser for the stub
+        return {w for w in re.findall(r"[a-z0-9]+", (s or "").lower())
+                if len(w) > 1 and w not in {"the", "of", "and", "v", "vs"}}
+
     class _StubDB:
+        """Minimal stand-in for opinion_db.OpinionDB exercising both retrieval
+        paths: exact ``find`` (id/citation) and lenient ``search_names``."""
+
         def __init__(self, hits):
             self._hits = hits
 
@@ -1347,6 +1411,17 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
             q = (query or "").lower()
             return [h for h in self._hits
                     if q in h["name"].lower() or q in (h.get("cite") or "").lower()]
+
+        def search_names(self, query, limit=40):
+            qt = _toks(query)
+            scored = [(len(qt & _toks(h["name"])), h) for h in self._hits]
+            scored = [(n, h) for n, h in scored if n]
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [h for _n, h in scored][:limit]
+
+    def _stub_scorer(query, name):  # token-overlap stand-in for _name_match_score
+        qt, nt = _toks(query), _toks(name)
+        return (len(qt & nt) / len(qt)) if qt else 0.0
 
     roe_hit = {
         "scholar_id": "12345678901234567890",
@@ -1357,9 +1432,22 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
         "year": "1973",
         "url": "https://scholar.google.com/scholar_case?case=12345678901234567890",
     }
+    # Stored under the Bluebook-abbreviated caption; a query spelling the word
+    # out in full must still match via the injected fuzzy scorer.
+    brown_hit = {
+        "scholar_id": "98765432109876543210",
+        "name": "Brown v. Board of Ed.",
+        "cite": "347 U.S. 483",
+        "cites": ["347 U.S. 483"],
+        "court": "scotus",
+        "year": "1954",
+        "url": "https://scholar.google.com/scholar_case?case=98765432109876543210",
+    }
     with _tempfile.TemporaryDirectory() as _d:
         f = GoogleScholarFetcher(
-            cache_path=Path(_d) / "cache.db", delay=0.0, db=_StubDB([roe_hit])
+            cache_path=Path(_d) / "cache.db", delay=0.0,
+            db=_StubDB([roe_hit, brown_hit]),
+            name_scorer=_stub_scorer, name_min=0.5,
         )
 
         def _boom(url):  # simulate Google blocking the IP
@@ -1374,7 +1462,19 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
         check(bool(hits) and hits[0].source.startswith("410 U.S. 113")
               and "Supreme Court" in hits[0].source and "1973" in hits[0].source,
               f"fallback byline parses (cite/court/year): {hits[0].source!r}")
-        check(f.search_cases("nonesuch", limit=10) == [],
+
+        # Fuzzy name match: "...Board of Education" finds stored "Board of Ed.",
+        # which the DB's all-tokens find_by_party would miss.
+        bhits = f.search_cases("Brown v. Board of Education", limit=10)
+        check(len(bhits) == 1 and bhits[0].title.startswith("Brown"),
+              f"fuzzy name match via injected scorer: {[h.title for h in bhits]}")
+
+        # A citation query still routes through the exact dispatch.
+        chits = f.search_cases("347 U.S. 483", limit=10)
+        check(len(chits) == 1 and chits[0].title.startswith("Brown"),
+              f"citation query uses exact dispatch: {[h.title for h in chits]}")
+
+        check(f.search_cases("nonesuch matter", limit=10) == [],
               "blocked search with no DB match returns empty")
 
         # With no database attached, a blocked search degrades to empty cleanly.
