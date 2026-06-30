@@ -3530,10 +3530,12 @@ class CourtListenerGUI:
             return
         _open_pdf_view(self.root, self, data, os.path.basename(path))
 
-    def _open_brief_from_bytes(self, data: bytes, name: str) -> None:
-        """Text-reader fallback for an imported PDF when the in-app PDF viewer
-        isn't available: write the bytes out, extract the text layer, and show
-        the same clickable citations in the brief reader."""
+    def _open_brief_from_bytes(self, data: bytes, name: str,
+                               citation: str = "") -> None:
+        """Open a PDF's selectable text in the brief reader: write the bytes out,
+        extract the text layer, and show the same clickable citations.  Used for
+        imported PDFs and for born-digital opinion PDFs (which pass the case's
+        Bluebook ``citation`` so the reader can display it)."""
         tmp: Optional[str] = None
         try:
             fd, tmp = tempfile.mkstemp(suffix=".pdf")
@@ -3560,7 +3562,7 @@ class CourtListenerGUI:
                 parent=self.root,
             )
             return
-        _BriefTextWindow(self.root, self, name, text)
+        _BriefTextWindow(self.root, self, name, text, citation=citation)
 
     def _show_settings_dialog(self) -> None:
         dlg = tk.Toplevel(self.root)
@@ -9844,7 +9846,14 @@ class _ScholarTextWindow:
         # to the raster pane below.
         if _pdf_is_born_digital(data):
             self._pdf_url = url
-            self._app._open_brief_from_bytes(data, self._pdf_text_title())
+            # The case's Bluebook citation, single reporter (the one the opinion
+            # is paginated in — i.e. the reporter this PDF shows).
+            try:
+                bb_cite = self._bluebook_citation(None)[0].rstrip(".")
+            except Exception:
+                bb_cite = ""
+            self._app._open_brief_from_bytes(
+                data, self._pdf_text_title(), citation=bb_cite)
             self._restore_view_pdf_button()
             self._status_var.set(
                 "Opened the PDF's selectable text — citations are linked.")
@@ -10696,9 +10705,10 @@ class _BriefTextWindow:
     _LINK_COLOR = "#1a56b0"   # subtle blue for clickable citations
 
     def __init__(self, parent: tk.Misc, app: "CourtListenerGUI",
-                 name: str, text: str) -> None:
+                 name: str, text: str, citation: str = "") -> None:
         self._app = app
         self._src = text
+        self._citation = (citation or "").strip()
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
 
@@ -10711,6 +10721,20 @@ class _BriefTextWindow:
 
     def _build_ui(self) -> None:
         win = self._win
+        # When this reader is showing an opinion PDF, surface the case's Bluebook
+        # citation (single reporter — the one the opinion is paginated in) in a
+        # read-only field so it can be read and copied.
+        if self._citation:
+            head = ttk.Frame(win)
+            head.pack(fill="x", padx=8, pady=(8, 0))
+            ttk.Label(head, text="Citation:").pack(side="left")
+            cvar = tk.StringVar(value=self._citation)
+            ent = ttk.Entry(
+                head, textvariable=cvar,
+                font=tkfont.Font(family="Georgia", size=_OPINION_FONT_PT),
+            )
+            ent.pack(side="left", fill="x", expand=True, padx=(6, 0))
+            ent.configure(state="readonly")
         legend = ttk.Frame(win)
         legend.pack(fill="x", padx=8, pady=(8, 0))
         ttk.Label(
