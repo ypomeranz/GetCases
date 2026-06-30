@@ -42,6 +42,15 @@ _CITE_PRIORITY = [
     re.compile(r" F\. Supp\. "),
     re.compile(r" B\.R\. "),
 ]
+_FED_APPX_RE = re.compile(r"F(?:ed)?\.?\s*App['\u2019]?x\.?", re.IGNORECASE)
+_CASE_LAW_REPORTER_ALIASES = {
+    "fed-rep": "f",
+    "fed-rep-2d": "f2d",
+    "fed-rep-3d": "f3d",
+    "fappx": "f-appx",
+    "fedappx": "f-appx",
+    "fed-appx": "f-appx",
+}
 
 
 @dataclass(frozen=True)
@@ -201,3 +210,43 @@ def extract_cluster_id(value: object) -> Optional[int]:
 def extract_opinion_id(value: object) -> Optional[int]:
     match = re.search(r"/opinions/(\d+)/?", str(value or ""))
     return int(match.group(1)) if match else None
+
+
+def is_federal_appendix_cite(citation: object) -> bool:
+    """Return whether a citation is to the Federal Appendix."""
+    return _FED_APPX_RE.search(str(citation or "")) is not None
+
+
+def federal_appendix_cite(item: dict) -> Optional[str]:
+    """Return the Federal Appendix citation on an item, if any."""
+    raw = item.get("citation")
+    cites = raw if isinstance(raw, list) else [raw] if raw else []
+    for cite in cites:
+        clean = strip_html(cite)
+        if is_federal_appendix_cite(clean):
+            return clean
+    return None
+
+
+def static_case_law_url(citation: str) -> Optional[str]:
+    """Return the static.case.law PDF URL candidate for a reporter citation."""
+    citation = strip_html(citation)
+    match = _CITE_PARSE_RE.match(citation)
+    if not match:
+        return None
+    volume, reporter, page = match.group(1), match.group(2).strip(), match.group(3)
+    slug = _slugify_case_law_reporter(reporter)
+    if not slug:
+        return None
+    try:
+        page_num = int(page)
+    except ValueError:
+        return None
+    return f"https://static.case.law/{slug}/{volume}/case-pdfs/{page_num:04d}-01.pdf"
+
+
+def _slugify_case_law_reporter(reporter: str) -> str:
+    slug = reporter.lower().replace(" ", "-")
+    slug = re.sub(r"[^a-z0-9-]", "", slug)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return _CASE_LAW_REPORTER_ALIASES.get(slug, slug)

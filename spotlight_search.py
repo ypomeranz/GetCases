@@ -20,6 +20,7 @@ from case_utils import (
     pick_citation,
     strip_html,
 )
+import eng_rep
 from court_catalog import (
     CIRCUIT_COURTS,
     COURT_BLUEBOOK,
@@ -114,6 +115,7 @@ class SpotlightResult:
         return {
             "courtlistener": "CourtListener",
             "cache": "Cache",
+            "engrep": "English Reports",
             "scholar": "Scholar",
         }.get(self.source, self.source.title())
 
@@ -269,6 +271,7 @@ _BUCKET_CAPS: dict[str, int] = {
     "scotus": 3,
     "juris": 3,
     "cl": 3,
+    "engrep": 1,
 }
 
 
@@ -309,6 +312,8 @@ def court_label(court_id: str) -> str:
     court_id = (court_id or "").strip().lower()
     if court_id == "scotus":
         return "SCOTUS"
+    if court_id == "engrep":
+        return "Eng. Rep."
     return COURT_BLUEBOOK.get(court_id, court_id.upper() if court_id else "")
 
 
@@ -587,7 +592,10 @@ def courtlistener_spotlight_results(client, query: str) -> list[SpotlightResult]
             if not _is_scotus_order_item(item)
         ][:4]
 
-    tagged = courtlistener_name_ranked_search(client, query)
+    try:
+        tagged = courtlistener_name_ranked_search(client, query)
+    except Exception:
+        return []
     return [_spotlight_from_cl_item(bucket, item) for bucket, item in tagged]
 
 
@@ -772,6 +780,27 @@ def scholar_spotlight_results(fetcher, query: str) -> list[SpotlightResult]:
     return out
 
 
+def english_reports_spotlight_results(query: str) -> list[SpotlightResult]:
+    """Offline English Reports name search for spotlight."""
+    try:
+        cases = eng_rep.search_by_name(query, limit=1)
+    except Exception:
+        return []
+    return [
+        SpotlightResult(
+            source="engrep",
+            bucket="engrep",
+            title=case.name or case.label,
+            cite=case.er_cite,
+            year="",
+            court_id="engrep",
+            detail=f"{case.er_cite} | {case.neutral}",
+            payload=case,
+        )
+        for case in cases
+    ]
+
+
 def spotlight_search(query: str, *, client=None, fetcher=None, db=None) -> list[SpotlightResult]:
     query = (query or "").strip()
     if not query:
@@ -779,4 +808,5 @@ def spotlight_search(query: str, *, client=None, fetcher=None, db=None) -> list[
     courtlistener = courtlistener_spotlight_results(client, query) if client is not None else []
     cache = cache_spotlight_results(query, db)
     scholar = scholar_spotlight_results(fetcher, query) if fetcher is not None else []
-    return merge_results(courtlistener, cache, scholar)
+    english_reports = english_reports_spotlight_results(query)
+    return merge_results(courtlistener, cache, scholar, english_reports)

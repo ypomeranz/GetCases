@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -30,6 +30,7 @@ class SpotlightWindow(QDialog):
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.resize(720, 520)
         self._results: list[SpotlightResult] = []
+        self._last_query = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 12)
@@ -43,6 +44,7 @@ class SpotlightWindow(QDialog):
 
         self.query_edit = QLineEdit()
         self.query_edit.setPlaceholderText("Case, citation, statute, rule, or regulation")
+        self.query_edit.installEventFilter(self)
         self.query_edit.returnPressed.connect(self._submit_search)
         search_layout.addWidget(self.query_edit, 1)
 
@@ -54,6 +56,7 @@ class SpotlightWindow(QDialog):
         self.results_list = QListWidget()
         self.results_list.setAlternatingRowColors(False)
         self.results_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.results_list.installEventFilter(self)
         self.results_list.itemDoubleClicked.connect(lambda _item: self._open_current())
         root.addWidget(self.results_list, 1)
 
@@ -76,6 +79,7 @@ class SpotlightWindow(QDialog):
         self.search_btn.setEnabled(not busy)
         self.status_label.setText(message if busy else "Ready")
         if busy:
+            self._results = []
             self.results_list.clear()
 
     def set_results(self, results: list[SpotlightResult]) -> None:
@@ -100,6 +104,10 @@ class SpotlightWindow(QDialog):
     def _submit_search(self) -> None:
         query = self.query_edit.text().strip()
         if query:
+            if self._results and query == self._last_query and self.results_list.currentRow() >= 0:
+                self._open_current()
+                return
+            self._last_query = query
             self.search_requested.emit(query)
 
     def _open_current(self) -> None:
@@ -115,11 +123,35 @@ class SpotlightWindow(QDialog):
         self.full_search_requested.emit(query)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override.
+        if event.key() == Qt.Key.Key_Escape:
+            self.hide()
+            return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if self.results_list.hasFocus() and self.results_list.currentRow() >= 0:
                 self._open_current()
                 return
         super().keyPressEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override.
+        if event.type() != QEvent.Type.KeyPress:
+            return super().eventFilter(watched, event)
+        key = event.key()
+        if watched is self.query_edit and key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
+            if self.results_list.count():
+                current = self.results_list.currentRow()
+                if current < 0:
+                    current = 0
+                elif key == Qt.Key.Key_Down:
+                    current = min(current + 1, self.results_list.count() - 1)
+                else:
+                    current = max(current - 1, 0)
+                self.results_list.setCurrentRow(current)
+                self.results_list.setFocus(Qt.FocusReason.ShortcutFocusReason)
+                return True
+        if watched is self.results_list and key == Qt.Key.Key_Escape:
+            self.query_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            return True
+        return super().eventFilter(watched, event)
 
 
 class SpotlightResultRow(QWidget):

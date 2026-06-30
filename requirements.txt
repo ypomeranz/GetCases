@@ -8,6 +8,10 @@ beautifulsoup4
 # This is the primary frontend for the migration away from Tkinter.
 PySide6
 
+# Global Ctrl+Space / Cmd+Space spotlight hotkey.
+# The app still runs without this, but the system-wide hotkey is disabled.
+pynput
+
 # In-app PDF viewer (View PDF button in the opinion window) and PDF-brief text
 # extraction ("Open Brief…" reads a PDF's text layer via pypdfium2).  Optional —
 # without these the app still runs; the opinion viewer offers the browser and

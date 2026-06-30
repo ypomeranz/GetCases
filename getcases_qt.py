@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    from PySide6.QtCore import Qt, QThreadPool, QTimer, QUrl
+    from PySide6.QtCore import QObject, Qt, QThreadPool, QTimer, QUrl, Signal
     from PySide6.QtGui import QAction, QDesktopServices
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from PySide6.QtWidgets import (
@@ -49,14 +49,18 @@ except ImportError as exc:  # pragma: no cover - user-facing startup check.
     ) from exc
 
 import brief_reader
+import eng_rep
 from case_utils import (
     build_default_filename,
     case_name,
+    federal_appendix_cite,
     format_case_row,
+    is_federal_appendix_cite,
     is_scotus_order,
     normalize_result_citations,
     pick_citation,
     preview_from_item,
+    static_case_law_url,
     strip_html,
 )
 from citations import detect_links
@@ -77,7 +81,12 @@ from qt_sources import (
     source_title,
 )
 from qt_workers import Worker
-from spotlight_search import SpotlightResult, spotlight_search
+from spotlight_search import (
+    SpotlightResult,
+    courtlistener_spotlight_results,
+    name_match_score,
+    spotlight_search,
+)
 
 try:
     from google_scholar import GoogleScholarFetcher
@@ -275,6 +284,10 @@ def _brief_body(text: str) -> str:
     return "".join(parts)
 
 
+class HotkeyBridge(QObject):
+    activated = Signal()
+
+
 class GetCasesQt(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -287,11 +300,17 @@ class GetCasesQt(QMainWindow):
         self._workers: list[Worker] = []
         self._court_results: list[dict] = []
         self._selected_courts: set[str] = set()
+        self._opinion_db: Optional[OpinionDB] = None
+        self._opinion_db_failed = False
         self._windows: list[QMainWindow] = []
         self._spotlight: Optional[SpotlightWindow] = None
+        self._hotkey_listener = None
+        self._hotkey_bridge = HotkeyBridge(self)
+        self._hotkey_bridge.activated.connect(self.show_spotlight)
 
         self._build_ui()
         self._wire_actions()
+        self._install_global_hotkey()
         self.statusBar().showMessage("Ready.")
 
     def _build_ui(self) -> None:
@@ -465,14 +484,21 @@ class GetCasesQt(QMainWindow):
         self._spotlight.focus_query(text)
 
     def _run_spotlight_search(self, query: str) -> None:
+        action = self._spotlight_direct_action(query)
+        if action is not None:
+            if self._spotlight is not None:
+                self._spotlight.hide()
+            self._handle_action(action)
+            return
         if self._spotlight is not None:
             self._spotlight.set_busy(True)
         client = self._client_for_token(required=False)
         fetcher = self._scholar_fetcher()
+        db = self._opinion_database()
 
         def task(status):
             status("Searching spotlight...")
-            return spotlight_search(query, client=client, fetcher=fetcher)
+            return spotlight_search(query, client=client, fetcher=fetcher, db=db)
 
         def done(results: list[SpotlightResult]) -> None:
             if self._spotlight is not None:
@@ -480,6 +506,13 @@ class GetCasesQt(QMainWindow):
             self.statusBar().showMessage(f"Spotlight found {len(results)} result(s).", 5000)
 
         self._queue_worker("Spotlight Search", task, done)
+
+    def _spotlight_direct_action(self, query: str) -> Optional[tuple[str, str]]:
+        action = parse_lookup(query)
+        if action is not None:
+            return action
+        detected = detect_links(query)
+        return detected[0][2] if detected else None
 
     def _open_spotlight_result(self, result: SpotlightResult) -> None:
         if result.source == "courtlistener" and isinstance(result.payload, dict):
@@ -492,6 +525,8 @@ class GetCasesQt(QMainWindow):
                 self._fetch_scholar_url(url, title)
         elif result.source == "cache" and isinstance(result.payload, dict):
             self._open_cached_opinion(result.payload)
+        elif result.source == "engrep":
+            self._open_english_reports_case(result.payload)
         else:
             QMessageBox.information(self, "Spotlight", "That result type is not openable yet.")
 
@@ -523,6 +558,37 @@ class GetCasesQt(QMainWindow):
             "The legacy Tkinter app is still available with:\n\n"
             "python courtlistener_gui.py",
         )
+
+    def _install_global_hotkey(self) -> None:
+        try:
+            from pynput import keyboard as pynput_keyboard
+        except Exception:
+            return
+        hotkey = "<cmd>+<space>" if sys.platform == "darwin" else "<ctrl>+<space>"
+        try:
+            listener = pynput_keyboard.GlobalHotKeys(
+                {hotkey: self._hotkey_bridge.activated.emit}
+            )
+            listener.daemon = True
+            listener.start()
+            self._hotkey_listener = listener
+        except Exception:
+            self._hotkey_listener = None
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
+        if self._hotkey_listener is not None:
+            try:
+                self._hotkey_listener.stop()
+            except Exception:
+                pass
+            self._hotkey_listener = None
+        if self._opinion_db is not None:
+            try:
+                self._opinion_db.close()
+            except Exception:
+                pass
+            self._opinion_db = None
+        super().closeEvent(event)
 
     def _set_result_actions(self, enabled: bool) -> None:
         self.open_text_btn.setEnabled(enabled)
@@ -576,8 +642,20 @@ class GetCasesQt(QMainWindow):
             )
             return None
         if self._scholar is None:
-            self._scholar = GoogleScholarFetcher()
+            self._scholar = GoogleScholarFetcher(
+                db=self._opinion_database(),
+                name_scorer=name_match_score,
+            )
         return self._scholar
+
+    def _opinion_database(self) -> Optional[OpinionDB]:
+        if self._opinion_db is None and not self._opinion_db_failed:
+            try:
+                self._opinion_db = OpinionDB()
+            except Exception as exc:
+                print(f"[qt] opinion database unavailable: {exc}")
+                self._opinion_db_failed = True
+        return self._opinion_db
 
     def _queue_worker(self, label: str, fn, finished) -> None:
         self._pending_jobs += 1
@@ -609,6 +687,9 @@ class GetCasesQt(QMainWindow):
             self._job_done()
 
     def _worker_error(self, label: str, message: str, worker: Worker) -> None:
+        if label == "Spotlight Search" and self._spotlight is not None:
+            short = message.strip().splitlines()[-1] if message.strip() else message
+            self._spotlight.set_error(short)
         self._show_error(label, message)
         self._release_worker(worker)
         self._job_done()
@@ -732,6 +813,9 @@ class GetCasesQt(QMainWindow):
         self._open_courtlistener_item_text(item)
 
     def _open_courtlistener_item_text(self, item: dict) -> None:
+        appx_cite = federal_appendix_cite(item)
+        if appx_cite and self._open_case_law_pdf(appx_cite):
+            return
         fetcher = self._scholar_fetcher()
         client = self._client_for_token(required=False)
         cite = pick_citation(item.get("citation", []))
@@ -947,7 +1031,7 @@ class GetCasesQt(QMainWindow):
             window = ChromiumPdfWindow(value, "Statutes at Large PDF")
             self._show_window(window)
         elif kind == "engrep":
-            QDesktopServices.openUrl(QUrl(english_reports_url(value)))
+            self._open_english_reports_spec(value)
         elif kind == "browse":
             QDesktopServices.openUrl(QUrl(value))
         else:
@@ -957,6 +1041,42 @@ class GetCasesQt(QMainWindow):
                 f"This Qt view detected a {kind or 'citation'} link, but that "
                 "source viewer has not been migrated yet.",
             )
+
+    def _open_english_reports_spec(self, spec: str) -> None:
+        cases = eng_rep.resolve(spec)
+        if not cases:
+            QDesktopServices.openUrl(QUrl(english_reports_url(spec)))
+            return
+        case = self._choose_english_reports_case(cases)
+        if case is not None:
+            self._open_english_reports_case(case)
+
+    def _choose_english_reports_case(self, cases: list[eng_rep.ERCase]):
+        if len(cases) == 1:
+            return cases[0]
+        labels = [case.label for case in cases]
+        chosen, ok = QInputDialog.getItem(
+            self,
+            "English Reports",
+            "Select case",
+            labels,
+            0,
+            False,
+        )
+        if not ok:
+            return None
+        try:
+            return cases[labels.index(chosen)]
+        except ValueError:
+            return None
+
+    def _open_english_reports_case(self, case) -> None:
+        if not hasattr(case, "pdf_url"):
+            QMessageBox.warning(self, "English Reports", "That English Reports case is unavailable.")
+            return
+        title = f"English Reports - {getattr(case, 'label', 'case')}"
+        window = ChromiumPdfWindow(case.pdf_url, title)
+        self._show_window(window)
 
     def _handle_link(self, url: str) -> None:
         parsed = urllib.parse.urlparse(url)
@@ -991,20 +1111,46 @@ class GetCasesQt(QMainWindow):
         self._queue_worker("Source Lookup", task, done)
 
     def _open_citation(self, cite: str) -> None:
-        fetcher = self._scholar_fetcher()
-        if fetcher is None:
-            return
         base = cite.split("@", 1)[0]
+        if is_federal_appendix_cite(base) and self._open_case_law_pdf(base):
+            return
+        fetcher = self._scholar_fetcher()
+        client = self._client_for_token(required=False)
+        if fetcher is None and client is None:
+            QMessageBox.warning(
+                self,
+                "Citation",
+                "No opinion source is available. Add a CourtListener token or install Scholar support.",
+            )
+            return
 
         def task(status):
             status(f"Opening {base}...")
-            return fetcher.fetch_by_citation(base)
+            if fetcher is not None:
+                result = fetcher.fetch_by_citation(base)
+                if result:
+                    return ("scholar", result)
+            if client is not None:
+                for candidate in courtlistener_spotlight_results(client, base):
+                    if isinstance(candidate.payload, dict):
+                        status("Fetching opinion text from CourtListener...")
+                        return ("courtlistener", assemble_case_parts(client, candidate.payload))
+            return None
 
         self._queue_worker(
             "Open Citation",
             task,
-            lambda result: self._show_text_result(("scholar", result) if result else None, base),
+            lambda result: self._show_text_result(result, base),
         )
+
+    def _open_case_law_pdf(self, cite: str) -> bool:
+        url = static_case_law_url(cite)
+        if not url:
+            return False
+        window = ChromiumPdfWindow(url, f"case.law PDF - {cite}")
+        self._show_window(window)
+        self.statusBar().showMessage(f"Opening {cite} from case.law.", 5000)
+        return True
 
 
 def main() -> None:
