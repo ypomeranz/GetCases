@@ -231,23 +231,20 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
             action = ("cite", m)  # m is the pre-built "vol rep page@pin"
             cite_base = m.split("@")[0]
         elif kind == "idcite":
-            # "Id." → the last citation.  When it points at a *case* and carries
-            # a page ("Id. at 152"), link it only if that page is plausibly a page
-            # of the reporter (within ID_PIN_WINDOW of its start); a far page is a
-            # record/appendix cite and is left unlinked.  A bare "Id." (no page)
-            # links to the case itself, and an "Id." after a statute/rule reopens
-            # that source.
+            # "Id." → the last citation, but conservatively, because in a brief an
+            # "Id." often points at a record document rather than the cited
+            # authority.  A bare "Id." (no page) is never linked.  "Id. at N" links
+            # to the previous *case* only when N is plausibly a page of its reporter
+            # (within ID_PIN_WINDOW of its start); a far page is a record/appendix
+            # cite, left unlinked.  "Id. at N" after a statute/rule reopens that
+            # source.
             la = last_cite_action
             pin = m.group(1)
-            if not la:
+            if not la or pin is None:
                 action = None
             elif la[0] == "cite":
-                if pin is None:
-                    action = ("cite", la[1])
-                elif _id_pin_in_range(la[1], pin):
-                    action = ("cite", f"{la[1]}@{pin}")
-                else:
-                    action = None
+                action = (("cite", f"{la[1]}@{pin}")
+                          if _id_pin_in_range(la[1], pin) else None)
             else:
                 action = la
         elif kind == "statestat":
@@ -303,10 +300,11 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     if any(a[0] == "cite" and "@1450" in a[1] for _, _, a in far):
         print("out-of-range Id. should not link to the case:", far)
         sys.exit(1)
-    # A bare "Id." (no page) still links to the case.
+    # A bare "Id." (no page) is never linked — too often a record cite — so the
+    # only case link here is the full citation itself, not the trailing "Id.".
     bare = detect_links("See Roe v. Wade, 410 U.S. 113 (1973). Id.")
-    if not any(a == ("cite", "410 U.S. 113") for _, _, a in bare):
-        print("bare Id. should link to the case:", bare)
+    if sum(1 for _, _, a in bare if a == ("cite", "410 U.S. 113")) != 1:
+        print("bare Id. should not add a link:", bare)
         sys.exit(1)
 
     print("\nOK:", len(found), "links;", sorted(kinds))
