@@ -6042,30 +6042,39 @@ def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
     return _citation_links_from_pages(_extract_pdf_text_pages(pdf_bytes))
 
 
-def _pdf_has_text_layer(pdf_bytes: bytes) -> bool:
-    """True when a PDF carries a real, selectable text layer (born-digital, or a
-    scan with OCR) rather than being a bare image scan.  Checked on the first
-    few pages so a scan is recognized quickly, under :data:`_PDFIUM_LOCK`."""
+def _pdf_is_born_digital(pdf_bytes: bytes) -> bool:
+    """True when a PDF's text is part of the document itself — a slip opinion, a
+    born-digital U.S. Reports PDF — rather than an OCR layer drawn invisibly over
+    a scanned image.
+
+    The tell is the text *render mode*: a born-digital page draws its text
+    visibly (fill/stroke), while an OCR layer draws it invisibly (render mode 3)
+    so the visible text comes from the scan image.  Sampled over the first
+    several pages under :data:`_PDFIUM_LOCK`; returns on the first visibly
+    rendered text object found, so it's quick for a real document and falls
+    through to ``False`` for a scan (with or without an OCR layer)."""
     try:
         import pypdfium2 as pdfium
+        import pypdfium2.raw as C
     except Exception:
         return False
+    hidden = (C.FPDF_TEXTRENDERMODE_INVISIBLE, C.FPDF_TEXTRENDERMODE_UNKNOWN)
     with _PDFIUM_LOCK:
         try:
             doc = pdfium.PdfDocument(pdf_bytes)
         except Exception:
             return False
         try:
-            n = len(doc)
-            for i in range(min(n, 5)):
+            for i in range(min(len(doc), 6)):
                 page = doc[i]
                 try:
-                    tp = page.get_textpage()
-                    try:
-                        if tp.count_chars() > 10:  # a few real glyphs, not noise
+                    for obj in page.get_objects(max_depth=4):
+                        if (obj.type == C.FPDF_PAGEOBJ_TEXT
+                                and C.FPDFTextObj_GetTextRenderMode(obj.raw)
+                                not in hidden):
                             return True
-                    finally:
-                        tp.close()
+                except Exception:
+                    continue
                 finally:
                     page.close()
             return False
@@ -6077,11 +6086,12 @@ def _pdf_has_text_layer(pdf_bytes: bytes) -> bool:
 
 def _open_pdf_view(parent: tk.Misc, app: "CourtListenerGUI",
                    data: bytes, title: str) -> None:
-    """Open a PDF the way the app now prefers.  A PDF with a real text layer
-    opens in the selectable/copyable text reader (citations shown as blue
-    clickable text, Ctrl-F find); a bare image scan — which has no text to
-    select — opens in the rendered viewer with on-page citation highlights."""
-    if _pdf_has_text_layer(data):
+    """Open a PDF the way the app now prefers.  A born-digital PDF (its text is
+    part of the document, not an OCR layer) opens in the selectable/copyable
+    text reader — citations shown as blue clickable text, Ctrl-F find.  A scan
+    (no core text, or only an OCR layer) opens in the rendered viewer, with
+    on-page citation highlights where an OCR layer makes them detectable."""
+    if _pdf_is_born_digital(data):
         app._open_brief_from_bytes(data, title)
     else:
         _LinkedPdfWindow(parent, app, data, title)
@@ -9809,7 +9819,36 @@ class _ScholarTextWindow:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _pdf_text_title(self) -> str:
+        it = self._pdf_item() or {}
+        nm = re.sub(r"<[^>]+>", "",
+                    it.get("caseName") or it.get("case_name") or "").strip()
+        return nm or "Opinion PDF"
+
+    def _restore_view_pdf_button(self) -> None:
+        """Re-enable the View-PDF control after handing the PDF off to the text
+        reader (a separate window); we stay on the current text view."""
+        if self._pre_pdf_mode == "courtlistener" and self._mode != "pdf":
+            self._refresh_pdf_button()
+        else:
+            try:
+                self._toggle_btn.config(text="View PDF", command=self._view_pdf,
+                                        state="normal")
+            except tk.TclError:
+                pass
+
     def _show_pdf(self, data: bytes, url: str) -> None:
+        # A born-digital PDF (slip opinion, newer U.S. Reports) carries real,
+        # selectable text — open it in the text reader with linked citations
+        # instead of a rendered image.  A scan (or an OCR-only PDF) falls through
+        # to the raster pane below.
+        if _pdf_is_born_digital(data):
+            self._pdf_url = url
+            self._app._open_brief_from_bytes(data, self._pdf_text_title())
+            self._restore_view_pdf_button()
+            self._status_var.set(
+                "Opened the PDF's selectable text — citations are linked.")
+            return
         width = max(self._text.winfo_width() - 24, 520)
         # US Reports scans get a roughly 3× margin (see _is_us_reports_pdf).
         margin = _PdfPane._MARGIN * 3 if _is_us_reports_pdf(url) else None
