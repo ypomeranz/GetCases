@@ -20,6 +20,7 @@ try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from PySide6.QtWidgets import (
         QApplication,
+        QDialog,
         QFileDialog,
         QFrame,
         QGridLayout,
@@ -60,9 +61,11 @@ from case_utils import (
 )
 from citations import detect_links
 from courtlistener import CourtListenerClient, CourtListenerError
+from courtlistener_text import CourtListenerOpinion, assemble_case_parts
 from getcases_config import load_token, save_token
 from pdf_resolver import fetch_pdf_bytes, resolve_pdf_url
-from qt_opinions import render_scholar_opinion_body
+from qt_courts import CourtPickerDialog, courts_summary
+from qt_opinions import render_opinion_parts_body, render_scholar_opinion_body
 from qt_pdf import ChromiumPdfWindow, LinkHandlingPage, html_document
 from qt_sources import (
     english_reports_url,
@@ -112,6 +115,17 @@ QPushButton {
 }
 QPushButton:hover { background: #334e68; }
 QPushButton:disabled { background: #a8b2bd; }
+QPushButton#FilterButton {
+  background: #ffffff;
+  color: #243b53;
+  border: 1px solid #cfd8e3;
+  padding: 5px 10px;
+  text-align: left;
+}
+QPushButton#FilterButton:hover {
+  background: #eef6ff;
+  border-color: #9fc6e8;
+}
 QHeaderView::section {
   background: #e8edf3;
   border: 0;
@@ -237,6 +251,7 @@ class GetCasesQt(QMainWindow):
         self._pending_jobs = 0
         self._workers: list[Worker] = []
         self._court_results: list[dict] = []
+        self._selected_courts: set[str] = set()
         self._windows: list[QMainWindow] = []
 
         self._build_ui()
@@ -276,10 +291,11 @@ class GetCasesQt(QMainWindow):
         search_layout.addWidget(QLabel("Token"), 1, 0)
         search_layout.addWidget(self.token_edit, 1, 1, 1, 2)
 
-        self.court_edit = QLineEdit()
-        self.court_edit.setPlaceholderText("Court IDs, optional: scotus ca9 cadc")
+        self.courts_btn = QPushButton(courts_summary(self._selected_courts))
+        self.courts_btn.setObjectName("FilterButton")
+        self.courts_btn.setMinimumWidth(160)
         search_layout.addWidget(QLabel("Courts"), 1, 3)
-        search_layout.addWidget(self.court_edit, 1, 4)
+        search_layout.addWidget(self.courts_btn, 1, 4)
 
         self.from_edit = QLineEdit()
         self.from_edit.setPlaceholderText("YYYY-MM-DD")
@@ -376,6 +392,7 @@ class GetCasesQt(QMainWindow):
     def _wire_actions(self) -> None:
         self.search_btn.clicked.connect(self.search)
         self.query_edit.returnPressed.connect(self.search)
+        self.courts_btn.clicked.connect(self.show_court_picker)
         self.save_token_action.triggered.connect(self._save_token)
         self.open_brief_action.triggered.connect(self.open_brief)
         self.quick_lookup_action.triggered.connect(self.quick_lookup)
@@ -392,6 +409,19 @@ class GetCasesQt(QMainWindow):
     def _save_token(self) -> None:
         save_token(self.token_edit.text())
         self.statusBar().showMessage("CourtListener token saved.", 3500)
+
+    def show_court_picker(self) -> None:
+        dialog = CourtPickerDialog(self._selected_courts, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._selected_courts = dialog.selected_courts()
+            self._update_courts_button()
+
+    def _update_courts_button(self) -> None:
+        self.courts_btn.setText(courts_summary(self._selected_courts))
+        if self._selected_courts:
+            self.courts_btn.setToolTip(" ".join(sorted(self._selected_courts)))
+        else:
+            self.courts_btn.setToolTip("All courts")
 
     def _show_legacy_hint(self) -> None:
         QMessageBox.information(
@@ -513,7 +543,7 @@ class GetCasesQt(QMainWindow):
         self._set_result_actions(False)
 
         started = False
-        court_ids = self.court_edit.text().strip() or None
+        court_ids = " ".join(sorted(self._selected_courts)) or None
         date_min = self.from_edit.text().strip() or None
         date_max = self.to_edit.text().strip() or None
         page_size = self.limit_spin.value()
@@ -607,24 +637,33 @@ class GetCasesQt(QMainWindow):
         if item is None:
             return
         fetcher = self._scholar_fetcher()
-        if fetcher is None:
-            return
+        client = self._client_for_token(required=False)
         cite = pick_citation(item.get("citation", []))
         name = case_name(item)
         year = str(item.get("dateFiled") or item.get("date_filed") or "")[:4] or None
 
         def task(status):
-            status("Fetching opinion text from Google Scholar...")
-            if cite:
-                result = fetcher.fetch_by_citation(cite)
-                if result:
-                    return result
-            return fetcher.fetch_by_name(name, year)
+            if fetcher is not None:
+                status("Fetching opinion text from Google Scholar...")
+                try:
+                    if cite:
+                        result = fetcher.fetch_by_citation(cite)
+                        if result:
+                            return ("scholar", result)
+                    result = fetcher.fetch_by_name(name, year)
+                    if result:
+                        return ("scholar", result)
+                except Exception as exc:
+                    print(f"[qt] Scholar text failed; trying CourtListener: {exc}")
+            if client is not None:
+                status("Fetching opinion text from CourtListener...")
+                return ("courtlistener", assemble_case_parts(client, item))
+            return None
 
         self._queue_worker(
-            "Scholar Text",
+            "Opinion Text",
             task,
-            lambda result: self._show_opinion_result(result, name),
+            lambda result: self._show_text_result(result, name),
         )
 
     def _fetch_scholar_url(self, url: str, title: str) -> None:
@@ -639,8 +678,32 @@ class GetCasesQt(QMainWindow):
         self._queue_worker(
             "Scholar Text",
             task,
-            lambda result: self._show_opinion_result(result, title),
+            lambda result: self._show_text_result(("scholar", result) if result else None, title),
         )
+
+    def _show_text_result(self, result, title: str) -> None:
+        if not result:
+            QMessageBox.warning(
+                self,
+                "Opinion Text",
+                "No matching opinion text was found from Scholar or CourtListener.",
+            )
+            return
+        source, payload = result
+        if source == "scholar":
+            self._show_opinion_result(payload, title)
+            return
+        if source == "courtlistener" and isinstance(payload, CourtListenerOpinion):
+            body = render_opinion_parts_body(
+                payload.title or title,
+                payload.parts,
+                source_label="CourtListener text",
+                note="Loaded from CourtListener because Scholar text was unavailable.",
+            )
+            window = HtmlWindow(payload.title or title, body, link_callback=self._handle_link)
+            self._show_window(window)
+            return
+        QMessageBox.warning(self, "Opinion Text", "The opinion text result was not understood.")
 
     def _show_opinion_result(self, result, title: str) -> None:
         if not result:
@@ -815,7 +878,7 @@ class GetCasesQt(QMainWindow):
         self._queue_worker(
             "Open Citation",
             task,
-            lambda result: self._show_opinion_result(result, base),
+            lambda result: self._show_text_result(("scholar", result) if result else None, base),
         )
 
 

@@ -24,7 +24,23 @@ def render_scholar_opinion_body(title: str, source_url: str, opinion_html: str) 
     link_footnotes_by_marker(parts)
     if not parts and blocks:
         parts = [OpinionPart("Opinion", "majority", blocks)]
+    return render_opinion_parts_body(
+        title,
+        parts,
+        source_url=source_url,
+        source_label="Google Scholar source" if source_url else "",
+    )
 
+
+def render_opinion_parts_body(
+    title: str,
+    parts: list[OpinionPart],
+    *,
+    source_url: str = "",
+    source_label: str = "",
+    note: str = "",
+) -> str:
+    """Render pre-parsed opinion parts into app-styled HTML."""
     body = [
         f"<h1>{html.escape(title or 'Opinion')}</h1>",
         '<div class="opinion-meta">',
@@ -32,8 +48,10 @@ def render_scholar_opinion_body(title: str, source_url: str, opinion_html: str) 
     if source_url:
         body.append(
             f'<span><a href="{html.escape(source_url, quote=True)}">'
-            "Google Scholar source</a></span>"
+            f"{html.escape(source_label or 'Source')}</a></span>"
         )
+    if note:
+        body.append(f"<span>{html.escape(note)}</span>")
     body.append("</div>")
 
     if not parts:
