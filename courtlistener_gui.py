@@ -5928,38 +5928,28 @@ def _union_line_runs(boxes: list) -> list:
     return out
 
 
-def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
-    """Scan a PDF's text layer for citations and return, per page, the
-    rectangles to make clickable:
+def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
+    """Extract a PDF's text layer as ``[[(char, box_or_None), …], …]`` — one
+    list per page, each a parallel run of characters and their glyph boxes
+    ``(left, bottom, right, top)`` in PDF points (``None`` for a char with no
+    usable box, e.g. a line break).
 
-        {page_index: [(rect_pts, action, snippet), ...]}
-
-    ``rect_pts`` is ``(left, bottom, right, top)`` in PDF points; ``action`` is
-    the ``(kind, value)`` pair the rest of the app opens (see
-    :func:`detect_brief_links`); ``snippet`` is the citation text.
-
-    Runs entirely on a background thread: it loads its *own* pdfium document
-    (never the pane's), touches no tk objects, and returns plain data.  Every
-    PDFium call is taken under :data:`_PDFIUM_LOCK`, per page, so it interleaves
-    safely with the main thread's page rendering instead of racing it.
-
-    Detection runs over the whole document at once (so "Id." and short forms
-    resolve against citations anywhere in it); a per-character offset map ties
-    each detected span back to its glyph boxes, and citations that wrap across
-    lines (or pages) become one rectangle per line."""
+    Runs on a background thread: it loads its *own* pdfium document (never the
+    pane's), touches no tk objects, and returns plain data.  Every PDFium call is
+    taken under :data:`_PDFIUM_LOCK`, per page, so it interleaves safely with the
+    main thread's page rendering instead of racing it.  Shared by the citation
+    linker and the find bar so the text is extracted only once."""
     import pypdfium2 as pdfium
 
     with _PDFIUM_LOCK:
         doc = pdfium.PdfDocument(pdf_bytes)
     try:
-        page_chars: list = []          # per page: list of (char, box_or_None)
-        parts: list = []               # global text pieces
-        gmap: list = []                # global index -> (page, local) or (None, None)
+        pages: list = []
         try:
             with _PDFIUM_LOCK:
                 n_pages = len(doc)
         except Exception:
-            return {}
+            return []
         for pi in range(n_pages):
             chars: list = []
             with _PDFIUM_LOCK:
@@ -5987,37 +5977,59 @@ def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
                     chars = []
                 finally:
                     page.close()
-            for li, (ch, _bx) in enumerate(chars):
-                parts.append(ch)
-                gmap.append((pi, li))
-            parts.append("\n")          # page separator (keeps words from fusing)
-            gmap.append((None, None))
-            page_chars.append(chars)
-
-        text = "".join(parts)
-        try:
-            links = detect_brief_links(text)
-        except Exception:
-            return {}
-
-        result: dict = {}
-        for start, end, action in links:
-            per_page: dict = {}
-            for g in range(start, end):
-                pi, li = gmap[g]
-                if pi is None:
-                    continue
-                bx = page_chars[pi][li][1]
-                if bx is not None:
-                    per_page.setdefault(pi, []).append(bx)
-            snippet = re.sub(r"\s+", " ", text[start:end]).strip()
-            for pi, boxes in per_page.items():
-                for rect in _union_line_runs(boxes):
-                    result.setdefault(pi, []).append((rect, action, snippet))
-        return result
+            pages.append(chars)
+        return pages
     finally:
         with _PDFIUM_LOCK:
             doc.close()
+
+
+def _citation_links_from_pages(pages: list) -> dict:
+    """Build the per-page clickable-citation rectangles from extracted page char
+    data (see :func:`_extract_pdf_text_pages`).  Pure — no PDFium, no tk — so it
+    is cheap to run on the worker right after extraction:
+
+        {page_index: [(rect_pts, action, snippet), …]}
+
+    Detection runs over the whole document at once (so "Id." and short forms
+    resolve against citations anywhere in it); a per-character offset map ties
+    each detected span back to its glyph boxes, and a citation that wraps across
+    lines (or pages) becomes one rectangle per line."""
+    parts: list = []               # global text pieces
+    gmap: list = []                # global index -> (page, local) or (None, None)
+    for pi, chars in enumerate(pages):
+        for li, (ch, _bx) in enumerate(chars):
+            parts.append(ch)
+            gmap.append((pi, li))
+        parts.append("\n")          # page separator (keeps words from fusing)
+        gmap.append((None, None))
+    text = "".join(parts)
+    try:
+        links = detect_brief_links(text)
+    except Exception:
+        return {}
+
+    result: dict = {}
+    for start, end, action in links:
+        per_page: dict = {}
+        for g in range(start, end):
+            pi, li = gmap[g]
+            if pi is None:
+                continue
+            bx = pages[pi][li][1]
+            if bx is not None:
+                per_page.setdefault(pi, []).append(bx)
+        snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+        for pi, boxes in per_page.items():
+            for rect in _union_line_runs(boxes):
+                result.setdefault(pi, []).append((rect, action, snippet))
+    return result
+
+
+def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
+    """Convenience wrapper: extract a PDF's text and return its citation
+    rectangles (see :func:`_citation_links_from_pages`)."""
+    return _citation_links_from_pages(_extract_pdf_text_pages(pdf_bytes))
 
 
 class _PdfPane(ttk.Frame):
@@ -6063,10 +6075,21 @@ class _PdfPane(ttk.Frame):
         self._overlay_ids: dict[int, list] = {}  # page → [canvas rectangle ids]
         self._cite_on_left = None
         self._cite_on_right = None
+        # Optional text find (enabled via enable_find): per-page char data, the
+        # current match list, and the page→highlight-ids map.
+        self._search_pages: Optional[list] = None
+        self._search_matches: list = []   # [(page_index, [rect_pts, …]), …]
+        self._search_cur: int = -1
+        self._search_ids: dict[int, list] = {}
+        self._find_bar = None
 
-        canvas = tk.Canvas(self, bg="#d9d9d9", highlightthickness=0,
+        # The canvas lives in a body frame so a find bar can sit above it.
+        body = ttk.Frame(self)
+        body.pack(side="top", fill="both", expand=True)
+        self._body = body
+        canvas = tk.Canvas(body, bg="#d9d9d9", highlightthickness=0,
                            yscrollincrement=1)
-        vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=self._on_yview)
         vsb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
@@ -6171,6 +6194,7 @@ class _PdfPane(ttk.Frame):
         self._photos.clear()
         self._img_ids.clear()
         self._overlay_ids.clear()
+        self._search_ids.clear()
         self._inner_w = max(1, self._target_w - 2 * self._margin)
         self._page_x = self._page_left()
         y = self._PAD
@@ -6200,6 +6224,9 @@ class _PdfPane(ttk.Frame):
             for iid in self._img_ids.values():
                 self._canvas.move(iid, dx, 0)
             for ids in self._overlay_ids.values():
+                for oid in ids:
+                    self._canvas.move(oid, dx, 0)
+            for ids in self._search_ids.values():
                 for oid in ids:
                     self._canvas.move(oid, dx, 0)
         self._update_scrollregion()
@@ -6262,6 +6289,8 @@ class _PdfPane(ttk.Frame):
                 self._photos.pop(i, None)
                 for oid in self._overlay_ids.pop(i, []):
                     c.delete(oid)
+                for oid in self._search_ids.pop(i, []):
+                    c.delete(oid)
 
     def _render_page(self, i: int) -> None:
         from PIL import Image, ImageTk
@@ -6287,6 +6316,9 @@ class _PdfPane(ttk.Frame):
         self._photos[i] = photo
         self._img_ids[i] = self._canvas.create_image(
             self._page_x, y, anchor="nw", image=photo)
+        # Search highlights sit just above the page image; citation overlays are
+        # drawn last so they stay clickable on top of any overlapping highlight.
+        self._draw_search(i)
         self._draw_overlays(i)
 
     # ------------------------------------------------------------------
@@ -6306,29 +6338,33 @@ class _PdfPane(ttk.Frame):
         for i in list(self._img_ids):
             self._draw_overlays(i)
 
+    def _rect_to_canvas(self, i: int, rect: tuple) -> tuple:
+        """Map a PDF-point box ``(l, b, r, t)`` on page *i* to canvas coordinates
+        ``(x0, y0, x1, y1)`` using the same scale/crop the page image used."""
+        y, _slot_h, frac, scale = self._slots[i]
+        fl, ft, _fr, _fb = frac
+        w_pt, h_pt, _ = self._meta[i]
+        x_off = self._page_x + self._margin - scale * fl * w_pt
+        y_off = y + self._margin + scale * h_pt * (1.0 - ft)
+        l, b, r, t = rect
+        return (x_off + scale * l, y_off - scale * t,
+                x_off + scale * r, y_off - scale * b)
+
     def _draw_overlays(self, i: int) -> None:
         """(Re)draw the clickable citation rectangles for page *i* on top of its
-        rendered image, mapping each PDF-point box to canvas coordinates with the
-        same scale/crop the page image used."""
+        rendered image."""
         c = self._canvas
         for oid in self._overlay_ids.pop(i, []):
             c.delete(oid)
         links = self._cite_links.get(i)
         if not links or i >= len(self._slots):
             return
-        y, _slot_h, frac, scale = self._slots[i]
-        fl, ft, _fr, _fb = frac
-        w_pt, h_pt, _ = self._meta[i]
-        x_off = self._page_x + self._margin - scale * fl * w_pt
-        y_off = y + self._margin + scale * h_pt * (1.0 - ft)
         ids: list = []
         for rect, action, snippet in links:
-            l, b, r, t = rect
-            x0, x1 = x_off + scale * l, x_off + scale * r
-            y0, y1 = y_off - scale * t, y_off - scale * b
+            x0, y0, x1, y1 = self._rect_to_canvas(i, rect)
             cat = _brief_action_category(action[0])
             oid = c.create_rectangle(
-                x0, y0, x1, y1, width=0,
+                x0, y0, x1, y1, width=0, tags=("cite_ov",),
                 fill=_BRIEF_TINTS.get(cat, "#cfe2ff"), stipple="gray50",
                 activefill=_BRIEF_TINTS.get(cat, "#cfe2ff"), activestipple="gray25",
             )
@@ -6349,6 +6385,185 @@ class _PdfPane(ttk.Frame):
         if cb is not None:
             cb(action, snippet)
         return "break"
+
+    # ------------------------------------------------------------------
+    # Text find (search the PDF's text layer; highlight matches on the page)
+    # ------------------------------------------------------------------
+
+    _SEARCH_FILL = "#fff15a"        # all matches: pale yellow
+    _SEARCH_FILL_CUR = "#ff9632"    # current match: orange
+
+    def enable_find(self, pages: list) -> None:
+        """Turn on Ctrl-F text search using ``pages`` (the extracted per-page
+        char data from :func:`_extract_pdf_text_pages`).  Binds the find keys on
+        the containing window; a no-op when ``pages`` is empty (a scan with no
+        text layer)."""
+        if not pages:
+            return
+        self._search_pages = pages
+        top = self.winfo_toplevel()
+        top.bind("<Control-f>", lambda _e: self._open_find())
+        top.bind("<F3>", lambda _e: self._find_step(1))
+        top.bind("<Shift-F3>", lambda _e: self._find_step(-1))
+
+    def has_find(self) -> bool:
+        return bool(self._search_pages)
+
+    def _open_find(self) -> str:
+        if not self._search_pages:
+            return "break"
+        if self._find_bar is None:
+            bar = ttk.Frame(self, padding=(6, 3))
+            ttk.Label(bar, text="Find:").pack(side="left")
+            self._find_var = tk.StringVar()
+            ent = ttk.Entry(bar, textvariable=self._find_var, width=30)
+            ent.pack(side="left", padx=4)
+            ent.bind("<Return>", lambda _e: self._find_step(1))
+            ent.bind("<Shift-Return>", lambda _e: self._find_step(-1))
+            ent.bind("<Escape>", lambda _e: self._close_find())
+            ent.bind("<KeyRelease>", self._on_find_key)
+            self._find_entry = ent
+            ttk.Button(bar, text="▲", width=2,
+                       command=lambda: self._find_step(-1)).pack(side="left")
+            ttk.Button(bar, text="▼", width=2,
+                       command=lambda: self._find_step(1)).pack(side="left",
+                                                                padx=(2, 6))
+            self._find_count = tk.StringVar(value="")
+            ttk.Label(bar, textvariable=self._find_count,
+                      foreground="gray").pack(side="left")
+            ttk.Button(bar, text="✕", width=2,
+                       command=self._close_find).pack(side="right")
+            self._find_bar = bar
+        self._find_bar.pack(side="top", fill="x", before=self._body)
+        self._find_entry.focus_set()
+        self._find_entry.selection_range(0, "end")
+        return "break"
+
+    def _close_find(self) -> str:
+        self._search_matches = []
+        self._search_cur = -1
+        self._redraw_search()
+        if self._find_bar is not None:
+            self._find_bar.pack_forget()
+        try:
+            self._canvas.focus_set()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _on_find_key(self, event: tk.Event) -> None:
+        if event.keysym in ("Return", "Escape", "Up", "Down",
+                             "Shift_L", "Shift_R"):
+            return
+        self._run_find()
+
+    def _run_find(self) -> None:
+        query = self._find_var.get() if self._find_bar is not None else ""
+        self._search_matches = self._compute_matches(query)
+        self._search_cur = 0 if self._search_matches else -1
+        self._update_find_count()
+        self._redraw_search()
+        if self._search_cur >= 0:
+            self._scroll_to_match(self._search_cur)
+
+    def _compute_matches(self, query: str) -> list:
+        """Whitespace-flexible, case-insensitive search of every page's text;
+        returns ``[(page_index, [rect_pts, …]), …]`` in document order.  A match
+        that wraps across a line becomes one rectangle per line."""
+        qn = re.sub(r"\s+", " ", query or "").strip().lower()
+        if not qn or not self._search_pages:
+            return []
+        matches: list = []
+        for pi, chars in enumerate(self._search_pages):
+            norm: list = []        # normalized chars
+            idxmap: list = []      # normalized index -> original char index
+            prev_ws = False
+            for li, (ch, _bx) in enumerate(chars):
+                if ch and ch.isspace():
+                    if not prev_ws:
+                        norm.append(" ")
+                        idxmap.append(li)
+                    prev_ws = True
+                elif ch:
+                    norm.append(ch)
+                    idxmap.append(li)
+                    prev_ws = False
+            ntext = "".join(norm).lower()
+            start = 0
+            while True:
+                k = ntext.find(qn, start)
+                if k < 0:
+                    break
+                boxes = [chars[idxmap[j]][1] for j in range(k, k + len(qn))
+                         if chars[idxmap[j]][1] is not None]
+                rects = _union_line_runs(boxes) if boxes else []
+                if rects:
+                    matches.append((pi, rects))
+                start = k + len(qn)
+        return matches
+
+    def _draw_search(self, i: int) -> None:
+        """(Re)draw the search-match highlights for page *i*; the current match
+        is drawn in a stronger colour.  Citation overlays are raised back on top
+        so they stay clickable."""
+        c = self._canvas
+        for oid in self._search_ids.pop(i, []):
+            c.delete(oid)
+        if not self._search_matches or i >= len(self._slots):
+            return
+        ids: list = []
+        for mi, (pi, rects) in enumerate(self._search_matches):
+            if pi != i:
+                continue
+            fill = self._SEARCH_FILL_CUR if mi == self._search_cur \
+                else self._SEARCH_FILL
+            for rect in rects:
+                x0, y0, x1, y1 = self._rect_to_canvas(i, rect)
+                ids.append(c.create_rectangle(
+                    x0, y0, x1, y1, width=0, fill=fill, stipple="gray50"))
+        self._search_ids[i] = ids
+        c.tag_raise("cite_ov")
+
+    def _redraw_search(self) -> None:
+        for i in list(self._img_ids):
+            self._draw_search(i)
+
+    def _update_find_count(self) -> None:
+        if not hasattr(self, "_find_count"):
+            return
+        n = len(self._search_matches)
+        if not n:
+            q = self._find_var.get().strip() if self._find_bar is not None else ""
+            self._find_count.set("No matches" if q else "")
+        else:
+            self._find_count.set(f"{self._search_cur + 1} of {n}")
+
+    def _find_step(self, direction: int) -> str:
+        if not self._search_matches:
+            return "break"
+        self._search_cur = (self._search_cur + direction) % len(self._search_matches)
+        self._update_find_count()
+        self._scroll_to_match(self._search_cur)
+        self._redraw_search()
+        return "break"
+
+    def _scroll_to_match(self, mi: int) -> None:
+        """Scroll the current match into view (about a third down the viewport),
+        then render and re-highlight the now-visible pages."""
+        if not (0 <= mi < len(self._search_matches)):
+            return
+        pi, rects = self._search_matches[mi]
+        if pi >= len(self._slots) or not rects:
+            return
+        _x0, y0, _x1, _y1 = self._rect_to_canvas(pi, rects[0])
+        try:
+            view_h = self._canvas.winfo_height() or 1
+        except tk.TclError:
+            return
+        target = max(0.0, y0 - view_h / 3.0)
+        self._canvas.yview_moveto(min(1.0, target / max(1, self._content_h)))
+        self._render_visible()
+        self._redraw_search()
 
     def export_pdf(self, path: str, dpi: int = 150) -> None:
         """Write a PDF that matches what's shown — each page cropped to its
@@ -10574,28 +10789,33 @@ class _LinkedPdfWindow:
 
     def _scan(self) -> None:
         try:
-            links = _detect_pdf_citation_links(self._bytes)
+            pages = _extract_pdf_text_pages(self._bytes)   # one extraction pass
+            links = _citation_links_from_pages(pages)
         except Exception as exc:
             self._post(self._scan_failed, str(exc))
             return
-        self._post(self._scan_done, links)
+        self._post(self._scan_done, links, pages)
 
     def _scan_failed(self, msg: str) -> None:
         self._legend_lbl.config(text="Citation scan failed:")
         self._status_var.set(msg)
 
-    def _scan_done(self, links: dict) -> None:
+    def _scan_done(self, links: dict, pages: list) -> None:
         if self._closed or self._pane is None:
             return
         self._pane.set_citation_links(links, self._open_cite, self._open_cite_browser)
+        self._pane.enable_find(pages)   # Ctrl-F searches the text layer
         n = sum(len(v) for v in links.values())
+        has_text = any(pages)
         self._legend_lbl.config(
             text=("Citations are highlighted and clickable:" if n
                   else "No citations detected:"))
-        self._status_var.set(
-            f"{n} citation link{'' if n == 1 else 's'} — left-click to open, "
-            "right-click for the browser." if n
-            else "No citations detected in this PDF's text layer.")
+        msg = (f"{n} citation link{'' if n == 1 else 's'} — left-click to open, "
+               "right-click for the browser." if n
+               else "No citations detected in this PDF's text layer.")
+        if has_text:
+            msg += "    Ctrl-F to search the text."
+        self._status_var.set(msg)
 
     def _open_cite(self, action: tuple, snippet: str) -> None:
         _follow_brief_action(self._app, self._win, action, self._safe_status)
