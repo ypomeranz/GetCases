@@ -170,6 +170,8 @@ class HtmlWindow(QMainWindow):
         parent=None,
     ) -> None:
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowFlag(Qt.WindowType.Window, True)
         self.setWindowTitle(title)
         self.resize(1000, 820)
         self.view = QWebEngineView(self)
@@ -224,6 +226,7 @@ class GetCasesQt(QMainWindow):
         self._client: Optional[CourtListenerClient] = None
         self._scholar = None
         self._pending_jobs = 0
+        self._workers: list[Worker] = []
         self._court_results: list[dict] = []
         self._windows: list[QMainWindow] = []
 
@@ -399,6 +402,13 @@ class GetCasesQt(QMainWindow):
         self._windows.append(window)
         window.destroyed.connect(lambda _=None, w=window: self._forget_window(w))
 
+    def _show_window(self, window: QMainWindow) -> None:
+        self._remember(window)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        window.setWindowState(window.windowState() & ~Qt.WindowState.WindowMinimized)
+
     def _forget_window(self, window: QMainWindow) -> None:
         try:
             self._windows.remove(window)
@@ -437,21 +447,34 @@ class GetCasesQt(QMainWindow):
         self._pending_jobs += 1
         self._set_busy(True)
         worker = Worker(fn)
+        self._workers.append(worker)
         worker.signals.status.connect(self.statusBar().showMessage)
-        worker.signals.finished.connect(lambda result: self._worker_finished(result, finished))
-        worker.signals.error.connect(lambda message: self._worker_error(label, message))
+        worker.signals.finished.connect(
+            lambda result, w=worker: self._worker_finished(result, finished, w)
+        )
+        worker.signals.error.connect(
+            lambda message, w=worker: self._worker_error(label, message, w)
+        )
         self.pool.start(worker)
 
-    def _worker_finished(self, result, finished) -> None:
+    def _release_worker(self, worker: Worker) -> None:
+        try:
+            self._workers.remove(worker)
+        except ValueError:
+            pass
+
+    def _worker_finished(self, result, finished, worker: Worker) -> None:
         try:
             finished(result)
         except Exception:
             self._show_error("UI update failed", traceback.format_exc())
         finally:
+            self._release_worker(worker)
             self._job_done()
 
-    def _worker_error(self, label: str, message: str) -> None:
+    def _worker_error(self, label: str, message: str, worker: Worker) -> None:
         self._show_error(label, message)
+        self._release_worker(worker)
         self._job_done()
 
     def _job_done(self) -> None:
@@ -537,8 +560,15 @@ class GetCasesQt(QMainWindow):
         self.statusBar().showMessage(f"Showing {len(results)} of {count:,} CourtListener results.")
 
     def _show_scholar_results(self, results: list) -> None:
-        rows = [([r.title, r.source], r) for r in results]
+        def field(row, name: str) -> str:
+            if isinstance(row, dict):
+                return str(row.get(name, ""))
+            return str(getattr(row, name, ""))
+
+        rows = [([field(r, "title"), field(r, "source")], r) for r in results]
         self.scholar_table.set_rows(rows)
+        self.scholar_table.setVisible(True)
+        self.scholar_table.viewport().update()
         self.statusBar().showMessage(f"Showing {len(results)} Google Scholar results.", 5000)
 
     def _on_court_selection(self) -> None:
@@ -605,9 +635,8 @@ class GetCasesQt(QMainWindow):
             return
         url, opinion_html = result
         body = f"<h1>{html.escape(title)}</h1>{opinion_html}"
-        window = HtmlWindow(title, body, base_url=url, parent=self)
-        self._remember(window)
-        window.show()
+        window = HtmlWindow(title, body, base_url=url)
+        self._show_window(window)
 
     def view_selected_pdf(self) -> None:
         item = self.court_table.current_payload()
@@ -624,9 +653,8 @@ class GetCasesQt(QMainWindow):
             if not url:
                 QMessageBox.warning(self, "PDF", "No PDF was found for this opinion.")
                 return
-            window = ChromiumPdfWindow(url, f"PDF - {case_name(item)}", self)
-            self._remember(window)
-            window.show()
+            window = ChromiumPdfWindow(url, f"PDF - {case_name(item)}")
+            self._show_window(window)
 
         self._queue_worker("PDF Lookup", task, done)
 
@@ -679,9 +707,8 @@ class GetCasesQt(QMainWindow):
 
         def done(text: str) -> None:
             title = f"Brief - {Path(path).name}"
-            window = BriefWindow(title, text, self._handle_link, self)
-            self._remember(window)
-            window.show()
+            window = BriefWindow(title, text, self._handle_link)
+            self._show_window(window)
             self.statusBar().showMessage("Brief opened.", 5000)
 
         self._queue_worker("Open Brief", task, done)
@@ -697,9 +724,8 @@ class GetCasesQt(QMainWindow):
         if kind == "cite":
             self._open_citation(value)
         elif kind == "statpdf":
-            window = ChromiumPdfWindow(value, "Statutes at Large PDF", self)
-            self._remember(window)
-            window.show()
+            window = ChromiumPdfWindow(value, "Statutes at Large PDF")
+            self._show_window(window)
         elif kind == "browse":
             QDesktopServices.openUrl(QUrl(value))
         else:

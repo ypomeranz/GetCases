@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import html
 
-from PySide6.QtCore import QTimer, QUrl, Signal
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -99,6 +99,8 @@ class ChromiumPdfWindow(QMainWindow):
 
     def __init__(self, url: str, title: str, parent=None) -> None:
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowFlag(Qt.WindowType.Window, True)
         self._url = url
         self.setWindowTitle(title or "PDF")
         self.resize(1120, 860)
