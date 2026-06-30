@@ -1978,6 +1978,10 @@ class CourtListenerGUI:
             label="Open Brief (highlight citations)…", accelerator="Ctrl+B",
             command=self._open_brief,
         )
+        brief_menu.add_command(
+            label="Import PDF & Link Citations (on the page)…",
+            command=self._open_linked_pdf,
+        )
         db_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Database", menu=db_menu)
         db_menu.add_command(
@@ -3495,6 +3499,67 @@ class CourtListenerGUI:
             )
             return
         _BriefTextWindow(self.root, self, os.path.basename(path), text)
+
+    def _open_linked_pdf(self) -> None:
+        """Brief menu: import a PDF and show it *as a PDF* with its citations
+        detected and drawn as clickable links on the page (cases / statutes /
+        rules / regulations / Constitution open in the app).  Falls back to the
+        text reader when the in-app PDF viewer libraries aren't installed."""
+        path = filedialog.askopenfilename(
+            title="Import a PDF to link its citations",
+            parent=self.root,
+            filetypes=[("PDF", "*.pdf"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except Exception as exc:
+            messagebox.showerror(
+                "Import PDF", f"Could not read this file:\n\n{exc}",
+                parent=self.root,
+            )
+            return
+        if not data[:1024].lstrip().startswith(b"%PDF"):
+            messagebox.showerror(
+                "Import PDF", "That doesn't look like a PDF file.",
+                parent=self.root,
+            )
+            return
+        _LinkedPdfWindow(self.root, self, data, os.path.basename(path))
+
+    def _open_brief_from_bytes(self, data: bytes, name: str) -> None:
+        """Text-reader fallback for an imported PDF when the in-app PDF viewer
+        isn't available: write the bytes out, extract the text layer, and show
+        the same clickable citations in the brief reader."""
+        tmp: Optional[str] = None
+        try:
+            fd, tmp = tempfile.mkstemp(suffix=".pdf")
+            os.close(fd)
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            text = brief_reader.extract_text(tmp)
+        except Exception as exc:
+            messagebox.showerror(
+                "Import PDF", f"Could not read this PDF:\n\n{exc}",
+                parent=self.root,
+            )
+            return
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+        if not text.strip():
+            messagebox.showwarning(
+                "Import PDF",
+                "No selectable text was found in this PDF (it may be a scan).",
+                parent=self.root,
+            )
+            return
+        _BriefTextWindow(self.root, self, name, text)
 
     def _show_settings_dialog(self) -> None:
         dlg = tk.Toplevel(self.root)
@@ -5700,6 +5765,16 @@ class _TextFinder:
 # detects the content and writes the cropped file, so no new package is needed.
 
 
+# PDFium (the C library behind pypdfium2) is NOT thread-safe — concurrent calls,
+# even on *different* documents, can crash the interpreter.  The PDF pane renders
+# on the main thread while the citation-linking worker (_detect_pdf_citation_links)
+# reads text/char-boxes on a background thread, so every stretch of PDFium work is
+# serialized through this one re-entrant lock.  This is the fix for the old
+# "import a PDF and link its citations" feature, which crashed because the page
+# render and the text scan ran in parallel.
+_PDFIUM_LOCK = threading.RLock()
+
+
 def _page_content_box_pts(page) -> Optional[tuple]:
     """The bounding box of a page's actual content in PDF points
     ``(left, bottom, right, top)``, or ``None`` when it can't be determined
@@ -5795,31 +5870,154 @@ def _crop_pdf_to_content(
 
     import pypdfium2 as pdfium
 
-    doc = pdfium.PdfDocument(pdf_bytes)
+    with _PDFIUM_LOCK:
+        doc = pdfium.PdfDocument(pdf_bytes)
+        try:
+            for i in range(len(doc)):
+                page = doc[i]
+                try:
+                    mb = tuple(page.get_mediabox())
+                    box = _page_content_box_pts(page)
+                    if box is None and frac_boxes and i < len(frac_boxes):
+                        box = _frac_box_to_points(frac_boxes[i], mb)
+                    if box is None:
+                        continue  # leave this page at full size
+                    l, b, r, t = box
+                    l, b = max(mb[0], l - margin_pt), max(mb[1], b - margin_pt)
+                    r, t = min(mb[2], r + margin_pt), min(mb[3], t + margin_pt)
+                    if r - l < 1 or t - b < 1:
+                        continue  # implausibly tight — skip rather than clip
+                    page.set_mediabox(l, b, r, t)
+                    page.set_cropbox(l, b, r, t)
+                finally:
+                    page.close()
+            buf = io.BytesIO()
+            doc.save(buf)
+            return buf.getvalue()
+        finally:
+            doc.close()
+
+
+# ---------------------------------------------------------------------------
+# Citation detection over a PDF's text layer (for the "link citations" feature)
+# ---------------------------------------------------------------------------
+
+
+def _union_line_runs(boxes: list) -> list:
+    """Group glyph boxes (in reading order, PDF points ``(l, b, r, t)``) into
+    one union rectangle per line: a new run starts whenever a box no longer
+    shares a vertical band with the current one (i.e. the citation wrapped to
+    the next line).  So a cite split across lines yields one rectangle per line
+    that the overlay can highlight separately."""
+    runs: list = []
+    cur: list = []
+    for bx in boxes:
+        if cur and (bx[3] <= cur[-1][1] or bx[1] >= cur[-1][3]):
+            runs.append(cur)
+            cur = [bx]
+        else:
+            cur.append(bx)
+    if cur:
+        runs.append(cur)
+    out: list = []
+    for run in runs:
+        out.append((
+            min(b[0] for b in run), min(b[1] for b in run),
+            max(b[2] for b in run), max(b[3] for b in run),
+        ))
+    return out
+
+
+def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
+    """Scan a PDF's text layer for citations and return, per page, the
+    rectangles to make clickable:
+
+        {page_index: [(rect_pts, action, snippet), ...]}
+
+    ``rect_pts`` is ``(left, bottom, right, top)`` in PDF points; ``action`` is
+    the ``(kind, value)`` pair the rest of the app opens (see
+    :func:`detect_brief_links`); ``snippet`` is the citation text.
+
+    Runs entirely on a background thread: it loads its *own* pdfium document
+    (never the pane's), touches no tk objects, and returns plain data.  Every
+    PDFium call is taken under :data:`_PDFIUM_LOCK`, per page, so it interleaves
+    safely with the main thread's page rendering instead of racing it.
+
+    Detection runs over the whole document at once (so "Id." and short forms
+    resolve against citations anywhere in it); a per-character offset map ties
+    each detected span back to its glyph boxes, and citations that wrap across
+    lines (or pages) become one rectangle per line."""
+    import pypdfium2 as pdfium
+
+    with _PDFIUM_LOCK:
+        doc = pdfium.PdfDocument(pdf_bytes)
     try:
-        for i in range(len(doc)):
-            page = doc[i]
-            try:
-                mb = tuple(page.get_mediabox())
-                box = _page_content_box_pts(page)
-                if box is None and frac_boxes and i < len(frac_boxes):
-                    box = _frac_box_to_points(frac_boxes[i], mb)
-                if box is None:
-                    continue  # leave this page at full size
-                l, b, r, t = box
-                l, b = max(mb[0], l - margin_pt), max(mb[1], b - margin_pt)
-                r, t = min(mb[2], r + margin_pt), min(mb[3], t + margin_pt)
-                if r - l < 1 or t - b < 1:
-                    continue  # implausibly tight — skip rather than clip
-                page.set_mediabox(l, b, r, t)
-                page.set_cropbox(l, b, r, t)
-            finally:
-                page.close()
-        buf = io.BytesIO()
-        doc.save(buf)
-        return buf.getvalue()
+        page_chars: list = []          # per page: list of (char, box_or_None)
+        parts: list = []               # global text pieces
+        gmap: list = []                # global index -> (page, local) or (None, None)
+        try:
+            with _PDFIUM_LOCK:
+                n_pages = len(doc)
+        except Exception:
+            return {}
+        for pi in range(n_pages):
+            chars: list = []
+            with _PDFIUM_LOCK:
+                page = doc[pi]
+                try:
+                    tp = page.get_textpage()
+                    try:
+                        n = tp.count_chars()
+                        whole = tp.get_text_range()
+                        aligned = len(whole) == n
+                        for i in range(n):
+                            ch = whole[i] if aligned else tp.get_text_range(i, 1)
+                            if not ch:
+                                ch = " "
+                            try:
+                                bx = tp.get_charbox(i)
+                                if not (bx and bx[2] > bx[0] and bx[3] > bx[1]):
+                                    bx = None
+                            except Exception:
+                                bx = None
+                            chars.append((ch, bx))
+                    finally:
+                        tp.close()
+                except Exception:
+                    chars = []
+                finally:
+                    page.close()
+            for li, (ch, _bx) in enumerate(chars):
+                parts.append(ch)
+                gmap.append((pi, li))
+            parts.append("\n")          # page separator (keeps words from fusing)
+            gmap.append((None, None))
+            page_chars.append(chars)
+
+        text = "".join(parts)
+        try:
+            links = detect_brief_links(text)
+        except Exception:
+            return {}
+
+        result: dict = {}
+        for start, end, action in links:
+            per_page: dict = {}
+            for g in range(start, end):
+                pi, li = gmap[g]
+                if pi is None:
+                    continue
+                bx = page_chars[pi][li][1]
+                if bx is not None:
+                    per_page.setdefault(pi, []).append(bx)
+            snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+            for pi, boxes in per_page.items():
+                for rect in _union_line_runs(boxes):
+                    result.setdefault(pi, []).append((rect, action, snippet))
+        return result
     finally:
-        doc.close()
+        with _PDFIUM_LOCK:
+            doc.close()
 
 
 class _PdfPane(ttk.Frame):
@@ -5859,6 +6057,12 @@ class _PdfPane(ttk.Frame):
         self._page_x = self._PAD               # left x of each page; centered later
         self._photos: dict[int, object] = {}   # page → PhotoImage (kept alive)
         self._img_ids: dict[int, int] = {}      # page → canvas image id
+        # Optional citation-link overlay (set via set_citation_links): per-page
+        # clickable rectangles drawn on top of the rendered pages.
+        self._cite_links: dict[int, list] = {}  # page → [(rect_pts, action, snippet)]
+        self._overlay_ids: dict[int, list] = {}  # page → [canvas rectangle ids]
+        self._cite_on_left = None
+        self._cite_on_right = None
 
         canvas = tk.Canvas(self, bg="#d9d9d9", highlightthickness=0,
                            yscrollincrement=1)
@@ -5873,18 +6077,19 @@ class _PdfPane(ttk.Frame):
         # cropped to a small, even margin.  The layout is (re)built from this
         # cached metadata whenever the window resizes or the zoom changes.
         self._meta: list[tuple] = []  # (w_pt, h_pt, frac_box)
-        for i in range(len(self._doc)):
-            page = self._doc[i]
-            try:
-                w_pt, h_pt = page.get_size()
+        with _PDFIUM_LOCK:
+            for i in range(len(self._doc)):
+                page = self._doc[i]
                 try:
-                    lo = page.render(scale=self._BBOX_SCALE).to_pil()
-                    frac = self._content_frac(lo)
-                except Exception:
-                    frac = (0.0, 0.0, 1.0, 1.0)
-            finally:
-                page.close()
-            self._meta.append((w_pt, h_pt, frac))
+                    w_pt, h_pt = page.get_size()
+                    try:
+                        lo = page.render(scale=self._BBOX_SCALE).to_pil()
+                        frac = self._content_frac(lo)
+                    except Exception:
+                        frac = (0.0, 0.0, 1.0, 1.0)
+                finally:
+                    page.close()
+                self._meta.append((w_pt, h_pt, frac))
 
         self._rect_ids: list[int] = []
         self._slots: list[tuple] = []  # (y, slot_h, frac_box, render_scale)
@@ -5965,6 +6170,7 @@ class _PdfPane(ttk.Frame):
         self._slots = []
         self._photos.clear()
         self._img_ids.clear()
+        self._overlay_ids.clear()
         self._inner_w = max(1, self._target_w - 2 * self._margin)
         self._page_x = self._page_left()
         y = self._PAD
@@ -5993,6 +6199,9 @@ class _PdfPane(ttk.Frame):
                 self._canvas.move(rid, dx, 0)
             for iid in self._img_ids.values():
                 self._canvas.move(iid, dx, 0)
+            for ids in self._overlay_ids.values():
+                for oid in ids:
+                    self._canvas.move(oid, dx, 0)
         self._update_scrollregion()
         self._render_visible()
 
@@ -6051,15 +6260,18 @@ class _PdfPane(ttk.Frame):
             elif not near and i in self._img_ids:
                 c.delete(self._img_ids.pop(i))
                 self._photos.pop(i, None)
+                for oid in self._overlay_ids.pop(i, []):
+                    c.delete(oid)
 
     def _render_page(self, i: int) -> None:
         from PIL import Image, ImageTk
         y, slot_h, frac, scale = self._slots[i]
-        page = self._doc[i]
-        try:
-            full = page.render(scale=scale).to_pil()
-        finally:
-            page.close()
+        with _PDFIUM_LOCK:
+            page = self._doc[i]
+            try:
+                full = page.render(scale=scale).to_pil()
+            finally:
+                page.close()
         fl, ft, fr, fb = frac
         W, H = full.size
         content = full.crop((int(fl * W), int(ft * H),
@@ -6075,6 +6287,68 @@ class _PdfPane(ttk.Frame):
         self._photos[i] = photo
         self._img_ids[i] = self._canvas.create_image(
             self._page_x, y, anchor="nw", image=photo)
+        self._draw_overlays(i)
+
+    # ------------------------------------------------------------------
+    # Citation-link overlay
+    # ------------------------------------------------------------------
+
+    def set_citation_links(self, page_links: dict,
+                           on_left=None, on_right=None) -> None:
+        """Attach clickable citation overlays.  ``page_links`` maps a page index
+        to ``[(rect_pts, action, snippet), …]`` (see
+        :func:`_detect_pdf_citation_links`).  ``on_left(action, snippet)`` fires
+        on a left click, ``on_right(action, snippet)`` on a right click.  Redraws
+        the overlays on every page currently on screen."""
+        self._cite_links = page_links or {}
+        self._cite_on_left = on_left
+        self._cite_on_right = on_right
+        for i in list(self._img_ids):
+            self._draw_overlays(i)
+
+    def _draw_overlays(self, i: int) -> None:
+        """(Re)draw the clickable citation rectangles for page *i* on top of its
+        rendered image, mapping each PDF-point box to canvas coordinates with the
+        same scale/crop the page image used."""
+        c = self._canvas
+        for oid in self._overlay_ids.pop(i, []):
+            c.delete(oid)
+        links = self._cite_links.get(i)
+        if not links or i >= len(self._slots):
+            return
+        y, _slot_h, frac, scale = self._slots[i]
+        fl, ft, _fr, _fb = frac
+        w_pt, h_pt, _ = self._meta[i]
+        x_off = self._page_x + self._margin - scale * fl * w_pt
+        y_off = y + self._margin + scale * h_pt * (1.0 - ft)
+        ids: list = []
+        for rect, action, snippet in links:
+            l, b, r, t = rect
+            x0, x1 = x_off + scale * l, x_off + scale * r
+            y0, y1 = y_off - scale * t, y_off - scale * b
+            cat = _brief_action_category(action[0])
+            oid = c.create_rectangle(
+                x0, y0, x1, y1, width=0,
+                fill=_BRIEF_TINTS.get(cat, "#cfe2ff"), stipple="gray50",
+                activefill=_BRIEF_TINTS.get(cat, "#cfe2ff"), activestipple="gray25",
+            )
+            c.tag_bind(oid, "<Enter>",
+                       lambda _e: c.config(cursor="hand2"))
+            c.tag_bind(oid, "<Leave>", lambda _e: c.config(cursor=""))
+            c.tag_bind(oid, "<Button-1>",
+                       lambda _e, a=action, s=snippet: self._fire_cite(
+                           self._cite_on_left, a, s))
+            c.tag_bind(oid, "<Button-3>",
+                       lambda _e, a=action, s=snippet: self._fire_cite(
+                           self._cite_on_right, a, s))
+            ids.append(oid)
+        self._overlay_ids[i] = ids
+
+    @staticmethod
+    def _fire_cite(cb, action, snippet):
+        if cb is not None:
+            cb(action, snippet)
+        return "break"
 
     def export_pdf(self, path: str, dpi: int = 150) -> None:
         """Write a PDF that matches what's shown — each page cropped to its
@@ -6088,11 +6362,12 @@ class _PdfPane(ttk.Frame):
         pages: list = []
         try:
             for i, (w_pt, h_pt, frac) in enumerate(self._meta):
-                page = self._doc[i]
-                try:
-                    full = page.render(scale=scale).to_pil().convert("RGB")
-                finally:
-                    page.close()
+                with _PDFIUM_LOCK:
+                    page = self._doc[i]
+                    try:
+                        full = page.render(scale=scale).to_pil().convert("RGB")
+                    finally:
+                        page.close()
                 fl, ft, fr, fb = frac
                 W, H = full.size
                 content = full.crop((int(fl * W), int(ft * H),
@@ -6119,17 +6394,18 @@ class _PdfPane(ttk.Frame):
         not a bare scan) — the case where a lossless, text-preserving crop is
         worth doing instead of the raster export."""
         try:
-            for i in range(len(self._doc)):
-                page = self._doc[i]
-                try:
-                    tp = page.get_textpage()
+            with _PDFIUM_LOCK:
+                for i in range(len(self._doc)):
+                    page = self._doc[i]
                     try:
-                        if tp.count_chars() > 0:
-                            return True
+                        tp = page.get_textpage()
+                        try:
+                            if tp.count_chars() > 0:
+                                return True
+                        finally:
+                            tp.close()
                     finally:
-                        tp.close()
-                finally:
-                    page.close()
+                        page.close()
         except Exception:
             return False
         return False
@@ -6159,8 +6435,12 @@ class _PdfPane(ttk.Frame):
         self.export_pdf(path)
 
     def destroy(self) -> None:
+        # Under the PDFium lock: closing the document is a PDFium call and may
+        # overlap the citation-scan worker (which holds its own document) if the
+        # window is closed mid-scan.
         try:
-            self._doc.close()
+            with _PDFIUM_LOCK:
+                self._doc.close()
         except Exception:
             pass
         super().destroy()
@@ -10193,6 +10473,163 @@ class _BriefTextWindow:
         if entry:
             _open_citation_in_browser(entry[0], entry[1])
         return "break"
+
+
+class _LinkedPdfWindow:
+    """Show an imported PDF *as a PDF* (the zoomable, cropped pane) with every
+    detected citation drawn as a clickable highlight on the page — cases open in
+    the Scholar reader, statutes/rules/regulations/Constitution in the statute
+    viewer, right-click opens in the browser.
+
+    The citation scan runs on a background thread; PDFium access (here and in the
+    pane's rendering) is serialized through ``_PDFIUM_LOCK`` so the scan and the
+    render never call the C library at the same time — the threading conflict
+    that sank the earlier attempt.  Detection produces only plain data, which is
+    handed to the pane back on the main thread.
+    """
+
+    def __init__(self, parent: tk.Misc, app: "CourtListenerGUI",
+                 pdf_bytes: bytes, name: str) -> None:
+        self._app = app
+        self._bytes = pdf_bytes
+        self._pane: Optional[_PdfPane] = None
+        self._closed = False
+
+        self._win = tk.Toplevel(parent)
+        self._win.title(f"PDF citations — {name}")
+        self._win.geometry("860x920")
+        self._win.minsize(520, 360)
+        self._win.bind("<Destroy>", self._on_destroy)
+
+        legend = ttk.Frame(self._win)
+        legend.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(legend, text="Scanning for citations…").pack(side="left")
+        for cat, label in (("case", "Cases"), ("statute", "Statutes / Rules"),
+                           ("const", "Constitution")):
+            tk.Label(legend, text=f" {label} ", background=_BRIEF_TINTS[cat],
+                     foreground="#222222").pack(side="left", padx=(8, 0))
+        self._legend_lbl = legend.winfo_children()[0]
+
+        self._body = ttk.Frame(self._win)
+        self._body.pack(fill="both", expand=True)
+
+        btns = ttk.Frame(self._win)
+        btns.pack(fill="x", side="bottom", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="Download Cropped PDF",
+                   command=self._download).pack(side="right")
+        ttk.Button(btns, text="−", width=3,
+                   command=lambda: self._zoom(-1)).pack(side="left")
+        ttk.Button(btns, text="+", width=3,
+                   command=lambda: self._zoom(+1)).pack(side="left", padx=(2, 8))
+        self._status_var = tk.StringVar(value="Loading PDF…")
+        ttk.Label(btns, textvariable=self._status_var,
+                  foreground="gray").pack(side="left", fill="x", expand=True)
+
+        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            self._win.bind(seq, lambda _e: self._zoom(+1))
+        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
+            self._win.bind(seq, lambda _e: self._zoom(-1))
+        self._win.bind("<Control-0>", lambda _e: self._zoom(0))
+
+        self._show()
+
+    def _post(self, fn, *args) -> None:
+        if self._closed:
+            return
+        try:
+            self._win.after(0, fn, *args)
+        except tk.TclError:
+            pass
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is self._win:
+            self._closed = True
+
+    def _zoom(self, delta: int) -> None:
+        if self._pane is not None:
+            self._pane.zoom(delta)
+            self._status_var.set(f"Zoom: {self._pane.zoom_percent()}%")
+
+    def _show(self) -> None:
+        try:
+            import pypdfium2  # noqa: F401
+            from PIL import ImageTk  # noqa: F401
+        except ImportError:
+            # No in-app PDF viewer — fall back to the text reader, which links
+            # the same citations (just not drawn on the page).
+            name = self._win.title().replace("PDF citations — ", "")
+            self._win.destroy()
+            self._app._open_brief_from_bytes(self._bytes, name)
+            return
+        try:
+            pane = _PdfPane(self._body, self._bytes, width=780)
+        except Exception as exc:
+            messagebox.showerror("Import PDF", str(exc), parent=self._win)
+            self._win.destroy()
+            return
+        pane.pack(fill="both", expand=True, padx=8, pady=4)
+        self._pane = pane
+        self._status_var.set("Scanning for citations…")
+        threading.Thread(target=self._scan, daemon=True).start()
+
+    def _scan(self) -> None:
+        try:
+            links = _detect_pdf_citation_links(self._bytes)
+        except Exception as exc:
+            self._post(self._scan_failed, str(exc))
+            return
+        self._post(self._scan_done, links)
+
+    def _scan_failed(self, msg: str) -> None:
+        self._legend_lbl.config(text="Citation scan failed:")
+        self._status_var.set(msg)
+
+    def _scan_done(self, links: dict) -> None:
+        if self._closed or self._pane is None:
+            return
+        self._pane.set_citation_links(links, self._open_cite, self._open_cite_browser)
+        n = sum(len(v) for v in links.values())
+        self._legend_lbl.config(
+            text=("Citations are highlighted and clickable:" if n
+                  else "No citations detected:"))
+        self._status_var.set(
+            f"{n} citation link{'' if n == 1 else 's'} — left-click to open, "
+            "right-click for the browser." if n
+            else "No citations detected in this PDF's text layer.")
+
+    def _open_cite(self, action: tuple, snippet: str) -> None:
+        _follow_brief_action(self._app, self._win, action, self._safe_status)
+
+    def _open_cite_browser(self, action: tuple, snippet: str) -> None:
+        _open_citation_in_browser(action, snippet)
+
+    def _safe_status(self, s: str) -> None:
+        try:
+            self._status_var.set(s)
+        except tk.TclError:
+            pass
+
+    def _download(self) -> None:
+        if self._pane is None:
+            return
+        safe = re.sub(r"[^\w.-]+", "_", self._win.title()).strip("_") or "document"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            initialfile=f"{safe}.pdf", title="Download PDF", parent=self._win,
+        )
+        if not path:
+            return
+        try:
+            self._pane.export_best(path)
+        except Exception:
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(self._bytes)
+            except Exception as exc:
+                messagebox.showerror("Download PDF", str(exc), parent=self._win)
+                return
+        self._status_var.set(f"Saved PDF to {path}")
 
 
 class _StatuteWindow:
