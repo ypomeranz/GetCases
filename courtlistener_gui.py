@@ -5687,6 +5687,141 @@ class _TextFinder:
         self._count_var.set(f"{i + 1} of {len(self._matches)}")
 
 
+# ---------------------------------------------------------------------------
+# Lossless PDF cropping (keeps the selectable text layer)
+# ---------------------------------------------------------------------------
+#
+# The viewer can also export a *raster* crop (``_PdfPane.export_pdf``) which
+# normalizes every page to one size with even margins — good for scans, but it
+# rasterizes the text.  These helpers instead crop by tightening each page's
+# MediaBox/CropBox to its content: a born-digital PDF keeps its real,
+# selectable/searchable text because nothing is re-rendered — only the visible
+# page boundary moves.  PDFium (via pypdfium2, already a dependency) both
+# detects the content and writes the cropped file, so no new package is needed.
+
+
+def _page_content_box_pts(page) -> Optional[tuple]:
+    """The bounding box of a page's actual content in PDF points
+    ``(left, bottom, right, top)``, or ``None`` when it can't be determined
+    (e.g. a bare scanned image with no text or vector objects).
+
+    Built from the page's own objects so it is exact for born-digital PDFs:
+    the union of every glyph box (the selectable text) plus any image/vector
+    object that does not span almost the whole page — a near-full-page image is
+    treated as a scan background and left to the caller's raster fallback."""
+    import ctypes
+    import math
+    import pypdfium2.raw as C
+
+    l = b = math.inf
+    r = t = -math.inf
+
+    tp = None
+    try:
+        tp = page.get_textpage()
+    except Exception:
+        tp = None
+    if tp is not None:
+        try:
+            for k in range(tp.count_chars()):
+                cl, cr, cb, ct = (ctypes.c_double() for _ in range(4))
+                if not C.FPDFText_GetCharBox(
+                    tp.raw, k, ctypes.byref(cl), ctypes.byref(cr),
+                    ctypes.byref(cb), ctypes.byref(ct),
+                ):
+                    continue
+                if cr.value <= cl.value or ct.value <= cb.value:
+                    continue  # empty / whitespace glyph box
+                l, r = min(l, cl.value), max(r, cr.value)
+                b, t = min(b, cb.value), max(t, ct.value)
+        except Exception:
+            pass
+        finally:
+            try:
+                tp.close()
+            except Exception:
+                pass
+
+    # Include drawn objects (images, vector graphics) so a figure isn't clipped,
+    # but skip any single object covering ~the whole page — that is the scan
+    # image itself, whose own margins are exactly what we want to crop away.
+    try:
+        mb = tuple(page.get_mediabox())
+        page_area = max(1.0, (mb[2] - mb[0]) * (mb[3] - mb[1]))
+        for obj in page.get_objects():
+            try:
+                ol, ob, orr, ot = obj.get_pos()
+            except Exception:
+                continue
+            if (orr - ol) * (ot - ob) >= 0.9 * page_area:
+                continue
+            l, r = min(l, ol), max(r, orr)
+            b, t = min(b, ob), max(t, ot)
+    except Exception:
+        pass
+
+    if l == math.inf or r <= l or t <= b:
+        return None
+    return (l, b, r, t)
+
+
+def _frac_box_to_points(frac: tuple, mb: tuple) -> Optional[tuple]:
+    """Convert a viewer content fraction ``(l, t, r, b)`` (0..1, top-left
+    origin — what ``_PdfPane._content_frac`` detects from a low-res render) into
+    a PDF-point box ``(left, bottom, right, top)`` within media box *mb*.
+    Returns ``None`` for the whole-page fraction (nothing to crop)."""
+    fl, ft, fr, fb = frac
+    if (fl, ft, fr, fb) == (0.0, 0.0, 1.0, 1.0):
+        return None
+    w, h = mb[2] - mb[0], mb[3] - mb[1]
+    return (mb[0] + fl * w, mb[3] - fb * h, mb[0] + fr * w, mb[3] - ft * h)
+
+
+def _crop_pdf_to_content(
+    pdf_bytes: bytes,
+    frac_boxes: Optional[list] = None,
+    margin_pt: float = 7.0,
+) -> bytes:
+    """Return *pdf_bytes* cropped to each page's content by tightening the page
+    boxes — a lossless crop that removes the wide blank borders while leaving
+    the original (selectable) text untouched.
+
+    Content is detected from the page objects (:func:`_page_content_box_pts`);
+    for a page where that fails — a bare scan — the matching entry in
+    *frac_boxes* (the viewer's ink-detected fraction) is used, so scanned pages
+    crop too.  A small *margin_pt* is left around the content and the result is
+    clamped to the original media box so a page is never enlarged."""
+    import io
+
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(pdf_bytes)
+    try:
+        for i in range(len(doc)):
+            page = doc[i]
+            try:
+                mb = tuple(page.get_mediabox())
+                box = _page_content_box_pts(page)
+                if box is None and frac_boxes and i < len(frac_boxes):
+                    box = _frac_box_to_points(frac_boxes[i], mb)
+                if box is None:
+                    continue  # leave this page at full size
+                l, b, r, t = box
+                l, b = max(mb[0], l - margin_pt), max(mb[1], b - margin_pt)
+                r, t = min(mb[2], r + margin_pt), min(mb[3], t + margin_pt)
+                if r - l < 1 or t - b < 1:
+                    continue  # implausibly tight — skip rather than clip
+                page.set_mediabox(l, b, r, t)
+                page.set_cropbox(l, b, r, t)
+            finally:
+                page.close()
+        buf = io.BytesIO()
+        doc.save(buf)
+        return buf.getvalue()
+    finally:
+        doc.close()
+
+
 class _PdfPane(ttk.Frame):
     """A scrollable, lazily-rendered view of a PDF, embedded in the opinion
     window (pypdfium2 + Pillow).
@@ -5714,6 +5849,7 @@ class _PdfPane(ttk.Frame):
         import pypdfium2 as pdfium
         from PIL import ImageTk  # noqa: F401  (availability check at construct)
 
+        self._pdf_bytes = pdf_bytes   # kept for the lossless text-preserving export
         self._doc = pdfium.PdfDocument(pdf_bytes)
         # White margin drawn around each cropped page; US Reports scans get a
         # roomier margin (their official typography sits in a small block).
@@ -5977,6 +6113,50 @@ class _PdfPane(ttk.Frame):
                     p.close()
                 except Exception:
                     pass
+
+    def has_text_layer(self) -> bool:
+        """True when the PDF carries a real selectable text layer (born-digital,
+        not a bare scan) — the case where a lossless, text-preserving crop is
+        worth doing instead of the raster export."""
+        try:
+            for i in range(len(self._doc)):
+                page = self._doc[i]
+                try:
+                    tp = page.get_textpage()
+                    try:
+                        if tp.count_chars() > 0:
+                            return True
+                    finally:
+                        tp.close()
+                finally:
+                    page.close()
+        except Exception:
+            return False
+        return False
+
+    def export_cropped_pdf(self, path: str) -> None:
+        """Write a PDF cropped to each page's content with the selectable text
+        layer preserved (see :func:`_crop_pdf_to_content`).  The viewer's
+        ink-detected boxes are passed as the per-page fallback so scanned pages
+        still crop."""
+        out = _crop_pdf_to_content(
+            self._pdf_bytes, frac_boxes=[m[2] for m in self._meta]
+        )
+        with open(path, "wb") as fh:
+            fh.write(out)
+
+    def export_best(self, path: str) -> None:
+        """Save the cropped PDF the user expects: a lossless crop that keeps the
+        text selectable when the source has a text layer, otherwise the raster
+        crop (which normalizes a scan's page sizes and margins).  Either way the
+        wide blank borders are removed."""
+        if self.has_text_layer():
+            try:
+                self.export_cropped_pdf(path)
+                return
+            except Exception as exc:
+                print(f"[pdf] lossless crop failed ({exc}); using raster export")
+        self.export_pdf(path)
 
     def destroy(self) -> None:
         try:
@@ -9125,9 +9305,10 @@ class _ScholarTextWindow:
         self._status_var.set("Showing the official PDF of the opinion.")
 
     def _download_pdf(self) -> None:
-        """Save the PDF currently being viewed to a file the user chooses —
-        re-spaced and centered the way the viewer shows it, falling back to the
-        original bytes if that rendering fails."""
+        """Save the PDF currently being viewed to a file the user chooses,
+        cropped to remove the wide blank margins — losslessly (keeping the
+        selectable text) when the PDF has a text layer, otherwise the raster
+        crop — and falling back to the original bytes if that fails."""
         data = getattr(self, "_pdf_bytes", None)
         if not data:
             return
@@ -9143,7 +9324,7 @@ class _ScholarTextWindow:
             return
         try:
             if self._pdf_pane is not None:
-                self._pdf_pane.export_pdf(path)
+                self._pdf_pane.export_best(path)
             else:
                 with open(path, "wb") as fh:
                     fh.write(data)
@@ -9166,7 +9347,7 @@ class _ScholarTextWindow:
         os.close(fd)
         try:
             if self._pdf_pane is not None:
-                self._pdf_pane.export_pdf(path)
+                self._pdf_pane.export_best(path)
             else:
                 with open(path, "wb") as fh:
                     fh.write(data)
@@ -9514,7 +9695,7 @@ class _PdfWindow:
         os.close(fd)
         try:
             if self._pane is not None:
-                self._pane.export_pdf(path)
+                self._pane.export_best(path)
             else:
                 with open(path, "wb") as fh:
                     fh.write(data)
@@ -9539,7 +9720,7 @@ class _PdfWindow:
             return
         try:
             if self._pane is not None:
-                self._pane.export_pdf(path)
+                self._pane.export_best(path)
             else:
                 with open(path, "wb") as fh:
                     fh.write(data)
