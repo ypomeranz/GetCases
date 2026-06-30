@@ -199,6 +199,7 @@ class CourtListenerClient:
             "court": court,
             "filed_after": date_filed_min,
             "filed_before": date_filed_max,
+            "page_size": page_size,
         }
         if extra:
             params.update(extra)

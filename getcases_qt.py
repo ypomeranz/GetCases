@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    from PySide6.QtCore import Qt, QThreadPool, QUrl
+    from PySide6.QtCore import Qt, QThreadPool, QTimer, QUrl
     from PySide6.QtGui import QAction, QDesktopServices
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from PySide6.QtWidgets import (
@@ -63,10 +63,12 @@ from citations import detect_links
 from courtlistener import CourtListenerClient, CourtListenerError
 from courtlistener_text import CourtListenerOpinion, assemble_case_parts
 from getcases_config import load_token, save_token
+from opinion_db import OpinionDB
 from pdf_resolver import fetch_pdf_bytes, resolve_pdf_url
 from qt_courts import CourtPickerDialog, courts_summary
 from qt_opinions import render_opinion_parts_body, render_scholar_opinion_body
 from qt_pdf import ChromiumPdfWindow, LinkHandlingPage, html_document
+from qt_spotlight import SpotlightWindow
 from qt_sources import (
     english_reports_url,
     load_source,
@@ -75,6 +77,7 @@ from qt_sources import (
     source_title,
 )
 from qt_workers import Worker
+from spotlight_search import SpotlightResult, spotlight_search
 
 try:
     from google_scholar import GoogleScholarFetcher
@@ -98,6 +101,9 @@ QLabel#SectionTitle {
   color: #334155;
   font-size: 11pt;
   font-weight: 600;
+}
+QLabel#MutedLabel {
+  color: #66788a;
 }
 QLineEdit, QSpinBox, QTextEdit, QTableWidget {
   background: #ffffff;
@@ -136,6 +142,35 @@ QHeaderView::section {
 QTableWidget {
   gridline-color: #edf1f5;
   alternate-background-color: #f8fafc;
+}
+QListWidget {
+  background: #ffffff;
+  border: 1px solid #dde3ea;
+  border-radius: 8px;
+  padding: 4px;
+}
+QListWidget::item {
+  border-radius: 6px;
+  margin: 2px;
+}
+QListWidget::item:selected {
+  background: #d9ebff;
+}
+QLabel#SourceBadge {
+  background: #2f5f8f;
+  color: #ffffff;
+  border-radius: 5px;
+  padding: 4px 6px;
+  font-weight: 600;
+}
+QLabel#SpotlightTitle {
+  color: #1f2933;
+  font-size: 10.5pt;
+  font-weight: 600;
+}
+QLabel#SpotlightDetail {
+  color: #66788a;
+  font-size: 9pt;
 }
 QStatusBar {
   background: #ffffff;
@@ -253,6 +288,7 @@ class GetCasesQt(QMainWindow):
         self._court_results: list[dict] = []
         self._selected_courts: set[str] = set()
         self._windows: list[QMainWindow] = []
+        self._spotlight: Optional[SpotlightWindow] = None
 
         self._build_ui()
         self._wire_actions()
@@ -294,6 +330,7 @@ class GetCasesQt(QMainWindow):
         self.courts_btn = QPushButton(courts_summary(self._selected_courts))
         self.courts_btn.setObjectName("FilterButton")
         self.courts_btn.setMinimumWidth(160)
+        self.courts_btn.setToolTip("All courts")
         search_layout.addWidget(QLabel("Courts"), 1, 3)
         search_layout.addWidget(self.courts_btn, 1, 4)
 
@@ -367,6 +404,10 @@ class GetCasesQt(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
+        self.spotlight_action = QAction("Spotlight", self)
+        self.spotlight_action.setShortcut("Ctrl+Space")
+        toolbar.addAction(self.spotlight_action)
+
         self.open_brief_action = QAction("Open Brief", self)
         toolbar.addAction(self.open_brief_action)
 
@@ -390,6 +431,7 @@ class GetCasesQt(QMainWindow):
         return panel
 
     def _wire_actions(self) -> None:
+        self.spotlight_action.triggered.connect(self.show_spotlight)
         self.search_btn.clicked.connect(self.search)
         self.query_edit.returnPressed.connect(self.search)
         self.courts_btn.clicked.connect(self.show_court_picker)
@@ -409,6 +451,57 @@ class GetCasesQt(QMainWindow):
     def _save_token(self) -> None:
         save_token(self.token_edit.text())
         self.statusBar().showMessage("CourtListener token saved.", 3500)
+
+    def show_spotlight(self, text: str = "") -> None:
+        if self._spotlight is None:
+            self._spotlight = SpotlightWindow(self)
+            self._spotlight.search_requested.connect(self._run_spotlight_search)
+            self._spotlight.open_requested.connect(self._open_spotlight_result)
+            self._spotlight.full_search_requested.connect(self._open_full_search_from_spotlight)
+            self._spotlight.destroyed.connect(lambda: setattr(self, "_spotlight", None))
+        self._spotlight.show()
+        self._spotlight.raise_()
+        self._spotlight.activateWindow()
+        self._spotlight.focus_query(text)
+
+    def _run_spotlight_search(self, query: str) -> None:
+        if self._spotlight is not None:
+            self._spotlight.set_busy(True)
+        client = self._client_for_token(required=False)
+        fetcher = self._scholar_fetcher()
+
+        def task(status):
+            status("Searching spotlight...")
+            return spotlight_search(query, client=client, fetcher=fetcher)
+
+        def done(results: list[SpotlightResult]) -> None:
+            if self._spotlight is not None:
+                self._spotlight.set_results(results)
+            self.statusBar().showMessage(f"Spotlight found {len(results)} result(s).", 5000)
+
+        self._queue_worker("Spotlight Search", task, done)
+
+    def _open_spotlight_result(self, result: SpotlightResult) -> None:
+        if result.source == "courtlistener" and isinstance(result.payload, dict):
+            self._open_courtlistener_item_text(result.payload)
+        elif result.source == "scholar":
+            scholar = result.payload
+            url = str(getattr(scholar, "url", "") or "")
+            title = str(getattr(scholar, "title", "") or result.title)
+            if url:
+                self._fetch_scholar_url(url, title)
+        elif result.source == "cache" and isinstance(result.payload, dict):
+            self._open_cached_opinion(result.payload)
+        else:
+            QMessageBox.information(self, "Spotlight", "That result type is not openable yet.")
+
+    def _open_full_search_from_spotlight(self, query: str) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if query:
+            self.query_edit.setText(query)
+            self.search()
 
     def show_court_picker(self) -> None:
         dialog = CourtPickerDialog(self._selected_courts, self)
@@ -636,6 +729,9 @@ class GetCasesQt(QMainWindow):
         item = self.court_table.current_payload()
         if item is None:
             return
+        self._open_courtlistener_item_text(item)
+
+    def _open_courtlistener_item_text(self, item: dict) -> None:
         fetcher = self._scholar_fetcher()
         client = self._client_for_token(required=False)
         cite = pick_citation(item.get("citation", []))
@@ -665,6 +761,35 @@ class GetCasesQt(QMainWindow):
             task,
             lambda result: self._show_text_result(result, name),
         )
+
+    def _open_cached_opinion(self, summary: dict) -> None:
+        scholar_id = str(summary.get("scholar_id") or "")
+        title = str(summary.get("name") or "Cached opinion")
+        if not scholar_id:
+            QMessageBox.warning(self, "Cache", "That cached result is missing its opinion id.")
+            return
+
+        def task(status):
+            status("Opening cached opinion...")
+            db = OpinionDB()
+            try:
+                record = db.get_by_scholar_id(scholar_id)
+                if not record or not record.get("html"):
+                    return None
+                return record
+            finally:
+                db.close()
+
+        def done(record: Optional[dict]) -> None:
+            if not record:
+                QMessageBox.warning(self, "Cache", "That cached opinion could not be opened.")
+                return
+            self._show_opinion_result(
+                (record.get("url") or "", record.get("html") or ""),
+                record.get("name") or title,
+            )
+
+        self._queue_worker("Cached Opinion", task, done)
 
     def _fetch_scholar_url(self, url: str, title: str) -> None:
         fetcher = self._scholar_fetcher()
@@ -889,6 +1014,7 @@ def main() -> None:
     app.setStyleSheet(APP_STYLE)
     window = GetCasesQt()
     window.show()
+    QTimer.singleShot(250, window.show_spotlight)
     sys.exit(app.exec())
 
 
