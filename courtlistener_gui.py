@@ -5671,8 +5671,17 @@ class _TextFinder:
 
     def open(self) -> None:
         if not self._visible:
-            self._bar.pack(fill="x", padx=8, pady=(4, 0),
-                           before=self._before)
+            # The find bar anchors above the text view.  When that view is hidden
+            # — e.g. the opinion reader is showing its PDF instead, so the text
+            # frame is pack_forget'd — there's nothing to find here, and packing
+            # "before" an unpacked widget raises TclError.  Bail out quietly.
+            try:
+                if not self._before.winfo_ismapped():
+                    return
+                self._bar.pack(fill="x", padx=8, pady=(4, 0),
+                               before=self._before)
+            except tk.TclError:
+                return
             self._visible = True
         self._entry.focus_set()
         self._entry.select_range(0, "end")
