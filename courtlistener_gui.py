@@ -1979,7 +1979,7 @@ class CourtListenerGUI:
             command=self._open_brief,
         )
         brief_menu.add_command(
-            label="Import PDF & Link Citations (on the page)…",
+            label="Import PDF (selectable text, linked citations)…",
             command=self._open_linked_pdf,
         )
         db_menu = tk.Menu(menubar, tearoff=0)
@@ -3501,12 +3501,13 @@ class CourtListenerGUI:
         _BriefTextWindow(self.root, self, os.path.basename(path), text)
 
     def _open_linked_pdf(self) -> None:
-        """Brief menu: import a PDF and show it *as a PDF* with its citations
-        detected and drawn as clickable links on the page (cases / statutes /
-        rules / regulations / Constitution open in the app).  Falls back to the
-        text reader when the in-app PDF viewer libraries aren't installed."""
+        """Brief menu: import a PDF and read it with its citations linked.  A PDF
+        with a real text layer opens in the selectable/copyable text reader
+        (citations shown as blue clickable text, Ctrl-F find); a bare image scan
+        — which has no text to select — falls back to the rendered viewer with
+        the citations drawn as clickable highlights on the page."""
         path = filedialog.askopenfilename(
-            title="Import a PDF to link its citations",
+            title="Import a PDF to read with linked citations",
             parent=self.root,
             filetypes=[("PDF", "*.pdf"), ("All files", "*.*")],
         )
@@ -3527,7 +3528,7 @@ class CourtListenerGUI:
                 parent=self.root,
             )
             return
-        _LinkedPdfWindow(self.root, self, data, os.path.basename(path))
+        _open_pdf_view(self.root, self, data, os.path.basename(path))
 
     def _open_brief_from_bytes(self, data: bytes, name: str) -> None:
         """Text-reader fallback for an imported PDF when the in-app PDF viewer
@@ -6039,6 +6040,51 @@ def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
     """Convenience wrapper: extract a PDF's text and return its citation
     rectangles (see :func:`_citation_links_from_pages`)."""
     return _citation_links_from_pages(_extract_pdf_text_pages(pdf_bytes))
+
+
+def _pdf_has_text_layer(pdf_bytes: bytes) -> bool:
+    """True when a PDF carries a real, selectable text layer (born-digital, or a
+    scan with OCR) rather than being a bare image scan.  Checked on the first
+    few pages so a scan is recognized quickly, under :data:`_PDFIUM_LOCK`."""
+    try:
+        import pypdfium2 as pdfium
+    except Exception:
+        return False
+    with _PDFIUM_LOCK:
+        try:
+            doc = pdfium.PdfDocument(pdf_bytes)
+        except Exception:
+            return False
+        try:
+            n = len(doc)
+            for i in range(min(n, 5)):
+                page = doc[i]
+                try:
+                    tp = page.get_textpage()
+                    try:
+                        if tp.count_chars() > 10:  # a few real glyphs, not noise
+                            return True
+                    finally:
+                        tp.close()
+                finally:
+                    page.close()
+            return False
+        except Exception:
+            return False
+        finally:
+            doc.close()
+
+
+def _open_pdf_view(parent: tk.Misc, app: "CourtListenerGUI",
+                   data: bytes, title: str) -> None:
+    """Open a PDF the way the app now prefers.  A PDF with a real text layer
+    opens in the selectable/copyable text reader (citations shown as blue
+    clickable text, Ctrl-F find); a bare image scan — which has no text to
+    select — opens in the rendered viewer with on-page citation highlights."""
+    if _pdf_has_text_layer(data):
+        app._open_brief_from_bytes(data, title)
+    else:
+        _LinkedPdfWindow(parent, app, data, title)
 
 
 class _PdfPane(ttk.Frame):
@@ -10602,10 +10648,13 @@ _BRIEF_TINTS = {"case": "#cfe2ff", "statute": "#d6f0d6", "const": "#fff3bf"}
 
 
 class _BriefTextWindow:
-    """Renders a brief's text (extracted from PDF, Word, RTF or plain text) with
-    every detected citation highlighted (by category) and clickable — cases open
-    in the Scholar reader, statutes / rules / regulations / the Constitution in
-    the statute viewer; right-click opens any citation in the web browser."""
+    """Renders a brief or PDF's text (extracted from PDF, Word, RTF or plain
+    text) — fully selectable and copyable — with every detected citation shown
+    as subtle blue clickable text: cases open in the Scholar reader, statutes /
+    rules / regulations / the Constitution in the statute viewer; right-click
+    opens any citation in the web browser."""
+
+    _LINK_COLOR = "#1a56b0"   # subtle blue for clickable citations
 
     def __init__(self, parent: tk.Misc, app: "CourtListenerGUI",
                  name: str, text: str) -> None:
@@ -10625,12 +10674,11 @@ class _BriefTextWindow:
         win = self._win
         legend = ttk.Frame(win)
         legend.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(legend, text="Citations are highlighted and clickable:").pack(
-            side="left")
-        for cat, label in (("case", "Cases"), ("statute", "Statutes / Rules"),
-                           ("const", "Constitution")):
-            tk.Label(legend, text=f" {label} ", background=_BRIEF_TINTS[cat],
-                     foreground="#222222").pack(side="left", padx=(8, 0))
+        ttk.Label(
+            legend,
+            text="Citations are shown in blue and clickable — left-click opens "
+                 "in the app, right-click in your browser.",
+        ).pack(side="left")
 
         text_frame = ttk.Frame(win)
         text_frame.pack(fill="both", expand=True, padx=8, pady=6)
@@ -10641,9 +10689,10 @@ class _BriefTextWindow:
         txt.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
-        for cat, color in _BRIEF_TINTS.items():
-            txt.tag_configure(cat, background=color)
-        txt.tag_configure("brieflink", underline=False)
+        # Links are just blue text (no background highlight), so the page reads
+        # like the document; copy is unaffected — Tk copies plain text, so a
+        # selection pastes as ordinary black text, not blue.
+        txt.tag_configure("brieflink", foreground=self._LINK_COLOR)
         txt.tag_bind("brieflink", "<Enter>",
                      lambda _e: txt.config(cursor="hand2"))
         txt.tag_bind("brieflink", "<Leave>", lambda _e: txt.config(cursor=""))
@@ -10669,8 +10718,7 @@ class _BriefTextWindow:
             tag = f"lnk{self._link_n}"
             seg = re.sub(r"\s+", " ", src[start:end]).strip()
             self._link_actions[tag] = (action, seg)
-            cat = _brief_action_category(action[0])
-            txt.insert("end", src[start:end], (cat, "brieflink", tag))
+            txt.insert("end", src[start:end], ("brieflink", tag))
             txt.tag_bind(tag, "<Button-1>",
                          lambda _e, t=tag: self._follow(t))
             txt.tag_bind(tag, "<Button-3>",
