@@ -27,6 +27,7 @@ try:
         QHeaderView,
         QLabel,
         QLineEdit,
+        QInputDialog,
         QMainWindow,
         QMessageBox,
         QPushButton,
@@ -62,6 +63,13 @@ from courtlistener import CourtListenerClient, CourtListenerError
 from getcases_config import load_token, save_token
 from pdf_resolver import fetch_pdf_bytes, resolve_pdf_url
 from qt_pdf import ChromiumPdfWindow, LinkHandlingPage, html_document
+from qt_sources import (
+    english_reports_url,
+    load_source,
+    parse_lookup,
+    source_body,
+    source_title,
+)
 from qt_workers import Worker
 
 try:
@@ -345,6 +353,9 @@ class GetCasesQt(QMainWindow):
         self.open_brief_action = QAction("Open Brief", self)
         toolbar.addAction(self.open_brief_action)
 
+        self.quick_lookup_action = QAction("Quick Lookup", self)
+        toolbar.addAction(self.quick_lookup_action)
+
         self.save_token_action = QAction("Save Token", self)
         toolbar.addAction(self.save_token_action)
 
@@ -366,6 +377,7 @@ class GetCasesQt(QMainWindow):
         self.query_edit.returnPressed.connect(self.search)
         self.save_token_action.triggered.connect(self._save_token)
         self.open_brief_action.triggered.connect(self.open_brief)
+        self.quick_lookup_action.triggered.connect(self.quick_lookup)
         self.legacy_action.triggered.connect(self._show_legacy_hint)
         self.court_table.itemSelectionChanged.connect(self._on_court_selection)
         self.scholar_table.itemSelectionChanged.connect(self._on_scholar_selection)
@@ -713,6 +725,50 @@ class GetCasesQt(QMainWindow):
 
         self._queue_worker("Open Brief", task, done)
 
+    def quick_lookup(self) -> None:
+        text, ok = QInputDialog.getText(
+            self,
+            "Quick Lookup",
+            "Citation or source lookup",
+            text=self.query_edit.text().strip(),
+        )
+        if not ok or not text.strip():
+            return
+        action = parse_lookup(text)
+        if action is None:
+            detected = detect_links(text)
+            if detected:
+                action = detected[0][2]
+        if action is None:
+            QMessageBox.information(
+                self,
+                "Quick Lookup",
+                "I could not parse that citation yet. Try the main search box for case names.",
+            )
+            return
+        self._handle_action(action)
+
+    def _handle_action(self, action: tuple[str, str]) -> None:
+        kind, value = action
+        if kind == "cite":
+            self._open_citation(value)
+        elif kind in {"usc", "cfr", "rule", "const", "statestat"}:
+            self._open_source_action(kind, value)
+        elif kind == "statpdf":
+            window = ChromiumPdfWindow(value, "Statutes at Large PDF")
+            self._show_window(window)
+        elif kind == "engrep":
+            QDesktopServices.openUrl(QUrl(english_reports_url(value)))
+        elif kind == "browse":
+            QDesktopServices.openUrl(QUrl(value))
+        else:
+            QMessageBox.information(
+                self,
+                "Citation",
+                f"This Qt view detected a {kind or 'citation'} link, but that "
+                "source viewer has not been migrated yet.",
+            )
+
     def _handle_link(self, url: str) -> None:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "getcases":
@@ -721,21 +777,22 @@ class GetCasesQt(QMainWindow):
         params = urllib.parse.parse_qs(parsed.query)
         kind = (params.get("kind") or [""])[0]
         value = (params.get("value") or [""])[0]
-        if kind == "cite":
-            self._open_citation(value)
-        elif kind == "statpdf":
-            window = ChromiumPdfWindow(value, "Statutes at Large PDF")
-            self._show_window(window)
-        elif kind == "browse":
-            QDesktopServices.openUrl(QUrl(value))
-        else:
-            QMessageBox.information(
-                self,
-                "Citation",
-                f"This Qt view detected a {kind or 'citation'} link, but that "
-                "source viewer has not been migrated yet.\n\n"
-                "The legacy Tk app still supports the full source viewer set.",
+        self._handle_action((kind, value))
+
+    def _open_source_action(self, kind: str, spec: str) -> None:
+        def task(status):
+            return load_source(kind, spec, status=status)
+
+        def done(loaded) -> None:
+            window = HtmlWindow(
+                source_title(loaded),
+                source_body(loaded),
+                base_url=str(getattr(loaded.doc, "url", "")),
+                link_callback=self._handle_link,
             )
+            self._show_window(window)
+
+        self._queue_worker("Source Lookup", task, done)
 
     def _open_citation(self, cite: str) -> None:
         fetcher = self._scholar_fetcher()

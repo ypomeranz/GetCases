@@ -81,6 +81,39 @@ def html_document(title: str, body: str, base_url: str = "") -> str:
       border-radius: 3px;
       padding: 0 2px;
     }}
+    .source-meta {{
+      display: grid;
+      gap: 4px;
+      margin: 0 0 24px;
+      padding: 12px 14px;
+      background: #f6f8fa;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--muted);
+    }}
+    .source-meta strong {{
+      color: var(--ink);
+      font-size: 1.02rem;
+    }}
+    .para.sechead {{
+      font-weight: 700;
+      font-size: 1.12rem;
+      margin-top: 1.2rem;
+    }}
+    .para.head, .para.note-head {{
+      font-weight: 650;
+      margin-top: 1rem;
+    }}
+    .para.credit, .para.note-body {{
+      color: var(--muted);
+      font-size: 0.94rem;
+    }}
+    .indent-1 {{ margin-left: 1.4rem; }}
+    .indent-2 {{ margin-left: 2.8rem; }}
+    .indent-3 {{ margin-left: 4.2rem; }}
+    .indent-4 {{ margin-left: 5.6rem; }}
+    .indent-5 {{ margin-left: 7rem; }}
+    .indent-6, .indent-7, .indent-8 {{ margin-left: 8.4rem; }}
     pre {{
       white-space: pre-wrap;
       font: inherit;
