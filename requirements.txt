@@ -4,6 +4,10 @@
 requests
 beautifulsoup4
 
+# Qt desktop UI + Chromium-backed PDF display.
+# This is the primary frontend for the migration away from Tkinter.
+PySide6
+
 # In-app PDF viewer (View PDF button in the opinion window) and PDF-brief text
 # extraction ("Open Brief…" reads a PDF's text layer via pypdfium2).  Optional —
 # without these the app still runs; the opinion viewer offers the browser and

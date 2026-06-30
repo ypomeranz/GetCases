@@ -1,6 +1,20 @@
 CourtListener GUI – Case Law & Legal Research Tool - (Code and this readme file created by AI)
 
-A desktop application (Tkinter) that searches U.S. case law, statutes, regulations, and historical legal materials. It pulls opinions from **CourtListener** and **Google Scholar**, and provides in‑app viewers for:
+## Qt migration status
+
+The primary desktop entry point is now the PySide6/QtWebEngine app:
+
+```bash
+python getcases_qt.py
+```
+
+It provides the new Qt search shell, Google Scholar text viewing, brief citation highlighting, and Chromium-backed PDF viewing/downloading. The original Tkinter app remains available during the migration:
+
+```bash
+python courtlistener_gui.py
+```
+
+GetCases is a desktop application that searches U.S. case law, statutes, regulations, and historical legal materials. It pulls opinions from **CourtListener** and **Google Scholar**, and provides in‑app viewers for:
 
 - Federal & state case law (Supreme Court, circuit courts, district courts, state appellate courts)
 - U.S. Code, Code of Federal Regulations (CFR)
