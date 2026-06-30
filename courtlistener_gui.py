@@ -3733,9 +3733,9 @@ class CourtListenerGUI:
 
         # Google Scholar search runs in parallel with the CourtListener one
         if _SCHOLAR_AVAILABLE:
-            if self._scholar is None:
-                self._scholar = GoogleScholarFetcher()
-            fetcher = self._scholar
+            # Build the fetcher with the opinion database attached so a blocked
+            # Scholar search can fall back to local results.
+            fetcher = self._get_scholar()
             self._scholar_status_var.set("Searching…")
 
             def scholar_run() -> None:

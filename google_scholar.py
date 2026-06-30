@@ -986,7 +986,10 @@ class GoogleScholarFetcher:
         Search Scholar case law (all state and federal courts) and return
         parsed results: title, case URL, byline, and snippet.
 
-        Results are cached in memory for the session.
+        Results are cached in memory for the session.  When Google Scholar is
+        unreachable or blocking the IP (the request raises, or the results page
+        comes back empty), the search falls back to the local opinion database
+        so an already-collected corpus still answers the query offline.
         """
         key = query.strip()
         if key in self._search_cache:
@@ -995,13 +998,76 @@ class GoogleScholarFetcher:
         print(f"[scholar] searching {url}")
         try:
             resp = self._get(url)
+            results = self._parse_results(resp.text)
+            print(f"[scholar] parsed {len(results)} case results")
         except Exception as exc:
             print(f"[scholar] search request failed: {exc}")
-            return []
-        results = self._parse_results(resp.text)
-        print(f"[scholar] parsed {len(results)} case results")
+            results = []
+        if not results:
+            # Scholar gave us nothing (blocked, rate-limited, or a genuine
+            # miss): serve candidates from the local opinion database instead.
+            # These are deliberately not cached, so a later online search —
+            # once the block clears — supersedes them.
+            db_results = self._db_search_results(query, limit)
+            if db_results:
+                print(
+                    f"[scholar] Google Scholar returned nothing; serving "
+                    f"{len(db_results)} result(s) from the local opinion database"
+                )
+            return db_results
         self._search_cache[key] = results
         return results[:limit]
+
+    @staticmethod
+    def _db_summary_byline(hit: dict) -> str:
+        """Build a Scholar-style byline ("410 U.S. 113 - Supreme Court, 1973")
+        from an opinion-database summary, so the GUI helpers that parse a
+        Scholar result's ``source`` recover the citation, court, and year for a
+        database-sourced fallback result.  Only the unambiguous SCOTUS court id
+        is mapped to a description; for other courts the byline carries just the
+        citation and year, which is all the GUI needs to display the row."""
+        cites = hit.get("cites") or ([hit["cite"]] if hit.get("cite") else [])
+        court = (hit.get("court") or "").strip().lower()
+        year = (hit.get("year") or "").strip()
+        court_desc = "Supreme Court" if court == "scotus" else ""
+        left = ", ".join(c for c in cites if c)
+        right = ", ".join(p for p in (court_desc, year) if p)
+        if left and right:
+            return f"{left} - {right}"
+        return left or right
+
+    def _db_search_results(self, query: str, limit: int) -> list["ScholarResult"]:
+        """Search the local opinion database and adapt its hits into
+        ``ScholarResult`` rows (the offline fallback for :meth:`search_cases`).
+
+        The database dispatches on the query shape — a Scholar id, a reporter
+        citation, or party names — exactly as the "Find Opinion in Database"
+        dialog does.  Each hit's ``url`` is a real ``scholar_case`` URL, so the
+        caller's open path (``fetch_by_url``) serves the opinion straight from
+        the database without a network round-trip."""
+        if self._opinion_db is None:
+            return []
+        try:
+            hits = self._opinion_db.find(query)
+        except Exception as exc:
+            print(f"[scholar] opinion-DB search failed: {exc}")
+            return []
+        out: list[ScholarResult] = []
+        for hit in hits[:limit]:
+            sid = hit.get("scholar_id") or ""
+            url = hit.get("url") or ""
+            if not url and sid:
+                url = f"{SCHOLAR_BASE}/scholar_case?case={sid}"
+            title = hit.get("name") or hit.get("cite") or sid
+            out.append(
+                ScholarResult(
+                    title=title,
+                    url=url,
+                    source=self._db_summary_byline(hit),
+                    snippet="",
+                )
+            )
+        return out
 
     @staticmethod
     def _parse_results(html: str) -> list["ScholarResult"]:
@@ -1267,6 +1333,55 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     fnrefs2 = sorted(s.fnref for p in fparts for b in p.blocks
                      for s in b.spans if s.fnref)
     check(fnrefs2 == fnrefs, "link_footnotes_by_marker is idempotent")
+
+    # search_cases falls back to the local opinion database when Google Scholar
+    # is unreachable/blocking (the request raises or the page parses empty).  A
+    # tiny stub stands in for opinion_db.OpinionDB.find() so this stays offline.
+    import tempfile as _tempfile
+
+    class _StubDB:
+        def __init__(self, hits):
+            self._hits = hits
+
+        def find(self, query):
+            q = (query or "").lower()
+            return [h for h in self._hits
+                    if q in h["name"].lower() or q in (h.get("cite") or "").lower()]
+
+    roe_hit = {
+        "scholar_id": "12345678901234567890",
+        "name": "Roe v. Wade",
+        "cite": "410 U.S. 113",
+        "cites": ["410 U.S. 113", "93 S. Ct. 705"],
+        "court": "scotus",
+        "year": "1973",
+        "url": "https://scholar.google.com/scholar_case?case=12345678901234567890",
+    }
+    with _tempfile.TemporaryDirectory() as _d:
+        f = GoogleScholarFetcher(
+            cache_path=Path(_d) / "cache.db", delay=0.0, db=_StubDB([roe_hit])
+        )
+
+        def _boom(url):  # simulate Google blocking the IP
+            raise ScholarError("403 blocked")
+
+        f._get = _boom  # type: ignore[assignment]
+        hits = f.search_cases("Roe v. Wade", limit=10)
+        check(len(hits) == 1 and hits[0].title == "Roe v. Wade",
+              f"blocked search falls back to opinion DB: {[h.title for h in hits]}")
+        check(bool(hits) and "case=12345678901234567890" in hits[0].url,
+              "fallback result keeps the scholar_case URL")
+        check(bool(hits) and hits[0].source.startswith("410 U.S. 113")
+              and "Supreme Court" in hits[0].source and "1973" in hits[0].source,
+              f"fallback byline parses (cite/court/year): {hits[0].source!r}")
+        check(f.search_cases("nonesuch", limit=10) == [],
+              "blocked search with no DB match returns empty")
+
+        # With no database attached, a blocked search degrades to empty cleanly.
+        f2 = GoogleScholarFetcher(cache_path=Path(_d) / "c2.db", delay=0.0, db=None)
+        f2._get = _boom  # type: ignore[assignment]
+        check(f2.search_cases("Roe v. Wade") == [],
+              "blocked search with no DB returns empty")
 
     if failures:
         print(f"\n{len(failures)} FAILED")
