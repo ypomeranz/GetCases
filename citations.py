@@ -107,6 +107,34 @@ def cite_target_from_text(
 # Whole-document detection (used by the brief viewer)
 # ---------------------------------------------------------------------------
 
+# An "Id., at N" links to the case last cited only when N is plausibly a page of
+# that reporter — within this many pages of its start.  A far page ("Id. at 1450"
+# pointing into the record / a joint appendix, not the reporter) falls outside the
+# window and is left unlinked.  Mirrors the opinion reader's _id_pin_in_range.
+ID_PIN_WINDOW = 100
+
+
+def _cite_first_page(base_cite: str) -> "int | None":
+    """Reporter start page of a base citation ("410 U.S. 113" → 113), ignoring
+    any "@pin" suffix; ``None`` when it doesn't parse."""
+    m = CITE_CAPTURE_RE.search((base_cite or "").split("@", 1)[0])
+    try:
+        return int(m.group(3)) if m else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _id_pin_in_range(base_cite: str, pin: str) -> bool:
+    """True when an "Id., at *pin*" page falls within :data:`ID_PIN_WINDOW` pages
+    of *base_cite*'s start page — i.e. a page of that reporter, not a record page."""
+    start = _cite_first_page(base_cite)
+    try:
+        n = int(pin)
+    except (TypeError, ValueError):
+        return False
+    return start is not None and start <= n <= start + ID_PIN_WINDOW
+
+
 def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     """Scan `text` and return ``(start, end, action)`` for every citation that
     can be opened, in document order with overlaps resolved (first/longest
@@ -203,12 +231,23 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
             action = ("cite", m)  # m is the pre-built "vol rep page@pin"
             cite_base = m.split("@")[0]
         elif kind == "idcite":
+            # "Id." → the last citation.  When it points at a *case* and carries
+            # a page ("Id. at 152"), link it only if that page is plausibly a page
+            # of the reporter (within ID_PIN_WINDOW of its start); a far page is a
+            # record/appendix cite and is left unlinked.  A bare "Id." (no page)
+            # links to the case itself, and an "Id." after a statute/rule reopens
+            # that source.
             la = last_cite_action
+            pin = m.group(1)
             if not la:
                 action = None
             elif la[0] == "cite":
-                pin = m.group(1)
-                action = ("cite", la[1] + (f"@{pin}" if pin else ""))
+                if pin is None:
+                    action = ("cite", la[1])
+                elif _id_pin_in_range(la[1], pin):
+                    action = ("cite", f"{la[1]}@{pin}")
+                else:
+                    action = None
             else:
                 action = la
         elif kind == "statestat":
@@ -253,4 +292,21 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     if not any(a == ("cite", "410 U.S. 113@164") for _, _, a in found):
         print("short form did not resolve to 410 U.S. 113@164")
         sys.exit(1)
+
+    # "Id., at N" links to the previous case only when N is within ID_PIN_WINDOW
+    # of its start page; a far page is a record/appendix cite, left unlinked.
+    near = detect_links("See Roe v. Wade, 410 U.S. 113 (1973). Id. at 160.")
+    if not any(a == ("cite", "410 U.S. 113@160") for _, _, a in near):
+        print("in-range Id. did not link:", near)
+        sys.exit(1)
+    far = detect_links("See Roe v. Wade, 410 U.S. 113 (1973). Id. at 1450.")
+    if any(a[0] == "cite" and "@1450" in a[1] for _, _, a in far):
+        print("out-of-range Id. should not link to the case:", far)
+        sys.exit(1)
+    # A bare "Id." (no page) still links to the case.
+    bare = detect_links("See Roe v. Wade, 410 U.S. 113 (1973). Id.")
+    if not any(a == ("cite", "410 U.S. 113") for _, _, a in bare):
+        print("bare Id. should link to the case:", bare)
+        sys.exit(1)
+
     print("\nOK:", len(found), "links;", sorted(kinds))
