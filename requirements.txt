@@ -4,6 +4,12 @@
 requests
 beautifulsoup4
 
+# Modern UI: the spotlight and the pop-up windows (opinion reader, statute and
+# citing-opinions viewers, PDF/brief viewers, and the dialogs) use CustomTkinter
+# for rounded, themed chrome.  Optional — without it those windows fall back to
+# plain Tk widgets and the app still runs.  The main window uses classic Tk/ttk.
+customtkinter
+
 # In-app PDF viewer (View PDF button in the opinion window) and PDF-brief text
 # extraction ("Open Brief…" reads a PDF's text layer via pypdfium2).  Optional —
 # without these the app still runs; the opinion viewer offers the browser and
