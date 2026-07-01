@@ -186,6 +186,138 @@ def _bind_recursive(widget, sequence: str, handler) -> None:
         _bind_recursive(child, sequence, handler)
 
 
+# ---- Normalised widget factories -------------------------------------------
+# Each returns a CustomTkinter widget when the package is available and an
+# equivalent Tk/ttk widget otherwise, so a window is written once and still
+# works (just less styled) without CustomTkinter.  Geometry (pack/grid) is left
+# to the caller.
+
+def _ui_toplevel(parent: tk.Misc) -> tk.Toplevel:
+    """A Toplevel with the modern light background.  Kept as a plain Toplevel
+    (native title bar, reliable modality) and filled with themed widgets."""
+    win = tk.Toplevel(parent)
+    if _CTK_AVAILABLE:
+        _ensure_modern_theme()
+        try:
+            win.configure(bg=_UI["window"])
+        except tk.TclError:
+            pass
+    return win
+
+
+def _ui_frame(parent, card: bool = False, fg: Optional[str] = None):
+    """A container.  ``card=True`` gives a bordered, rounded surface."""
+    if _CTK_AVAILABLE:
+        if card:
+            return ctk.CTkFrame(parent, corner_radius=12,
+                                fg_color=fg or _UI["window"],
+                                border_width=1, border_color=_UI["border"])
+        return ctk.CTkFrame(parent, fg_color=fg or "transparent")
+    return tk.Frame(parent, bg=fg or _UI["window"])
+
+
+def _ui_label(parent, text: str = "", size: int = 13, weight: str = "normal",
+              muted: bool = False, anchor: Optional[str] = None,
+              textvariable=None):
+    color = _UI["muted"] if muted else _UI["text"]
+    if _CTK_AVAILABLE:
+        lbl = ctk.CTkLabel(parent, text=text, font=_ui_font(size, weight),
+                           text_color=color, fg_color="transparent",
+                           textvariable=textvariable)
+        if anchor:
+            lbl.configure(anchor=anchor)
+        return lbl
+    return tk.Label(parent, text=text, bg=_UI["window"], fg=color,
+                    font=("TkDefaultFont", size,
+                          "bold" if weight == "bold" else "normal"),
+                    anchor=anchor or "center", textvariable=textvariable)
+
+
+def _ui_button(parent, text: str, command=None, primary: bool = False,
+               width: Optional[int] = None):
+    if _CTK_AVAILABLE:
+        kw = dict(
+            text=text, command=command, corner_radius=8, height=34,
+            font=_ui_font(13, "bold" if primary else "normal"),
+        )
+        if primary:
+            kw.update(fg_color=_UI["accent"], hover_color=_UI["accent_dim"],
+                      text_color="#ffffff")
+        else:
+            kw.update(fg_color=_UI["surface"], hover_color=_UI["surface_alt"],
+                      text_color=_UI["text"], border_width=1,
+                      border_color=_UI["border"])
+        if width:
+            kw["width"] = width
+        return ctk.CTkButton(parent, **kw)
+    btn = ttk.Button(parent, text=text, command=command)
+    return btn
+
+
+def _ui_checkbox(parent, text: str, variable, command=None):
+    if _CTK_AVAILABLE:
+        return ctk.CTkCheckBox(parent, text=text, variable=variable,
+                               command=command, font=_ui_font(12),
+                               text_color=_UI["text"], fg_color=_UI["accent"],
+                               hover_color=_UI["accent_dim"],
+                               checkbox_width=20, checkbox_height=20,
+                               corner_radius=5)
+    return ttk.Checkbutton(parent, text=text, variable=variable,
+                           command=command)
+
+
+def _ui_entry(parent, textvariable=None, show: Optional[str] = None):
+    if _CTK_AVAILABLE:
+        kw = dict(textvariable=textvariable, corner_radius=8, height=34,
+                  border_color=_UI["border"], fg_color=_UI["window"],
+                  text_color=_UI["text"], font=_ui_font(13))
+        if show is not None:
+            kw["show"] = show
+        return ctk.CTkEntry(parent, **kw)
+    return ttk.Entry(parent, textvariable=textvariable,
+                     **({"show": show} if show is not None else {}))
+
+
+_MODERN_TTK_READY = False
+
+
+def _ensure_modern_ttk_styles(widget: tk.Misc) -> None:
+    """Define named ttk styles ("Modern.Treeview", "Modern.Vertical.TScrollbar")
+    for the ttk widgets that stay ttk inside modernised windows (there is no
+    CustomTkinter tree).  Named — not global — so the classic main window keeps
+    its default ttk look."""
+    global _MODERN_TTK_READY
+    if not _CTK_AVAILABLE or _MODERN_TTK_READY:
+        return
+    try:
+        style = ttk.Style(widget)
+        style.configure(
+            "Modern.Treeview", background=_UI["window"],
+            fieldbackground=_UI["window"], foreground=_UI["text"],
+            borderwidth=0, rowheight=28, font=("TkDefaultFont", 11),
+        )
+        style.map(
+            "Modern.Treeview",
+            background=[("selected", _UI["selection"])],
+            foreground=[("selected", _UI["text"])],
+        )
+        style.configure(
+            "Modern.Treeview.Heading", background=_UI["surface"],
+            foreground=_UI["muted"], relief="flat",
+            font=("TkDefaultFont", 10, "bold"), padding=(6, 4),
+        )
+        style.map("Modern.Treeview.Heading",
+                  background=[("active", _UI["surface_alt"])])
+        style.configure(
+            "Modern.Vertical.TScrollbar", background=_UI["surface"],
+            troughcolor=_UI["window"], bordercolor=_UI["window"],
+            arrowcolor=_UI["muted"],
+        )
+    except tk.TclError:
+        pass
+    _MODERN_TTK_READY = True
+
+
 from bluebook_names import abbreviate_case_name
 from cl_parse import parse_cl_html as _parse_cl_html
 from courtlistener import CourtListenerClient, CourtListenerError
@@ -3768,38 +3900,40 @@ class CourtListenerGUI:
         _BriefTextWindow(self.root, self, name, text)
 
     def _show_settings_dialog(self) -> None:
-        dlg = tk.Toplevel(self.root)
+        dlg = _ui_toplevel(self.root)
         dlg.title("Settings")
-        dlg.geometry("460x95")
+        dlg.geometry("480x210" if _CTK_AVAILABLE else "460x175")
         dlg.resizable(False, False)
         dlg.grab_set()
         dlg.transient(self.root)
 
-        frame = ttk.LabelFrame(dlg, text="CourtListener API Token", padding=10)
-        frame.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        outer = _ui_frame(dlg)
+        outer.pack(fill="both", expand=True, padx=16, pady=14)
+        _ui_label(outer, "CourtListener API Token", size=14, weight="bold",
+                  anchor="w").pack(fill="x")
+        _ui_label(outer, "Used for CourtListener search and text retrieval.",
+                  size=11, muted=True, anchor="w").pack(fill="x", pady=(2, 10))
 
-        ttk.Label(frame, text="Token:").pack(side="left")
-        entry = ttk.Entry(frame, textvariable=self._token_var, show="*", width=42)
-        entry.pack(side="left", padx=6, fill="x", expand=True)
+        entry = _ui_entry(outer, textvariable=self._token_var, show="*")
+        entry.pack(fill="x")
 
         show_var = tk.BooleanVar(value=False)
 
         def _toggle() -> None:
-            entry.config(show="" if show_var.get() else "*")
+            entry.configure(show="" if show_var.get() else "*")
 
-        ttk.Checkbutton(frame, text="Show", variable=show_var, command=_toggle).pack(
-            side="left"
-        )
+        _ui_checkbox(outer, "Show token", show_var, _toggle).pack(
+            anchor="w", pady=(8, 0))
 
-        btn_frame = ttk.Frame(dlg)
-        btn_frame.pack(fill="x", padx=10, pady=(4, 10))
-        ttk.Button(
-            btn_frame,
-            text="Save & Close",
-            command=lambda: (_save_token(self._token_var.get().strip()), dlg.destroy()),
+        btn_frame = _ui_frame(dlg)
+        btn_frame.pack(fill="x", padx=16, pady=(0, 14))
+        _ui_button(
+            btn_frame, "Save & Close", primary=True, width=120,
+            command=lambda: (_save_token(self._token_var.get().strip()),
+                             dlg.destroy()),
         ).pack(side="right")
-        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(
-            side="right", padx=4
+        _ui_button(btn_frame, "Cancel", command=dlg.destroy, width=88).pack(
+            side="right", padx=8
         )
 
     # ------------------------------------------------------------------
@@ -4903,21 +5037,35 @@ class _CourtPickerDialog:
         self._labels: dict[str, str] = {}        # tree iid → bare label
         self._group_leaves: dict[str, set[str]] = {}  # group iid → descendant ids
 
-        win = tk.Toplevel(parent)
+        win = _ui_toplevel(parent)
         self._win = win
         win.title("Select Courts")
         win.geometry("440x560")
         win.minsize(360, 400)
         win.transient(parent)
         win.grab_set()
+        _ensure_modern_ttk_styles(win)
 
-        tree_frame = ttk.Frame(win)
-        tree_frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
-        self._tree = ttk.Treeview(tree_frame, show="tree", selectmode="none")
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self._tree.yview)
+        header = _ui_label(win, "Select Courts to Search", size=15, weight="bold",
+                           anchor="w")
+        header.pack(fill="x", padx=16, pady=(14, 0))
+        _ui_label(win, "Clicking a group toggles everything under it.",
+                  size=11, muted=True, anchor="w").pack(fill="x", padx=16,
+                                                        pady=(2, 8))
+
+        tree_frame = _ui_frame(win, card=True)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        tree_style = "Modern.Treeview" if _CTK_AVAILABLE else "Treeview"
+        pad = 8 if _CTK_AVAILABLE else 0
+        self._tree = ttk.Treeview(tree_frame, show="tree", selectmode="none",
+                                  style=tree_style)
+        sb_style = "Modern.Vertical.TScrollbar" if _CTK_AVAILABLE else "Vertical.TScrollbar"
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self._tree.yview,
+                            style=sb_style)
         self._tree.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        self._tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y", pady=pad, padx=(0, pad))
+        self._tree.pack(side="left", fill="both", expand=True, padx=(pad, 0),
+                        pady=pad)
 
         self._build_nodes("", _COURT_CATALOG)
         # Open the two top-level branches so the structure is visible
@@ -4926,17 +5074,15 @@ class _CourtPickerDialog:
         self._refresh_glyphs()
         self._tree.bind("<Button-1>", self._on_click)
 
-        bot = ttk.Frame(win)
-        bot.pack(fill="x", padx=8, pady=(0, 8))
+        bot = _ui_frame(win)
+        bot.pack(fill="x", padx=16, pady=(0, 14))
         self._count_var = tk.StringVar()
-        ttk.Label(bot, textvariable=self._count_var, foreground="gray").pack(
-            side="left"
-        )
-        ttk.Button(bot, text="Apply", command=self._apply).pack(side="right")
-        ttk.Button(bot, text="Cancel", command=win.destroy).pack(
-            side="right", padx=4
-        )
-        ttk.Button(bot, text="Clear", command=self._clear).pack(side="right", padx=4)
+        _ui_label(bot, muted=True, textvariable=self._count_var).pack(side="left")
+        _ui_button(bot, "Apply", command=self._apply, primary=True,
+                   width=92).pack(side="right")
+        _ui_button(bot, "Cancel", command=win.destroy, width=88).pack(
+            side="right", padx=8)
+        _ui_button(bot, "Clear", command=self._clear, width=80).pack(side="right")
         self._update_count()
 
     # -- tree construction ---------------------------------------------------
@@ -5014,20 +5160,25 @@ class _DbMatchDialog:
     def __init__(self, parent: tk.Misc, app: "CourtListenerGUI", candidates: list[dict]) -> None:
         self._app = app
         self._candidates = candidates
-        win = tk.Toplevel(parent)
+        win = _ui_toplevel(parent)
         self._win = win
         win.title("Select an Opinion")
-        win.geometry("660x340")
-        win.minsize(420, 220)
-        frame = ttk.Frame(win, padding=10)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(
-            frame,
-            text=f"{len(candidates)} opinions match — choose one:",
-        ).pack(anchor="w")
+        win.geometry("660x420")
+        win.minsize(420, 260)
+        _ensure_modern_ttk_styles(win)
+        frame = _ui_frame(win)
+        frame.pack(fill="both", expand=True, padx=14, pady=12)
+        _ui_label(
+            frame, f"{len(candidates)} opinions match — choose one",
+            size=14, weight="bold", anchor="w",
+        ).pack(anchor="w", fill="x")
+        card = _ui_frame(frame, card=True)
+        card.pack(fill="both", expand=True, pady=(8, 10))
+        pad = 8 if _CTK_AVAILABLE else 0
         cols = ("name", "cite", "court", "year")
         tree = ttk.Treeview(
-            frame, columns=cols, show="headings", selectmode="browse", height=10,
+            card, columns=cols, show="headings", selectmode="browse", height=8,
+            style="Modern.Treeview" if _CTK_AVAILABLE else "Treeview",
         )
         for col, title, width in (
             ("name", "Case", 320), ("cite", "Citation", 150),
@@ -5041,13 +5192,14 @@ class _DbMatchDialog:
                 values=(h.get("name") or "(unknown)", h.get("cite", ""),
                         h.get("court", ""), h.get("year", "")),
             )
-        tree.pack(fill="both", expand=True, pady=(6, 6))
+        tree.pack(fill="both", expand=True, padx=pad, pady=pad)
         self._tree = tree
-        btns = ttk.Frame(frame)
+        btns = _ui_frame(frame)
         btns.pack(fill="x")
-        ttk.Button(btns, text="Open", command=self._open).pack(side="right")
-        ttk.Button(btns, text="Cancel", command=win.destroy).pack(
-            side="right", padx=(0, 6)
+        _ui_button(btns, "Open", command=self._open, primary=True,
+                   width=92).pack(side="right")
+        _ui_button(btns, "Cancel", command=win.destroy, width=88).pack(
+            side="right", padx=(0, 8)
         )
         tree.bind("<Double-1>", lambda _e: self._open())
         if candidates:
