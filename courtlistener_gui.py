@@ -313,6 +313,25 @@ def _ensure_modern_ttk_styles(widget: tk.Misc) -> None:
             troughcolor=_UI["window"], bordercolor=_UI["window"],
             arrowcolor=_UI["muted"],
         )
+        style.configure(
+            "Modern.TCombobox", fieldbackground=_UI["surface"],
+            background=_UI["surface"], bordercolor=_UI["border"],
+            arrowcolor=_UI["muted"], foreground=_UI["text"], padding=4,
+            relief="flat",
+        )
+        style.map("Modern.TCombobox",
+                  fieldbackground=[("readonly", _UI["surface"])],
+                  selectbackground=[("readonly", _UI["surface"])],
+                  selectforeground=[("readonly", _UI["text"])])
+        style.configure(
+            "Modern.TEntry", fieldbackground=_UI["surface"],
+            bordercolor=_UI["border"], foreground=_UI["text"], padding=5,
+            relief="flat",
+        )
+        style.configure("Modern.TLabel", background=_UI["window"],
+                        foreground=_UI["text"])
+        style.configure("ModernMuted.TLabel", background=_UI["window"],
+                        foreground=_UI["muted"])
     except tk.TclError:
         pass
     _MODERN_TTK_READY = True
@@ -7170,7 +7189,8 @@ class _ScholarTextWindow:
         )
         self._fed_appx = (not self._cl_primary) and self._is_fed_appx()
 
-        self._win = tk.Toplevel(parent)
+        self._win = _ui_toplevel(parent)
+        _ensure_modern_ttk_styles(self._win)
         self._win.title(
             self._title_citation() or (
                 "CourtListener Opinion Text" if self._cl_primary
@@ -7211,31 +7231,38 @@ class _ScholarTextWindow:
 
     def _build_ui(self) -> None:
         win = self._win
+        lbl_style = "Modern.TLabel" if _CTK_AVAILABLE else "TLabel"
+        muted_style = "ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel"
+        entry_style = "Modern.TEntry" if _CTK_AVAILABLE else "TEntry"
+        combo_style = "Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox"
 
-        url_frame = ttk.Frame(win)
-        url_frame.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(url_frame, text="Source:").pack(side="left")
+        url_frame = _ui_frame(win)
+        url_frame.pack(fill="x", padx=12, pady=(12, 0))
+        ttk.Label(url_frame, text="Source", style=muted_style).pack(side="left")
         self._source_var = tk.StringVar(value=self._scholar_url)
-        ttk.Entry(url_frame, textvariable=self._source_var, state="readonly").pack(
-            side="left", fill="x", expand=True, padx=4
+        ttk.Entry(url_frame, textvariable=self._source_var, state="readonly",
+                  style=entry_style).pack(
+            side="left", fill="x", expand=True, padx=(8, 0)
         )
 
         # Part navigation: what you're viewing, and a selector to filter
-        view_frame = ttk.Frame(win)
-        view_frame.pack(fill="x", padx=8, pady=(6, 0))
-        ttk.Label(view_frame, text="Viewing:").pack(side="left")
+        view_frame = _ui_frame(win)
+        view_frame.pack(fill="x", padx=12, pady=(8, 0))
+        ttk.Label(view_frame, text="Viewing", style=muted_style).pack(side="left")
         self._view_label_var = tk.StringVar(value="Full opinion")
         self._view_label = ttk.Label(
             view_frame,
             textvariable=self._view_label_var,
-            font=("TkDefaultFont", 10, "bold"),
+            style=lbl_style,
+            font=("TkDefaultFont", 11, "bold"),
         )
-        self._view_label.pack(side="left", padx=(4, 12))
+        self._view_label.pack(side="left", padx=(6, 12))
         part_values = ["Full opinion"] + [
             f"{i + 1}. {p.label}" for i, p in enumerate(self._parts)
         ]
         self._part_combo = ttk.Combobox(
-            view_frame, state="readonly", width=44, values=part_values
+            view_frame, state="readonly", width=44, values=part_values,
+            style=combo_style,
         )
         self._part_combo.current(0)
         self._part_combo.pack(side="right")
@@ -7315,60 +7342,65 @@ class _ScholarTextWindow:
         txt.tag_configure("justify-pad")
         self._finder = _TextFinder(win, txt, text_frame)
 
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(fill="x", padx=8, pady=(0, 8))
+        btn_frame = _ui_frame(win)
+        btn_frame.pack(fill="x", padx=12, pady=(2, 10))
         self._btn_frame = btn_frame  # PDF/text panes pack just above this
         # (Copy-with-citation lives on Ctrl-C / Cmd-C; no button needed.)
         # In text view this exports RTF; in PDF view it becomes "Download PDF".
-        self._export_btn = ttk.Button(
-            btn_frame, text="Export RTF…", command=self._export_rtf
+        self._export_btn = _ui_button(
+            btn_frame, "Export RTF…", command=self._export_rtf, width=120
         )
-        self._export_btn.pack(side="right", padx=4)
+        self._export_btn.pack(side="right", padx=(6, 0))
         # Print: only meaningful in the PDF view, so it's packed there and
         # hidden again in the text view.
-        self._print_btn = ttk.Button(
-            btn_frame, text="Print…", command=self._print_pdf
+        self._print_btn = _ui_button(
+            btn_frame, "Print…", command=self._print_pdf, width=96
         )
-        self._toggle_btn = ttk.Button(
-            btn_frame, text="CourtListener Text", command=self._toggle_source
+        self._toggle_btn = _ui_button(
+            btn_frame, "CourtListener Text", command=self._toggle_source,
+            primary=True, width=168,
         )
-        self._toggle_btn.pack(side="right", padx=4)
+        self._toggle_btn.pack(side="right", padx=(6, 0))
         # The CourtListener text view gets its own "View PDF" button (the
         # Scholar view reuses the toggle for that).  Packed in _render_cl_blocks
         # / _show_courtlistener, hidden elsewhere; enabled once a PDF is located.
-        self._pdf_btn = ttk.Button(
-            btn_frame, text="View PDF", command=self._view_pdf, state="disabled"
+        self._pdf_btn = _ui_button(
+            btn_frame, "View PDF", command=self._view_pdf, width=110
         )
+        try:
+            self._pdf_btn.configure(state="disabled")
+        except tk.TclError:
+            pass
         # The Scholar text view's switch back to the CourtListener opinion (the
         # mirror of CL's "Google Scholar Text" button).  Packed in
         # _render_scholar, hidden in the CL and PDF views.
-        self._cl_btn = ttk.Button(
-            btn_frame, text="CourtListener Text", command=self._toggle_source
+        self._cl_btn = _ui_button(
+            btn_frame, "CourtListener Text", command=self._toggle_source,
+            width=168,
         )
 
         # Size controls: text size in the reader, PDF zoom in the PDF view
         # (also Ctrl +/−/0 and Ctrl+mouse wheel).
-        self._zoom_out_btn = ttk.Button(
-            btn_frame, text="A−", width=3, command=lambda: self._zoom(-1)
+        self._zoom_out_btn = _ui_button(
+            btn_frame, "A−", command=lambda: self._zoom(-1), width=42
         )
         self._zoom_out_btn.pack(side="left")
-        self._zoom_in_btn = ttk.Button(
-            btn_frame, text="A+", width=3, command=lambda: self._zoom(+1)
+        self._zoom_in_btn = _ui_button(
+            btn_frame, "A+", command=lambda: self._zoom(+1), width=42
         )
-        self._zoom_in_btn.pack(side="left", padx=(2, 8))
+        self._zoom_in_btn.pack(side="left", padx=(6, 10))
         # On by default for Supreme Court cases (Oyez fills the panel); the
         # window was widened to fit it.  _toggle_details is fired below.
         self._details_var = tk.BooleanVar(value=self._is_scotus)
-        ttk.Checkbutton(
-            btn_frame, text="Case details", variable=self._details_var,
-            command=self._toggle_details,
-        ).pack(side="left", padx=(0, 8))
+        _ui_checkbox(
+            btn_frame, "Case details", self._details_var, self._toggle_details,
+        ).pack(side="left", padx=(0, 10))
         # When checked (default), Ctrl-C appends the Bluebook citation (with the
         # pin cite) to the copied text; unchecked, it copies the selection alone.
         self._copy_with_cite = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            btn_frame, text="Copy with citation", variable=self._copy_with_cite,
-        ).pack(side="left", padx=(0, 8))
+        _ui_checkbox(
+            btn_frame, "Copy with citation", self._copy_with_cite,
+        ).pack(side="left", padx=(0, 10))
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
             win.bind(seq, lambda _e: self._zoom(+1))
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
@@ -7391,14 +7423,27 @@ class _ScholarTextWindow:
                 pass  # modifier not supported on this platform
 
         self._status_var = tk.StringVar()
-        ttk.Label(btn_frame, textvariable=self._status_var, foreground="gray").pack(
-            side="left", fill="x", expand=True
+        _ui_label(btn_frame, muted=True, anchor="w",
+                  textvariable=self._status_var).pack(
+            side="left", fill="x", expand=True, padx=(10, 0)
         )
 
         # Supreme Court cases: open the Oyez case-details panel from the start
         # (the checkbox above defaults on and the window is sized to fit it).
         if self._is_scotus:
             self._toggle_details()
+
+    def _set_view_color(self, color: str) -> None:
+        """Recolour the "Viewing" label to mark a concurrence/dissent — via the
+        right option for whichever widget kind the label is (a ttk.Label styled
+        with a modern theme here, so ``foreground`` applies)."""
+        try:
+            if isinstance(self._view_label, ttk.Label):
+                self._view_label.configure(foreground=color)
+            else:
+                self._view_label.configure(text_color=color)
+        except tk.TclError:
+            pass
 
     def _zoom(self, delta: int) -> None:
         """In the reader, grow/shrink every font (delta 0 resets to default);
@@ -8039,25 +8084,24 @@ class _ScholarTextWindow:
         self._source_var.set(self._scholar_url)
         # From the Scholar view, offer the official PDF (the CourtListener text
         # is invariably worse, so it's no longer offered here).
-        self._toggle_btn.config(text="View PDF", command=self._view_pdf,
+        self._toggle_btn.configure(text="View PDF", command=self._view_pdf,
                                 state="normal")
         self._hide_pdf_button()  # Scholar view uses the toggle for the PDF
         self._show_cl_button()   # …and offers a switch to the CourtListener text
-        self._export_btn.config(text="Export RTF…", command=self._export_rtf)
+        self._export_btn.configure(text="Export RTF…", command=self._export_rtf)
         self._print_btn.pack_forget()  # text view: no Print button
-        self._zoom_out_btn.config(text="A−")
-        self._zoom_in_btn.config(text="A+")
+        self._zoom_out_btn.configure(text="A−")
+        self._zoom_in_btn.configure(text="A+")
         if len(self._parts) > 1:
             self._part_combo.config(state="readonly")
         if self._current_part is None:
             self._view_label_var.set("Full opinion")
-            self._view_label.config(foreground="black")
+            self._set_view_color("black")
         else:
             part = self._parts[self._current_part]
             self._view_label_var.set(part.label)
-            self._view_label.config(
-                foreground=self._PART_LABEL_COLORS.get(part.kind, "black")
-            )
+            self._set_view_color(
+                self._PART_LABEL_COLORS.get(part.kind, "black"))
         extra = f" | {self._note}" if self._note else ""
         self._status_var.set(
             f"{len(self._scholar_text):,} characters | Google Scholar version{extra}"
@@ -8109,11 +8153,11 @@ class _ScholarTextWindow:
         kind = parts[pi].kind
         if kind in ("concurrence", "dissent"):
             self._view_label_var.set(parts[pi].label)
-            self._view_label.config(
-                foreground=self._PART_LABEL_COLORS.get(kind, "black"))
+            self._set_view_color(
+                self._PART_LABEL_COLORS.get(kind, "black"))
         else:
             self._view_label_var.set("Full opinion")
-            self._view_label.config(foreground="black")
+            self._set_view_color("black")
 
     # ------------------------------------------------------------------
     # Text justification
@@ -8481,7 +8525,7 @@ class _ScholarTextWindow:
         toggle_label = (
             "Google Scholar Text" if self._scholar_url else "Scholar unavailable"
         )
-        self._toggle_btn.config(
+        self._toggle_btn.configure(
             text=toggle_label, command=self._toggle_source,
             state="normal" if self._scholar_url else "disabled",
         )
@@ -8491,13 +8535,12 @@ class _ScholarTextWindow:
             self._part_combo.config(state="disabled")
         if self._current_part is None:
             self._view_label_var.set("Full opinion")
-            self._view_label.config(foreground="black")
+            self._set_view_color("black")
         else:
             part = parts[self._current_part]
             self._view_label_var.set(part.label)
-            self._view_label.config(
-                foreground=self._PART_LABEL_COLORS.get(part.kind, "black")
-            )
+            self._set_view_color(
+                self._PART_LABEL_COLORS.get(part.kind, "black"))
         char_count = len(self._cl_text or self._scholar_text or "")
         self._status_var.set(
             f"{char_count:,} characters | CourtListener version"
@@ -8519,12 +8562,12 @@ class _ScholarTextWindow:
         txt.config(state="disabled")
         self._mode = "courtlistener"
         self._source_var.set("CourtListener (assembled from the REST API)")
-        self._toggle_btn.config(text="Google Scholar Text",
+        self._toggle_btn.configure(text="Google Scholar Text",
                                 command=self._toggle_source, state="normal")
         self._hide_cl_button()
         self._part_combo.config(state="disabled")
         self._view_label_var.set("CourtListener text")
-        self._view_label.config(foreground="black")
+        self._set_view_color("black")
         self._status_var.set(
             f"{len(self._cl_text or ''):,} characters | CourtListener version"
         )
@@ -9838,7 +9881,7 @@ class _ScholarTextWindow:
         client = self._app._get_client()
         if client is None:
             return
-        self._toggle_btn.config(state="disabled")
+        self._toggle_btn.configure(state="disabled")
         self._status_var.set("Fetching CourtListener text…")
         item = dict(self._item)
         cite = self._bb["cite"]
@@ -9874,7 +9917,7 @@ class _ScholarTextWindow:
             self._show_courtlistener()
 
     def _on_cl_error(self, msg: str) -> None:
-        self._toggle_btn.config(state="normal")
+        self._toggle_btn.configure(state="normal")
         self._status_var.set(f"CourtListener: {msg}")
         messagebox.showerror("CourtListener", msg, parent=self._win)
 
@@ -9952,7 +9995,7 @@ class _ScholarTextWindow:
         # (If the PDF is up, its button is left alone — the Scholar text is
         # picked up when the reader returns to the text view.)
         if self._mode == "courtlistener":
-            self._toggle_btn.config(
+            self._toggle_btn.configure(
                 text="Google Scholar Text", command=self._toggle_source,
                 state="normal",
             )
@@ -10299,7 +10342,7 @@ class _ScholarTextWindow:
         self._hide_pdf_button()  # the toggle below is the way back from the PDF
         self._part_combo.config(state="disabled")
         self._view_label_var.set("PDF of opinion")
-        self._view_label.config(foreground="black")
+        self._set_view_color("black")
         self._source_var.set(url)
         # Returning from the PDF goes back to whichever text view we came from:
         # the Scholar text, or — for a CourtListener-primary window — the CL text.
@@ -10313,15 +10356,15 @@ class _ScholarTextWindow:
             back_state = ("disabled"
                           if self._fed_appx and not self._scholar_has_text
                           else "normal")
-        self._toggle_btn.config(
+        self._toggle_btn.configure(
             text=back_label, command=self._back_from_pdf, state=back_state)
         self._hide_cl_button()
         # In PDF view, the RTF export becomes a "Download PDF" action, a Print
         # button appears, and the text-size buttons zoom the page.
-        self._export_btn.config(text="Download PDF", command=self._download_pdf)
+        self._export_btn.configure(text="Download PDF", command=self._download_pdf)
         self._print_btn.pack(side="right", padx=4)
-        self._zoom_out_btn.config(text="−")
-        self._zoom_in_btn.config(text="+")
+        self._zoom_out_btn.configure(text="−")
+        self._zoom_in_btn.configure(text="+")
         self._status_var.set("Showing the official PDF of the opinion.")
 
     def _download_pdf(self) -> None:
@@ -10395,7 +10438,7 @@ class _ScholarTextWindow:
             # rather than turning the Scholar toggle into a "View PDF".
             self._refresh_pdf_button()
         else:
-            self._toggle_btn.config(text="View PDF", command=self._view_pdf,
+            self._toggle_btn.configure(text="View PDF", command=self._view_pdf,
                                     state="normal")
         self._status_var.set(f"PDF: {msg}")
         if self._pdf_url and messagebox.askyesno(
