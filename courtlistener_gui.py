@@ -4051,7 +4051,7 @@ class CourtListenerGUI:
         if self._scholar_tree.selection():
             self._scholar_tree.selection_remove(*self._scholar_tree.selection())
         self._download_btn.config(state="normal")
-        self._scholar_btn.config(state="normal")
+        self._scholar_btn.configure(state="normal")
         self._show_preview(self._iid_to_idx(sel[0]))
 
     def _on_scholar_row_select(self) -> None:
@@ -4062,7 +4062,7 @@ class CourtListenerGUI:
             if tree.selection():
                 tree.selection_remove(*tree.selection())
         self._download_btn.config(state="disabled")  # no CourtListener record
-        self._scholar_btn.config(state="normal")
+        self._scholar_btn.configure(state="normal")
         idx = int(sel[0])
         if 0 <= idx < len(self._scholar_results):
             r = self._scholar_results[idx]
@@ -4142,7 +4142,7 @@ class CourtListenerGUI:
         # Clear previous results
         self._search_btn.config(state="disabled")
         self._download_btn.config(state="disabled")
-        self._scholar_btn.config(state="disabled")
+        self._scholar_btn.configure(state="disabled")
         self._status_var.set("Searching…")
         for row in self._tree.get_children():
             self._tree.delete(row)
@@ -4298,7 +4298,7 @@ class CourtListenerGUI:
 
         self._status_var.set("Resolving PDF URL…")
         self._download_btn.config(state="disabled")
-        self._scholar_btn.config(state="disabled")
+        self._scholar_btn.configure(state="disabled")
         self._search_btn.config(state="disabled")
 
         def run() -> None:
@@ -4689,7 +4689,7 @@ class CourtListenerGUI:
         _, item = selected
 
         self._download_btn.config(state="disabled")
-        self._scholar_btn.config(state="disabled")
+        self._scholar_btn.configure(state="disabled")
         self._search_btn.config(state="disabled")
         self._status_var.set("Searching Google Scholar…")
 
@@ -4951,7 +4951,7 @@ class CourtListenerGUI:
             self._status_var.set(
                 "Scholar unavailable — loading CourtListener text…"
             )
-            self._scholar_btn.config(state="disabled")
+            self._scholar_btn.configure(state="disabled")
             client = self._get_client()
             if client is None:
                 self._status_var.set("Google Scholar text unavailable.")
@@ -5004,7 +5004,7 @@ class CourtListenerGUI:
 
     def _restore_buttons(self) -> None:
         self._download_btn.config(state="normal")
-        self._scholar_btn.config(state="normal")
+        self._scholar_btn.configure(state="normal")
         self._search_btn.config(state="normal")
 
     def _on_download_done(self, path: str) -> None:
@@ -11443,7 +11443,8 @@ class _StatuteWindow:
         self._neighbors: tuple = (None, None)
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
-        self._win = tk.Toplevel(parent)
+        self._win = _ui_toplevel(parent)
+        _ensure_modern_ttk_styles(self._win)
         self._win.title(f"{doc.label} — {doc.source_name}")
         self._win.geometry("760x640")
         self._win.minsize(440, 280)
@@ -11454,27 +11455,33 @@ class _StatuteWindow:
 
     def _build_ui(self) -> None:
         win = self._win
-        top = ttk.Frame(win)
-        top.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(top, text="Source:").pack(side="left")
+        muted_style = "ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel"
+        entry_style = "Modern.TEntry" if _CTK_AVAILABLE else "TEntry"
+        top = _ui_frame(win)
+        top.pack(fill="x", padx=12, pady=(12, 0))
+        ttk.Label(top, text="Source", style=muted_style).pack(side="left")
         self._src_var = tk.StringVar(value=self._doc.url)
-        ttk.Entry(top, textvariable=self._src_var, state="readonly").pack(
-            side="left", fill="x", expand=True, padx=4
+        ttk.Entry(top, textvariable=self._src_var, state="readonly",
+                  style=entry_style).pack(
+            side="left", fill="x", expand=True, padx=(8, 8)
         )
-        ttk.Button(
-            top, text="Open in Browser",
-            command=lambda: webbrowser.open(self._doc.url),
+        _ui_button(
+            top, "Open in Browser",
+            command=lambda: webbrowser.open(self._doc.url), width=132,
         ).pack(side="right")
-        self._next_btn = ttk.Button(
-            top, text="Next § ▶", width=8, state="disabled",
-            command=lambda: self._go_neighbor(1),
+        self._next_btn = _ui_button(
+            top, "Next § ▶", width=88, command=lambda: self._go_neighbor(1),
         )
-        self._next_btn.pack(side="right", padx=(2, 8))
-        self._prev_btn = ttk.Button(
-            top, text="◀ Prev §", width=8, state="disabled",
-            command=lambda: self._go_neighbor(0),
+        self._next_btn.pack(side="right", padx=(6, 8))
+        self._prev_btn = _ui_button(
+            top, "◀ Prev §", width=88, command=lambda: self._go_neighbor(0),
         )
         self._prev_btn.pack(side="right")
+        for b in (self._next_btn, self._prev_btn):
+            try:
+                b.configure(state="disabled")
+            except tk.TclError:
+                pass
 
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True, padx=8, pady=4)
@@ -11516,29 +11523,27 @@ class _StatuteWindow:
                      lambda _e: txt.config(cursor=""))
         self._finder = _TextFinder(win, txt, frame)
 
-        btns = ttk.Frame(win)
-        btns.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Button(btns, text="A−", width=3,
+        btns = _ui_frame(win)
+        btns.pack(fill="x", padx=12, pady=(2, 10))
+        _ui_button(btns, "A−", width=42,
                    command=lambda: self._zoom(-1)).pack(side="left")
-        ttk.Button(btns, text="A+", width=3,
-                   command=lambda: self._zoom(+1)).pack(side="left",
-                                                        padx=(2, 8))
+        _ui_button(btns, "A+", width=42,
+                   command=lambda: self._zoom(+1)).pack(side="left", padx=(6, 10))
         self._notes_var = tk.BooleanVar(value=False)
-        self._notes_btn = ttk.Checkbutton(
-            btns, text="Show notes", variable=self._notes_var,
-            command=self._render,
+        self._notes_btn = _ui_checkbox(
+            btns, "Show notes", self._notes_var, self._render,
         )
-        self._notes_btn.pack(side="left", padx=8)
+        self._notes_btn.pack(side="left", padx=(0, 8))
         if not self._has_notes:
-            self._notes_btn.config(state="disabled")
-        ttk.Button(btns, text="Copy + Cite",
-                   command=self._copy_cite).pack(side="right", padx=(4, 0))
-        ttk.Button(btns, text="Export RTF…",
-                   command=self._export_rtf).pack(side="right", padx=4)
+            self._notes_btn.configure(state="disabled")
+        _ui_button(btns, "Copy + Cite", primary=True, width=110,
+                   command=self._copy_cite).pack(side="right", padx=(6, 0))
+        _ui_button(btns, "Export RTF…", width=120,
+                   command=self._export_rtf).pack(side="right")
         # Status doubles as the provenance note until an action overwrites it
         self._status_var = tk.StringVar(value=self._doc.source_note)
-        ttk.Label(btns, textvariable=self._status_var,
-                  foreground="gray").pack(side="left", padx=8)
+        _ui_label(btns, muted=True, anchor="w",
+                  textvariable=self._status_var).pack(side="left", padx=(10, 0))
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
             win.bind(seq, lambda _e: self._zoom(+1))
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
@@ -11715,8 +11720,8 @@ class _StatuteWindow:
         """Resolve the adjacent sections in the background (the C.F.R.
         side may fetch the title's structure tree) and grey the buttons
         accordingly."""
-        self._prev_btn.config(state="disabled")
-        self._next_btn.config(state="disabled")
+        self._prev_btn.configure(state="disabled")
+        self._next_btn.configure(state="disabled")
         doc = self._doc
 
         def run() -> None:
@@ -11727,9 +11732,9 @@ class _StatuteWindow:
                     return  # user already navigated elsewhere
                 self._neighbors = nb
                 try:
-                    self._prev_btn.config(
+                    self._prev_btn.configure(
                         state="normal" if nb[0] else "disabled")
-                    self._next_btn.config(
+                    self._next_btn.configure(
                         state="normal" if nb[1] else "disabled")
                 except tk.TclError:
                     pass  # window closed while neighbors were resolving
@@ -11746,8 +11751,8 @@ class _StatuteWindow:
         if not target:
             return
         mod = _STATUTE_SOURCES[self._doc.kind]
-        self._prev_btn.config(state="disabled")
-        self._next_btn.config(state="disabled")
+        self._prev_btn.configure(state="disabled")
+        self._next_btn.configure(state="disabled")
         self._status_var.set(
             f"Fetching {'previous' if which == 0 else 'next'} section…"
         )
@@ -11779,7 +11784,7 @@ class _StatuteWindow:
         self._doc = doc
         self._highlight = tuple(highlight)
         self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
-        self._notes_btn.config(
+        self._notes_btn.configure(
             state="normal" if self._has_notes else "disabled")
         self._win.title(f"{doc.label} — {doc.source_name}")
         self._src_var.set(doc.url)
@@ -11925,7 +11930,8 @@ class _CitingOpinionsWindow:
             cited_item.get("caseName") or cited_item.get("case_name") or "?",
         ).strip()
 
-        self._win = tk.Toplevel(parent)
+        self._win = _ui_toplevel(parent)
+        _ensure_modern_ttk_styles(self._win)
         self._win.title(f"Citing: {case_name}")
         self._win.geometry("950x480")
         self._win.minsize(700, 300)
@@ -11939,22 +11945,29 @@ class _CitingOpinionsWindow:
     # ------------------------------------------------------------------
 
     def _build_ui(self, case_name: str) -> None:
+        muted_style = "ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel"
+        tree_style = "Modern.Treeview" if _CTK_AVAILABLE else "Treeview"
+        sb_style = "Modern.Vertical.TScrollbar" if _CTK_AVAILABLE else "Vertical.TScrollbar"
+        pad = 8 if _CTK_AVAILABLE else 0
+
         # ── status bar (top) ──────────────────────────────────────────
-        top = ttk.Frame(self._win)
-        top.pack(fill="x", padx=6, pady=(6, 0))
-        ttk.Label(top, text=f"Opinions citing:  {case_name}", font=("TkDefaultFont", 9, "italic")).pack(side="left")
+        top = _ui_frame(self._win)
+        top.pack(fill="x", padx=12, pady=(12, 0))
+        _ui_label(top, f"Opinions citing:  {case_name}", size=13,
+                  weight="bold", anchor="w").pack(side="left")
         self._status_var = tk.StringVar(value="Loading…")
-        ttk.Label(top, textvariable=self._status_var, foreground="gray").pack(side="right")
+        _ui_label(top, muted=True, textvariable=self._status_var).pack(side="right")
 
         # ── treeview ─────────────────────────────────────────────────
-        tree_frame = ttk.Frame(self._win)
-        tree_frame.pack(fill="both", expand=True, padx=6, pady=4)
+        tree_frame = _ui_frame(self._win, card=True)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=8)
 
         self._tree = ttk.Treeview(
             tree_frame,
             columns=self._COLS,
             show="headings",
             selectmode="browse",
+            style=tree_style,
         )
         for col, label in self._COL_LABELS.items():
             self._tree.heading(col, text=label)
@@ -11964,31 +11977,42 @@ class _CitingOpinionsWindow:
         self._tree.column("citation",   width=150, minwidth=90)
         self._tree.column("depth",      width=55,  minwidth=40,  anchor="center")
 
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self._tree.yview)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical",
+                            command=self._tree.yview, style=sb_style)
         self._tree.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        self._tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y", pady=pad, padx=(0, pad))
+        self._tree.pack(side="left", fill="both", expand=True, padx=(pad, 0),
+                        pady=pad)
 
         self._tree.bind("<Double-1>", lambda _e: self._download_selected())
 
         # ── bottom button bar ────────────────────────────────────────
-        bot = ttk.Frame(self._win)
-        bot.pack(fill="x", padx=6, pady=(0, 6))
+        bot = _ui_frame(self._win)
+        bot.pack(fill="x", padx=12, pady=(0, 12))
 
-        self._prev_btn = ttk.Button(bot, text="◀  Prev", command=self._go_prev, state="disabled")
-        self._prev_btn.pack(side="left", padx=(0, 4))
+        self._prev_btn = _ui_button(bot, "◀  Prev", command=self._go_prev,
+                                    width=84)
+        self._prev_btn.pack(side="left", padx=(0, 6))
 
         self._page_var = tk.StringVar(value="Page 1")
-        ttk.Label(bot, textvariable=self._page_var, width=10, anchor="center").pack(side="left")
+        _ui_label(bot, muted=True, textvariable=self._page_var).pack(side="left")
 
-        self._next_btn = ttk.Button(bot, text="Next  ▶", command=self._go_next, state="disabled")
-        self._next_btn.pack(side="left", padx=(4, 20))
+        self._next_btn = _ui_button(bot, "Next  ▶", command=self._go_next,
+                                    width=84)
+        self._next_btn.pack(side="left", padx=(6, 20))
 
-        self._dl_btn = ttk.Button(bot, text="Download PDF", command=self._download_selected, state="disabled")
-        self._dl_btn.pack(side="right", padx=(4, 0))
+        self._dl_btn = _ui_button(bot, "Download PDF", command=self._download_selected,
+                                  primary=True, width=124)
+        self._dl_btn.pack(side="right", padx=(6, 0))
 
-        self._scholar_btn = ttk.Button(bot, text="Google Scholar", command=self._open_scholar, state="disabled")
-        self._scholar_btn.pack(side="right", padx=4)
+        self._scholar_btn = _ui_button(bot, "Google Scholar", command=self._open_scholar,
+                                       width=124)
+        self._scholar_btn.pack(side="right")
+        for b in (self._prev_btn, self._next_btn, self._dl_btn, self._scholar_btn):
+            try:
+                b.configure(state="disabled")
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
     # Navigation
@@ -12030,10 +12054,10 @@ class _CitingOpinionsWindow:
         self._bg_stop = threading.Event()
 
     def _set_buttons_loading(self) -> None:
-        self._prev_btn.config(state="disabled")
-        self._next_btn.config(state="disabled")
-        self._dl_btn.config(state="disabled")
-        self._scholar_btn.config(state="disabled")
+        self._prev_btn.configure(state="disabled")
+        self._next_btn.configure(state="disabled")
+        self._dl_btn.configure(state="disabled")
+        self._scholar_btn.configure(state="disabled")
 
     # ------------------------------------------------------------------
     # Data loading – single stage (citations endpoint → parallel cluster
@@ -12239,11 +12263,11 @@ class _CitingOpinionsWindow:
         self._status_var.set(
             f"Showing {shown:,} of {total:,} citing opinions · Loading more…"
         )
-        self._prev_btn.config(state="normal" if self._history_idx > 0 else "disabled")
-        self._next_btn.config(state="disabled")
+        self._prev_btn.configure(state="normal" if self._history_idx > 0 else "disabled")
+        self._next_btn.configure(state="disabled")
         has = bool(results)
-        self._dl_btn.config(state="normal" if has else "disabled")
-        self._scholar_btn.config(state="normal" if has else "disabled")
+        self._dl_btn.configure(state="normal" if has else "disabled")
+        self._scholar_btn.configure(state="normal" if has else "disabled")
 
     def _append_bg_results(
         self, batch: list[dict], loaded: int, total: int, final: bool
@@ -12262,8 +12286,8 @@ class _CitingOpinionsWindow:
                 if total else f"Page {self._page_num()} · {loaded:,} results"
             )
             has = bool(self._page_results)
-            self._dl_btn.config(state="normal" if has else "disabled")
-            self._scholar_btn.config(state="normal" if has else "disabled")
+            self._dl_btn.configure(state="normal" if has else "disabled")
+            self._scholar_btn.configure(state="normal" if has else "disabled")
         else:
             self._status_var.set(
                 f"Showing {loaded:,} of {total:,} citing opinions · Loading more…"
@@ -12299,11 +12323,11 @@ class _CitingOpinionsWindow:
             f"Page {page} · {shown} of {total:,} citing opinions"
             if total else f"Page {page} · {shown} results"
         )
-        self._prev_btn.config(state="normal" if self._history_idx > 0 else "disabled")
-        self._next_btn.config(state="normal" if self._next_cursor else "disabled")
+        self._prev_btn.configure(state="normal" if self._history_idx > 0 else "disabled")
+        self._next_btn.configure(state="normal" if self._next_cursor else "disabled")
         has = bool(self._page_results)
-        self._dl_btn.config(state="normal" if has else "disabled")
-        self._scholar_btn.config(state="normal" if has else "disabled")
+        self._dl_btn.configure(state="normal" if has else "disabled")
+        self._scholar_btn.configure(state="normal" if has else "disabled")
 
     def _format_row(self, item: dict, depth: str = "") -> tuple:
         case_name = re.sub(
@@ -12402,10 +12426,10 @@ class _CitingOpinionsWindow:
 
     def _restore_buttons(self) -> None:
         has = bool(self._page_results)
-        self._dl_btn.config(state="normal" if has else "disabled")
-        self._scholar_btn.config(state="normal" if has else "disabled")
-        self._prev_btn.config(state="normal" if self._history_idx > 0 else "disabled")
-        self._next_btn.config(state="normal" if self._next_cursor else "disabled")
+        self._dl_btn.configure(state="normal" if has else "disabled")
+        self._scholar_btn.configure(state="normal" if has else "disabled")
+        self._prev_btn.configure(state="normal" if self._history_idx > 0 else "disabled")
+        self._next_btn.configure(state="normal" if self._next_cursor else "disabled")
 
     # ------------------------------------------------------------------
     # Google Scholar  (reuses the main app's fetcher + text window)
@@ -12423,7 +12447,7 @@ class _CitingOpinionsWindow:
             return
         client = self._app._get_client()
 
-        self._scholar_btn.config(state="disabled")
+        self._scholar_btn.configure(state="disabled")
         self._status_var.set("Searching Google Scholar…")
 
         def status_cb(msg: str) -> None:
