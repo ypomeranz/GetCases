@@ -18,6 +18,7 @@ Token lookup order:
 from __future__ import annotations
 
 import difflib
+import importlib.util
 import json
 import os
 import re
@@ -45,9 +46,10 @@ def _ensure_dependencies() -> None:
     ``requests`` is required; the rest enable features and declining just
     disables them: ``beautifulsoup4`` (Google Scholar / opinion parsing),
     ``pynput`` (global hotkey), ``pypdfium2`` + ``Pillow`` (the in-app PDF
-    viewer), and ``curl_cffi`` + ``browser_cookie3`` (fetching the CommonLII
-    English Reports scans in-app through CloudFlare; without them E.R. cases
-    open in the browser instead).
+    viewer), ``customtkinter`` (the modern spotlight and pop-up window styling;
+    without it those windows fall back to plain Tk), and ``curl_cffi`` +
+    ``browser_cookie3`` (fetching the CommonLII English Reports scans in-app
+    through CloudFlare; without them E.R. cases open in the browser instead).
     """
     import importlib
     import importlib.util
@@ -61,6 +63,7 @@ def _ensure_dependencies() -> None:
                 ("pynput", "pynput"),
                 ("pypdfium2", "pypdfium2"),  # in-app PDF viewer
                 ("PIL", "Pillow"),           # in-app PDF viewer (imports as PIL)
+                ("customtkinter", "customtkinter"),  # modern spotlight / window chrome
                 ("curl_cffi", "curl_cffi"),  # English Reports scan fetch (CloudFlare)
                 ("browser_cookie3", "browser_cookie3"),  # reads Firefox clearance cookie
             )
@@ -108,6 +111,80 @@ def _ensure_dependencies() -> None:
 _ensure_dependencies()
 
 import requests as _requests
+
+# ----------------------------------------------------------------------------
+# Modern UI toolkit (CustomTkinter)
+# ----------------------------------------------------------------------------
+# CustomTkinter gives the spotlight and the pop-up windows rounded, themed
+# chrome.  It is optional: when it is not installed the same windows are built
+# with plain Tk widgets instead, so the app keeps working (just less polished).
+# The main window is deliberately left on classic Tk/ttk for now.
+if importlib.util.find_spec("customtkinter") is not None:
+    import customtkinter as ctk  # type: ignore
+else:  # pragma: no cover - exercised only where the package is absent
+    ctk = None  # type: ignore
+_CTK_AVAILABLE = ctk is not None
+
+# One cohesive light palette shared by every modernised window, so the
+# spotlight, dialogs, and viewers read as one product rather than a grab-bag of
+# Tk defaults.
+_UI = {
+    "window":      "#ffffff",  # card / window background
+    "surface":     "#f2f3f5",  # inset surfaces (search bar, toolbars)
+    "surface_alt": "#e9ebef",  # hover on inset surfaces
+    "border":      "#e2e4e9",  # hairline separators
+    "text":        "#1c1d21",  # primary text
+    "muted":       "#8b909a",  # secondary text / placeholders
+    "accent":      "#2f6bd8",  # primary action / links
+    "accent_dim":  "#255ac0",  # accent hover
+    "selection":   "#e8f0fd",  # highlighted list row
+    "badge":       "#3a5a8c",  # court badge (high courts)
+    "badge_alt":   "#737d8c",  # court badge (other courts)
+    "danger":      "#c0392b",
+}
+
+_MODERN_THEME_READY = False
+
+
+def _ensure_modern_theme() -> None:
+    """Initialise CustomTkinter once, in a light appearance that matches the
+    document-style windows.  A no-op when the package is unavailable."""
+    global _MODERN_THEME_READY
+    if not _CTK_AVAILABLE or _MODERN_THEME_READY:
+        return
+    try:
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("blue")
+    except Exception:
+        pass
+    _MODERN_THEME_READY = True
+
+
+def _ui_font(size: int, weight: str = "normal"):
+    """A CTkFont at *size* when CustomTkinter is present, else a Tk font tuple.
+    Centralised so every modern window shares one type ramp."""
+    if _CTK_AVAILABLE:
+        try:
+            return ctk.CTkFont(size=size, weight=weight)
+        except Exception:
+            pass
+    return ("TkDefaultFont", size, "bold" if weight == "bold" else "normal")
+
+
+def _bind_recursive(widget, sequence: str, handler) -> None:
+    """Bind *handler* for *sequence* on *widget* and all of its descendants.
+
+    CustomTkinter renders each widget from nested internal canvases/labels, so a
+    single ``bind`` on a composite row misses clicks that land on those inner
+    widgets.  Binding the whole subtree makes a click (or hover) anywhere on the
+    row register regardless of which internal piece received the event."""
+    try:
+        widget.bind(sequence, handler, add="+")
+    except tk.TclError:
+        pass
+    for child in widget.winfo_children():
+        _bind_recursive(child, sequence, handler)
+
 
 from bluebook_names import abbreviate_case_name
 from cl_parse import parse_cl_html as _parse_cl_html
@@ -2272,6 +2349,20 @@ class CourtListenerGUI:
     def _on_global_hotkey(self) -> None:
         self.root.after(0, self._toggle_quick_search_popup)
 
+    def _spot_knockout_corners(self, popup: tk.Toplevel) -> None:
+        """On Windows, punch the popup's square window corners out to
+        transparent so the rounded CustomTkinter card reads cleanly over
+        whatever is behind it.  Elsewhere this is a no-op — the corners simply
+        show the card's own background colour."""
+        if sys.platform != "win32":
+            return
+        key = "#010203"  # a colour the UI never uses, keyed out to transparent
+        try:
+            popup.configure(bg=key)
+            popup.wm_attributes("-transparentcolor", key)
+        except tk.TclError:
+            pass
+
     def _toggle_quick_search_popup(self) -> None:
         if self._quick_popup is not None:
             try:
@@ -2292,27 +2383,56 @@ class CourtListenerGUI:
         popup.overrideredirect(True)
         popup.attributes("-topmost", True)
 
-        pw, ph = 520, 48
+        entry_var = tk.StringVar()
+
+        if _CTK_AVAILABLE:
+            # Modern spotlight: a rounded, themed card with a large search
+            # field.  `border` is the card into which the results dropdown packs
+            # itself later, mirroring the plain-Tk layout below.
+            _ensure_modern_theme()
+            pw, ph = 600, 66
+            popup.configure(bg=_UI["window"])
+            self._spot_knockout_corners(popup)
+            border = ctk.CTkFrame(
+                popup, corner_radius=16, fg_color=_UI["window"],
+                border_width=1, border_color=_UI["border"],
+            )
+            border.pack(fill="both", expand=True)
+            bar = ctk.CTkFrame(border, corner_radius=12, fg_color=_UI["surface"])
+            bar.pack(fill="x", padx=12, pady=12)
+            ctk.CTkLabel(
+                bar, text="⚖", font=_ui_font(20), text_color=_UI["muted"],
+                width=26,
+            ).pack(side="left", padx=(12, 0))
+            entry = ctk.CTkEntry(
+                bar, textvariable=entry_var, font=_ui_font(17),
+                placeholder_text="Search cases, citations, statutes…",
+                border_width=0, fg_color="transparent",
+                text_color=_UI["text"], height=42,
+            )
+            entry.pack(side="left", fill="x", expand=True, padx=(4, 12), pady=6)
+            focus_target = entry._entry
+        else:
+            pw, ph = 520, 48
+            popup.configure(bg="#888888")
+            border = tk.Frame(popup, bg="#888888")
+            border.pack(fill="both", expand=True)
+            inner = tk.Frame(border, bg="#ffffff", padx=10, pady=6)
+            inner.pack(fill="both", expand=True, padx=2, pady=2)
+            tk.Label(
+                inner, text="Search CourtListener:", bg="#ffffff",
+                fg="#555555", font=("TkDefaultFont", 11),
+            ).pack(side="left", padx=(0, 6))
+            entry = tk.Entry(
+                inner, textvariable=entry_var, font=("TkDefaultFont", 13),
+                relief="flat", bg="#ffffff",
+            )
+            entry.pack(side="left", fill="x", expand=True)
+            focus_target = entry
+
         sx = popup.winfo_screenwidth()
         sy = popup.winfo_screenheight()
         popup.geometry(f"{pw}x{ph}+{(sx - pw) // 2}+{sy // 3}")
-
-        border = tk.Frame(popup, bg="#888888")
-        border.pack(fill="both", expand=True)
-        inner = tk.Frame(border, bg="#ffffff", padx=10, pady=6)
-        inner.pack(fill="both", expand=True, padx=2, pady=2)
-
-        tk.Label(
-            inner, text="Search CourtListener:", bg="#ffffff",
-            fg="#555555", font=("TkDefaultFont", 11),
-        ).pack(side="left", padx=(0, 6))
-
-        entry_var = tk.StringVar()
-        entry = tk.Entry(
-            inner, textvariable=entry_var, font=("TkDefaultFont", 13),
-            relief="flat", bg="#ffffff",
-        )
-        entry.pack(side="left", fill="x", expand=True)
 
         def _submit(_e=None) -> None:
             query = entry_var.get().strip()
@@ -2398,12 +2518,18 @@ class CourtListenerGUI:
                 if sys.platform == "win32":
                     self._win_force_foreground(popup)
                 popup.focus_force()
-                entry.focus_force()
-                entry.icursor(tk.END)
-                entry.selection_range(0, tk.END)
+                # `focus_target` is the real Tk entry — for a CustomTkinter
+                # field that is the internal widget wrapped by CTkEntry, which is
+                # also what `focus_get` reports, so the identity check below holds.
+                focus_target.focus_force()
+                focus_target.icursor(tk.END)
+                try:
+                    focus_target.select_range(0, tk.END)
+                except tk.TclError:
+                    pass
                 # The entry may not hold keyboard focus on the first try;
                 # retry until it does (or we run out of attempts).
-                if popup.focus_get() is not entry and attempt < 25:
+                if popup.focus_get() is not focus_target and attempt < 25:
                     popup.after(20, lambda: _grab_focus(attempt + 1))
             except tk.TclError:
                 pass
@@ -2431,6 +2557,85 @@ class CourtListenerGUI:
             self._query_var.set(query)
             self._do_search()
 
+    @staticmethod
+    def _spot_tier_color(court_id: str) -> str:
+        """Badge colour: the Supreme Court gets the deep navy accent, every
+        other court a quieter slate, so SCOTUS results stand out at a glance."""
+        return _UI["badge"] if court_id == "scotus" else _UI["badge_alt"]
+
+    def _spot_build_row(self, parent, court_abbr: str, tier_color: str,
+                        display_name: str, detail_text: str) -> dict:
+        """Create one spotlight result row and return the widgets the caller
+        needs to bind clicks and re-colour on highlight.  Builds a rounded,
+        themed card when CustomTkinter is present, or the plain-Tk row otherwise.
+        """
+        if _CTK_AVAILABLE:
+            row = ctk.CTkFrame(parent, corner_radius=10,
+                               fg_color=_UI["window"], height=54)
+            row.pack(side="top", fill="x", padx=10, pady=(4, 0))
+            row.pack_propagate(False)
+            badge = ctk.CTkLabel(
+                row, text=court_abbr, fg_color=tier_color, corner_radius=6,
+                text_color="#ffffff", font=_ui_font(11, "bold"),
+                width=78, height=36,
+            )
+            badge.pack(side="left", padx=(10, 12), pady=9)
+            text_frame = ctk.CTkFrame(row, fg_color="transparent")
+            text_frame.pack(side="left", fill="both", expand=True, padx=(0, 12))
+            name_lbl = ctk.CTkLabel(
+                text_frame, text=display_name, fg_color="transparent",
+                text_color=_UI["text"], font=_ui_font(14), anchor="w",
+            )
+            name_lbl.pack(fill="x", pady=(7, 0))
+            detail_lbl = ctk.CTkLabel(
+                text_frame, text=detail_text, fg_color="transparent",
+                text_color=_UI["muted"], font=_ui_font(11), anchor="w",
+            )
+            detail_lbl.pack(fill="x")
+            return {
+                "row": row, "badge": badge, "text_frame": text_frame,
+                "name": name_lbl, "detail": detail_lbl, "modern": True,
+            }
+        row = tk.Frame(parent, bg="#ffffff", height=52, cursor="hand2")
+        row.pack(side="top", fill="x", padx=4, pady=(2, 0))
+        row.pack_propagate(False)
+        badge = tk.Label(
+            row, text=court_abbr, bg=tier_color, fg="#ffffff",
+            font=("TkDefaultFont", 10, "bold"), padx=6, pady=2,
+            anchor="center", width=8,
+        )
+        badge.pack(side="left", padx=(6, 8))
+        text_frame = tk.Frame(row, bg="#ffffff")
+        text_frame.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        name_lbl = tk.Label(
+            text_frame, text=display_name, bg="#ffffff", fg="#222222",
+            font=("TkDefaultFont", 10), anchor="w",
+        )
+        name_lbl.pack(fill="x")
+        detail_lbl = tk.Label(
+            text_frame, text=detail_text, bg="#ffffff", fg="#888888",
+            font=("TkDefaultFont", 8), anchor="w",
+        )
+        detail_lbl.pack(fill="x")
+        return {
+            "row": row, "badge": badge, "text_frame": text_frame,
+            "name": name_lbl, "detail": detail_lbl, "modern": False,
+        }
+
+    def _spot_highlight_row(self, r: dict, selected: bool) -> None:
+        """Colour a result row for the current keyboard/hover selection."""
+        if r["modern"]:
+            r["row"].configure(
+                fg_color=_UI["selection"] if selected else _UI["window"]
+            )
+            return
+        bg = "#d0e0f0" if selected else "#ffffff"
+        for w in (r["row"], r["text_frame"], r["name"], r["detail"]):
+            try:
+                w.config(bg=bg)
+            except tk.TclError:
+                pass
+
     def _show_spotlight_dropdown(
         self, popup: tk.Toplevel, border: tk.Frame,
         entry: tk.Entry, query: str,
@@ -2456,21 +2661,36 @@ class CourtListenerGUI:
         # plus the two Google Scholar matches and an English Reports row — so
         # the popup starts just tall enough for the "Searching…" line and is
         # resized as each result row streams in (up to max_rows).
-        pw = 580
-        row_h = 52
-        row_gap = 2
         max_rows = 10
-        header_h = 48
-        status_h = 26
+        if _CTK_AVAILABLE:
+            # The modern card auto-fits to its content (see _resize_to), so it
+            # only needs the width; the metrics below are the plain-Tk path's.
+            pw = 600
+            row_h = row_gap = header_h = status_h = body_pad = 0
+        else:
+            pw = 580
+            row_h = 52
+            row_gap = 2
+            header_h = 48
+            status_h = 26
+            body_pad = 6
         sx = popup.winfo_screenwidth()
         sy = popup.winfo_screenheight()
         pos_x = (sx - pw) // 2
         pos_y = sy // 3
 
         def _resize_to(n_rows: int) -> None:
-            n = max(0, min(n_rows, max_rows))
-            body_h = n * (row_h + row_gap) + status_h + 6
             try:
+                if _CTK_AVAILABLE:
+                    # Let the themed card report the exact height its packed
+                    # children need — more reliable than summing widget metrics
+                    # across platforms and keeps the last row fully visible.
+                    popup.update_idletasks()
+                    h = border.winfo_reqheight()
+                    popup.geometry(f"{pw}x{h}+{pos_x}+{pos_y}")
+                    return
+                n = max(0, min(n_rows, max_rows))
+                body_h = n * (row_h + row_gap) + status_h + body_pad
                 popup.geometry(f"{pw}x{header_h + body_h}+{pos_x}+{pos_y}")
             except tk.TclError:
                 pass
@@ -2478,8 +2698,14 @@ class CourtListenerGUI:
         _resize_to(0)
 
         # Results frame below the search bar
-        results_frame = tk.Frame(border, bg="#f0f0f0")
-        results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
+        if _CTK_AVAILABLE:
+            # padx=2 here + padx=10 on each row aligns the row cards with the
+            # search-bar card above (both sit 12px in from the card edge).
+            results_frame = ctk.CTkFrame(border, fg_color=_UI["window"])
+            results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 8))
+        else:
+            results_frame = tk.Frame(border, bg="#f0f0f0")
+            results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
         self._spotlight_results_frame = results_frame
 
         # Tracking state
@@ -2518,11 +2744,6 @@ class CourtListenerGUI:
             # Append a fresh row at the bottom.  Rows are added in arrival order
             # and never moved, so a result already on screen keeps its position
             # while the dropdown grows downward to fit the new one.
-            row = tk.Frame(results_frame, bg="#ffffff", height=row_h,
-                           cursor="hand2")
-            row.pack(side="top", fill="x", padx=4, pady=(row_gap, 0))
-            row.pack_propagate(False)  # keep the row's height fixed
-
             court_abbr = _COURT_BLUEBOOK.get(
                 court_id, court_id.upper() if court_id else "?"
             )
@@ -2531,63 +2752,41 @@ class CourtListenerGUI:
             elif court_id == "engrep":
                 court_abbr = "Eng. Rep."
 
-            # Court badge on the left
-            badge = tk.Label(
-                row, text=court_abbr, bg="#3a5a8c", fg="#ffffff",
-                font=("TkDefaultFont", 10, "bold"),
-                padx=6, pady=2, anchor="center", width=8,
-            )
-            badge.pack(side="left", padx=(6, 8))
-
-            # Text on the right (fill x only, so it sits centred in the slot)
-            text_frame = tk.Frame(row, bg="#ffffff")
-            text_frame.pack(side="left", fill="x", expand=True, padx=(0, 6))
-
-            # Truncate name for display
             display_name = name[:80] + ("…" if len(name) > 80 else "")
-            tk.Label(
-                text_frame, text=display_name, bg="#ffffff", fg="#222222",
-                font=("TkDefaultFont", 10), anchor="w",
-            ).pack(fill="x")
-
             detail = f"{cite}" if cite else ""
             if year:
                 detail = f"{detail} ({year})" if detail else f"({year})"
-            detail_suffix = f"  — {source_label}" if source_label else ""
-            tk.Label(
-                text_frame, text=detail + detail_suffix, bg="#ffffff",
-                fg="#888888", font=("TkDefaultFont", 8), anchor="w",
-            ).pack(fill="x")
+            if source_label:
+                sep = "  ·  " if _CTK_AVAILABLE else "  — "
+                detail = f"{detail}{sep}{source_label}" if detail else source_label
 
-            entry_data = {
-                "row": row, "open_fn": open_fn, "badge": badge,
-                "text_frame": text_frame,
-            }
-            result_rows.append(entry_data)
+            r = self._spot_build_row(
+                results_frame, court_abbr,
+                self._spot_tier_color(court_id), display_name, detail,
+            )
+            r["open_fn"] = open_fn
+            result_rows.append(r)
+            this_idx = len(result_rows) - 1
 
             def on_click(_e=None) -> None:
                 popup.destroy()
                 self._quick_popup = None
                 open_fn()
 
-            for widget in (row, badge, text_frame):
-                widget.bind("<Button-1>", on_click)
-            for child in text_frame.winfo_children():
-                child.bind("<Button-1>", on_click)
+            _bind_recursive(r["row"], "<Button-1>", on_click)
+            # Hovering a row selects it, so mouse and keyboard share one
+            # highlight and a click always opens the row under the pointer.
+            def on_hover(_e=None, i=this_idx) -> None:
+                selected_idx[0] = i
+                _highlight(i)
+            _bind_recursive(r["row"], "<Enter>", on_hover)
 
             # Grow the dropdown to fit the row just added.
             _resize_to(len(result_rows))
 
         def _highlight(idx: int) -> None:
             for i, r in enumerate(result_rows):
-                bg = "#d0e0f0" if i == idx else "#ffffff"
-                r["row"].config(bg=bg)
-                r["text_frame"].config(bg=bg)
-                for child in r["text_frame"].winfo_children():
-                    try:
-                        child.config(bg=bg)
-                    except tk.TclError:
-                        pass
+                self._spot_highlight_row(r, i == idx)
 
         def _on_key(event) -> None:
             if not result_rows:
@@ -2631,11 +2830,18 @@ class CourtListenerGUI:
 
         # Status label, pinned at the bottom so the result rows above it stay
         # put as results stream in.
-        status_lbl = tk.Label(
-            results_frame, text="Searching…", bg="#f0f0f0", fg="#999999",
-            font=("TkDefaultFont", 8), anchor="w",
-        )
-        status_lbl.pack(side="bottom", fill="x", padx=8, pady=(4, 4))
+        if _CTK_AVAILABLE:
+            status_lbl = ctk.CTkLabel(
+                results_frame, text="Searching…", fg_color="transparent",
+                text_color=_UI["muted"], font=_ui_font(11), anchor="w",
+            )
+            status_lbl.pack(side="bottom", fill="x", padx=14, pady=(6, 8))
+        else:
+            status_lbl = tk.Label(
+                results_frame, text="Searching…", bg="#f0f0f0", fg="#999999",
+                font=("TkDefaultFont", 8), anchor="w",
+            )
+            status_lbl.pack(side="bottom", fill="x", padx=8, pady=(4, 4))
         search_done = [0]  # track how many searches completed
         total_searches = 3  # Google Scholar + CourtListener + English Reports
 
@@ -2647,11 +2853,11 @@ class CourtListenerGUI:
                     return
                 n = len(result_rows)
                 if search_done[0] >= total_searches:
-                    status_lbl.config(
+                    status_lbl.configure(
                         text=f"{n} results" if n else "No results found"
                     )
                 else:
-                    status_lbl.config(text=f"{n} results so far…")
+                    status_lbl.configure(text=f"{n} results so far…")
             except tk.TclError:
                 pass
 
