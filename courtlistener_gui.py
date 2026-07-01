@@ -7805,6 +7805,28 @@ class _ScholarTextWindow:
                 return True
         return False
 
+    def _is_filled_hard_break(self, line_end: str, used: float,
+                              width: int, space_px: int) -> bool:
+        """Whether a display line that reaches its logical end — a <br>/source
+        hard break rather than a soft wrap — should still be justified.
+
+        Only a line the source *filled* and that the same paragraph continues
+        past is stretched to the margin.  A paragraph's last line, a line
+        standing on its own, or any line onto which the next line's first word
+        would still have fit is left ragged-right so short and final lines keep
+        their natural left (or centered) alignment instead of being spread out.
+        """
+        txt = self._text
+        next_start = txt.index(f"{line_end} +1c")
+        if txt.compare(next_start, ">=", "end-1c"):
+            return False  # nothing follows: last line of the document
+        next_text = txt.get(next_start, f"{next_start} lineend")
+        if not next_text.strip():
+            return False  # a blank line ends the paragraph: this is its last line
+        first_word = next_text.split(None, 1)[0]
+        remaining = width - used
+        return remaining < self._fonts["base"].measure(first_word) + space_px
+
     def _justify_display_lines(self) -> None:
         txt = self._text
         try:
@@ -7831,13 +7853,20 @@ class _ScholarTextWindow:
                 line_text = txt.get(idx, line_end)
                 used = self._fonts["base"].measure(line_text)
                 is_wrapped_line = txt.compare(line_end, "<", logical_end)
-                is_wide_hard_line = used >= width * 0.60
-                # Lower-court sources commonly arrive with hard line breaks
-                # rather than one logical Tk paragraph.  Justify those
-                # already-wide hard-broken lines too; otherwise only Supreme
-                # Court / Scholar text that wraps inside a logical paragraph
-                # gets stretched.
-                if ((is_wrapped_line or is_wide_hard_line)
+                # Full justification stretches every line of a paragraph except
+                # its last one, and never a line standing on its own.  A
+                # soft-wrapped display line is always a mid-paragraph line, so it
+                # is justified.  A line that reaches its logical end is a
+                # paragraph's last line, a lone line, or a <br>/source hard break;
+                # only a filled hard break the same paragraph runs on past is
+                # justified — last and short lines stay ragged-right (their
+                # natural left or centered alignment).
+                if is_wrapped_line:
+                    should_justify = True
+                else:
+                    should_justify = self._is_filled_hard_break(
+                        line_end, used, width, space_px)
+                if (should_justify
                         and not self._line_has_any_tag(
                             idx, line_end,
                             ("center", "heading", "blockquote", "pagenum", "fnhead"))):
