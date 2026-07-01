@@ -194,6 +194,17 @@ QStatusBar {
   background: #ffffff;
   border-top: 1px solid #dde3ea;
 }
+QToolButton#SpotlightActionButton {
+  background: #ffffff;
+  color: #243b53;
+  border: 1px solid #cfd8e3;
+  border-radius: 5px;
+  padding: 5px 8px;
+}
+QToolButton#SpotlightActionButton:hover {
+  background: #eef6ff;
+  border-color: #9fc6e8;
+}
 """
 
 
@@ -611,6 +622,7 @@ class GetCasesQt(QMainWindow):
             self._spotlight = SpotlightWindow(self)
             self._spotlight.search_requested.connect(self._run_spotlight_search)
             self._spotlight.open_requested.connect(self._open_spotlight_result)
+            self._spotlight.pdf_requested.connect(self._open_spotlight_pdf_result)
             self._spotlight.full_search_requested.connect(self._open_full_search_from_spotlight)
             self._spotlight.destroyed.connect(lambda: setattr(self, "_spotlight", None))
         self._spotlight.show()
@@ -664,6 +676,12 @@ class GetCasesQt(QMainWindow):
             self._open_english_reports_case(result.payload)
         else:
             QMessageBox.information(self, "Spotlight", "That result type is not openable yet.")
+
+    def _open_spotlight_pdf_result(self, result: SpotlightResult) -> None:
+        if result.source == "courtlistener" and isinstance(result.payload, dict):
+            self._open_courtlistener_item_pdf(result.payload)
+            return
+        QMessageBox.information(self, "Spotlight", "PDF opening is available for CourtListener results.")
 
     def _open_full_search_from_spotlight(self, query: str) -> None:
         self.show()
@@ -1147,11 +1165,15 @@ class GetCasesQt(QMainWindow):
         item = self.court_table.current_payload()
         if item is None:
             return
+        self._open_courtlistener_item_pdf(item)
+
+    def _open_courtlistener_item_pdf(self, item: dict) -> None:
         client = self._client_for_token(required=True)
         if client is None:
             return
 
         def task(status):
+            status("Finding PDF...")
             return resolve_pdf_url(client, item, status=status)
 
         def done(url: Optional[str]) -> None:

@@ -185,6 +185,10 @@ def name_match_score(query: str, candidate: str) -> float:
         q = set(_name_tokens(query))
         c = set(_name_tokens(candidate))
         return _party_overlap(q, c) if q else 0.0
+    if len(q_parties) == 1 and len(c_parties) > 1:
+        return _party_overlap(q_parties[0], set().union(*c_parties))
+    if len(c_parties) == 1 and len(q_parties) > 1:
+        return _party_overlap(set().union(*q_parties), c_parties[0])
     per_side = [max(_party_overlap(qp, cp) for cp in c_parties) for qp in q_parties]
     if max(per_side) < 0.6:
         return 0.0
@@ -209,6 +213,11 @@ def _match_tier(query: str, candidate: str) -> int:
             return 3
         if matches(qa, cb) and matches(qb, ca):
             return 2
+
+    if len(q_parties) == 1 and len(c_parties) > 1:
+        return 1 if _party_overlap(q_parties[0], set().union(*c_parties)) >= 0.6 else -1
+    if len(c_parties) == 1 and len(q_parties) > 1:
+        return 1 if _party_overlap(set().union(*q_parties), c_parties[0]) >= 0.6 else -1
 
     matched = [qp for qp in q_parties if any(matches(qp, cp) for cp in c_parties)]
     if not matched:
@@ -634,12 +643,15 @@ def courtlistener_spotlight_results(client, query: str) -> list[SpotlightResult]
 def cache_spotlight_results(query: str, db=None) -> list[SpotlightResult]:
     if OpinionDB is None and db is None:
         return []
+    parsed_citation = parse_citation_line(query or "")
+    citation_name = parsed_citation[0] if parsed_citation else ""
+    citation_query = parsed_citation[1] if parsed_citation else ""
     created_db = db is None
     database = db or OpinionDB()
     try:
         candidates = (
-            database.find(query)
-            if _is_citation_query(query)
+            database.find(citation_query)
+            if parsed_citation is not None
             else database.search_names(query, limit=60)
         )
     except Exception:
@@ -651,13 +663,17 @@ def cache_spotlight_results(query: str, db=None) -> list[SpotlightResult]:
     scored: list[tuple[int, float, str, dict]] = []
     for record in candidates:
         title = str(record.get("name") or "")
-        if _is_citation_query(query):
-            score = 1.0
-            tier = 3
+        if parsed_citation is not None:
+            if citation_name:
+                score = name_match_score(citation_name, title)
+                tier = max(0, _match_tier(citation_name, title))
+            else:
+                score = 1.0
+                tier = 3
         else:
             score = name_match_score(query, title)
             tier = _match_tier(query, title)
-        if score >= _NAME_MATCH_MIN:
+        if parsed_citation is not None or score >= _NAME_MATCH_MIN:
             scored.append((tier, score, str(record.get("year") or ""), record))
     scored.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
 

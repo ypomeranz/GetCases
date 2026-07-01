@@ -12,16 +12,18 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from spotlight_search import SpotlightResult, court_label
+from spotlight_search import SpotlightResult
 
 
 class SpotlightWindow(QDialog):
     search_requested = Signal(str)
     open_requested = Signal(object)
+    pdf_requested = Signal(object)
     full_search_requested = Signal(str)
 
     def __init__(self, parent=None) -> None:
@@ -87,9 +89,11 @@ class SpotlightWindow(QDialog):
         self.results_list.clear()
         for result in results:
             item = QListWidgetItem()
-            item.setSizeHint(QSize(660, 68))
+            item.setSizeHint(QSize(660, 72))
             self.results_list.addItem(item)
-            self.results_list.setItemWidget(item, SpotlightResultRow(result))
+            row = SpotlightResultRow(result)
+            row.pdf_requested.connect(self._request_pdf)
+            self.results_list.setItemWidget(item, row)
         if results:
             self.results_list.setCurrentRow(0)
             self.status_label.setText(f"{len(results)} result(s)")
@@ -116,6 +120,10 @@ class SpotlightWindow(QDialog):
             result = self._results[row]
             self.hide()
             self.open_requested.emit(result)
+
+    def _request_pdf(self, result: SpotlightResult) -> None:
+        self.hide()
+        self.pdf_requested.emit(result)
 
     def _open_full_search(self) -> None:
         query = self.query_edit.text().strip()
@@ -155,6 +163,8 @@ class SpotlightWindow(QDialog):
 
 
 class SpotlightResultRow(QWidget):
+    pdf_requested = Signal(object)
+
     def __init__(self, result: SpotlightResult, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("SpotlightRow")
@@ -162,12 +172,11 @@ class SpotlightResultRow(QWidget):
         layout.setContentsMargins(8, 7, 8, 7)
         layout.setSpacing(10)
 
-        badge_text = result.source_label
-        if result.court_id:
-            badge_text = court_label(result.court_id) or badge_text
+        badge_text = _source_badge(result)
         badge = QLabel(badge_text[:12])
         badge.setObjectName("SourceBadge")
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setToolTip(result.source_label)
         badge.setMinimumWidth(86)
         badge.setMaximumWidth(96)
         layout.addWidget(badge)
@@ -188,3 +197,20 @@ class SpotlightResultRow(QWidget):
         sub.setWordWrap(False)
         text_col.addWidget(sub)
         layout.addLayout(text_col, 1)
+
+        if result.source == "courtlistener" and isinstance(result.payload, dict):
+            pdf_btn = QToolButton()
+            pdf_btn.setObjectName("SpotlightActionButton")
+            pdf_btn.setText("PDF")
+            pdf_btn.setToolTip("Open PDF")
+            pdf_btn.clicked.connect(lambda: self.pdf_requested.emit(result))
+            layout.addWidget(pdf_btn)
+
+
+def _source_badge(result: SpotlightResult) -> str:
+    return {
+        "courtlistener": "CL",
+        "cache": "Cache",
+        "scholar": "Scholar",
+        "engrep": "Eng. Rep.",
+    }.get(result.source, result.source_label)
