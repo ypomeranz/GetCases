@@ -18,6 +18,7 @@ Token lookup order:
 from __future__ import annotations
 
 import difflib
+import importlib.util
 import json
 import os
 import re
@@ -45,9 +46,9 @@ def _ensure_dependencies() -> None:
     ``requests`` is required; the rest enable features and declining just
     disables them: ``beautifulsoup4`` (Google Scholar / opinion parsing),
     ``pynput`` (global hotkey), ``pypdfium2`` + ``Pillow`` (the in-app PDF
-    viewer), and ``curl_cffi`` + ``browser_cookie3`` (fetching the CommonLII
-    English Reports scans in-app through CloudFlare; without them E.R. cases
-    open in the browser instead).
+    viewer), ``customtkinter`` (modern window chrome/theme), and ``curl_cffi``
+    + ``browser_cookie3`` (fetching the CommonLII English Reports scans in-app
+    through CloudFlare; without them E.R. cases open in the browser instead).
     """
     import importlib
     import importlib.util
@@ -61,6 +62,7 @@ def _ensure_dependencies() -> None:
                 ("pynput", "pynput"),
                 ("pypdfium2", "pypdfium2"),  # in-app PDF viewer
                 ("PIL", "Pillow"),           # in-app PDF viewer (imports as PIL)
+                ("customtkinter", "customtkinter"),  # modern Tk shell/theme
                 ("curl_cffi", "curl_cffi"),  # English Reports scan fetch (CloudFlare)
                 ("browser_cookie3", "browser_cookie3"),  # reads Firefox clearance cookie
             )
@@ -108,6 +110,53 @@ def _ensure_dependencies() -> None:
 _ensure_dependencies()
 
 import requests as _requests
+
+if importlib.util.find_spec("customtkinter") is not None:
+    import customtkinter as ctk
+else:
+    ctk = None
+_CUSTOMTK_AVAILABLE = ctk is not None
+
+
+def _make_root() -> tk.Tk:
+    """Create the main window, using CustomTkinter when it is installed."""
+    if _CUSTOMTK_AVAILABLE:
+        ctk.set_appearance_mode("System")
+        ctk.set_default_color_theme("blue")
+        return ctk.CTk()
+    return tk.Tk()
+
+
+def _configure_modern_ttk_style(root: tk.Misc) -> None:
+    """Give the remaining ttk widgets a cleaner CustomTkinter-adjacent look."""
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    bg = "#f4f6f8"
+    card = "#ffffff"
+    border = "#d7dee8"
+    text = "#1f2937"
+    muted = "#4b5563"
+    accent = "#2563eb"
+    try:
+        root.configure(fg_color=bg)
+    except tk.TclError:
+        root.configure(background=bg)
+    style.configure(".", background=bg, foreground=text, font=("TkDefaultFont", 10))
+    style.configure("TFrame", background=bg)
+    style.configure("TLabelframe", background=bg, bordercolor=border, relief="solid")
+    style.configure("TLabelframe.Label", background=bg, foreground=muted, font=("TkDefaultFont", 10, "bold"))
+    style.configure("TLabel", background=bg, foreground=text)
+    style.configure("TButton", padding=(12, 6), borderwidth=0, focusthickness=0)
+    style.map("TButton", background=[("active", "#dbeafe")], foreground=[("disabled", "#9ca3af")])
+    style.configure("TEntry", fieldbackground=card, bordercolor=border, lightcolor=border, darkcolor=border, padding=4)
+    style.configure("TCombobox", fieldbackground=card, bordercolor=border, arrowcolor=accent, padding=4)
+    style.configure("Treeview", background=card, fieldbackground=card, foreground=text, rowheight=30, bordercolor=border)
+    style.configure("Treeview.Heading", background="#e5edf7", foreground=text, font=("TkDefaultFont", 10, "bold"))
+    style.map("Treeview", background=[("selected", accent)], foreground=[("selected", "#ffffff")])
+    style.configure("Vertical.TScrollbar", background="#e5e7eb", troughcolor=bg, bordercolor=bg, arrowcolor=muted)
 
 from bluebook_names import abbreviate_case_name
 from cl_parse import parse_cl_html as _parse_cl_html
@@ -1949,8 +1998,7 @@ class CourtListenerGUI:
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        style = ttk.Style()
-        style.configure("Treeview", rowheight=28)
+        _configure_modern_ttk_style(self.root)
 
         # --- Menubar ---
         menubar = tk.Menu(self.root)
@@ -12045,7 +12093,7 @@ class _CitingOpinionsWindow:
 
 
 def main() -> None:
-    root = tk.Tk()
+    root = _make_root()
     app = CourtListenerGUI(root)
     eng_rep.warm()  # load the English Reports index in the background
 
