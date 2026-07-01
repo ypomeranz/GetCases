@@ -326,22 +326,46 @@ class HtmlWindow(QMainWindow):
 
 
 class BriefWindow(HtmlWindow):
-    def __init__(self, title: str, text: str, link_callback, parent=None) -> None:
+    def __init__(
+        self,
+        title: str,
+        text: str,
+        link_callback,
+        *,
+        source_path: str = "",
+        open_original_callback=None,
+        parent=None,
+    ) -> None:
         super().__init__(
             title,
-            _brief_body(text),
+            _brief_body(title, text, source_path),
             link_callback=link_callback,
             parent=parent,
         )
+        if source_path and open_original_callback is not None:
+            toolbar = QToolBar("Brief", self)
+            toolbar.setMovable(False)
+            self.addToolBar(toolbar)
+            action = QAction("Original PDF", self)
+            action.triggered.connect(open_original_callback)
+            toolbar.addAction(action)
 
 
-def _brief_body(text: str) -> str:
+def _brief_body(title: str, text: str, source_path: str = "") -> str:
     links = detect_links(text)
+    source_name = Path(source_path).name if source_path else ""
+    count_text = f"{len(links)} citation link" + ("" if len(links) == 1 else "s")
     parts: list[str] = [
-        "<h1>Brief</h1>",
-        '<p class="muted">Detected citations are highlighted and clickable.</p>',
-        "<pre>",
+        f"<h1>{html.escape(title or 'Brief')}</h1>",
+        '<div class="opinion-meta">',
+        f"<span>{html.escape(count_text)}</span>",
     ]
+    if source_name:
+        parts.append(f"<span>{html.escape(source_name)}</span>")
+    parts.extend([
+        "</div>",
+        "<pre>",
+    ])
     pos = 0
     for start, end, action in links:
         if start < pos:
@@ -350,7 +374,7 @@ def _brief_body(text: str) -> str:
         kind, value = action
         href = "getcases://open?" + urllib.parse.urlencode({"kind": kind, "value": value})
         label = html.escape(text[start:end])
-        parts.append(f'<a class="cite" href="{href}">{label}</a>')
+        parts.append(f'<a class="cite cite-{html.escape(kind)}" href="{href}">{label}</a>')
         pos = end
     parts.append(html.escape(text[pos:]))
     parts.append("</pre>")
@@ -445,6 +469,7 @@ class GetCasesQt(QMainWindow):
         self._opinion_db_failed = False
         self._windows: list[QMainWindow] = []
         self._spotlight: Optional[SpotlightWindow] = None
+        self._spotlight_generation = 0
         self._citation_list_dialog: Optional[CitationListDialog] = None
         self._hotkey_listener = None
         self._hotkey_bridge = HotkeyBridge(self)
@@ -631,6 +656,8 @@ class GetCasesQt(QMainWindow):
         self._spotlight.focus_query(text)
 
     def _run_spotlight_search(self, query: str) -> None:
+        self._spotlight_generation += 1
+        generation = self._spotlight_generation
         action = self._spotlight_direct_action(query)
         if action is not None:
             if self._spotlight is not None:
@@ -645,12 +672,18 @@ class GetCasesQt(QMainWindow):
 
         def task(status):
             status("Searching spotlight...")
-            return spotlight_search(query, client=client, fetcher=fetcher, db=db)
+            return generation, query, spotlight_search(query, client=client, fetcher=fetcher, db=db)
 
-        def done(results: list[SpotlightResult]) -> None:
+        def done(payload) -> None:
+            completed_generation, completed_query, results = payload
+            if completed_generation != self._spotlight_generation:
+                return
             if self._spotlight is not None:
                 self._spotlight.set_results(results)
-            self.statusBar().showMessage(f"Spotlight found {len(results)} result(s).", 5000)
+            self.statusBar().showMessage(
+                f"Spotlight found {len(results)} result(s) for {completed_query}.",
+                5000,
+            )
 
         self._queue_worker("Spotlight Search", task, done)
 
@@ -1234,11 +1267,28 @@ class GetCasesQt(QMainWindow):
 
         def done(text: str) -> None:
             title = f"Brief - {Path(path).name}"
-            window = BriefWindow(title, text, self._handle_link)
+            open_original = (
+                (lambda checked=False, p=path: self._open_local_pdf(p))
+                if Path(path).suffix.lower() == ".pdf"
+                else None
+            )
+            window = BriefWindow(
+                title,
+                text,
+                self._handle_link,
+                source_path=path,
+                open_original_callback=open_original,
+            )
             self._show_window(window)
             self.statusBar().showMessage("Brief opened.", 5000)
 
         self._queue_worker("Open Brief", task, done)
+
+    def _open_local_pdf(self, path: str) -> None:
+        pdf_path = Path(path).resolve()
+        url = QUrl.fromLocalFile(str(pdf_path)).toString()
+        window = ChromiumPdfWindow(url, f"PDF - {pdf_path.name}")
+        self._show_window(window)
 
     def open_citation_list(self) -> None:
         if self._citation_list_dialog is None:
