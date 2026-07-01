@@ -10653,31 +10653,31 @@ class _PdfWindow:
         self._bytes: Optional[bytes] = None
         self._pane: Optional[_PdfPane] = None
 
-        self._win = tk.Toplevel(parent)
+        self._win = _ui_toplevel(parent)
         self._win.title(title)
         self._win.geometry("820x900")
         self._win.minsize(500, 320)
 
-        top = ttk.Frame(self._win)
-        top.pack(fill="x", padx=8, pady=(8, 4))
-        ttk.Label(top, text=title,
-                  font=("TkDefaultFont", 12, "bold")).pack(side="left")
+        top = _ui_frame(self._win)
+        top.pack(fill="x", padx=12, pady=(12, 4))
+        _ui_label(top, title, size=14, weight="bold", anchor="w").pack(side="left")
 
-        btns = ttk.Frame(self._win)
-        btns.pack(fill="x", side="bottom", padx=8, pady=(0, 8))
-        ttk.Button(btns, text="Download PDF",
+        btns = _ui_frame(self._win)
+        btns.pack(fill="x", side="bottom", padx=12, pady=(0, 10))
+        _ui_button(btns, "Download PDF", primary=True, width=124,
                    command=self._download).pack(side="right")
-        ttk.Button(btns, text="Print…",
-                   command=self._print).pack(side="right", padx=4)
-        ttk.Button(btns, text="−", width=3,
+        _ui_button(btns, "Print…", width=96,
+                   command=self._print).pack(side="right", padx=(0, 6))
+        _ui_button(btns, "−", width=42,
                    command=lambda: self._zoom(-1)).pack(side="left")
-        ttk.Button(btns, text="+", width=3,
-                   command=lambda: self._zoom(+1)).pack(side="left", padx=(2, 8))
+        _ui_button(btns, "+", width=42,
+                   command=lambda: self._zoom(+1)).pack(side="left", padx=(6, 10))
         self._status_var = tk.StringVar(value="Loading PDF…")
-        ttk.Label(btns, textvariable=self._status_var,
-                  foreground="gray").pack(side="left", fill="x", expand=True)
+        _ui_label(btns, muted=True, anchor="w",
+                  textvariable=self._status_var).pack(
+            side="left", fill="x", expand=True, padx=(10, 0))
 
-        self._body = ttk.Frame(self._win)
+        self._body = _ui_frame(self._win)
         self._body.pack(fill="both", expand=True)
 
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
@@ -10966,25 +10966,33 @@ def _choose_eng_rep_case(parent: tk.Misc,
                          cases: "list[eng_rep.ERCase]") -> "eng_rep.ERCase | None":
     """Several cases share one E.R. page — let the user pick.  Returns the chosen
     case, or None if cancelled."""
-    dlg = tk.Toplevel(parent)
+    dlg = _ui_toplevel(parent)
+    _ensure_modern_ttk_styles(dlg)
     dlg.title(f"{cases[0].er_cite} — {len(cases)} cases")
-    dlg.geometry("640x360")
+    dlg.geometry("640x380")
     # Only tie the dialog to the parent when the parent is actually on screen.
     # Invoked from the spotlight the main window is withdrawn, and making a modal
     # dialog transient to (or grabbing against) a hidden window leaves it
     # invisible / raises "grab failed: window not viewable".
     if parent.winfo_viewable():
         dlg.transient(parent)
-    ttk.Label(dlg, padding=(10, 8),
-              text=f"{len(cases)} cases are reported at {cases[0].er_cite}. "
-                   "Pick one:").pack(anchor="w")
-    box = ttk.Frame(dlg)
-    box.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-    lb = tk.Listbox(box, activestyle="dotbox")
-    sb = ttk.Scrollbar(box, orient="vertical", command=lb.yview)
+    _ui_label(dlg, f"{len(cases)} cases are reported at {cases[0].er_cite}. "
+                   "Pick one:", size=13, weight="bold", anchor="w").pack(
+        anchor="w", fill="x", padx=14, pady=(12, 0))
+    box = _ui_frame(dlg, card=True)
+    box.pack(fill="both", expand=True, padx=12, pady=(8, 8))
+    sb_style = "Modern.Vertical.TScrollbar" if _CTK_AVAILABLE else "Vertical.TScrollbar"
+    lb_kw = dict(activestyle="dotbox", borderwidth=0, highlightthickness=0)
+    if _CTK_AVAILABLE:
+        lb_kw.update(bg=_UI["window"], fg=_UI["text"],
+                     selectbackground=_UI["selection"],
+                     selectforeground=_UI["text"], font=("TkDefaultFont", 11))
+    lb = tk.Listbox(box, **lb_kw)
+    sb = ttk.Scrollbar(box, orient="vertical", command=lb.yview, style=sb_style)
     lb.configure(yscrollcommand=sb.set)
-    sb.pack(side="right", fill="y")
-    lb.pack(side="left", fill="both", expand=True)
+    pad = 8 if _CTK_AVAILABLE else 0
+    sb.pack(side="right", fill="y", pady=pad, padx=(0, pad))
+    lb.pack(side="left", fill="both", expand=True, padx=(pad, 0), pady=pad)
     for c in cases:
         tag = f"({c.letter}) " if c.letter else ""
         lb.insert("end", f"{tag}{c.name}  ·  {c.neutral}")
@@ -11001,10 +11009,10 @@ def _choose_eng_rep_case(parent: tk.Misc,
         dlg.destroy()
 
     lb.bind("<Double-Button-1>", lambda _e: ok())
-    btns = ttk.Frame(dlg)
-    btns.pack(fill="x", padx=10, pady=(0, 10))
-    ttk.Button(btns, text="Open", command=ok).pack(side="right")
-    ttk.Button(btns, text="Cancel", command=cancel).pack(side="right", padx=8)
+    btns = _ui_frame(dlg)
+    btns.pack(fill="x", padx=14, pady=(0, 12))
+    _ui_button(btns, "Open", command=ok, primary=True, width=92).pack(side="right")
+    _ui_button(btns, "Cancel", command=cancel, width=88).pack(side="right", padx=8)
     dlg.bind("<Return>", lambda _e: ok())
     dlg.bind("<Escape>", lambda _e: cancel())
     # Make sure the dialog is mapped and focused before grabbing — with the main
@@ -11173,7 +11181,7 @@ class _BriefTextWindow:
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
 
-        self._win = tk.Toplevel(parent)
+        self._win = _ui_toplevel(parent)
         self._win.title(f"Brief — {name}")
         self._win.geometry("860x720")
         self._win.minsize(500, 320)
@@ -11182,17 +11190,17 @@ class _BriefTextWindow:
 
     def _build_ui(self) -> None:
         win = self._win
-        legend = ttk.Frame(win)
-        legend.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(legend, text="Citations are highlighted and clickable:").pack(
-            side="left")
+        legend = _ui_frame(win)
+        legend.pack(fill="x", padx=12, pady=(12, 0))
+        _ui_label(legend, "Citations are highlighted and clickable:",
+                  muted=True).pack(side="left")
         for cat, label in (("case", "Cases"), ("statute", "Statutes / Rules"),
                            ("const", "Constitution")):
             tk.Label(legend, text=f" {label} ", background=_BRIEF_TINTS[cat],
                      foreground="#222222").pack(side="left", padx=(8, 0))
 
-        text_frame = ttk.Frame(win)
-        text_frame.pack(fill="both", expand=True, padx=8, pady=6)
+        text_frame = _ui_frame(win)
+        text_frame.pack(fill="both", expand=True, padx=12, pady=8)
         base = tkfont.Font(family="Georgia", size=_OPINION_FONT_PT)
         txt = tk.Text(text_frame, wrap="word", font=base, padx=14, pady=10)
         self._text = txt
@@ -11208,11 +11216,12 @@ class _BriefTextWindow:
         txt.tag_bind("brieflink", "<Leave>", lambda _e: txt.config(cursor=""))
         self._finder = _TextFinder(win, txt, text_frame)
 
-        bottom = ttk.Frame(win)
-        bottom.pack(fill="x", padx=8, pady=(0, 8))
+        bottom = _ui_frame(win)
+        bottom.pack(fill="x", padx=12, pady=(0, 10))
         self._status_var = tk.StringVar(value="")
-        ttk.Label(bottom, textvariable=self._status_var,
-                  foreground="gray").pack(side="left", fill="x", expand=True)
+        _ui_label(bottom, muted=True, anchor="w",
+                  textvariable=self._status_var).pack(
+            side="left", fill="x", expand=True)
 
     def _render(self) -> None:
         txt = self._text
@@ -11278,35 +11287,37 @@ class _LinkedPdfWindow:
         self._pane: Optional[_PdfPane] = None
         self._closed = False
 
-        self._win = tk.Toplevel(parent)
+        self._win = _ui_toplevel(parent)
         self._win.title(f"PDF citations — {name}")
         self._win.geometry("860x920")
         self._win.minsize(520, 360)
         self._win.bind("<Destroy>", self._on_destroy)
 
-        legend = ttk.Frame(self._win)
-        legend.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(legend, text="Scanning for citations…").pack(side="left")
+        legend = _ui_frame(self._win)
+        legend.pack(fill="x", padx=12, pady=(12, 0))
+        self._legend_lbl = _ui_label(legend, "Scanning for citations…",
+                                     muted=True)
+        self._legend_lbl.pack(side="left")
         for cat, label in (("case", "Cases"), ("statute", "Statutes / Rules"),
                            ("const", "Constitution")):
             tk.Label(legend, text=f" {label} ", background=_BRIEF_TINTS[cat],
                      foreground="#222222").pack(side="left", padx=(8, 0))
-        self._legend_lbl = legend.winfo_children()[0]
 
-        self._body = ttk.Frame(self._win)
+        self._body = _ui_frame(self._win)
         self._body.pack(fill="both", expand=True)
 
-        btns = ttk.Frame(self._win)
-        btns.pack(fill="x", side="bottom", padx=8, pady=(0, 8))
-        ttk.Button(btns, text="Download Cropped PDF",
+        btns = _ui_frame(self._win)
+        btns.pack(fill="x", side="bottom", padx=12, pady=(0, 10))
+        _ui_button(btns, "Download Cropped PDF", primary=True, width=176,
                    command=self._download).pack(side="right")
-        ttk.Button(btns, text="−", width=3,
+        _ui_button(btns, "−", width=42,
                    command=lambda: self._zoom(-1)).pack(side="left")
-        ttk.Button(btns, text="+", width=3,
-                   command=lambda: self._zoom(+1)).pack(side="left", padx=(2, 8))
+        _ui_button(btns, "+", width=42,
+                   command=lambda: self._zoom(+1)).pack(side="left", padx=(6, 10))
         self._status_var = tk.StringVar(value="Loading PDF…")
-        ttk.Label(btns, textvariable=self._status_var,
-                  foreground="gray").pack(side="left", fill="x", expand=True)
+        _ui_label(btns, muted=True, anchor="w",
+                  textvariable=self._status_var).pack(
+            side="left", fill="x", expand=True, padx=(10, 0))
 
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
             self._win.bind(seq, lambda _e: self._zoom(+1))
@@ -11365,7 +11376,7 @@ class _LinkedPdfWindow:
         self._post(self._scan_done, links, pages)
 
     def _scan_failed(self, msg: str) -> None:
-        self._legend_lbl.config(text="Citation scan failed:")
+        self._legend_lbl.configure(text="Citation scan failed:")
         self._status_var.set(msg)
 
     def _scan_done(self, links: dict, pages: list) -> None:
@@ -11375,7 +11386,7 @@ class _LinkedPdfWindow:
         self._pane.enable_find(pages)   # Ctrl-F searches the text layer
         n = sum(len(v) for v in links.values())
         has_text = any(pages)
-        self._legend_lbl.config(
+        self._legend_lbl.configure(
             text=("Citations are highlighted and clickable:" if n
                   else "No citations detected:"))
         msg = (f"{n} citation link{'' if n == 1 else 's'} — left-click to open, "
