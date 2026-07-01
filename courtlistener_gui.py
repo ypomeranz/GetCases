@@ -18,6 +18,7 @@ Token lookup order:
 from __future__ import annotations
 
 import difflib
+import importlib.util
 import json
 import os
 import re
@@ -45,9 +46,9 @@ def _ensure_dependencies() -> None:
     ``requests`` is required; the rest enable features and declining just
     disables them: ``beautifulsoup4`` (Google Scholar / opinion parsing),
     ``pynput`` (global hotkey), ``pypdfium2`` + ``Pillow`` (the in-app PDF
-    viewer), and ``curl_cffi`` + ``browser_cookie3`` (fetching the CommonLII
-    English Reports scans in-app through CloudFlare; without them E.R. cases
-    open in the browser instead).
+    viewer), ``customtkinter`` (modern window chrome/theme), and ``curl_cffi``
+    + ``browser_cookie3`` (fetching the CommonLII English Reports scans in-app
+    through CloudFlare; without them E.R. cases open in the browser instead).
     """
     import importlib
     import importlib.util
@@ -61,6 +62,7 @@ def _ensure_dependencies() -> None:
                 ("pynput", "pynput"),
                 ("pypdfium2", "pypdfium2"),  # in-app PDF viewer
                 ("PIL", "Pillow"),           # in-app PDF viewer (imports as PIL)
+                ("customtkinter", "customtkinter"),  # modern Tk shell/theme
                 ("curl_cffi", "curl_cffi"),  # English Reports scan fetch (CloudFlare)
                 ("browser_cookie3", "browser_cookie3"),  # reads Firefox clearance cookie
             )
@@ -108,6 +110,53 @@ def _ensure_dependencies() -> None:
 _ensure_dependencies()
 
 import requests as _requests
+
+if importlib.util.find_spec("customtkinter") is not None:
+    import customtkinter as ctk
+else:
+    ctk = None
+_CUSTOMTK_AVAILABLE = ctk is not None
+
+
+def _make_root() -> tk.Tk:
+    """Create the main window, using CustomTkinter when it is installed."""
+    if _CUSTOMTK_AVAILABLE:
+        ctk.set_appearance_mode("System")
+        ctk.set_default_color_theme("blue")
+        return ctk.CTk()
+    return tk.Tk()
+
+
+def _configure_modern_ttk_style(root: tk.Misc) -> None:
+    """Give the remaining ttk widgets a cleaner CustomTkinter-adjacent look."""
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    bg = "#f4f6f8"
+    card = "#ffffff"
+    border = "#d7dee8"
+    text = "#1f2937"
+    muted = "#4b5563"
+    accent = "#2563eb"
+    try:
+        root.configure(fg_color=bg)
+    except tk.TclError:
+        root.configure(background=bg)
+    style.configure(".", background=bg, foreground=text, font=("TkDefaultFont", 10))
+    style.configure("TFrame", background=bg)
+    style.configure("TLabelframe", background=bg, bordercolor=border, relief="solid")
+    style.configure("TLabelframe.Label", background=bg, foreground=muted, font=("TkDefaultFont", 10, "bold"))
+    style.configure("TLabel", background=bg, foreground=text)
+    style.configure("TButton", padding=(12, 6), borderwidth=0, focusthickness=0)
+    style.map("TButton", background=[("active", "#dbeafe")], foreground=[("disabled", "#9ca3af")])
+    style.configure("TEntry", fieldbackground=card, bordercolor=border, lightcolor=border, darkcolor=border, padding=4)
+    style.configure("TCombobox", fieldbackground=card, bordercolor=border, arrowcolor=accent, padding=4)
+    style.configure("Treeview", background=card, fieldbackground=card, foreground=text, rowheight=30, bordercolor=border)
+    style.configure("Treeview.Heading", background="#e5edf7", foreground=text, font=("TkDefaultFont", 10, "bold"))
+    style.map("Treeview", background=[("selected", accent)], foreground=[("selected", "#ffffff")])
+    style.configure("Vertical.TScrollbar", background="#e5e7eb", troughcolor=bg, bordercolor=bg, arrowcolor=muted)
 
 from bluebook_names import abbreviate_case_name
 from cl_parse import parse_cl_html as _parse_cl_html
@@ -1949,8 +1998,7 @@ class CourtListenerGUI:
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        style = ttk.Style()
-        style.configure("Treeview", rowheight=28)
+        _configure_modern_ttk_style(self.root)
 
         # --- Menubar ---
         menubar = tk.Menu(self.root)
@@ -6912,7 +6960,7 @@ class _ScholarTextWindow:
         vsb.pack(side="right", fill="y")
         self._partmap.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
-        txt.bind("<Configure>", lambda _e: self._schedule_gutter_redraw())
+        txt.bind("<Configure>", lambda _e: self._on_text_configure())
         self._partmap.bind("<Button-1>", self._on_partmap_click)
         self._partmap.bind("<Enter>", lambda _e: self._partmap.config(cursor="hand2"))
         self._partmap.bind("<Leave>", lambda _e: self._partmap.config(cursor=""))
@@ -6954,6 +7002,7 @@ class _ScholarTextWindow:
         txt.tag_bind("citelink", "<Enter>", lambda _e: txt.config(cursor="hand2"))
         txt.tag_bind("citelink", "<Leave>", lambda _e: txt.config(cursor=""))
         txt.tag_configure("jumpflash", background="#fff2a8")
+        txt.tag_configure("justify-pad")
         self._finder = _TextFinder(win, txt, text_frame)
 
         btn_frame = ttk.Frame(win)
@@ -7074,6 +7123,7 @@ class _ScholarTextWindow:
         if getattr(self, "_pagecol_font", None) is not None:
             self._pagecol_font.configure(size=max(new - 2, 7))
             self._partmap_font.configure(size=max(new - 3, 7))
+        self._schedule_text_justify()
         self._schedule_gutter_redraw()
         self._status_var.set(f"Text size: {new} pt")
 
@@ -7109,16 +7159,35 @@ class _ScholarTextWindow:
         "TeX Gyre Schola",
         "Century",
     )
+    # Non-SCOTUS opinions use Palatino Linotype; the follow-on names cover
+    # common Palatino-compatible installs on macOS/Linux before falling back to
+    # Georgia when no Palatino family is available.
+    _NON_SCOTUS_FONT_FAMILIES = (
+        "Palatino Linotype",
+        "Palatino",
+        "Book Antiqua",
+        "URW Palladio L",
+        "TeX Gyre Pagella",
+        "Georgia",
+    )
 
     def _opinion_font_family(self) -> str:
-        """Body font for the opinion: Century Schoolbook for Supreme Court
-        decisions (its house typeface), the default serif otherwise."""
-        if self._is_scotus:
-            available = {f.lower() for f in tkfont.families(self._win)}
-            for fam in self._SCOTUS_FONT_FAMILIES:
-                if fam.lower() in available:
-                    return fam
-        return "Georgia"
+        """Body font for the opinion text.
+
+        Supreme Court decisions use Century Schoolbook variants where present;
+        all other opinions prefer Palatino Linotype for consistent justification
+        metrics, with compatible fallbacks for systems that lack the Windows
+        font.
+        """
+        available = {f.lower() for f in tkfont.families(self._win)}
+        families = (
+            self._SCOTUS_FONT_FAMILIES
+            if self._is_scotus else self._NON_SCOTUS_FONT_FAMILIES
+        )
+        for fam in families:
+            if fam.lower() in available:
+                return fam
+        return families[0]
 
     def _new_link(self, action: tuple[str, str]) -> str:
         self._link_n += 1
@@ -7684,6 +7753,7 @@ class _ScholarTextWindow:
             f"{len(self._scholar_text):,} characters | Google Scholar version{extra}"
         )
         self._finder.refresh()
+        self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
     def _on_part_selected(self, _event=None) -> None:
@@ -7734,6 +7804,110 @@ class _ScholarTextWindow:
         else:
             self._view_label_var.set("Full opinion")
             self._view_label.config(foreground="black")
+
+    # ------------------------------------------------------------------
+    # Text justification
+    # ------------------------------------------------------------------
+
+    def _on_text_configure(self) -> None:
+        """Reflow display-line justification and redraw side gutters on resize."""
+        self._schedule_text_justify()
+        self._schedule_gutter_redraw()
+
+    def _schedule_text_justify(self) -> None:
+        """Justify opinion text after Tk has recalculated display lines.
+
+        Tk's Text widget supports left, right, and centered paragraphs, but not
+        newspaper-style full justification.  The standard workaround is to add
+        small runs of extra spaces to each wrapped display line and then rebuild
+        those padding spaces whenever the widget is resized.  The spaces are
+        tagged so they can be removed before each recalculation.
+        """
+        if getattr(self, "_justify_pending", False):
+            return
+        if getattr(self, "_mode", None) == "pdf":
+            return
+        self._justify_pending = True
+
+        def run() -> None:
+            self._justify_pending = False
+            self._justify_display_lines()
+            self._schedule_gutter_redraw()
+
+        try:
+            self._win.after_idle(run)
+        except tk.TclError:
+            self._justify_pending = False
+
+    def _clear_justification(self) -> None:
+        txt = self._text
+        ranges = list(txt.tag_ranges("justify-pad"))
+        for start, end in zip(ranges[-2::-2], ranges[-1::-2]):
+            txt.delete(start, end)
+
+    def _line_has_any_tag(self, start: str, end: str, names: tuple[str, ...]) -> bool:
+        txt = self._text
+        for name in names:
+            ranges = txt.tag_nextrange(name, start, end)
+            if ranges:
+                return True
+        return False
+
+    def _justify_display_lines(self) -> None:
+        txt = self._text
+        try:
+            old_state = str(txt.cget("state"))
+        except tk.TclError:
+            return
+        try:
+            txt.config(state="normal")
+            self._clear_justification()
+            txt.update_idletasks()
+            width = txt.winfo_width() - int(txt.cget("padx")) * 2 - 4
+            if width <= 100:
+                return
+            space_px = max(self._fonts["base"].measure(" "), 1)
+            idx = "1.0"
+            while txt.compare(idx, "<", "end-1c"):
+                try:
+                    line_end = txt.index(f"{idx} display lineend")
+                    txt.mark_set("__justify_next", f"{line_end} +1c")
+                    txt.mark_gravity("__justify_next", "right")
+                except tk.TclError:
+                    break
+                logical_end = txt.index(f"{idx} lineend")
+                line_text = txt.get(idx, line_end)
+                used = self._fonts["base"].measure(line_text)
+                is_wrapped_line = txt.compare(line_end, "<", logical_end)
+                is_wide_hard_line = used >= width * 0.60
+                # Lower-court sources commonly arrive with hard line breaks
+                # rather than one logical Tk paragraph.  Justify those
+                # already-wide hard-broken lines too; otherwise only Supreme
+                # Court / Scholar text that wraps inside a logical paragraph
+                # gets stretched.
+                if ((is_wrapped_line or is_wide_hard_line)
+                        and not self._line_has_any_tag(
+                            idx, line_end,
+                            ("center", "heading", "blockquote", "pagenum", "fnhead"))):
+                    space_offsets = [m.start() for m in re.finditer(r"(?<=\S) (?=\S)", line_text)]
+                    if space_offsets:
+                        need = max(0, width - used)
+                        # Leave a small safety margin so approximate font
+                        # measurements do not push the line onto the next wrap.
+                        extra = max(0, (need // space_px) - 1)
+                        if extra:
+                            per, rem = divmod(extra, len(space_offsets))
+                            # Insert from right to left so offsets remain valid.
+                            for n, off in enumerate(reversed(space_offsets)):
+                                add = per + (1 if n < rem else 0)
+                                if add:
+                                    txt.insert(f"{idx}+{off + 1}c", " " * add, ("justify-pad",))
+                idx = txt.index("__justify_next")
+        finally:
+            try:
+                txt.config(state=old_state)
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
     # Side gutters: left page-number column and right concurrence/dissent map
@@ -7992,6 +8166,7 @@ class _ScholarTextWindow:
         self._hide_cl_button()  # CL view uses the toggle for "Google Scholar Text"
         self._show_pdf_button()
         self._finder.refresh()
+        self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
     def _show_courtlistener(self) -> None:
@@ -8016,6 +8191,8 @@ class _ScholarTextWindow:
         )
         self._show_pdf_button()
         self._finder.refresh()
+        self._schedule_text_justify()
+        self._schedule_gutter_redraw()
 
     # ------------------------------------------------------------------
     # Bluebook citation
@@ -11916,7 +12093,7 @@ class _CitingOpinionsWindow:
 
 
 def main() -> None:
-    root = tk.Tk()
+    root = _make_root()
     app = CourtListenerGUI(root)
     eng_rep.warm()  # load the English Reports index in the background
 
