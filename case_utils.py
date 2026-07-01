@@ -19,6 +19,12 @@ except Exception:  # pragma: no cover
 
 
 _CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+)\s+(\d+)")
+_LINE_CITE_RE = re.compile(
+    r"(\d{1,4})\s+([A-Z][A-Za-z0-9.'\u2019 ]{0,24}?)\s+(\d{1,5})(?=[\s,;.)(]|$)"
+)
+_PINCITE_AFTER_RE = re.compile(
+    r",\s*(\d{1,5})(?:\s*[-\u2013\u2014]\s*\d{1,5})?(?!\d|\s*[A-Z])"
+)
 _NOISE_CITE_RE = re.compile(r"lexis|westlaw|\bwl\b", re.IGNORECASE)
 _REPORTER_SERIES_RE = re.compile(r"\b\d*(?:2d|3d|4th|5th|6th)\b\.?|\b\d+\b")
 _SCOTUS_REPORTERS = {
@@ -66,6 +72,20 @@ def strip_html(value: object) -> str:
     """Return text with tags removed and whitespace normalized."""
     text = re.sub(r"<[^>]+>", "", str(value or ""))
     return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_citation_line(line: str) -> Optional[tuple[str, str, str]]:
+    """Parse a typed citation line into ``(name, cite, pin)``."""
+    match = _LINE_CITE_RE.search(line or "")
+    if not match:
+        return None
+    cite = re.sub(r"\s+", " ", f"{match.group(1)} {match.group(2)} {match.group(3)}")
+    cite = cite.replace("U. S.", "U.S.").replace("\u2019", "'")
+    cite = re.sub(r"\bU\s*S\b", "U.S.", cite, flags=re.IGNORECASE)
+    name = (line or "")[: match.start()].strip().rstrip(",;- ").strip()
+    pin_match = _PINCITE_AFTER_RE.match(line or "", match.end())
+    pin = pin_match.group(1) if pin_match else ""
+    return name, cite, pin
 
 
 def cluster_citations_to_strings(citations: object) -> list[str]:

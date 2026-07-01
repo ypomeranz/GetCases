@@ -15,8 +15,10 @@ from typing import Optional
 
 from case_utils import (
     case_name,
+    citation_list,
     cluster_citations_to_strings,
     normalize_result_citations,
+    parse_citation_line,
     pick_citation,
     strip_html,
 )
@@ -49,10 +51,6 @@ _NAME_STOPWORDS = {
 _NAME_PARTY_SPLIT_RE = re.compile(r"\s+v(?:s)?\.?\s+", re.IGNORECASE)
 _US_PARTY_RE = re.compile(r"^\s*u\.?\s*s\.?\s*a?\.?\s*$", re.IGNORECASE)
 _CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+)\s+(\d+)")
-_LINE_CITE_RE = re.compile(
-    r"(\d{1,4})\s+([A-Z][A-Za-z0-9.' ]{0,24}?)\s+(\d{1,5})(?=[\s,;.)(]|$)"
-)
-
 _CIRCUIT_ORDINAL_IDS = {
     "1st": "ca1", "2d": "ca2", "2nd": "ca2", "3d": "ca3", "3rd": "ca3",
     "4th": "ca4", "5th": "ca5", "6th": "ca6", "7th": "ca7", "8th": "ca8",
@@ -325,6 +323,8 @@ def _is_scotus_order_item(item: dict) -> bool:
         return False
     opinions = item.get("opinions") or []
     main_op = max(opinions, key=lambda op: len(op.get("cites") or []), default=None)
+    if main_op is None:
+        return False
     cites_count = len(main_op.get("cites") or []) if main_op else 0
     return cites_count <= 2
 
@@ -544,7 +544,49 @@ def _item_from_cluster(cluster: dict) -> dict:
 
 
 def _is_citation_query(query: str) -> bool:
-    return _LINE_CITE_RE.search(query or "") is not None
+    return parse_citation_line(query or "") is not None
+
+
+def _normalize_citation_key(cite: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", cite.lower())
+
+
+def _item_has_citation(item: dict, cite: str) -> bool:
+    want = _normalize_citation_key(cite)
+    return any(_normalize_citation_key(candidate) == want for candidate in citation_list(item.get("citation")))
+
+
+def _courtlistener_citation_lookup_items(client, cite: str) -> list[dict]:
+    results: list[dict] = []
+    try:
+        for entry in client.lookup_citation(cite):
+            if entry.get("status") != 200:
+                continue
+            for cluster in entry.get("clusters") or []:
+                item = _item_from_cluster(cluster)
+                if item.get("cluster_id"):
+                    results.append(item)
+    except Exception:
+        return []
+    return results
+
+
+def _courtlistener_citation_search_items(client, cite: str) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for query in (f"citation:({cite})", f'"{cite}"'):
+        try:
+            data = client.search(query, type="o", page_size=10)
+        except Exception:
+            continue
+        for item in data.get("results") or []:
+            normalize_result_citations(item)
+            key = str(item.get("cluster_id") or item.get("absolute_url") or item.get("caseName"))
+            if key in seen or not _item_has_citation(item, cite):
+                continue
+            seen.add(key)
+            out.append(item)
+    return out
 
 
 def _spotlight_from_cl_item(bucket: str, item: dict) -> SpotlightResult:
@@ -570,22 +612,12 @@ def _spotlight_from_cl_item(bucket: str, item: dict) -> SpotlightResult:
 def courtlistener_spotlight_results(client, query: str) -> list[SpotlightResult]:
     if client is None:
         return []
-    if _is_citation_query(query):
-        results: list[dict] = []
-        try:
-            for entry in client.lookup_citation(query):
-                if entry.get("status") != 200:
-                    continue
-                for cluster in entry.get("clusters") or []:
-                    results.append(_item_from_cluster(cluster))
-        except Exception:
-            results = []
+    parsed = parse_citation_line(query or "")
+    if parsed is not None:
+        _name, cite, _pin = parsed
+        results = _courtlistener_citation_lookup_items(client, cite)
         if not results:
-            try:
-                data = client.search(query, type="o", page_size=10)
-                results = data.get("results") or []
-            except Exception:
-                results = []
+            results = _courtlistener_citation_search_items(client, cite)
         return [
             _spotlight_from_cl_item("cl", item)
             for item in results
@@ -733,9 +765,9 @@ def scholar_result_cite(result) -> str:
     if cites:
         return pick_citation(cites)
     text = f"{getattr(result, 'title', '')} {getattr(result, 'snippet', '')}"
-    match = _LINE_CITE_RE.search(text)
-    if match:
-        return re.sub(r"\s+", " ", f"{match.group(1)} {match.group(2)} {match.group(3)}")
+    parsed = parse_citation_line(text)
+    if parsed:
+        return parsed[1]
     return ""
 
 

@@ -8,6 +8,8 @@ over incrementally.
 from __future__ import annotations
 
 import html
+import json
+import re
 import sys
 import traceback
 import urllib.parse
@@ -50,14 +52,17 @@ except ImportError as exc:  # pragma: no cover - user-facing startup check.
 
 import brief_reader
 import eng_rep
+import oyez
 from case_utils import (
     build_default_filename,
     case_name,
+    citation_list,
     federal_appendix_cite,
     format_case_row,
     is_federal_appendix_cite,
     is_scotus_order,
     normalize_result_citations,
+    parse_citation_line,
     pick_citation,
     preview_from_item,
     static_case_law_url,
@@ -70,7 +75,11 @@ from getcases_config import load_token, save_token
 from opinion_db import OpinionDB
 from pdf_resolver import fetch_pdf_bytes, resolve_pdf_url
 from qt_courts import CourtPickerDialog, courts_summary
-from qt_opinions import render_opinion_parts_body, render_scholar_opinion_body
+from qt_opinions import (
+    render_opinion_parts_body,
+    render_oyez_case_details,
+    render_scholar_opinion_body,
+)
 from qt_pdf import ChromiumPdfWindow, LinkHandlingPage, html_document
 from qt_spotlight import SpotlightWindow
 from qt_sources import (
@@ -251,6 +260,59 @@ class HtmlWindow(QMainWindow):
         self.view.setHtml(html_document(title, body, base_url), QUrl(base_url or "about:blank"))
         self.setCentralWidget(self.view)
 
+    def run_javascript_soon(self, js: str, delay_ms: int = 150) -> None:
+        def run() -> None:
+            try:
+                self.view.page().runJavaScript(js)
+            except RuntimeError:
+                pass
+
+        self.view.loadFinished.connect(lambda _ok: QTimer.singleShot(delay_ms, run))
+        QTimer.singleShot(delay_ms + 200, run)
+
+    def insert_top_fragment(self, fragment: str) -> None:
+        if not fragment:
+            return
+        js = f"""
+(() => {{
+  const template = document.createElement("template");
+  template.innerHTML = {json.dumps(fragment)};
+  const node = template.content.firstElementChild;
+  if (!node) return false;
+  const existing = document.getElementById(node.id);
+  if (existing) {{
+    existing.replaceWith(node);
+    return true;
+  }}
+  const anchor = document.querySelector(".opinion-meta") || document.querySelector("h1");
+  if (anchor) {{
+    anchor.insertAdjacentElement("afterend", node);
+    return true;
+  }}
+  const main = document.querySelector("main") || document.body;
+  main.prepend(node);
+  return true;
+}})();
+"""
+        self.run_javascript_soon(js)
+
+    def scroll_to_page(self, pin: str) -> None:
+        page = "".join(ch for ch in str(pin or "") if ch.isalnum())
+        if not page:
+            return
+        anchor = "page-" + page
+        js = f"""
+(() => {{
+  const el = document.getElementById({anchor!r});
+  if (!el) return false;
+  el.scrollIntoView({{block: "center", behavior: "smooth"}});
+  el.style.background = "rgba(73, 168, 255, .22)";
+  el.style.borderRadius = "4px";
+  return true;
+}})();
+"""
+        self.run_javascript_soon(js)
+
 
 class BriefWindow(HtmlWindow):
     def __init__(self, title: str, text: str, link_callback, parent=None) -> None:
@@ -288,6 +350,74 @@ class HotkeyBridge(QObject):
     activated = Signal()
 
 
+class CitationListDialog(QDialog):
+    open_requested = Signal(list)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Open Citation List")
+        self.resize(620, 480)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel("One citation per line. Case name is optional.")
+        intro.setObjectName("SectionTitle")
+        layout.addWidget(intro)
+
+        hint = QLabel("Example: Monroe v. Pape, 365 U.S. 167, 171 (1961)")
+        hint.setObjectName("MutedLabel")
+        layout.addWidget(hint)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setAcceptRichText(False)
+        layout.addWidget(self.text_edit, 1)
+
+        self.failure_box = QTextEdit()
+        self.failure_box.setReadOnly(True)
+        self.failure_box.setMaximumHeight(110)
+        self.failure_box.hide()
+        layout.addWidget(self.failure_box)
+
+        row = QHBoxLayout()
+        self.open_btn = QPushButton("Open All")
+        self.open_btn.clicked.connect(self._request_open)
+        row.addWidget(self.open_btn)
+        self.status_label = QLabel("Ready")
+        self.status_label.setObjectName("MutedLabel")
+        row.addWidget(self.status_label, 1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+
+    def lines(self) -> list[str]:
+        return [line.strip() for line in self.text_edit.toPlainText().splitlines() if line.strip()]
+
+    def set_status(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def set_running(self, running: bool) -> None:
+        self.open_btn.setEnabled(not running)
+        if running:
+            self.failure_box.clear()
+            self.failure_box.hide()
+
+    def set_finished(self, opened: int, total: int, failures: list[str]) -> None:
+        self.set_running(False)
+        if failures:
+            self.status_label.setText(f"Opened {opened} of {total}; {len(failures)} not found.")
+            self.failure_box.setPlainText("\n".join(failures))
+            self.failure_box.show()
+        else:
+            self.status_label.setText(f"Opened all {opened} citation(s).")
+
+    def _request_open(self) -> None:
+        lines = self.lines()
+        if not lines:
+            self.set_status("Nothing to open.")
+            return
+        self.open_requested.emit(lines)
+
+
 class GetCasesQt(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -304,6 +434,7 @@ class GetCasesQt(QMainWindow):
         self._opinion_db_failed = False
         self._windows: list[QMainWindow] = []
         self._spotlight: Optional[SpotlightWindow] = None
+        self._citation_list_dialog: Optional[CitationListDialog] = None
         self._hotkey_listener = None
         self._hotkey_bridge = HotkeyBridge(self)
         self._hotkey_bridge.activated.connect(self.show_spotlight)
@@ -430,6 +561,9 @@ class GetCasesQt(QMainWindow):
         self.open_brief_action = QAction("Open Brief", self)
         toolbar.addAction(self.open_brief_action)
 
+        self.open_citation_list_action = QAction("Open Citation List", self)
+        toolbar.addAction(self.open_citation_list_action)
+
         self.quick_lookup_action = QAction("Quick Lookup", self)
         toolbar.addAction(self.quick_lookup_action)
 
@@ -456,6 +590,7 @@ class GetCasesQt(QMainWindow):
         self.courts_btn.clicked.connect(self.show_court_picker)
         self.save_token_action.triggered.connect(self._save_token)
         self.open_brief_action.triggered.connect(self.open_brief)
+        self.open_citation_list_action.triggered.connect(self.open_citation_list)
         self.quick_lookup_action.triggered.connect(self.quick_lookup)
         self.legacy_action.triggered.connect(self._show_legacy_hint)
         self.court_table.itemSelectionChanged.connect(self._on_court_selection)
@@ -840,11 +975,12 @@ class GetCasesQt(QMainWindow):
                 return ("courtlistener", assemble_case_parts(client, item))
             return None
 
-        self._queue_worker(
-            "Opinion Text",
-            task,
-            lambda result: self._show_text_result(result, name),
-        )
+        def done(result) -> None:
+            window = self._show_text_result(result, name)
+            if result and result[0] == "scholar":
+                self._attach_oyez_details_for_item(window, item)
+
+        self._queue_worker("Opinion Text", task, done)
 
     def _open_cached_opinion(self, summary: dict) -> None:
         scholar_id = str(summary.get("scholar_id") or "")
@@ -890,18 +1026,17 @@ class GetCasesQt(QMainWindow):
             lambda result: self._show_text_result(("scholar", result) if result else None, title),
         )
 
-    def _show_text_result(self, result, title: str) -> None:
+    def _show_text_result(self, result, title: str) -> Optional[HtmlWindow]:
         if not result:
             QMessageBox.warning(
                 self,
                 "Opinion Text",
                 "No matching opinion text was found from Scholar or CourtListener.",
             )
-            return
+            return None
         source, payload = result
         if source == "scholar":
-            self._show_opinion_result(payload, title)
-            return
+            return self._show_opinion_result(payload, title)
         if source == "courtlistener" and isinstance(payload, CourtListenerOpinion):
             body = render_opinion_parts_body(
                 payload.title or title,
@@ -911,17 +1046,102 @@ class GetCasesQt(QMainWindow):
             )
             window = HtmlWindow(payload.title or title, body, link_callback=self._handle_link)
             self._show_window(window)
-            return
+            self._attach_oyez_details_for_cluster(window, payload.cluster, payload.title or title)
+            return window
         QMessageBox.warning(self, "Opinion Text", "The opinion text result was not understood.")
+        return None
 
-    def _show_opinion_result(self, result, title: str) -> None:
+    def _show_opinion_result(self, result, title: str) -> Optional[HtmlWindow]:
         if not result:
             QMessageBox.warning(self, "Scholar Text", "No matching opinion text was found.")
-            return
+            return None
         url, opinion_html = result
         body = render_scholar_opinion_body(title, url, opinion_html)
         window = HtmlWindow(title, body, base_url=url, link_callback=self._handle_link)
         self._show_window(window)
+        self._attach_oyez_details_for_title(window, title)
+        return window
+
+    def _attach_oyez_details_for_item(self, window: Optional[HtmlWindow], item: dict) -> None:
+        cites = citation_list(item.get("citation", []))
+        name = case_name(item, "")
+        year = str(item.get("dateFiled") or item.get("date_filed") or "")[:4]
+        hint = " ".join(
+            str(item.get(key) or "")
+            for key in ("court_id", "court", "court_citation_string")
+        )
+        self._attach_oyez_details(window, cites, name, year, hint)
+
+    def _attach_oyez_details_for_cluster(
+        self,
+        window: Optional[HtmlWindow],
+        cluster: dict,
+        fallback_title: str,
+    ) -> None:
+        cites = citation_list(cluster.get("citations") or [])
+        name = strip_html(cluster.get("case_name") or fallback_title)
+        year = str(cluster.get("date_filed") or "")[:4]
+        hint = str(cluster.get("court_id") or cluster.get("court") or "")
+        self._attach_oyez_details(window, cites, name, year, hint)
+
+    def _attach_oyez_details_for_title(
+        self,
+        window: Optional[HtmlWindow],
+        title: str,
+    ) -> None:
+        parsed = parse_citation_line(title)
+        if parsed is None:
+            cites: list[str] = []
+            name = re.split(r"\s[-\u2013]\s", title or "", maxsplit=1)[0].strip()
+        else:
+            name, cite, _pin = parsed
+            cites = [cite]
+            if not name:
+                name = re.split(r"\s[-\u2013]\s", title or "", maxsplit=1)[0].strip()
+        years = re.findall(r"\b(?:17|18|19|20)\d{2}\b", title or "")
+        year = years[-1] if years else ""
+        hint = "Supreme Court" if "supreme court" in (title or "").lower() else ""
+        self._attach_oyez_details(window, cites, name, year, hint)
+
+    def _attach_oyez_details(
+        self,
+        window: Optional[HtmlWindow],
+        cites: list[str],
+        name: str,
+        year: str,
+        hint: str = "",
+    ) -> None:
+        if window is None:
+            return
+        clean_cites = list(dict.fromkeys(c for c in cites if c))
+        if not self._should_lookup_oyez(clean_cites, hint):
+            return
+
+        def task(status):
+            status("Looking up Supreme Court details...")
+            try:
+                return oyez.lookup(cites=clean_cites, name=name, year=year)
+            except Exception as exc:
+                print(f"[qt] Oyez lookup failed for {name!r}: {exc}")
+                return None
+
+        def done(case) -> None:
+            fragment = render_oyez_case_details(case)
+            if not fragment:
+                return
+            try:
+                window.insert_top_fragment(fragment)
+            except RuntimeError:
+                pass
+
+        self._queue_worker("Oyez Details", task, done)
+
+    @staticmethod
+    def _should_lookup_oyez(cites: list[str], hint: str = "") -> bool:
+        haystack = " ".join(cites + [hint]).lower()
+        if "scotus" in haystack or "supreme court" in haystack:
+            return True
+        return any(re.search(r"\b\d+\s+U\.?\s*S\.?\s+\d+\b", cite, re.IGNORECASE) for cite in cites)
 
     def view_selected_pdf(self) -> None:
         item = self.court_table.current_payload()
@@ -997,6 +1217,64 @@ class GetCasesQt(QMainWindow):
             self.statusBar().showMessage("Brief opened.", 5000)
 
         self._queue_worker("Open Brief", task, done)
+
+    def open_citation_list(self) -> None:
+        if self._citation_list_dialog is None:
+            dialog = CitationListDialog(self)
+            dialog.open_requested.connect(lambda lines, d=dialog: self._run_citation_list(lines, d))
+            dialog.destroyed.connect(lambda: setattr(self, "_citation_list_dialog", None))
+            self._citation_list_dialog = dialog
+        self._citation_list_dialog.show()
+        self._citation_list_dialog.raise_()
+        self._citation_list_dialog.activateWindow()
+
+    def _run_citation_list(self, lines: list[str], dialog: CitationListDialog) -> None:
+        entries: list[tuple[str, str, str, str]] = []
+        failures: list[str] = []
+        for line in lines:
+            parsed = parse_citation_line(line)
+            if parsed is None:
+                failures.append(f"{line}   (no citation recognized)")
+                continue
+            name, cite, pin = parsed
+            entries.append((line, name, cite, pin))
+        if not entries:
+            dialog.set_finished(0, len(lines), failures)
+            return
+
+        fetcher = self._scholar_fetcher() if GoogleScholarFetcher is not None else None
+        client = self._client_for_token(required=False)
+        has_direct_pdf = any(is_federal_appendix_cite(cite) for _line, _name, cite, _pin in entries)
+        if fetcher is None and client is None and not has_direct_pdf:
+            dialog.set_status("Neither Google Scholar nor CourtListener is available.")
+            return
+
+        dialog.set_running(True)
+
+        def task(status):
+            opened = []
+            missed = list(failures)
+            total = len(entries)
+            for index, (line, name, cite, pin) in enumerate(entries, 1):
+                status(f"({index}/{total}) Opening {cite}...")
+                resolved = self._resolve_citation(name, cite, pin, fetcher, client, status)
+                if resolved is None:
+                    missed.append(line)
+                else:
+                    opened.append(resolved)
+            return opened, missed
+
+        def done(result) -> None:
+            opened, missed = result
+            for resolved in opened:
+                self._show_resolved_citation(resolved)
+            dialog.set_finished(len(opened), len(lines), missed)
+            self.statusBar().showMessage(
+                f"Opened {len(opened)} of {len(lines)} citation(s).",
+                7000,
+            )
+
+        self._queue_worker("Open Citation List", task, done)
 
     def quick_lookup(self) -> None:
         text, ok = QInputDialog.getText(
@@ -1112,6 +1390,7 @@ class GetCasesQt(QMainWindow):
 
     def _open_citation(self, cite: str) -> None:
         base = cite.split("@", 1)[0]
+        pin = cite.split("@", 1)[1] if "@" in cite else ""
         if is_federal_appendix_cite(base) and self._open_case_law_pdf(base):
             return
         fetcher = self._scholar_fetcher()
@@ -1126,22 +1405,59 @@ class GetCasesQt(QMainWindow):
 
         def task(status):
             status(f"Opening {base}...")
-            if fetcher is not None:
-                result = fetcher.fetch_by_citation(base)
-                if result:
-                    return ("scholar", result)
-            if client is not None:
-                for candidate in courtlistener_spotlight_results(client, base):
-                    if isinstance(candidate.payload, dict):
-                        status("Fetching opinion text from CourtListener...")
-                        return ("courtlistener", assemble_case_parts(client, candidate.payload))
-            return None
+            return self._resolve_citation("", base, pin, fetcher, client, status)
 
         self._queue_worker(
             "Open Citation",
             task,
-            lambda result: self._show_text_result(result, base),
+            lambda result: self._show_resolved_citation(result, fallback_title=base),
         )
+
+    def _resolve_citation(self, name: str, cite: str, pin: str, fetcher, client, status):
+        if is_federal_appendix_cite(cite):
+            url = static_case_law_url(cite)
+            if url:
+                title = f"{name} - {cite}" if name else cite
+                return "pdf", (url, title), title, ""
+        if fetcher is not None:
+            try:
+                result = fetcher.fetch_by_citation(cite)
+                if not result and name:
+                    hits = fetcher.search_cases(f"{name} {cite}", limit=1)
+                    if hits:
+                        result = fetcher.fetch_by_url(hits[0].url)
+                if result:
+                    return "scholar", result, name or cite, pin
+            except Exception as exc:
+                print(f"[qt] Scholar citation lookup failed for {cite!r}: {exc}")
+        if client is not None:
+            try:
+                for candidate in courtlistener_spotlight_results(client, cite):
+                    if isinstance(candidate.payload, dict):
+                        status("Fetching opinion text from CourtListener...")
+                        opinion = assemble_case_parts(client, candidate.payload)
+                        return "courtlistener", opinion, name or cite, pin
+            except Exception as exc:
+                print(f"[qt] CourtListener citation lookup failed for {cite!r}: {exc}")
+        return None
+
+    def _show_resolved_citation(self, resolved, fallback_title: str = "Citation") -> None:
+        if not resolved:
+            self._show_text_result(None, fallback_title)
+            return
+        if len(resolved) == 3:
+            source, payload, title = resolved
+            pin = ""
+        else:
+            source, payload, title, pin = resolved
+        if source == "pdf":
+            url, pdf_title = payload
+            window = ChromiumPdfWindow(url, pdf_title)
+            self._show_window(window)
+            return
+        window = self._show_text_result((source, payload), title or fallback_title)
+        if pin and isinstance(window, HtmlWindow):
+            window.scroll_to_page(pin)
 
     def _open_case_law_pdf(self, cite: str) -> bool:
         url = static_case_law_url(cite)

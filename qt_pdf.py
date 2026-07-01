@@ -183,6 +183,40 @@ def html_document(title: str, body: str, base_url: str = "") -> str:
       font-size: 0.94rem;
       color: #374151;
     }}
+    .case-details {{
+      margin: 0 0 26px;
+      padding: 16px 18px;
+      background: #f7fafc;
+      border: 1px solid var(--line);
+      border-left: 4px solid #49a8ff;
+      border-radius: 8px;
+    }}
+    .case-details h2 {{
+      margin: 0 0 8px;
+      font-size: 1.05rem;
+      color: #243b53;
+    }}
+    .case-details h3 {{
+      margin: 14px 0 6px;
+      font-size: 0.96rem;
+      color: #334155;
+    }}
+    .case-details p {{
+      margin: 0 0 0.58rem;
+    }}
+    .case-details ul {{
+      margin: 0.2rem 0 0.4rem 1.2rem;
+      padding: 0;
+    }}
+    .case-details-meta,
+    .case-details-source {{
+      color: var(--muted);
+      font-size: 0.93rem;
+    }}
+    .vote-lineup {{
+      padding-top: 2px;
+      border-top: 1px solid var(--line);
+    }}
     pre {{
       white-space: pre-wrap;
       font: inherit;
