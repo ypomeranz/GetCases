@@ -6912,7 +6912,7 @@ class _ScholarTextWindow:
         vsb.pack(side="right", fill="y")
         self._partmap.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
-        txt.bind("<Configure>", lambda _e: self._schedule_gutter_redraw())
+        txt.bind("<Configure>", lambda _e: self._on_text_configure())
         self._partmap.bind("<Button-1>", self._on_partmap_click)
         self._partmap.bind("<Enter>", lambda _e: self._partmap.config(cursor="hand2"))
         self._partmap.bind("<Leave>", lambda _e: self._partmap.config(cursor=""))
@@ -6954,6 +6954,7 @@ class _ScholarTextWindow:
         txt.tag_bind("citelink", "<Enter>", lambda _e: txt.config(cursor="hand2"))
         txt.tag_bind("citelink", "<Leave>", lambda _e: txt.config(cursor=""))
         txt.tag_configure("jumpflash", background="#fff2a8")
+        txt.tag_configure("justify-pad")
         self._finder = _TextFinder(win, txt, text_frame)
 
         btn_frame = ttk.Frame(win)
@@ -7074,6 +7075,7 @@ class _ScholarTextWindow:
         if getattr(self, "_pagecol_font", None) is not None:
             self._pagecol_font.configure(size=max(new - 2, 7))
             self._partmap_font.configure(size=max(new - 3, 7))
+        self._schedule_text_justify()
         self._schedule_gutter_redraw()
         self._status_var.set(f"Text size: {new} pt")
 
@@ -7109,16 +7111,35 @@ class _ScholarTextWindow:
         "TeX Gyre Schola",
         "Century",
     )
+    # Non-SCOTUS opinions use Palatino Linotype; the follow-on names cover
+    # common Palatino-compatible installs on macOS/Linux before falling back to
+    # Georgia when no Palatino family is available.
+    _NON_SCOTUS_FONT_FAMILIES = (
+        "Palatino Linotype",
+        "Palatino",
+        "Book Antiqua",
+        "URW Palladio L",
+        "TeX Gyre Pagella",
+        "Georgia",
+    )
 
     def _opinion_font_family(self) -> str:
-        """Body font for the opinion: Century Schoolbook for Supreme Court
-        decisions (its house typeface), the default serif otherwise."""
-        if self._is_scotus:
-            available = {f.lower() for f in tkfont.families(self._win)}
-            for fam in self._SCOTUS_FONT_FAMILIES:
-                if fam.lower() in available:
-                    return fam
-        return "Georgia"
+        """Body font for the opinion text.
+
+        Supreme Court decisions use Century Schoolbook variants where present;
+        all other opinions prefer Palatino Linotype for consistent justification
+        metrics, with compatible fallbacks for systems that lack the Windows
+        font.
+        """
+        available = {f.lower() for f in tkfont.families(self._win)}
+        families = (
+            self._SCOTUS_FONT_FAMILIES
+            if self._is_scotus else self._NON_SCOTUS_FONT_FAMILIES
+        )
+        for fam in families:
+            if fam.lower() in available:
+                return fam
+        return families[0]
 
     def _new_link(self, action: tuple[str, str]) -> str:
         self._link_n += 1
@@ -7684,6 +7705,7 @@ class _ScholarTextWindow:
             f"{len(self._scholar_text):,} characters | Google Scholar version{extra}"
         )
         self._finder.refresh()
+        self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
     def _on_part_selected(self, _event=None) -> None:
@@ -7734,6 +7756,103 @@ class _ScholarTextWindow:
         else:
             self._view_label_var.set("Full opinion")
             self._view_label.config(foreground="black")
+
+    # ------------------------------------------------------------------
+    # Text justification
+    # ------------------------------------------------------------------
+
+    def _on_text_configure(self) -> None:
+        """Reflow display-line justification and redraw side gutters on resize."""
+        self._schedule_text_justify()
+        self._schedule_gutter_redraw()
+
+    def _schedule_text_justify(self) -> None:
+        """Justify opinion text after Tk has recalculated display lines.
+
+        Tk's Text widget supports left, right, and centered paragraphs, but not
+        newspaper-style full justification.  The standard workaround is to add
+        small runs of extra spaces to each wrapped display line and then rebuild
+        those padding spaces whenever the widget is resized.  The spaces are
+        tagged so they can be removed before each recalculation.
+        """
+        if getattr(self, "_justify_pending", False):
+            return
+        if getattr(self, "_mode", None) == "pdf":
+            return
+        self._justify_pending = True
+
+        def run() -> None:
+            self._justify_pending = False
+            self._justify_display_lines()
+            self._schedule_gutter_redraw()
+
+        try:
+            self._win.after_idle(run)
+        except tk.TclError:
+            self._justify_pending = False
+
+    def _clear_justification(self) -> None:
+        txt = self._text
+        ranges = list(txt.tag_ranges("justify-pad"))
+        for start, end in zip(ranges[-2::-2], ranges[-1::-2]):
+            txt.delete(start, end)
+
+    def _line_has_any_tag(self, start: str, end: str, names: tuple[str, ...]) -> bool:
+        txt = self._text
+        for name in names:
+            ranges = txt.tag_nextrange(name, start, end)
+            if ranges:
+                return True
+        return False
+
+    def _justify_display_lines(self) -> None:
+        txt = self._text
+        try:
+            old_state = str(txt.cget("state"))
+        except tk.TclError:
+            return
+        try:
+            txt.config(state="normal")
+            self._clear_justification()
+            txt.update_idletasks()
+            width = txt.winfo_width() - int(txt.cget("padx")) * 2 - 4
+            if width <= 100:
+                return
+            space_px = max(self._fonts["base"].measure(" "), 1)
+            idx = "1.0"
+            while txt.compare(idx, "<", "end-1c"):
+                try:
+                    line_end = txt.index(f"{idx} display lineend")
+                    txt.mark_set("__justify_next", f"{line_end} +1c")
+                    txt.mark_gravity("__justify_next", "right")
+                except tk.TclError:
+                    break
+                logical_end = txt.index(f"{idx} lineend")
+                # Do not stretch the final display line of a paragraph or any
+                # centered/heading/blockquote/page-marker line.
+                if (txt.compare(line_end, "<", logical_end)
+                        and not self._line_has_any_tag(
+                            idx, line_end,
+                            ("center", "heading", "blockquote", "pagenum", "fnhead"))):
+                    line_text = txt.get(idx, line_end)
+                    space_offsets = [m.start() for m in re.finditer(r"(?<=\S) (?=\S)", line_text)]
+                    if space_offsets:
+                        used = self._fonts["base"].measure(line_text)
+                        need = max(0, width - used)
+                        extra = min(8, need // space_px)
+                        if extra:
+                            per, rem = divmod(extra, len(space_offsets))
+                            # Insert from right to left so offsets remain valid.
+                            for n, off in enumerate(reversed(space_offsets)):
+                                add = per + (1 if n < rem else 0)
+                                if add:
+                                    txt.insert(f"{idx}+{off + 1}c", " " * add, ("justify-pad",))
+                idx = txt.index("__justify_next")
+        finally:
+            try:
+                txt.config(state=old_state)
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
     # Side gutters: left page-number column and right concurrence/dissent map
@@ -7992,6 +8111,7 @@ class _ScholarTextWindow:
         self._hide_cl_button()  # CL view uses the toggle for "Google Scholar Text"
         self._show_pdf_button()
         self._finder.refresh()
+        self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
     def _show_courtlistener(self) -> None:
@@ -8016,6 +8136,8 @@ class _ScholarTextWindow:
         )
         self._show_pdf_button()
         self._finder.refresh()
+        self._schedule_text_justify()
+        self._schedule_gutter_redraw()
 
     # ------------------------------------------------------------------
     # Bluebook citation
