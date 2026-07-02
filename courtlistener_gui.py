@@ -274,6 +274,31 @@ def _fit_toplevel_geometry(
     return f"{w}x{h}+{x}+{y}"
 
 
+def _clamp_toplevel_to_work_area(
+    win: tk.Misc,
+    *,
+    min_width: int,
+    min_height: int,
+    bottom_gap: int = 64,
+) -> None:
+    """Keep an existing top-level from extending into the taskbar/work-area edge."""
+    try:
+        win.update_idletasks()
+        left, top, work_w, work_h = _work_area(win)
+        max_w = max(min_width, work_w - 32)
+        max_h = max(min_height, work_h - bottom_gap - 32)
+        w = max(min_width, min(win.winfo_width() or min_width, max_w))
+        h = max(min_height, min(win.winfo_height() or min_height, max_h))
+        x = win.winfo_x()
+        y = win.winfo_y()
+        x = max(left + 16, min(x, left + work_w - w - 16))
+        y = max(top + 16, min(y, top + work_h - bottom_gap - h))
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        win.update_idletasks()
+    except tk.TclError:
+        pass
+
+
 def _set_ui_button_width(button, width: int) -> None:
     """Apply a pixel-ish width hint across CTk and ttk buttons."""
     try:
@@ -10742,6 +10767,9 @@ class _ScholarTextWindow:
         threading.Thread(target=run, daemon=True).start()
 
     def _show_pdf(self, data: bytes, url: str) -> None:
+        _clamp_toplevel_to_work_area(
+            self._win, min_width=430, min_height=300, bottom_gap=72
+        )
         width = max(self._text.winfo_width() - 24, 520)
         # US Reports scans get a roughly 3× margin (see _is_us_reports_pdf).
         margin = _PdfPane._MARGIN * 3 if _is_us_reports_pdf(url) else None
@@ -11074,7 +11102,12 @@ class _PdfWindow:
 
         self._win = _ui_toplevel(parent)
         self._win.title(title)
-        self._win.geometry("820x900")
+        self._win.geometry(
+            _fit_toplevel_geometry(
+                self._win, 820, 900, min_width=500, min_height=320,
+                bottom_gap=72,
+            )
+        )
         self._win.minsize(500, 320)
 
         top = _ui_frame(self._win)
@@ -11708,7 +11741,12 @@ class _LinkedPdfWindow:
 
         self._win = _ui_toplevel(parent)
         self._win.title(f"PDF citations — {name}")
-        self._win.geometry("860x920")
+        self._win.geometry(
+            _fit_toplevel_geometry(
+                self._win, 860, 920, min_width=520, min_height=360,
+                bottom_gap=72,
+            )
+        )
         self._win.minsize(520, 360)
         self._win.bind("<Destroy>", self._on_destroy)
 
