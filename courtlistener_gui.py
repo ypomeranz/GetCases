@@ -5802,6 +5802,8 @@ def _dump_to_rtf(
         elif key == "tagoff":
             active.discard(value)
         elif key == "text":
+            if "justify-pad" in active:
+                continue
             for i, seg in enumerate(value.split("\n")):
                 if i and par_open:
                     out.append("\\par\n")
@@ -5821,6 +5823,20 @@ def _dump_to_rtf(
                     out.append(run)
     if par_open:
         out.append("\\par\n")
+    return "".join(out)
+
+
+def _plain_without_layout_chars(txt: tk.Text, start: str, end: str) -> str:
+    """Text content without temporary on-screen justification fragments."""
+    out: list[str] = []
+    active: set[str] = set(txt.tag_names(start))
+    for key, value, _index in txt.dump(start, end, text=True, tag=True):
+        if key == "tagon":
+            active.add(value)
+        elif key == "tagoff":
+            active.discard(value)
+        elif key == "text" and "justify-pad" not in active:
+            out.append(value)
     return "".join(out)
 
 
@@ -7175,6 +7191,13 @@ class _ScholarTextWindow:
     # full width instead of shrinking to make room.
     _DETAILS_PANEL_W = 300
     _JUSTIFY_HARD_BREAK_EXTRA_SPACES = 4
+    _JUSTIFY_PAD_TAG = "justify-pad"
+    _JUSTIFY_HIDE_TAG = "justify-hide"
+    _HYPHEN_MIN_WORD = 7
+    _HYPHEN_MIN_PREFIX = 2
+    _HYPHEN_MIN_SUFFIX = 3
+    _HYPHEN_SAFETY_PX = 3
+    _VOWELS = frozenset("aeiouy")
 
     def __init__(
         self,
@@ -7426,7 +7449,8 @@ class _ScholarTextWindow:
         txt.tag_bind("citelink", "<Enter>", lambda _e: txt.config(cursor="hand2"))
         txt.tag_bind("citelink", "<Leave>", lambda _e: txt.config(cursor=""))
         txt.tag_configure("jumpflash", background="#fff2a8")
-        txt.tag_configure("justify-pad")
+        txt.tag_configure(self._JUSTIFY_PAD_TAG)
+        txt.tag_configure(self._JUSTIFY_HIDE_TAG, elide=True)
         self._finder = _TextFinder(win, txt, text_frame)
 
         btn_frame = _ui_frame(win)
@@ -8339,9 +8363,10 @@ class _ScholarTextWindow:
         try:
             if old_state != "normal":
                 txt.config(state="normal")
-            ranges = list(txt.tag_ranges("justify-pad"))
+            ranges = list(txt.tag_ranges(self._JUSTIFY_PAD_TAG))
             for start, end in zip(ranges[-2::-2], ranges[-1::-2]):
                 txt.delete(start, end)
+            txt.tag_remove(self._JUSTIFY_HIDE_TAG, "1.0", "end")
         finally:
             try:
                 if old_state != "normal":
@@ -8365,6 +8390,115 @@ class _ScholarTextWindow:
             if ranges:
                 return True
         return False
+
+    def _hyphen_points(self, word: str) -> list[int]:
+        """Conservative English-ish syllable break candidates for layout only."""
+        if (len(word) < self._HYPHEN_MIN_WORD
+                or not word.isascii()
+                or not word.isalpha()
+                or not any(c.islower() for c in word)):
+            return []
+
+        lower = word.lower()
+        vowel_groups: list[tuple[int, int]] = []
+        i, n = 0, len(lower)
+        while i < n:
+            if lower[i] not in self._VOWELS:
+                i += 1
+                continue
+            start = i
+            while i < n and lower[i] in self._VOWELS:
+                i += 1
+            vowel_groups.append((start, i))
+
+        onsets = {
+            "bl", "br", "ch", "cl", "cr", "dr", "fl", "fr", "gh", "gl",
+            "gr", "ph", "pl", "pr", "qu", "sc", "sh", "sk", "sl", "sm",
+            "sn", "sp", "st", "str", "sw", "th", "tr", "tw", "wh", "wr",
+        }
+        points: list[int] = []
+        for (_v_start, v_end), (next_v_start, _next_v_end) in zip(
+                vowel_groups, vowel_groups[1:]):
+            cluster = lower[v_end:next_v_start]
+            if not cluster:
+                continue
+            if len(cluster) == 1:
+                next_piece = lower[v_end:]
+                if next_piece.startswith((
+                        "ci", "gi", "si", "ti", "tu", "cial", "sion",
+                        "tial", "tian", "tion", "tious", "tive", "tory",
+                        "ture")):
+                    candidates = (v_end,)
+                else:
+                    candidates = (next_v_start,)
+            else:
+                point = v_end + 1
+                for off in range(1, len(cluster)):
+                    if cluster[off:] in onsets:
+                        point = v_end + off
+                        break
+                candidates = (point,)
+            for point in candidates:
+                if (self._HYPHEN_MIN_PREFIX <= point
+                        and n - point >= self._HYPHEN_MIN_SUFFIX):
+                    points.append(point)
+        return sorted(set(points))
+
+    def _hyphenate_next_word(self, line_end: str, used: float, width: int,
+                             space_px: int) -> bool:
+        """Borrow a syllable-like prefix from the next wrapped word.
+
+        The original prefix is hidden, not deleted; the visible prefix, hyphen,
+        and forced line break are tagged as temporary justification characters
+        and are removed on the next reflow.
+        """
+        txt = self._text
+        try:
+            scan = txt.index("__justify_next")
+            line_limit = txt.index(f"{scan} lineend")
+        except tk.TclError:
+            return False
+        following = txt.get(scan, line_limit)
+        m = re.match(r"\s*([A-Za-z]{%d,})\b" % self._HYPHEN_MIN_WORD,
+                     following)
+        if not m:
+            return False
+
+        word = m.group(1)
+        word_start = txt.index(f"{scan}+{m.start(1)}c")
+        word_end = txt.index(f"{word_start}+{len(word)}c")
+        if self._line_has_any_tag(
+                word_start, word_end,
+                ("center", "heading", "blockquote", "pagenum", "fnhead")):
+            return False
+
+        available = width - used - self._HYPHEN_SAFETY_PX
+        if available <= space_px:
+            return False
+        best: Optional[int] = None
+        gap_px = space_px if m.start(1) else 0
+        for point in self._hyphen_points(word):
+            fragment = word[:point] + "-"
+            if gap_px + self._fonts["base"].measure(fragment) <= available:
+                best = point
+            else:
+                break
+        if best is None:
+            return False
+
+        fragment = word[:best]
+        tags = tuple(
+            t for t in txt.tag_names(word_start)
+            if t not in ("sel", self._JUSTIFY_HIDE_TAG)
+        )
+        txt.insert(word_start, fragment + "-\n",
+                   tags + (self._JUSTIFY_PAD_TAG,))
+        hidden_start = txt.index(f"{word_start}+{len(fragment) + 2}c")
+        hidden_end = txt.index(f"{hidden_start}+{best}c")
+        txt.tag_add(self._JUSTIFY_HIDE_TAG, hidden_start, hidden_end)
+        txt.mark_set("__justify_next", hidden_end)
+        txt.mark_gravity("__justify_next", "right")
+        return True
 
     def _is_filled_hard_break(self, line_end: str, used: float,
                               width: int, space_px: int) -> bool:
@@ -8438,6 +8572,14 @@ class _ScholarTextWindow:
                         and not self._line_has_any_tag(
                             idx, line_end,
                             ("center", "heading", "blockquote", "pagenum", "fnhead"))):
+                    if is_wrapped_line and self._hyphenate_next_word(
+                            line_end, used, width, space_px):
+                        try:
+                            line_end = txt.index(f"{idx} display lineend")
+                            line_text = txt.get(idx, line_end)
+                            used = self._fonts["base"].measure(line_text)
+                        except tk.TclError:
+                            pass
                     space_offsets = [m.start() for m in re.finditer(r"(?<=\S) (?=\S)", line_text)]
                     if space_offsets:
                         need = max(0, width - used)
@@ -8450,7 +8592,8 @@ class _ScholarTextWindow:
                             for n, off in enumerate(reversed(space_offsets)):
                                 add = per + (1 if n < rem else 0)
                                 if add:
-                                    txt.insert(f"{idx}+{off + 1}c", " " * add, ("justify-pad",))
+                                    txt.insert(f"{idx}+{off + 1}c", " " * add,
+                                               (self._JUSTIFY_PAD_TAG,))
                 idx = txt.index("__justify_next")
         finally:
             try:
@@ -9296,7 +9439,7 @@ class _ScholarTextWindow:
             plain_cite, rtf_cite = self._bluebook_citation(pin, writer)
         body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map())
         rtf = _rtf_document(body + rtf_cite)
-        plain = txt.get(start, end).rstrip()
+        plain = _plain_without_layout_chars(txt, start, end).rstrip()
         if plain_cite:
             plain += "\n\n" + plain_cite + "\n"
         how = _copy_rich_clipboard(self._win, rtf, plain)
