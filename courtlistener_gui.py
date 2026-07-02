@@ -10584,11 +10584,11 @@ class _ScholarTextWindow:
             return
         try:
             if self._pdf_located is True or self._pdf_prefetch is not None:
-                btn.config(state="normal", text="View PDF")
+                btn.configure(state="normal", text="View PDF")
             elif self._pdf_located is False:
-                btn.config(state="disabled", text="No PDF")
+                btn.configure(state="disabled", text="No PDF")
             else:
-                btn.config(state="disabled", text="Finding PDF…")
+                btn.configure(state="disabled", text="Finding PDF…")
         except tk.TclError:
             pass
 
@@ -10713,7 +10713,7 @@ class _ScholarTextWindow:
         busy = (self._pdf_btn if self._pre_pdf_mode == "courtlistener"
                 else self._toggle_btn)
         try:
-            busy.config(state="disabled")
+            busy.configure(state="disabled")
         except tk.TclError:
             pass
         self._status_var.set("Locating a PDF of the opinion…")
