@@ -3422,6 +3422,18 @@ class CourtListenerGUI:
         except tk.TclError:
             pass
 
+    def _post_case_law_pdf(self, url: str, cite: str, pin: str = "",
+                           name: str = "") -> None:
+        title = f"{name} — {cite}" if name and cite else (cite or name)
+        if pin:
+            title += f" at {pin}"
+
+        def open_pdf() -> None:
+            self._status_var.set(f"Opening {cite or name} (case.law PDF)…")
+            _PdfWindow(self.root, url, title, self._status_var.set)
+
+        self._post_root(open_pdf)
+
     def _try_open_citation(self, name: str, cite: str, pin: str,
                            fetcher, client, prefetch_pdf: bool = True) -> bool:
         """Resolve one case citation and open its window (call from a
@@ -3502,6 +3514,10 @@ class CourtListenerGUI:
                         return True
             except Exception as exc:
                 print(f"[citelist] courtlistener {cite!r}: {exc}")
+        pdf = _case_law_pdf_for_cite(cite) if cite else None
+        if pdf:
+            self._post_case_law_pdf(pdf, cite, pin, name)
+            return True
         return False
 
     def _show_citation_list_dialog(self) -> None:
@@ -4693,6 +4709,10 @@ class CourtListenerGUI:
                 try:
                     target = _cl_item_for_citation(client, cite)
                     if not target:
+                        pdf = _case_law_pdf_for_cite(cite)
+                        if pdf:
+                            self._post_case_law_pdf(pdf, cite, pin)
+                            return
                         self._post_root(
                             lambda: self._status_var.set(
                                 f"No CourtListener match for {cite}."
@@ -4716,11 +4736,56 @@ class CourtListenerGUI:
 
                     self._post_root(open_cl)
                 except Exception as exc:
+                    pdf = _case_law_pdf_for_cite(cite)
+                    if pdf:
+                        self._post_case_law_pdf(pdf, cite, pin)
+                        return
                     self._post_root(
                         lambda e=exc: self._status_var.set(f"CourtListener: {e}")
                     )
 
             threading.Thread(target=run, daemon=True).start()
+            return
+
+        if cite:
+            self._status_var.set(f"Checking case.law for {cite}…")
+
+            def try_pdf() -> None:
+                pdf = _case_law_pdf_for_cite(cite)
+                if pdf:
+                    self._post_case_law_pdf(pdf, cite, pin)
+                    return
+                self._post_root(
+                    self._status_var.set,
+                    "Could not load this case from Google Scholar."
+                    if fetcher is None
+                    else "Google Scholar busy — retrying…",
+                )
+                if fetcher is not None:
+                    threading.Thread(target=retry, daemon=True).start()
+
+            def retry() -> None:
+                for _ in range(3):
+                    time.sleep(4.0)
+                    try:
+                        result = fetcher.fetch_by_url(url)
+                    except Exception:
+                        result = None
+                    if result:
+                        r_url, html = result
+                        self._post_root(
+                            lambda u=r_url, h=html: _ScholarTextWindow(
+                                self.root, self, u, h, item=None,
+                            )
+                        )
+                        return
+                self._post_root(
+                    lambda: self._status_var.set(
+                        "Google Scholar still unavailable for this case."
+                    )
+                )
+
+            threading.Thread(target=try_pdf, daemon=True).start()
             return
 
         if fetcher is None:
@@ -10048,6 +10113,15 @@ class _ScholarTextWindow:
     def _on_cl_link_error(self, msg: str) -> None:
         self._status_var.set(f"CourtListener: {msg}")
 
+    def _try_case_law_link_pdf(self, cite: str, pin: str = "") -> bool:
+        if not cite:
+            return False
+        pdf = _case_law_pdf_for_cite(cite)
+        if not pdf:
+            return False
+        self._post(self._open_cited_case_pdf, pdf, cite, pin)
+        return True
+
     def _follow_cite_via_cl(self, cite: str, pin: str = "", name: str = "",
                             retry=None) -> None:
         """Follow a cited-case link Google Scholar can't supply — whether it is
@@ -10097,7 +10171,12 @@ class _ScholarTextWindow:
                     self._on_cl_link_ready, parts, blocks, plain, target, retry,
                 )
             except Exception as exc:
-                self._post(self._on_cl_link_error, str(exc))
+                if self._try_case_law_link_pdf(cite, pin):
+                    return
+                if retry:
+                    self._post(self._retry_scholar_only, *retry)
+                else:
+                    self._post(self._on_cl_link_error, str(exc))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -10136,6 +10215,21 @@ class _ScholarTextWindow:
             self._follow_cite_via_cl(
                 cite, pin, name=name, retry=(cite, pin, url_val, name),
             )
+        elif cite:
+            self._status_var.set(f"Checking case.law for {cite}…")
+
+            def run() -> None:
+                if self._try_case_law_link_pdf(cite, pin):
+                    return
+                if fetcher is not None and (url_val or cite):
+                    self._post(self._retry_scholar_only, cite, pin, url_val, name)
+                else:
+                    self._post(
+                        self._status_var.set,
+                        "Google Scholar: cited case not found (or blocked).",
+                    )
+
+            threading.Thread(target=run, daemon=True).start()
         elif fetcher is not None and (url_val or cite):
             # Nothing to locate the case with — just keep retrying Google
             # Scholar, and open it if it comes through.
