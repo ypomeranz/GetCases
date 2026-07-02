@@ -205,6 +205,86 @@ def _ui_toplevel(parent: tk.Misc) -> tk.Toplevel:
     return win
 
 
+def _work_area(widget: tk.Misc) -> tuple[int, int, int, int]:
+    """Return the usable desktop rectangle: left, top, width, height."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", wintypes.LONG),
+                    ("top", wintypes.LONG),
+                    ("right", wintypes.LONG),
+                    ("bottom", wintypes.LONG),
+                ]
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", RECT),
+                    ("rcWork", RECT),
+                    ("dwFlags", wintypes.DWORD),
+                ]
+
+            user32 = ctypes.windll.user32
+            HMONITOR = getattr(wintypes, "HMONITOR", wintypes.HANDLE)
+            user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+            user32.MonitorFromWindow.restype = HMONITOR
+            user32.GetMonitorInfoW.argtypes = [
+                HMONITOR, ctypes.POINTER(MONITORINFO)
+            ]
+            user32.GetMonitorInfoW.restype = wintypes.BOOL
+            hwnd = wintypes.HWND(widget.winfo_id())
+            monitor = user32.MonitorFromWindow(hwnd, 2)  # nearest monitor
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                r = info.rcWork
+                return r.left, r.top, r.right - r.left, r.bottom - r.top
+        except Exception:
+            pass
+    try:
+        return (
+            widget.winfo_vrootx(),
+            widget.winfo_vrooty(),
+            widget.winfo_vrootwidth(),
+            widget.winfo_vrootheight(),
+        )
+    except tk.TclError:
+        return 0, 0, widget.winfo_screenwidth(), widget.winfo_screenheight()
+
+
+def _fit_toplevel_geometry(
+    win: tk.Misc,
+    width: int,
+    height: int,
+    *,
+    min_width: int,
+    min_height: int,
+    bottom_gap: int = 64,
+) -> str:
+    """Geometry string that keeps a new top-level inside the usable desktop."""
+    left, top, work_w, work_h = _work_area(win)
+    w = max(min_width, min(width, max(min_width, work_w - 32)))
+    h = max(min_height, min(height, max(min_height, work_h - bottom_gap - 32)))
+    x = left + max(16, (work_w - w) // 2)
+    y = top + 20
+    return f"{w}x{h}+{x}+{y}"
+
+
+def _set_ui_button_width(button, width: int) -> None:
+    """Apply a pixel-ish width hint across CTk and ttk buttons."""
+    try:
+        if _CTK_AVAILABLE:
+            button.configure(width=width)
+        else:
+            button.configure(width=max(1, round(width / 9)))
+    except tk.TclError:
+        pass
+
+
 def _ui_frame(parent, card: bool = False, fg: Optional[str] = None):
     """A container.  ``card=True`` gives a bordered, rounded surface."""
     if _CTK_AVAILABLE:
@@ -251,6 +331,8 @@ def _ui_button(parent, text: str, command=None, primary: bool = False,
             kw["width"] = width
         return ctk.CTkButton(parent, **kw)
     btn = ttk.Button(parent, text=text, command=command)
+    if width:
+        _set_ui_button_width(btn, width)
     return btn
 
 
@@ -7092,6 +7174,7 @@ class _ScholarTextWindow:
     # cases, where the panel opens by default, so the opinion text keeps its
     # full width instead of shrinking to make room.
     _DETAILS_PANEL_W = 300
+    _JUSTIFY_HARD_BREAK_EXTRA_SPACES = 4
 
     def __init__(
         self,
@@ -7201,8 +7284,12 @@ class _ScholarTextWindow:
         # in _build_ui); widen the window by the panel's width so the opinion
         # text keeps its usual room with the panel added to the right of it.
         win_w = 860 + (self._DETAILS_PANEL_W if self._is_scotus else 0)
-        self._win.geometry(f"{win_w}x680")
-        self._win.minsize(500, 300)
+        self._win.geometry(
+            _fit_toplevel_geometry(
+                self._win, win_w, 680, min_width=430, min_height=300
+            )
+        )
+        self._win.minsize(430, 300)
         self._build_ui()
         if self._cl_primary:
             self._render_cl_blocks()
@@ -7401,6 +7488,11 @@ class _ScholarTextWindow:
         _ui_checkbox(
             btn_frame, "Copy with citation", self._copy_with_cite,
         ).pack(side="left", padx=(0, 10))
+        self._justify_text = tk.BooleanVar(value=False)
+        _ui_checkbox(
+            btn_frame, "Justify Opinion Text.", self._justify_text,
+            self._on_justify_toggle,
+        ).pack(side="left", padx=(0, 10))
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
             win.bind(seq, lambda _e: self._zoom(+1))
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
@@ -7427,11 +7519,39 @@ class _ScholarTextWindow:
                   textvariable=self._status_var).pack(
             side="left", fill="x", expand=True, padx=(10, 0)
         )
+        self._button_bar_compact: Optional[bool] = None
+        btn_frame.bind("<Configure>", self._on_button_bar_configure)
 
         # Supreme Court cases: open the Oyez case-details panel from the start
         # (the checkbox above defaults on and the window is sized to fit it).
         if self._is_scotus:
             self._toggle_details()
+
+    def _on_button_bar_configure(self, event) -> None:
+        compact = event.width < 680
+        if compact == self._button_bar_compact:
+            return
+        self._button_bar_compact = compact
+        self._apply_button_bar_compact()
+
+    def _apply_button_bar_compact(self) -> None:
+        compact = bool(getattr(self, "_button_bar_compact", False))
+        widths = (
+            (self._export_btn, 120, 86),
+            (self._print_btn, 96, 68),
+            (self._toggle_btn, 168, 118),
+            (self._pdf_btn, 110, 78),
+            (self._cl_btn, 168, 118),
+            (self._zoom_out_btn, 42, 34),
+            (self._zoom_in_btn, 42, 34),
+        )
+        for btn, normal, small in widths:
+            _set_ui_button_width(btn, small if compact else normal)
+            if _CTK_AVAILABLE:
+                try:
+                    btn.configure(height=30 if compact else 34)
+                except tk.TclError:
+                    pass
 
     def _set_view_color(self, color: str) -> None:
         """Recolour the "Viewing" label to mark a concurrence/dissent — via the
@@ -8168,6 +8288,20 @@ class _ScholarTextWindow:
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
+    def _justification_enabled(self) -> bool:
+        var = getattr(self, "_justify_text", None)
+        try:
+            return bool(var is not None and var.get())
+        except tk.TclError:
+            return False
+
+    def _on_justify_toggle(self) -> None:
+        if self._justification_enabled():
+            self._schedule_text_justify()
+        else:
+            self._clear_justification()
+            self._schedule_gutter_redraw()
+
     def _schedule_text_justify(self) -> None:
         """Justify opinion text after Tk has recalculated display lines.
 
@@ -8180,6 +8314,9 @@ class _ScholarTextWindow:
         if getattr(self, "_justify_pending", False):
             return
         if getattr(self, "_mode", None) == "pdf":
+            return
+        if not self._justification_enabled():
+            self._clear_justification()
             return
         self._justify_pending = True
 
@@ -8195,13 +8332,35 @@ class _ScholarTextWindow:
 
     def _clear_justification(self) -> None:
         txt = self._text
-        ranges = list(txt.tag_ranges("justify-pad"))
-        for start, end in zip(ranges[-2::-2], ranges[-1::-2]):
-            txt.delete(start, end)
+        try:
+            old_state = str(txt.cget("state"))
+        except tk.TclError:
+            return
+        try:
+            if old_state != "normal":
+                txt.config(state="normal")
+            ranges = list(txt.tag_ranges("justify-pad"))
+            for start, end in zip(ranges[-2::-2], ranges[-1::-2]):
+                txt.delete(start, end)
+        finally:
+            try:
+                if old_state != "normal":
+                    txt.config(state=old_state)
+            except tk.TclError:
+                pass
 
     def _line_has_any_tag(self, start: str, end: str, names: tuple[str, ...]) -> bool:
         txt = self._text
         for name in names:
+            if name in txt.tag_names(start):
+                return True
+            try:
+                before_end = txt.index(f"{end} -1c")
+                if (txt.compare(before_end, ">=", start)
+                        and name in txt.tag_names(before_end)):
+                    return True
+            except tk.TclError:
+                pass
             ranges = txt.tag_nextrange(name, start, end)
             if ranges:
                 return True
@@ -8227,10 +8386,17 @@ class _ScholarTextWindow:
             return False  # a blank line ends the paragraph: this is its last line
         first_word = next_text.split(None, 1)[0]
         remaining = width - used
-        return remaining < self._fonts["base"].measure(first_word) + space_px
+        threshold = (
+            self._fonts["base"].measure(first_word)
+            + self._JUSTIFY_HARD_BREAK_EXTRA_SPACES * space_px
+        )
+        return remaining < threshold
 
     def _justify_display_lines(self) -> None:
         txt = self._text
+        if not self._justification_enabled():
+            self._clear_justification()
+            return
         try:
             old_state = str(txt.cget("state"))
         except tk.TclError:
