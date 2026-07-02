@@ -127,8 +127,30 @@ def html_document(title: str, body: str, base_url: str = "") -> str:
       margin: -6px 0 22px;
       color: var(--muted);
     }}
+    .opinion-toc {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: -6px 0 24px;
+      padding: 10px 0 12px;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }}
+    .opinion-toc a {{
+      display: inline-block;
+      max-width: 100%;
+      padding: 4px 8px;
+      border: 1px solid rgba(73, 168, 255, 0.34);
+      border-radius: 5px;
+      background: rgba(73, 168, 255, 0.08);
+      color: #256a9d;
+      font-size: 0.9rem;
+      text-decoration: none;
+      overflow-wrap: anywhere;
+    }}
     .opinion-part {{
       margin: 0 0 28px;
+      scroll-margin-top: 18px;
     }}
     .opinion-part.dissent {{
       border-left: 4px solid #d76666;

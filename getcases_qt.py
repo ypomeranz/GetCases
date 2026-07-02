@@ -18,7 +18,8 @@ from typing import Optional
 
 try:
     from PySide6.QtCore import QObject, Qt, QThreadPool, QTimer, QUrl, Signal
-    from PySide6.QtGui import QAction, QDesktopServices
+    from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
+    from PySide6.QtWebEngineCore import QWebEnginePage
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from PySide6.QtWidgets import (
         QApplication,
@@ -261,6 +262,8 @@ class HtmlWindow(QMainWindow):
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.setWindowTitle(title)
         self.resize(1000, 820)
+        self._base_url = base_url
+        self._zoom_factor = 1.0
         self.view = QWebEngineView(self)
         page = LinkHandlingPage(self.view)
         if link_callback is not None:
@@ -270,6 +273,85 @@ class HtmlWindow(QMainWindow):
         self.view.setPage(page)
         self.view.setHtml(html_document(title, body, base_url), QUrl(base_url or "about:blank"))
         self.setCentralWidget(self.view)
+        self._build_reader_toolbar()
+
+    def _build_reader_toolbar(self) -> None:
+        toolbar = QToolBar("Reader", self)
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        self.find_edit = QLineEdit(self)
+        self.find_edit.setPlaceholderText("Find")
+        self.find_edit.setClearButtonEnabled(True)
+        self.find_edit.setMaximumWidth(220)
+        self.find_edit.returnPressed.connect(self.find_next)
+        toolbar.addWidget(self.find_edit)
+
+        prev_action = QAction("Prev", self)
+        prev_action.triggered.connect(self.find_previous)
+        toolbar.addAction(prev_action)
+
+        next_action = QAction("Next", self)
+        next_action.triggered.connect(self.find_next)
+        toolbar.addAction(next_action)
+        toolbar.addSeparator()
+
+        zoom_out_action = QAction("A-", self)
+        zoom_out_action.triggered.connect(lambda: self._adjust_zoom(-0.1))
+        toolbar.addAction(zoom_out_action)
+
+        reset_zoom_action = QAction("100%", self)
+        reset_zoom_action.triggered.connect(self._reset_zoom)
+        toolbar.addAction(reset_zoom_action)
+
+        zoom_in_action = QAction("A+", self)
+        zoom_in_action.triggered.connect(lambda: self._adjust_zoom(0.1))
+        toolbar.addAction(zoom_in_action)
+
+        top_action = QAction("Top", self)
+        top_action.triggered.connect(
+            lambda: self.view.page().runJavaScript("window.scrollTo({top: 0, behavior: 'smooth'});")
+        )
+        toolbar.addAction(top_action)
+
+        if self._base_url:
+            source_action = QAction("Source", self)
+            source_action.triggered.connect(
+                lambda: QDesktopServices.openUrl(QUrl(self._base_url))
+            )
+            toolbar.addAction(source_action)
+
+        QShortcut(QKeySequence.StandardKey.Find, self, activated=self._focus_find)
+        QShortcut(QKeySequence("F3"), self, activated=self.find_next)
+        QShortcut(QKeySequence("Shift+F3"), self, activated=self.find_previous)
+        QShortcut(QKeySequence.ZoomIn, self, activated=lambda: self._adjust_zoom(0.1))
+        QShortcut(QKeySequence.ZoomOut, self, activated=lambda: self._adjust_zoom(-0.1))
+
+    def _focus_find(self) -> None:
+        self.find_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.find_edit.selectAll()
+
+    def find_next(self) -> None:
+        self._find(backward=False)
+
+    def find_previous(self) -> None:
+        self._find(backward=True)
+
+    def _find(self, *, backward: bool) -> None:
+        text = self.find_edit.text().strip()
+        if not text:
+            self._focus_find()
+            return
+        flags = QWebEnginePage.FindFlag.FindBackward if backward else QWebEnginePage.FindFlag(0)
+        self.view.findText(text, flags)
+
+    def _adjust_zoom(self, delta: float) -> None:
+        self._zoom_factor = min(2.0, max(0.65, round(self._zoom_factor + delta, 2)))
+        self.view.setZoomFactor(self._zoom_factor)
+
+    def _reset_zoom(self) -> None:
+        self._zoom_factor = 1.0
+        self.view.setZoomFactor(self._zoom_factor)
 
     def run_javascript_soon(self, js: str, delay_ms: int = 150) -> None:
         def run() -> None:

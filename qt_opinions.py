@@ -58,8 +58,16 @@ def render_opinion_parts_body(
         body.append("<p class=\"muted\">No opinion text was found.</p>")
         return "\n".join(body)
 
-    for part in parts:
-        body.append(_render_part(part))
+    anchors = [_part_anchor_id(part, index) for index, part in enumerate(parts)]
+    if len(parts) > 1:
+        body.append('<nav class="opinion-toc">')
+        for part, anchor in zip(parts, anchors):
+            label = re.sub(r"\s+", " ", part.label or "Opinion").strip()
+            body.append(f'<a href="#{anchor}">{html.escape(label)}</a>')
+        body.append("</nav>")
+
+    for index, part in enumerate(parts):
+        body.append(_render_part(part, anchors[index]))
     return "\n".join(body)
 
 
@@ -136,10 +144,10 @@ def render_oyez_case_details(case) -> str:
     return "\n".join(out)
 
 
-def _render_part(part: OpinionPart) -> str:
+def _render_part(part: OpinionPart, anchor_id: str) -> str:
     part_kind = _class_token(part.kind or "opinion")
     out = [
-        f'<section class="opinion-part {part_kind}">',
+        f'<section id="{anchor_id}" class="opinion-part {part_kind}">',
         f'<h2 class="part-label">{html.escape(part.label or "Opinion")}</h2>',
     ]
     out.extend(_render_block(block) for block in part.blocks)
@@ -242,6 +250,11 @@ def _anchor_id(value: str) -> str:
 def _page_anchor_id(value: str) -> str:
     safe = re.sub(r"[^0-9A-Za-z_.-]+", "", value or "").lstrip("*")
     return "page-" + (safe or "marker")
+
+
+def _part_anchor_id(part: OpinionPart, index: int) -> str:
+    label = _class_token(part.label or part.kind or "opinion")
+    return f"part-{index + 1}-{label}"
 
 
 def _class_token(value: str) -> str:
