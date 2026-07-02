@@ -8500,6 +8500,30 @@ class _ScholarTextWindow:
         txt.mark_gravity("__justify_next", "right")
         return True
 
+    def _pad_display_line_to_margin(self, start: str, end: str, used: float,
+                                    width: int, space_px: int) -> None:
+        """Apply the original extra-space justification to one display line."""
+        txt = self._text
+        line_text = txt.get(start, end)
+        space_offsets = [
+            m.start() for m in re.finditer(r"(?<=\S) (?=\S)", line_text)
+        ]
+        if not space_offsets:
+            return
+        need = max(0, width - used)
+        # Leave a small safety margin so approximate font measurements do not
+        # push the line onto the next wrap.
+        extra = max(0, (need // space_px) - 1)
+        if not extra:
+            return
+        per, rem = divmod(extra, len(space_offsets))
+        # Insert from right to left so offsets remain valid.
+        for n, off in enumerate(reversed(space_offsets)):
+            add = per + (1 if n < rem else 0)
+            if add:
+                txt.insert(f"{start}+{off + 1}c", " " * add,
+                           (self._JUSTIFY_PAD_TAG,))
+
     def _is_filled_hard_break(self, line_end: str, used: float,
                               width: int, space_px: int) -> bool:
         """Whether a display line that reaches its logical end — a <br>/source
@@ -8572,28 +8596,20 @@ class _ScholarTextWindow:
                         and not self._line_has_any_tag(
                             idx, line_end,
                             ("center", "heading", "blockquote", "pagenum", "fnhead"))):
+                    # Step 1: if the next word can be split cleanly, pull a
+                    # syllable-like prefix up so this line starts closer to the
+                    # right margin.  Step 2 below still runs the original
+                    # extra-space justification on the resulting display line.
                     if is_wrapped_line and self._hyphenate_next_word(
                             line_end, used, width, space_px):
                         try:
                             line_end = txt.index(f"{idx} display lineend")
-                            line_text = txt.get(idx, line_end)
-                            used = self._fonts["base"].measure(line_text)
+                            used = self._fonts["base"].measure(
+                                txt.get(idx, line_end))
                         except tk.TclError:
                             pass
-                    space_offsets = [m.start() for m in re.finditer(r"(?<=\S) (?=\S)", line_text)]
-                    if space_offsets:
-                        need = max(0, width - used)
-                        # Leave a small safety margin so approximate font
-                        # measurements do not push the line onto the next wrap.
-                        extra = max(0, (need // space_px) - 1)
-                        if extra:
-                            per, rem = divmod(extra, len(space_offsets))
-                            # Insert from right to left so offsets remain valid.
-                            for n, off in enumerate(reversed(space_offsets)):
-                                add = per + (1 if n < rem else 0)
-                                if add:
-                                    txt.insert(f"{idx}+{off + 1}c", " " * add,
-                                               (self._JUSTIFY_PAD_TAG,))
+                    self._pad_display_line_to_margin(
+                        idx, line_end, used, width, space_px)
                 idx = txt.index("__justify_next")
         finally:
             try:
