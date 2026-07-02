@@ -28,11 +28,13 @@ import state_statutes
 import statutes_at_large
 import us_code
 
-# A pinpoint page following a case citation: ", 171" or ", 171-72" — but not
+# A pinpoint page following a case citation: ", 171", ", at 171", or
+# ", 171-72" — but not
 # the volume of a parallel citation (", 510 A.2d 562"), recognized by the
 # capital letter that follows the number.
 PINCITE_AFTER_RE = re.compile(
-    r",\s*(\d{1,5})(?:\s*[-–—]\s*\d{1,5})?(?!\d|\s*[A-Z])"
+    r",\s*(?:at\s+)?\*?(\d{1,6})(?:\s*[-–—]\s*\*?\d{1,6})?(?!\d|\s*[A-Z])",
+    re.IGNORECASE,
 )
 
 # Citations recognized inside running text (made clickable → Scholar lookup).
@@ -51,14 +53,50 @@ TEXT_CITE_RE = re.compile(r"\b\d{1,4}\s+" + REPORTER_ALT + r"\s+\d{1,5}\b")
 CITE_CAPTURE_RE = re.compile(
     r"\b(\d{1,4})\s+(" + REPORTER_ALT + r")\s+(\d{1,5})\b")
 
+# Briefs often cite official state reporters that are too numerous to list in
+# REPORTER_ALT ("306 Md. 556", "100 Cal. 400", "515 Pa. 1").  This guarded
+# fallback is intentionally broad but excludes statute/regulation abbreviations
+# before they can become case links.
+_REPORTER_TOKEN = r"(?:[A-Z][A-Za-z0-9.'’]*|\d+d|\d+th)"
+BROAD_CITE_CAPTURE_RE = re.compile(
+    r"\b(\d{1,4})\s+("
+    + _REPORTER_TOKEN
+    + r"(?:\s+"
+    + _REPORTER_TOKEN
+    + r"){0,5}?)\s+(\d{1,6})(?=[\s,;.)(]|$)"
+)
+_NONCASE_REPORTERS = {
+    "usc", "usca", "uscs", "cfr", "fr", "fedr", "fedreg",
+}
+_PLAIN_CASE_REPORTERS = {
+    "alaska", "idaho", "iowa", "ohio", "utah", "vermont", "wyoming",
+    "wl", "lexis",
+}
+
 # Short-form citation: "Roe, 410 U.S., at 152" → volume, reporter, pin page.
 SHORT_CITE_RE = re.compile(
     r"\b(\d{1,4})\s+(" + REPORTER_ALT + r")\s*,?\s+at\s+(\d{1,5})\b")
+BROAD_SHORT_CITE_RE = re.compile(
+    r"\b(\d{1,4})\s+("
+    + _REPORTER_TOKEN
+    + r"(?:\s+"
+    + _REPORTER_TOKEN
+    + r"){0,5}?)\s*,?\s+at\s+\*?(\d{1,6})\b",
+    re.IGNORECASE,
+)
 
 # "Id." short form — refers to the immediately preceding citation; group 1 is
 # the optional pin page ("Id. at 152").  ("Ibid." is deliberately not traced —
 # it usually points at a non-case source.)
-ID_CITE_RE = re.compile(r"\b[Ii]d\.(?:\s*,?\s*at\s+(\d{1,5}))?")
+ID_CITE_RE = re.compile(r"\bid\.(?:\s*,?\s*at\s+\*?(\d{1,6}))?", re.IGNORECASE)
+
+# Record cites in briefs commonly use "Id." too.  If one appears between an
+# authority and a later "Id. at N", do not carry the authority forward.
+_RECORD_CITE_RE = re.compile(
+    r"\b(?:App\.|J\.?A\.|A\.R\.|R\.|Tr\.|Dkt\.|Doc\.|ECF|Ex\.|ER|SER)"
+    r"\s*(?:No\.?\s*)?[\w*.-]+|\b(?:ECF|Dkt\.|Doc\.)\s+No\.?\s+\d+|¶\s*\d+",
+    re.IGNORECASE,
+)
 
 
 def norm_reporter(rep: str) -> str:
@@ -66,12 +104,62 @@ def norm_reporter(rep: str) -> str:
     return re.sub(r"\s+", "", rep or "").lower()
 
 
+def _reporter_key(rep: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", rep or "").lower()
+
+
+def _valid_case_reporter(rep: str) -> bool:
+    key = _reporter_key(rep)
+    if not key or key in _NONCASE_REPORTERS:
+        return False
+    if key in _PLAIN_CASE_REPORTERS or key.endswith("lexis"):
+        return True
+    return "." in (rep or "")
+
+
+def _case_match_text(m: re.Match) -> str:
+    return re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.").replace("’", "'")
+
+
+def _iter_case_cites(text: str) -> list[re.Match]:
+    matches: list[re.Match] = list(CITE_CAPTURE_RE.finditer(text or ""))
+    for m in BROAD_CITE_CAPTURE_RE.finditer(text or ""):
+        if not _valid_case_reporter(m.group(2)):
+            continue
+        if any(m.start() < km.end() and km.start() < m.end() for km in matches):
+            continue
+        matches.append(m)
+    matches.sort(key=lambda m: (m.start(), -(m.end() - m.start())))
+    return matches
+
+
+def _iter_short_cites(text: str) -> list[re.Match]:
+    matches: list[re.Match] = list(SHORT_CITE_RE.finditer(text or ""))
+    for m in BROAD_SHORT_CITE_RE.finditer(text or ""):
+        if not _valid_case_reporter(m.group(2)):
+            continue
+        if any(m.start() < km.end() and km.start() < m.end() for km in matches):
+            continue
+        matches.append(m)
+    matches.sort(key=lambda m: (m.start(), -(m.end() - m.start())))
+    return matches
+
+
+def _id_chain_broken(gap: str) -> bool:
+    stripped = (gap or "").strip()
+    return bool(stripped and (
+        len(stripped) > 240
+        or "\n\n" in gap
+        or _RECORD_CITE_RE.search(gap)
+    ))
+
+
 def build_short_cite_index(text: str) -> dict[tuple[str, str], list[int]]:
     """Map (volume, reporter) → sorted first-pages of every full citation in
     `text`, so a short form ('410 U.S. at 152') can be resolved to the case's
     first page (and thence opened and pin-jumped)."""
     idx: dict[tuple[str, str], set] = {}
-    for m in CITE_CAPTURE_RE.finditer(text or ""):
+    for m in _iter_case_cites(text or ""):
         idx.setdefault((m.group(1), norm_reporter(m.group(2))),
                        set()).add(int(m.group(3)))
     return {k: sorted(v) for k, v in idx.items()}
@@ -84,13 +172,15 @@ def cite_target_from_text(
     whether the cite is written in full ("8 F.4th 557, 565") or short
     ("8 F.4th at 565", resolved to its first page via `index`); the pin is the
     pincite/short page, or "".  Empty base when no reporter cite is present."""
-    cm = CITE_CAPTURE_RE.search(text)
-    if cm:
-        base = re.sub(r"\s+", " ", cm.group(0)).replace("U. S.", "U.S.")
+    case_matches = _iter_case_cites(text)
+    if case_matches:
+        cm = case_matches[0]
+        base = _case_match_text(cm)
         pm = PINCITE_AFTER_RE.match(text, cm.end())
         return base, (pm.group(1) if pm else "")
-    sm = SHORT_CITE_RE.search(text)
-    if sm:
+    short_matches = _iter_short_cites(text)
+    if short_matches:
+        sm = short_matches[0]
         rep = re.sub(r"\s+", " ", sm.group(2)).strip().replace("U. S.", "U.S.")
         pin = int(sm.group(3))
         pages = index.get((sm.group(1), norm_reporter(sm.group(2))))
@@ -117,7 +207,8 @@ ID_PIN_WINDOW = 100
 def _cite_first_page(base_cite: str) -> "int | None":
     """Reporter start page of a base citation ("410 U.S. 113" → 113), ignoring
     any "@pin" suffix; ``None`` when it doesn't parse."""
-    m = CITE_CAPTURE_RE.search((base_cite or "").split("@", 1)[0])
+    matches = _iter_case_cites((base_cite or "").split("@", 1)[0])
+    m = matches[0] if matches else None
     try:
         return int(m.group(3)) if m else None
     except (TypeError, ValueError):
@@ -154,7 +245,7 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         return []
     index = build_short_cite_index(text)
     matches: list[tuple[int, int, str, object]] = []
-    for m in TEXT_CITE_RE.finditer(text):
+    for m in _iter_case_cites(text):
         matches.append((m.start(), m.end(), "cite", m))
     for m in us_code.USC_CITE_RE.finditer(text):
         matches.append((m.start(), m.end(), "usc", m))
@@ -165,7 +256,7 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     for m in constitution.CONST_CITE_RE.finditer(text):
         matches.append((m.start(), m.end(), "const", m))
     # Short forms ("Roe, 410 U.S. at 152") resolve to the case's full citation.
-    for m in SHORT_CITE_RE.finditer(text):
+    for m in _iter_short_cites(text):
         pages = index.get((m.group(1), norm_reporter(m.group(2))))
         if not pages:
             continue
@@ -180,6 +271,8 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     for m in ID_CITE_RE.finditer(text):
         matches.append((m.start(), m.end(), "idcite", m))
     for c in state_statutes.iter_cites(text):
+        if re.match(r"\s*id\.", c.text, re.IGNORECASE):
+            continue
         matches.append((c.start, c.end, "statestat", c))
     for m in statutes_at_large.STAT_CITE_RE.finditer(text):
         if statutes_at_large.url_for(m):  # only link volumes GovInfo has
@@ -191,6 +284,7 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     out: list[tuple[int, int, tuple[str, str]]] = []
     pos = 0
     last_cite_action: tuple[str, str] | None = None
+    last_cite_end: int | None = None
     const_linked: set[int] = set()  # amendments already linked (prose dedup)
     for start, end, kind, m in matches:
         if start < pos:
@@ -198,8 +292,7 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         action: tuple[str, str] | None
         cite_base = ""
         if kind == "cite":
-            cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
-            cite = cite.replace("’", "'")
+            cite = _case_match_text(m)
             cite_base = cite
             pin_m = PINCITE_AFTER_RE.match(text, end)
             if pin_m:
@@ -239,6 +332,10 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
             # cite, left unlinked.  "Id. at N" after a statute/rule reopens that
             # source.
             la = last_cite_action
+            if la and last_cite_end is not None and _id_chain_broken(
+                text[last_cite_end:start]
+            ):
+                la = None
             pin = m.group(1)
             if not la or pin is None:
                 action = None
@@ -262,6 +359,7 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
                 last_cite_action = ("cite", cite_base)
             else:
                 last_cite_action = action
+            last_cite_end = end
         pos = end
     return out
 
@@ -305,6 +403,37 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     bare = detect_links("See Roe v. Wade, 410 U.S. 113 (1973). Id.")
     if sum(1 for _, _, a in bare if a == ("cite", "410 U.S. 113")) != 1:
         print("bare Id. should not add a link:", bare)
+        sys.exit(1)
+
+    # Official state reporters, common in briefs, should be clickable and should
+    # support short forms and in-range Id. references.
+    state = detect_links(
+        "Smith v. Jones, 306 Md. 556, 560 (1986). 306 Md. at 561. Id. at 562."
+    )
+    for want in (
+        ("cite", "306 Md. 556@560"),
+        ("cite", "306 Md. 556@561"),
+        ("cite", "306 Md. 556@562"),
+    ):
+        if not any(a == want for _, _, a in state):
+            print("state reporter/short/Id. failed:", want, state)
+            sys.exit(1)
+
+    # Do not mistake U.S.C./C.F.R. references for broad case reporters.
+    statutory = detect_links("See 42 U.S.C. 1983 and 29 C.F.R. 1614.105.")
+    if any(a[0] == "cite" for _, _, a in statutory):
+        print("statutory citations became case cites:", statutory)
+        sys.exit(1)
+
+    # Brief record cites between an authority and Id. break the Id. chain.
+    record_gap = detect_links("See Foo, 1 F.4th 1. App. 5. Id. at 6.")
+    if any(a == ("cite", "1 F.4th 1@6") for _, _, a in record_gap):
+        print("record Id. should not point to the case:", record_gap)
+        sys.exit(1)
+
+    star_pin = detect_links("See Foo, 1 F.4th 1. Id. at *6.")
+    if not any(a == ("cite", "1 F.4th 1@6") for _, _, a in star_pin):
+        print("star-page Id. did not link:", star_pin)
         sys.exit(1)
 
     print("\nOK:", len(found), "links;", sorted(kinds))
