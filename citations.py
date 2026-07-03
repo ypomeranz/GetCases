@@ -48,10 +48,19 @@ REPORTER_ALT = (
 )
 TEXT_CITE_RE = re.compile(r"\b\d{1,4}\s+" + REPORTER_ALT + r"\s+\d{1,5}\b")
 
+# Some citators — and Google Scholar, for old state cases — drop a court /
+# jurisdiction parenthetical between the reporter and the page:
+# "5 Johns. (N.Y.) 37", "15 Johns. (N.Y.) 121".  Matched optionally and never
+# captured, so the reporter/page groups stay clean; :func:`_case_match_text`
+# strips it back out of the matched span so the normalized cite is "5 Johns.
+# 37".  Requiring a letter-led parenthetical leaves a parallel-reporter form
+# ("5 U.S. (1 Cranch) 137") untouched.
+_COURT_PAREN = r"(?:\s*\([A-Za-z][A-Za-z.'’ ]{0,20}\))?"
+
 # Capturing form (volume, reporter, page) — used to index every full citation
 # in a document so short forms can be resolved back to it.
 CITE_CAPTURE_RE = re.compile(
-    r"\b(\d{1,4})\s+(" + REPORTER_ALT + r")\s+(\d{1,5})\b")
+    r"\b(\d{1,4})\s+(" + REPORTER_ALT + r")" + _COURT_PAREN + r"\s+(\d{1,5})\b")
 
 # Briefs often cite official state reporters that are too numerous to list in
 # REPORTER_ALT ("306 Md. 556", "100 Cal. 400", "515 Pa. 1").  This guarded
@@ -63,7 +72,9 @@ BROAD_CITE_CAPTURE_RE = re.compile(
     + _REPORTER_TOKEN
     + r"(?:\s+"
     + _REPORTER_TOKEN
-    + r"){0,5}?)\s+(\d{1,6})(?=[\s,;.)(]|$)"
+    + r"){0,5}?)"
+    + _COURT_PAREN
+    + r"\s+(\d{1,6})(?=[\s,;.)(]|$)"
 )
 _NONCASE_REPORTERS = {
     "usc", "usca", "uscs", "cfr", "fr", "fedr", "fedreg",
@@ -118,7 +129,11 @@ def _valid_case_reporter(rep: str) -> bool:
 
 
 def _case_match_text(m: re.Match) -> str:
-    return re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.").replace("’", "'")
+    s = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.").replace("’", "'")
+    # Drop the court/jurisdiction parenthetical the reporter regexes tolerate
+    # between reporter and page ("5 Johns. (N.Y.) 37" -> "5 Johns. 37").  The
+    # match ends at the page, so the only parenthetical it can contain is that.
+    return re.sub(r"\s*\([^)]*\)\s*", " ", s).strip()
 
 
 def _iter_case_cites(text: str) -> list[re.Match]:
@@ -434,6 +449,21 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     star_pin = detect_links("See Foo, 1 F.4th 1. Id. at *6.")
     if not any(a == ("cite", "1 F.4th 1@6") for _, _, a in star_pin):
         print("star-page Id. did not link:", star_pin)
+        sys.exit(1)
+
+    # A court/jurisdiction parenthetical between reporter and page (as Google
+    # Scholar prints old state cases) must not defeat the cite — it normalizes
+    # away so the link resolves to "5 Johns. 37" (Kilburn v. Woodworth), not a
+    # dead cite that dead-ends on a fuzzy name search.
+    juris = detect_links("Kilbourn v. Woodworth, 5 Johns. (N.Y.) 37, was an "
+                         "action of debt; see Borden v. Fitch, 15 Johns. (N.Y.) 121.")
+    for want in (("cite", "5 Johns. 37"), ("cite", "15 Johns. 121")):
+        if not any(a == want for _, _, a in juris):
+            print("embedded jurisdiction paren cite failed:", want, juris)
+            sys.exit(1)
+    base, _pin = cite_target_from_text("5 Johns. (N.Y.) 37", {})
+    if base != "5 Johns. 37":
+        print("cite_target_from_text kept the paren:", repr(base))
         sys.exit(1)
 
     print("\nOK:", len(found), "links;", sorted(kinds))

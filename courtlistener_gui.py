@@ -10150,8 +10150,12 @@ class _ScholarTextWindow:
     def _follow_cite_via_cl(self, cite: str, pin: str = "", name: str = "",
                             retry=None) -> None:
         """Follow a cited-case link Google Scholar can't supply — whether it is
-        missing, flaky, or blocking: locate the case on CourtListener (by
-        citation, then by name) and fall back to its static.case.law PDF.
+        missing, flaky, or blocking.  Resolve in order of how surely each source
+        is the opinion *at* the clicked cite: CourtListener by citation, then
+        the citation-keyed static.case.law PDF, and only then a (fuzzy)
+        CourtListener name search — so a cite CourtListener lacks opens the
+        right case.law scan rather than a same-party namesake (clicking "5
+        Johns. 37", Kilburn v. Woodworth, must never open Kilbourn v. Thompson).
 
         ``retry`` (cite, pin, url, name) keeps trying Google Scholar in the
         background after the CourtListener view opens (used when a Scholar link
@@ -10168,23 +10172,32 @@ class _ScholarTextWindow:
         def run() -> None:
             try:
                 # CourtListener by the cite as printed and — for an old
-                # nominative SCOTUS cite — by its modern "U.S." form; then, when
-                # no usable cite resolves, by the case name.
+                # nominative SCOTUS cite — by its modern "U.S." form; then the
+                # citation-keyed case.law PDF; and only as a last resort the
+                # (fuzzy) case name.
                 target = _cl_item_for_citation(client, cite) if cite else None
                 if target is None and cite:
                     alt = _us_reports_cite(cite)
                     if alt:
                         target = _cl_item_for_citation(client, alt)
+                if target is None and cite:
+                    # CourtListener has no cluster at this exact citation.
+                    # Prefer the citation-keyed static.case.law PDF — the
+                    # opinion *at* that cite — over the name search below, which
+                    # ranks by party name and can surface a different case:
+                    # clicking "5 Johns. 37" (Kilburn v. Woodworth) must not
+                    # open the unrelated "Kilbourn v. Thompson, 103 U.S. 168".
+                    pdf = _case_law_pdf_for_cite(cite)
+                    if pdf:
+                        self._post(self._open_cited_case_pdf, pdf, cite, pin)
+                        return
                 if target is None and name:
                     target = _cl_item_for_name(client, name)
                 if not target:
-                    # Not on CourtListener — try the official case.law PDF.
-                    pdf = _case_law_pdf_for_cite(cite) if cite else None
-                    if pdf:
-                        self._post(self._open_cited_case_pdf, pdf, cite, pin)
-                    elif retry:
-                        # Nothing anywhere — keep retrying Google Scholar and
-                        # open it if it comes through.
+                    # Nothing keyed to the cite and no name match — keep
+                    # retrying Google Scholar and open it if it comes through,
+                    # else report nothing found.
+                    if retry:
                         self._post(self._retry_scholar_only, *retry)
                     else:
                         self._post(self._on_cl_link_error, f"No match for {label}.")
