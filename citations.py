@@ -269,7 +269,20 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         return []
     index = build_short_cite_index(text)
     matches: list[tuple[int, int, str, object]] = []
+    # English Reports citations first — both the reprint form ("156 Eng. Rep.
+    # 145") and the original nominate cites ("9 Exch. 341", resolution-gated in
+    # eng_rep) — so the broad case-reporter fallback below can yield to them:
+    # a Scholar lookup by an English cite lands on an unrelated case.
+    engrep_spans: list[tuple[int, int]] = []
+    for m in eng_rep.ER_CITE_RE.finditer(text):
+        engrep_spans.append((m.start(), m.end()))
+        matches.append((m.start(), m.end(), "engrep", eng_rep.cite_spec(m)))
+    for start, end, spec, _cases in eng_rep.iter_nominate_cites(text):
+        engrep_spans.append((start, end))
+        matches.append((start, end, "engrep", spec))
     for m in _iter_case_cites(text):
+        if any(m.start() < e and s < m.end() for s, e in engrep_spans):
+            continue
         matches.append((m.start(), m.end(), "cite", m))
     for m in us_code.USC_CITE_RE.finditer(text):
         matches.append((m.start(), m.end(), "usc", m))
@@ -301,8 +314,6 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     for m in statutes_at_large.STAT_CITE_RE.finditer(text):
         if statutes_at_large.url_for(m):  # only link volumes GovInfo has
             matches.append((m.start(), m.end(), "stat", m))
-    for m in eng_rep.ER_CITE_RE.finditer(text):
-        matches.append((m.start(), m.end(), "engrep", m))
 
     matches.sort(key=lambda t: (t[0], -t[1]))
     out: list[tuple[int, int, tuple[str, str]]] = []
@@ -373,8 +384,9 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         elif kind == "stat":
             action = ("statpdf", statutes_at_large.url_for(m))
         elif kind == "engrep":
-            # English Reports cite ("156 Eng. Rep. 145") -> CommonLII scan.
-            action = ("engrep", eng_rep.cite_spec(m))
+            # English Reports cite — reprint ("156 Eng. Rep. 145") or nominate
+            # ("9 Exch. 341") — -> CommonLII scan; m is the pre-built spec.
+            action = ("engrep", m)
         else:  # pragma: no cover - defensive
             action = None
         if action is not None:
@@ -489,6 +501,26 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
             sys.exit(1)
     if any(a[0] == "cite" for _, _, a in er):
         print("Eng. Rep. cite leaked into a Scholar case link:", er)
+        sys.exit(1)
+
+    # The nominate-report parallel cites route to the same viewer (resolution-
+    # gated on the shipped index): "9 Exch. 341" is Hadley, "5 East 10" is
+    # Wain.  U.S. cites sharing an abbreviation stay ordinary case links —
+    # New York's volumed "5 Johns. 37" must never be claimed by the volumeless
+    # English Johnson.
+    nom = detect_links(
+        "Hadley v. Baxendale, 9 Exch. 341, 156 Eng. Rep. 145 (1854); "
+        "Wain v. Warlters, 5 East 10; Kilbourn v. Woodworth, 5 Johns. "
+        "(N.Y.) 37."
+    )
+    for want in (("engrep", "n:exch:9:341"), ("engrep", "156:145"),
+                 ("engrep", "n:east:5:10"), ("cite", "5 Johns. 37")):
+        if not any(a == want for _, _, a in nom):
+            print("nominate detection failed:", want, nom)
+            sys.exit(1)
+    if any(a == ("cite", "9 Exch. 341") or a == ("cite", "5 East 10")
+           for _, _, a in nom):
+        print("nominate cite leaked into a Scholar case link:", nom)
         sys.exit(1)
 
     print("\nOK:", len(found), "links;", sorted(kinds))

@@ -22,12 +22,29 @@ The index is a gzipped TSV, one row per citation, sorted by (vol, page, letter):
 cases share one reprint page -- so a single "<vol> E.R. <page>" can resolve to
 more than one case (28% of pages), and :func:`resolve` returns a *list*.
 
+A second shipped index (``eng_rep_nominate.tsv.gz``) maps the original
+*nominate-report* citations — the parallel cites the English Reports reprint,
+"9 Exch. 341" (Hadley), "5 East 10", "Cro. Jac. 489" — to the same cases, one
+row per citation:
+
+    reporter <tab> volume <tab> page <tab> year <tab> num
+
+``reporter`` is CommonLII's printed form ("Exch", "Cro Jac", "M & W"); the
+detection regex derives period/spacing-tolerant patterns from it so the dotted
+Bluebook forms briefs use ("M. & W.", "Q.B.", "Bro. C.C.") match too.
+``volume`` is 0 for one-volume reporters cited without one.  Nominate matching
+is *resolution-gated*: only a citation whose exact (reporter, volume, page) is
+an indexed start page ever becomes a link, so U.S. citations that share an
+abbreviation (New York's volumed "5 Johns. 37" vs the volumeless English
+Johnson) are never claimed.
+
 Only the citation/name/URL facts are shipped here (an index, like a citator);
 the PDFs themselves stay on CommonLII and are fetched on demand, with
 attribution, by the viewer.
 
-To regenerate the index: see ``_engr_build/parse_engr.py`` then
-``_engr_build/build_index.py``.
+To regenerate both indexes: ``python _engr_build/fetch_toc.py`` (downloads
+CommonLII's A-Z browse pages) then ``python _engr_build/build_nominate.py``;
+the main index was built the same way from those pages.
 
 This module has no third-party dependencies and is import-safe even if the index
 file is missing (it simply resolves nothing).  Run ``python -X utf8 eng_rep.py``
@@ -55,6 +72,7 @@ _REPORTER = r"(?:Eng\.?\s?Rep\.?|E\.?\s?R\.?)"
 ER_CITE_RE = re.compile(r"\b(\d{1,3})\s+" + _REPORTER + r"\s+(\d{1,5})\b")
 
 INDEX_FILENAME = "eng_rep_index.tsv.gz"
+NOMINATE_FILENAME = "eng_rep_nominate.tsv.gz"
 BASE_URL = "https://www.commonlii.org/uk/cases/EngR"
 
 
@@ -101,6 +119,7 @@ class ERCase:
 
 _INDEX: dict[tuple[int, int], list[ERCase]] | None = None
 _VOL_PAGES: dict[int, list[int]] | None = None
+_BY_NEUTRAL: dict[tuple[int, int], ERCase] | None = None
 _LOCK = threading.Lock()
 
 
@@ -112,7 +131,7 @@ def _load() -> None:
     """Populate the in-memory index from the gzipped TSV (idempotent).  Any
     failure (missing/corrupt file) leaves an empty index so the app still runs;
     E.R. citations just won't resolve."""
-    global _INDEX, _VOL_PAGES
+    global _INDEX, _VOL_PAGES, _BY_NEUTRAL
     if _INDEX is not None:
         return
     with _LOCK:
@@ -144,13 +163,24 @@ def _load() -> None:
         for vol, page in idx:
             vol_pages.setdefault(vol, set()).add(page)
         _VOL_PAGES = {v: sorted(p) for v, p in vol_pages.items()}
+        # neutral cite -> case, joining the nominate index to the case records
+        by_neutral: dict[tuple[int, int], ERCase] = {}
+        for cases in idx.values():
+            for c in cases:
+                by_neutral.setdefault((c.year, c.num), c)
+        _BY_NEUTRAL = by_neutral
         _INDEX = idx
 
 
 def warm() -> None:
-    """Load the index in a background thread (call at GUI start so the first
+    """Load the indexes in a background thread (call at GUI start so the first
     click is instant).  Best-effort."""
-    threading.Thread(target=_load, daemon=True).start()
+
+    def run() -> None:
+        _load()
+        _load_nominate()
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def is_available() -> bool:
@@ -184,6 +214,129 @@ def lookup_nearest(vol: int, page: int) -> list[ERCase]:
     import bisect
     i = bisect.bisect_right(pages, int(page)) - 1
     return lookup(vol, pages[i]) if i >= 0 else []
+
+
+# ---------------------------------------------------------------------------
+# Nominate-report citations ("9 Exch. 341", "5 East 10", "Cro. Jac. 489") --
+# the original citations the English Reports reprint.  Detected with a regex
+# built from the reporter vocabulary actually in the shipped index, and
+# resolution-gated: a match is only reported when its exact (reporter, volume,
+# page) is an indexed start page, so shared abbreviations can't misfire.
+# ---------------------------------------------------------------------------
+
+_NOM_INDEX: "dict[tuple[str, int, int], list[tuple[int, int]]] | None" = None
+_NOM_RE: "re.Pattern | None" = None
+
+# Reporter keys never matched in text, because in a U.S. document the bare
+# abbreviation means something else: "Curt." is Curtis' Circuit Court reports
+# (English Curteis is cited "Curt. Ecc."), and a capitalized "And" is prose
+# ("... 2 And 45 ..." in a title-case heading), not Anderson's Common Pleas.
+_NOMINATE_DENY = frozenset({"curt", "and"})
+
+
+def _nom_key(rep: str) -> str:
+    """Lookup key for a reporter abbreviation, ignoring case, periods and
+    spacing ('Cro Jac' == 'Cro. Jac.' == 'cro jac' -> 'crojac')."""
+    return re.sub(r"[^a-z0-9]+", "", (rep or "").lower())
+
+
+def _nom_token_pattern(tok: str) -> str:
+    """Period/spacing-tolerant pattern for one reporter token.  An all-caps
+    token allows periods between the letters ('TR' -> 'T.R.', 'CC' -> 'C.C.'),
+    since briefs write the dotted Bluebook forms; other tokens take an optional
+    trailing period ('Exch' -> 'Exch.', 'Cro' -> 'Cro.')."""
+    if tok == "&":
+        return r"&"
+    if re.fullmatch(r"[A-Z]{2,5}", tok):
+        return r"\.?\s?".join(tok) + r"\.?"
+    esc = re.escape(tok).replace("'", "['’]").replace("’", "['’]")
+    return esc + r"\.?"
+
+
+def _nom_form_pattern(form: str) -> str:
+    """Pattern for a whole reporter form ('M & W' -> M\\.?\\s*&\\s*W\\.?)."""
+    toks = form.split()
+    parts: list[str] = []
+    for i, tok in enumerate(toks):
+        if i:
+            parts.append(r"\s*" if "&" in (tok, toks[i - 1]) else r"\s+")
+        parts.append(_nom_token_pattern(tok))
+    return "".join(parts)
+
+
+def _load_nominate() -> None:
+    """Populate the nominate index and its detection regex (idempotent).  Any
+    failure leaves them empty so the app still runs; nominate citations just
+    won't resolve.  Loads the main index first (case records join by neutral
+    cite)."""
+    global _NOM_INDEX, _NOM_RE
+    if _NOM_INDEX is not None:
+        return
+    _load()  # outside _LOCK -- it takes the same (non-reentrant) lock
+    with _LOCK:
+        if _NOM_INDEX is not None:
+            return
+        idx: dict[tuple[str, int, int], list[tuple[int, int]]] = {}
+        forms: set[str] = set()
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            NOMINATE_FILENAME)
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                for line in fh:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 5:
+                        continue
+                    rep, vol, page, year, num = parts[:5]
+                    key = _nom_key(rep)
+                    if not key or key in _NOMINATE_DENY:
+                        continue
+                    try:
+                        entry = (key, int(vol), int(page))
+                        target = (int(year), int(num))
+                    except ValueError:
+                        continue
+                    idx.setdefault(entry, []).append(target)
+                    forms.add(rep)
+        except FileNotFoundError:
+            print(f"[eng_rep] nominate index not found: {path}")
+        except Exception as exc:  # pragma: no cover - corrupt file
+            print(f"[eng_rep] failed to load nominate index: {exc}")
+        for targets in idx.values():
+            targets.sort()
+        if forms:
+            # Longest form first, so 'Ves Jun Supp' outranks 'Ves Jun' and
+            # 'CB NS' outranks 'CB' (regex alternation is first-match).
+            alt = "|".join(_nom_form_pattern(f)
+                           for f in sorted(forms, key=len, reverse=True))
+            _NOM_RE = re.compile(
+                r"\b(?:(\d{1,3})\s+)?(" + alt + r")\s+(\d{1,5})(?:\s*[ab])?\b")
+        _NOM_INDEX = idx
+
+
+def iter_nominate_cites(text: str) -> "list[tuple[int, int, str, list[ERCase]]]":
+    """Nominate-report citations in *text* that resolve to indexed cases, as
+    ``(start, end, spec, cases)`` in document order.  ``spec`` ('n:exch:9:341')
+    round-trips through :func:`resolve`.  Unresolvable look-alikes (a U.S. "5
+    Johns. 37", prose) are simply not reported."""
+    if not text:
+        return []
+    _load_nominate()
+    if _NOM_RE is None or not _NOM_INDEX:
+        return []
+    assert _BY_NEUTRAL is not None
+    out: list[tuple[int, int, str, list[ERCase]]] = []
+    for m in _NOM_RE.finditer(text):
+        vol = int(m.group(1) or 0)
+        key = _nom_key(m.group(2))
+        page = int(m.group(3))
+        targets = _NOM_INDEX.get((key, vol, page))
+        if not targets:
+            continue
+        cases = [c for c in (_BY_NEUTRAL.get(t) for t in targets)
+                 if c is not None]
+        if cases:
+            out.append((m.start(), m.end(), f"n:{key}:{vol}:{page}", cases))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -325,8 +478,19 @@ def cite_label(m: "re.Match") -> str:
 
 
 def resolve(spec: str) -> list[ERCase]:
-    """Candidates for a '<vol>:<page>' spec (exact start page)."""
-    vp = parse_spec(spec)
+    """Candidates for a spec: '<vol>:<page>' (E.R. start page) or
+    'n:<reporter-key>:<vol>:<page>' (a nominate citation, exact)."""
+    s = (spec or "").strip()
+    nm = re.fullmatch(r"n:([a-z0-9]+):(\d+):(\d+)", s)
+    if nm:
+        _load_nominate()
+        if not _NOM_INDEX or _BY_NEUTRAL is None:
+            return []
+        targets = _NOM_INDEX.get(
+            (nm.group(1), int(nm.group(2)), int(nm.group(3)))) or []
+        return [c for c in (_BY_NEUTRAL.get(t) for t in targets)
+                if c is not None]
+    vp = parse_spec(s)
     return lookup(*vp) if vp else []
 
 
@@ -408,6 +572,37 @@ if __name__ == "__main__":
 
     # a bogus citation resolves to nothing
     check(lookup(999, 99999) == [], "bogus cite -> no cases")
+
+    # --- nominate-report citations (needs eng_rep_nominate.tsv.gz) ---
+    def nom_one(text, expect_spec, expect_name_substr):
+        hits = iter_nominate_cites(text)
+        ok = any(spec == expect_spec
+                 and any(expect_name_substr.lower() in c.name.lower()
+                         for c in cases)
+                 for _s, _e, spec, cases in hits)
+        check(ok, f"nominate {text!r} -> {expect_spec} "
+                  f"({expect_name_substr!r}); got {[(s, [c.name[:24] for c in cs]) for _a, _b, s, cs in hits]!r}")
+
+    nom_one("Hadley v. Baxendale, 9 Exch. 341 (1854)", "n:exch:9:341", "Hadley")
+    nom_one("Wain v. Warlters, 5 East 10", "n:east:5:10", "Wain")
+    # dotted all-caps forms, as briefs write them ("3 T.R. 557" = "3 TR 557")
+    nom_one("Rawlinson v. Shaw, 3 T.R. 557", "n:tr:3:557", "Rawlinson")
+    nom_one("Abell v. Heathcote, 4 Bro. C.C. 278", "n:brocc:4:278", "Abell")
+    # a volumeless one-volume reporter ("Cro. Jac. 3")
+    check(any(spec == "n:crojac:0:3"
+              for _s, _e, spec, _c in iter_nominate_cites("see Cro. Jac. 3")),
+          "volumeless 'Cro. Jac. 3' resolves")
+    # nominate specs round-trip through resolve()
+    check(any("Hadley" in c.name for c in resolve("n:exch:9:341")),
+          "resolve('n:exch:9:341') -> Hadley")
+    # U.S. citations sharing an abbreviation must never be claimed: New York's
+    # volumed Johnson ("5 Johns. 37") vs the volumeless English Johnson, a U.S.
+    # reporter cite, and the denied "Curt." (Curtis' U.S. circuit reports).
+    for us_text in ["Kilbourn v. Woodworth, 5 Johns. 37",
+                    "Roe v. Wade, 410 U.S. 113", "306 Md. 556",
+                    "In re X, 1 Curt. 344"]:
+        check(iter_nominate_cites(us_text) == [],
+              f"no nominate claim on {us_text!r}")
 
     # --- name search ---
     def name_one(query, expect_substr):

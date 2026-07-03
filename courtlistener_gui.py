@@ -1129,6 +1129,8 @@ def _special_citation_ranges(spans) -> "list[tuple[int, int, tuple[str, str]]]":
         spec = eng_rep.cite_spec(m)
         if eng_rep.resolve(spec):  # only cases we actually have
             targets.append((m.start(), m.end(), ("engrep", spec)))
+    for s, e, spec, _cases in eng_rep.iter_nominate_cites(text):
+        targets.append((s, e, ("engrep", spec)))  # gated on the index already
     if _FED_APPX_RE.search(text):  # cheap guard before the full reporter scan
         for m in _TEXT_CITE_RE.finditer(text):
             cite = re.sub(r"\s+", " ", m.group(0)).strip()
@@ -2727,6 +2729,15 @@ class CourtListenerGUI:
                 self._quick_popup = None
                 _open_eng_rep(self.root, eng_rep.cite_spec(er_m),
                               self._status_var.set)
+                return
+            # ... or its original nominate-report form ("9 Exch. 341",
+            # "Cro. Jac. 489").  Resolution-gated in eng_rep, so a U.S. cite
+            # sharing an abbreviation falls through to the case search below.
+            nom = eng_rep.iter_nominate_cites(query)
+            if nom:
+                popup.destroy()
+                self._quick_popup = None
+                _open_eng_rep(self.root, nom[0][2], self._status_var.set)
                 return
 
             # 2. Case citation: "365 U.S. 167" or "Monroe v. Pape, 365 U.S. 167, 171"
@@ -7909,6 +7920,12 @@ class _ScholarTextWindow:
             if eng_rep.resolve(er_spec):
                 self._last_cite_action = ("engrep", er_spec)
                 return ("engrep", er_spec)
+        # Same for a link citing only the nominate form ("9 Exch. 341" with no
+        # E.R. parallel) — resolution-gated, so U.S. cites are never claimed.
+        nom = eng_rep.iter_nominate_cites(re.sub(r"<[^>]+>", "", full_text))
+        if nom:
+            self._last_cite_action = ("engrep", nom[0][2])
+            return ("engrep", nom[0][2])
         # Open the Scholar opinion, carrying the pincite (so it jumps to the
         # right page), the reporter cite, and the case name so a failed/blocked
         # fetch still locates the case on CourtListener (by cite, or by name
@@ -8001,6 +8018,8 @@ class _ScholarTextWindow:
                 matches.append((m.start(), m.end(), "stat", m))
         for m in eng_rep.ER_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "engrep", m))
+        for s, e, spec, _cases in eng_rep.iter_nominate_cites(text):
+            matches.append((s, e, "engrepn", spec))
         matches.sort(key=lambda t: (t[0], -t[1]))
         pos = 0
         for start, end, kind, m in matches:
@@ -8058,6 +8077,10 @@ class _ScholarTextWindow:
             elif kind == "engrep":
                 # English Reports cite ("156 Eng. Rep. 145") → CommonLII scan.
                 action = ("engrep", eng_rep.cite_spec(m))
+            elif kind == "engrepn":
+                # Nominate-report cite ("9 Exch. 341") → same viewer; m is the
+                # pre-built, resolution-gated spec ("n:exch:9:341").
+                action = ("engrep", m)
             else:
                 action = ("cfr", ecfr.cite_spec(m))
             if action is None:
