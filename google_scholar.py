@@ -415,6 +415,19 @@ _SEP_HEADER_RE = re.compile(
 # headers but are not.
 _NOT_SEP_RE = re.compile(r"\b(?:filed|delivered|announced)\b", re.IGNORECASE)
 
+# A separate opinion introduced *without* "concurring"/"dissenting": the bare
+# old-style attribution ("MR. JUSTICE HOLMES:" opening his separate opinion in
+# INS v. AP) or an end-of-report statement ("Statement of JUSTICE SOUTER." in
+# Lucas).  Exactly one justice name followed by the closing punctuation —
+# anything longer is prose.  Only honored once the majority opinion has begun:
+# before it, the same bare line would be the majority's own byline.
+_BARE_SEP_HEADER_RE = re.compile(
+    r"^(?:Statement\s+of\s+)?"
+    r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(?:CHIEF\s+)?JUSTICE\s+"
+    r"[A-Z][\w.'’-]+\s*[.:]$",
+    re.IGNORECASE,
+)
+
 # The byline shared with the body of _SEP_HEADER_RE — a justice/judge name
 # followed (within a clause) by "concurring"/"dissenting".
 _SEP_BYLINE = (
@@ -636,7 +649,8 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
         return []
     blocks = _split_inline_sep_headers(blocks)
     boundaries: list[tuple[int, str, str]] = []  # (block index, kind, label)
-    maj_phrase_idx: Optional[int] = None
+    bare_headers: list[tuple[int, str, str]] = []  # keyword-less attributions
+    maj_phrase_all: list[int] = []
     maj_author_idx: Optional[int] = None
     for i, b in enumerate(blocks):
         t = _content_text(b)
@@ -647,15 +661,43 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
             label = t if len(t) <= 90 else t[:87] + "…"
             boundaries.append((i, kind, label))
             continue
-        if not boundaries:
-            if _MAJ_PHRASE_RE.search(t[:160]) and _MAJ_ATTRIB_RE.match(t):
-                # Keep the LAST candidate: the syllabus disposition line
-                # ("BLACKMUN, J., delivered…") precedes the true opinion
-                # start ("MR. JUSTICE BLACKMUN delivered…").
-                maj_phrase_idx = i
-            elif maj_author_idx is None and len(t) <= 120 and _AUTHOR_LINE_RE.match(t):
-                maj_author_idx = i
+        if len(t) <= 60 and _BARE_SEP_HEADER_RE.match(t):
+            bare_headers.append((i, "concurrence", t))
+            continue
+        if _MAJ_PHRASE_RE.search(t[:160]) and _MAJ_ATTRIB_RE.match(t):
+            # Candidates are collected over the whole document: an attribution
+            # *after* the first "separate-opinion" line reveals that line to be
+            # a front-matter announcement (see below).
+            maj_phrase_all.append(i)
+        elif (maj_author_idx is None and not boundaries
+              and len(t) <= 120 and _AUTHOR_LINE_RE.match(t)):
+            maj_author_idx = i
+    first_sep = boundaries[0][0] if boundaries else len(blocks)
+    phrase_before = [i for i in maj_phrase_all if i < first_sep]
+    maj_phrase_idx: Optional[int] = None
+    if phrase_before:
+        # Keep the LAST candidate: the syllabus disposition line ("BLACKMUN,
+        # J., delivered…") precedes the true opinion start ("MR. JUSTICE
+        # BLACKMUN delivered…").
+        maj_phrase_idx = phrase_before[-1]
+    elif maj_phrase_all:
+        # The majority attribution ("PER CURIAM:", "…delivered the opinion")
+        # comes only *after* the first separate-opinion line — but a separate
+        # opinion can never begin before the majority does.  Those early lines
+        # are front-matter announcements of the separate opinions ("TAMM,
+        # Circuit Judge, …, dissenting from the per curiam opinion" in Buckley
+        # v. Valeo, 519 F.2d 821): part of the header, not boundaries.
+        maj_phrase_idx = maj_phrase_all[0]
+        boundaries = [bd for bd in boundaries if bd[0] > maj_phrase_idx]
     maj_idx = maj_phrase_idx if maj_phrase_idx is not None else maj_author_idx
+    # Keyword-less attributions ("MR. JUSTICE HOLMES:", "Statement of JUSTICE
+    # SOUTER.") open a separate opinion only once the majority — or an explicit
+    # separate opinion — has begun; earlier ones would be the majority byline.
+    anchor = maj_idx if maj_idx is not None else (
+        boundaries[0][0] if boundaries else None)
+    if anchor is not None:
+        boundaries += [bd for bd in bare_headers if bd[0] > anchor]
+        boundaries.sort(key=lambda bd: bd[0])
     first_sep = boundaries[0][0] if boundaries else len(blocks)
 
     parts: list[OpinionPart] = []

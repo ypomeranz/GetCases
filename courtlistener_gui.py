@@ -361,6 +361,17 @@ def _ui_button(parent, text: str, command=None, primary: bool = False,
     return btn
 
 
+def _history_button(app, parent_frame):
+    """The "History ▾" button case windows share: drops the app-wide list of
+    the last 15 viewed cases (see ``CourtListenerGUI.record_case_view``).
+    ``app`` may be None (a window opened without an app handle) — no button."""
+    if app is None or not hasattr(app, "post_history_menu"):
+        return None
+    btn = _ui_button(parent_frame, "History ▾", width=100)
+    btn.configure(command=lambda: app.post_history_menu(btn))
+    return btn
+
+
 def _ui_checkbox(parent, text: str, variable, command=None):
     if _CTK_AVAILABLE:
         return ctk.CTkCheckBox(parent, text=text, variable=variable,
@@ -1185,7 +1196,7 @@ def _item_from_cluster(cluster: dict) -> dict:
     return item
 
 
-def _cl_item_for_citation(client, cite: str) -> Optional[dict]:
+def _cl_item_for_citation(client, cite: str, name: str = "") -> Optional[dict]:
     """Resolve a reporter citation to the CourtListener cluster that actually
     bears it, as a search-result-shaped item (or ``None``).
 
@@ -1196,34 +1207,84 @@ def _cl_item_for_citation(client, cite: str) -> Optional[dict]:
     if that finds nothing — and even then accept a result only when its own
     citations include the requested one, rather than blindly taking the first.
     Returning ``None`` (so the caller reports "not found") is preferable to
-    opening the wrong case."""
+    opening the wrong case.
+
+    A citation can be *ambiguous*: CourtListener answers "1 Cranch 299" with
+    status 300 and two clusters, because the D.C. Circuit's Cranch reports are
+    normalized to the same form — Stuart v. Laird (5 U.S. 299, 1803) and
+    Wiggins v. Wiggins (1806) both "bear" it.  Rather than skipping those (and
+    falling into the even less careful full-text search), the candidates are
+    scored: the cluster also bearing the citation's modern U.S.-Reports
+    parallel wins, then a match on the case ``name`` the caller knows, then
+    the Supreme Court for a nominative SCOTUS cite."""
     cite = (cite or "").split("@", 1)[0].strip()
     if not cite:
         return None
     want = re.sub(r"\s+", "", cite).lower()
+    alt = _us_reports_cite(cite)
+    altkey = re.sub(r"\s+", "", alt).lower() if alt else ""
 
-    # 1) Exact resolution via the citation-lookup endpoint.
+    def norm_cites(raw) -> set[str]:
+        out: set[str] = set()
+        for c in raw or []:
+            if isinstance(c, dict):
+                v, r, p = c.get("volume"), c.get("reporter"), c.get("page")
+                if v and r and p:
+                    out.add(re.sub(r"\s+", "", f"{v}{r}{p}").lower())
+            else:
+                out.add(re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", str(c))).lower())
+        return out
+
+    def score(case_name: str, cites: set[str], court: str) -> int:
+        s = 0
+        if altkey and altkey in cites:
+            s += 4
+        if name and _name_match_score(name, case_name or "") >= _NAME_MATCH_MIN:
+            s += 2
+        if altkey and (court or "").lower() == _SCOTUS_COURT_ID:
+            s += 1
+        return s
+
+    # 1) Resolution via the citation-lookup endpoint (exact; 300 = ambiguous).
     try:
+        clusters = []
         for entry in client.lookup_citation(cite):
-            if entry.get("status") != 200:
-                continue
-            for cl in entry.get("clusters") or []:
-                item = _item_from_cluster(cl)
-                if item.get("cluster_id"):
-                    return item
+            if entry.get("status") in (200, 300):
+                clusters.extend(entry.get("clusters") or [])
+        if clusters:
+            best = max(
+                clusters,
+                key=lambda cl: score(
+                    cl.get("case_name") or cl.get("case_name_full") or "",
+                    norm_cites(cl.get("citations")),
+                    str(cl.get("court_id") or cl.get("court") or ""),
+                ),
+            )
+            item = _item_from_cluster(best)
+            if item.get("cluster_id"):
+                return item
     except Exception as exc:
         print(f"[cl-cite] citation-lookup failed for {cite!r}: {exc}")
 
-    # 2) Fall back to full-text search, trusting only a real citation match.
+    # 2) Fall back to full-text search, trusting only a real citation match
+    # (and preferring the same disambiguation signals when several match).
     for q in (f"citation:({cite})", f'"{cite}"'):
         try:
             results = client.search(q, type="o", page_size=5).get("results") or []
         except Exception:
             continue
-        for it in results:
-            if any(re.sub(r"\s+", "", str(c)).lower() == want
-                   for c in (it.get("citation") or [])):
-                return it
+        matched = [it for it in results
+                   if want in norm_cites(it.get("citation"))]
+        if matched:
+            return max(
+                matched,
+                key=lambda it: score(
+                    re.sub(r"<[^>]+>", "",
+                           it.get("caseName") or it.get("case_name") or ""),
+                    norm_cites(it.get("citation")),
+                    str(it.get("court_id") or ""),
+                ),
+            )
     return None
 
 
@@ -1916,6 +1977,64 @@ _CL_TYPE_KIND: dict[str, str] = {
 }
 
 
+#: CAP headmatter elements that duplicate metadata the header already shows.
+_HEADMATTER_DROP = {"parties", "docketnumber", "court", "decisiondate",
+                    "otherdate", "citation"}
+#: Section headings for the elements that are shown, in CAP's own order.
+_HEADMATTER_HEADINGS = {
+    "headnotes": "Headnotes", "syllabus": "Syllabus", "summary": "Summary",
+    "attorneys": "Counsel", "seealso": "See Also", "history": "History",
+    "disposition": "Disposition", "correction": "Correction",
+}
+_HEADMATTER_EL_RE = re.compile(
+    r"<(parties|docketnumber|court|decisiondate|otherdate|citation|"
+    r"headnotes|syllabus|summary|attorneys|seealso|history|disposition|"
+    r"correction)\b[^>]*>(.*?)</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _headmatter_blocks(headmatter: str) -> "tuple[list, list]":
+    """(blocks, footnotes) rendering a cluster's CAP ``headmatter`` — the
+    material printed before the opinion (headnotes, the arguments of counsel,
+    procedural summaries).  Elements duplicating the header metadata (parties,
+    docket number, dates) are dropped; the rest keep their printed order, each
+    section introduced by a small heading.  Reporter page markers inside the
+    headmatter are removed: the argument pages would otherwise collide with
+    the opinion's own star pagination in the page map."""
+    try:
+        from google_scholar import Block, Span
+    except ImportError:
+        return [], []
+    blocks: list = []
+    footnotes: list = []
+    prev_tag = ""
+    for m in _HEADMATTER_EL_RE.finditer(headmatter or ""):
+        tag = m.group(1).lower()
+        if tag in _HEADMATTER_DROP:
+            continue
+        try:
+            parsed, fns = _parse_cl_html(m.group(2), fn_prefix="hm_")
+        except Exception:
+            parsed, fns = [], []
+        # Drop star-pagination marker spans (see docstring).
+        cleaned = []
+        for b in parsed:
+            spans = [s for s in b.spans if not s.pagenum]
+            if any(s.text.strip() for s in spans):
+                cleaned.append(Block(kind=b.kind, spans=spans))
+        if not cleaned:
+            continue
+        if tag != prev_tag:
+            heading = _HEADMATTER_HEADINGS.get(tag, tag.title())
+            blocks.append(Block(kind="heading",
+                                spans=[Span(text=heading, bold=True)]))
+            prev_tag = tag
+        blocks.extend(cleaned)
+        footnotes.extend(fns)
+    return blocks, footnotes
+
+
 def _pick_combined_opinion(opinions: list[dict]) -> Optional[dict]:
     """The CourtListener "combined" opinion — the whole case as one
     star-paginated document (structurally a Google Scholar opinion) — when the
@@ -1953,7 +2072,7 @@ def _assemble_case_parts(
     cluster = client.get_cluster(
         int(cluster_id),
         fields="case_name,citations,judges,attorneys,syllabus,headnotes,"
-               "sub_opinions,date_filed,docket",
+               "headmatter,sub_opinions,date_filed,docket",
     )
 
     # The Bluebook date parenthetical needs the court, but citation-lookup
@@ -2010,19 +2129,35 @@ def _assemble_case_parts(
                 Span(text=val),
             ]))
 
-    for field_name, label in [("syllabus", "Syllabus"), ("headnotes", "Headnotes")]:
-        val = (cluster.get(field_name) or "").strip()
-        if val:
-            parsed, _fn = _parse_cl_html(val)  # syllabus/headnotes have no footnotes
-            if parsed:
-                header_blocks.append(Block(kind="heading", spans=[
-                    Span(text=label, bold=True),
-                ]))
-                header_blocks.extend(parsed)
+    # The CAP ``headmatter`` — everything printed before the opinion
+    # (headnotes, the arguments of counsel, procedural summaries) — becomes
+    # its own part.  It embeds the syllabus/headnotes, so those separate
+    # fields are only rendered when there is no headmatter to show.
+    hm_blocks, hm_footnotes = _headmatter_blocks(
+        (cluster.get("headmatter") or "").strip()
+    )
+    if not hm_blocks:
+        for field_name, label in [("syllabus", "Syllabus"),
+                                  ("headnotes", "Headnotes")]:
+            val = (cluster.get(field_name) or "").strip()
+            if val:
+                parsed, _fn = _parse_cl_html(val)  # these carry no footnotes
+                if parsed:
+                    header_blocks.append(Block(kind="heading", spans=[
+                        Span(text=label, bold=True),
+                    ]))
+                    header_blocks.extend(parsed)
 
     parts: list[OpinionPart] = []
     if header_blocks:
         parts.append(OpinionPart(label="Header", kind="header", blocks=header_blocks))
+    hm_part: "Optional[OpinionPart]" = None
+    if hm_blocks:
+        hm_part = OpinionPart(label="Headmatter (headnotes & arguments)",
+                              kind="header", blocks=hm_blocks,
+                              footnotes=hm_footnotes)
+        parts.append(hm_part)
+        header_blocks = header_blocks + hm_blocks
 
     # --- Sub-opinions ---
     sub_urls = cluster.get("sub_opinions") or []
@@ -2061,6 +2196,13 @@ def _assemble_case_parts(
             print(f"[cl-parts] combined-opinion parse failed: {exc}")
             cparts = []
         if cparts:
+            # The combined text is the whole printed case *from the opinion
+            # on*; the CAP headmatter (headnotes, arguments of counsel) still
+            # belongs before the opinion — after the caption header when the
+            # combined text carries one.
+            if hm_part is not None:
+                at = 1 if cparts and cparts[0].kind == "header" else 0
+                cparts = cparts[:at] + [hm_part] + cparts[at:]
             body = [b for p in cparts for b in p.blocks]
             try:
                 plain = blocks_to_text(body)
@@ -2277,9 +2419,60 @@ class CourtListenerGUI:
         self._hotkey_listener = None
         self._root_hidden = False
 
+        # Recently viewed cases, most recent first, for the "History ▾"
+        # dropdown every case window carries: {"key", "label", "reopen"}.
+        # Deduped by key (a re-view moves the case to the front), capped.
+        self._case_history: list[dict] = []
+
         self._build_ui()
         self._setup_global_hotkey()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_window)
+
+    # ------------------------------------------------------------------
+    # Case-view history (the "History ▾" dropdown on case windows)
+    # ------------------------------------------------------------------
+
+    _CASE_HISTORY_MAX = 15
+
+    def record_case_view(self, key: str, label: str, reopen) -> None:
+        """Remember a viewed case for the History dropdowns.  ``key``
+        identifies the case (so a re-view moves it to the front instead of
+        duplicating it); ``reopen`` is a no-argument callable that shows the
+        case again the same way it was shown before."""
+        label = re.sub(r"\s+", " ", label or "").strip() or key
+        self._case_history = [e for e in self._case_history if e["key"] != key]
+        self._case_history.insert(0,
+                                  {"key": key, "label": label, "reopen": reopen})
+        del self._case_history[self._CASE_HISTORY_MAX:]
+
+    def retitle_case_view(self, key: str, label: str) -> None:
+        """Update a history entry's label in place (e.g. once the Bluebook
+        citation has been enriched with the court/year) without promoting it."""
+        label = re.sub(r"\s+", " ", label or "").strip()
+        if not label:
+            return
+        for e in self._case_history:
+            if e["key"] == key:
+                e["label"] = label
+
+    def post_history_menu(self, widget: tk.Misc) -> None:
+        """Drop the last-viewed-cases menu below *widget* (a History button)."""
+        menu = tk.Menu(widget, tearoff=0)
+        if not self._case_history:
+            menu.add_command(label="No cases viewed yet", state="disabled")
+        for e in self._case_history:
+            label = e["label"]
+            if len(label) > 72:
+                label = label[:69] + "…"
+            menu.add_command(label=label, command=e["reopen"])
+        try:
+            menu.tk_popup(widget.winfo_rootx(),
+                          widget.winfo_rooty() + widget.winfo_height())
+        finally:
+            try:
+                menu.grab_release()
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
     # UI construction
@@ -2728,7 +2921,7 @@ class CourtListenerGUI:
                 popup.destroy()
                 self._quick_popup = None
                 _open_eng_rep(self.root, eng_rep.cite_spec(er_m),
-                              self._status_var.set)
+                              self._status_var.set, app=self)
                 return
             # ... or its original nominate-report form ("9 Exch. 341",
             # "Cro. Jac. 489").  Resolution-gated in eng_rep, so a U.S. cite
@@ -2737,7 +2930,8 @@ class CourtListenerGUI:
             if nom:
                 popup.destroy()
                 self._quick_popup = None
-                _open_eng_rep(self.root, nom[0][2], self._status_var.set)
+                _open_eng_rep(self.root, nom[0][2], self._status_var.set,
+                              app=self)
                 return
 
             # 2. Case citation: "365 U.S. 167" or "Monroe v. Pape, 365 U.S. 167, 171"
@@ -3141,7 +3335,8 @@ class CourtListenerGUI:
             cite_label = re.sub(r"\s+", " ", cite_m.group(0)).strip()
 
             def _open_appx(u=appx_url, t=cite_label):
-                _PdfWindow(self.root, u, t, self._status_var.set)
+                _PdfWindow(self.root, u, t, self._status_var.set,
+                           app=self, is_case=True)
 
             self.root.after(
                 0, _add_result, "appx", "", f"{cite_label} — Federal Appendix",
@@ -3328,7 +3523,7 @@ class CourtListenerGUI:
                 def make_opener(c=case):
                     def open_it():
                         _open_eng_rep_case(
-                            self.root, c, self._status_var.set,
+                            self.root, c, self._status_var.set, app=self,
                         )
                     return open_it
 
@@ -3466,7 +3661,8 @@ class CourtListenerGUI:
 
         def open_pdf() -> None:
             self._status_var.set(f"Opening {cite or name} (case.law PDF)…")
-            _PdfWindow(self.root, url, title, self._status_var.set)
+            _PdfWindow(self.root, url, title, self._status_var.set,
+                       app=self, is_case=True)
 
         self._post_root(open_pdf)
 
@@ -3488,7 +3684,8 @@ class CourtListenerGUI:
                 title = f"{name} — {cite}" if name else cite
                 self._post_root(
                     lambda u=url, t=title: _PdfWindow(
-                        self.root, u, t, self._status_var.set)
+                        self.root, u, t, self._status_var.set,
+                        app=self, is_case=True)
                 )
                 return True
         if fetcher is not None:
@@ -3527,7 +3724,7 @@ class CourtListenerGUI:
                 retry_url = ""
         if client is not None:
             try:
-                target = _cl_item_for_citation(client, cite)
+                target = _cl_item_for_citation(client, cite, name=name)
                 if target:
                     parts, blocks, plain, cluster = _assemble_case_parts(
                         client, target,
@@ -4908,7 +5105,8 @@ class CourtListenerGUI:
             ).strip()
             title = f"{name} — {cite}" if name else cite
             self._status_var.set(f"Opening {cite} (case.law)…")
-            _PdfWindow(self.root, url, title, self._status_var.set)
+            _PdfWindow(self.root, url, title, self._status_var.set,
+                       app=self, is_case=True)
             return
         self._status_var.set("Federal Appendix case — opening the PDF…")
         _ScholarTextWindow(self.root, self, "", "", item=item)
@@ -5527,22 +5725,190 @@ def _party_ends_in_abbrev(s: str) -> bool:
     return last.rstrip(".").replace("’", "'").lower() in _PARTY_ABBR_SUFFIXES
 
 
+# A comma segment of a caption that is a procedural designation, personal
+# suffix, or descriptive office — not part of the party's name — so
+# _caption_party can strip such segments from the right.  Role/office
+# segments swallow their qualifiers ("Warden of the Penitentiary", "U.S.
+# Senator from the State of New York", "Sec'y of the U.S. Senate").
+_ROLE_WORD = (
+    r"(?:cross[- ])?(?:plaintiffs?|defendants?|appellants?|appellees?|"
+    r"petitioners?|respondents?|intervenors?|movants?|claimants?|relators?|"
+    r"libell?ants?|libell?ees?|garnishees?|contestants?)"
+)
+_US_STATE_NAMES = (
+    r"alabama|alaska|arizona|arkansas|california|colorado|connecticut|"
+    r"delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|"
+    r"kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|"
+    r"mississippi|missouri|montana|nebraska|nevada|new\s+hampshire|"
+    r"new\s+jersey|new\s+mexico|new\s+york|north\s+carolina|north\s+dakota|"
+    r"ohio|oklahoma|oregon|pennsylvania|rhode\s+island|south\s+carolina|"
+    r"south\s+dakota|tennessee|texas|utah|vermont|virginia|washington|"
+    r"west\s+virginia|wisconsin|wyoming|district\s+of\s+columbia"
+)
+_PARTY_DESIGNATION_RE = re.compile(
+    r"(?:"
+    r"et\s+als?\.?|etc\.?|jr\.?|sr\.?|ii|iii|iv|deceased|minor|an?\s+minor|"
+    r"m\.?d\.?|ph\.?d\.?|esq\.?|afl[-\s]?cio(?:[-\s]?clc)?|"
+    + _ROLE_WORD + r"(?:[-/\s]+" + _ROLE_WORD + r")*(?:\s+in\s+error)?|"
+    # a role ending one consolidated caption, with the next spilling into the
+    # same segment ("Appellant. United States of America")
+    + _ROLE_WORD + r"\.\s+.*|"
+    r"in\s+error|successors?\b.*|"
+    # a bare state name qualifying a governmental party ("Humboldt County,
+    # California"; "City of Milwaukee, Wisconsin")
+    r"(?:" + _US_STATE_NAMES + r")|"
+    # offices / roles, with any qualifiers around them ("Warden", "Michigan
+    # Secretary of State", "District Attorney of Dallas County",
+    # "Corrections Director", "Assessor of Contra Costa County")
+    r"[\w.'’ -]{0,40}\b"
+    r"(?:secretary|sec'y|superintendent|directors?|commissioners?|"
+    r"administrat(?:ors?|rix)|attorneys?|att'y|assessors?|treasurer|"
+    r"wardens?|sheriffs?|governor|senators?|representatives?|"
+    r"execut(?:ors?|rix)|trustees?|receivers?|guardians?|conservators?|"
+    r"comptroller|clerk|marshal|postmaster|solicitor)\b[\w.'’ -]{0,60}|"
+    r"president\s+of\b.*|grand\s+jury\b.*|fictitious\w*\b.*|"
+    r"national\s+association|"
+    # descriptive phrases
+    r"(?:individually|personally)\b.*|(?:as|by|in\s+(?:his|her|its|their))\b.*|"
+    r"on\s+behalf\b.*|for\s+the\s+use\b.*|d/?b/?a\b.*|"
+    r"(?:[A-Za-z]\.\s*){2,}(?:[;,]\s*(?:[A-Za-z]\.\s*){2,})+|"  # minors' initials
+    r"an?\s+(?:\w+\s+)*(?:corporation|company|partnership|association|"
+    r"municipality|municipal\s+corporation|body\s+politic)\b.*"
+    r")\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+# A comma segment that is a business-entity suffix continuing the previous
+# segment ("Socony-Vacuum Oil Co., Inc." — one party, two segments).
+_ENTITY_SUFFIX_RE = re.compile(
+    r"(?:inc|incorporated|l\.?l\.?c|l\.?l\.?p|l\.?p|ltd|ltda|p\.?l\.?c|"
+    r"p\.?c|s\.?a|s\.?p\.?a|a\.?g|n\.?v|s\.?l|gmbh|co|corp|n\.?a)\.?",
+    re.IGNORECASE,
+)
+
+# A segment *ending* in an organization word plausibly continues the first
+# segment's name ("CHICAGO, BURLINGTON AND QUINCY RAILROAD COMPANY";
+# "LOCAL 174, TEAMSTERS, ..., WAREHOUSEMEN & HELPERS OF AMERICA").
+_ORG_TAIL_RE = re.compile(
+    r"\b(?:company|co\.?|corp\.?|corporation|incorporated|railroad|railway|"
+    r"r\.?r\.?|union|association|ass'n|brotherhood|workers|helpers|"
+    r"america|bank|trust|society|club|university|college|institute|"
+    r"partners(?:hip)?|group|bros\.?|brothers|sons|"
+    r"inc\.?|llc|llp|ltd\.?|plc)\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+
 def _caption_party(s: str) -> str:
     """One side of a Scholar caption → its Bluebook party name.  Drops the
     procedural designation and 'et al.'; when Scholar mixes cases, the
     all-caps run is the operative name ('Brent BREWBAKER' → 'Brewbaker',
-    'UNITED STATES of America' → 'United States')."""
-    s = s.split(",")[0].strip().lstrip(".;").rstrip(";").strip()
-    s = re.sub(r"\s+et\s+al\.?$", "", s, flags=re.IGNORECASE).strip()
+    'UNITED STATES of America' → 'United States').
+
+    Comma segments after the first are handled structurally rather than by
+    cutting at the first comma (which would amputate a party whose own name
+    contains one — "CHICAGO, BURLINGTON AND QUINCY RAILROAD COMPANY" is one
+    party, not "CHICAGO"):
+
+      1. cut at the first sign of a co-party / consolidated caption (a
+         repeated party, an "and Ace Garage" co-defendant, a new "v."),
+      2. strip procedural designations, offices and suffixes from the right,
+      3. keep a business-entity suffix ("…Oil Co., Inc."), and
+      4. keep the remaining segments only when they read as one entity name
+         (few, short, ending in an organization word — "…RAILROAD COMPANY",
+         "…HELPERS OF AMERICA"); otherwise they are co-parties: dropped."""
+
+    def clean_seg(p: str) -> str:
+        p = re.sub(r"\s*\[[^\]]{1,4}\]\s*$", "", p.strip())  # footnote marker
+        p = re.sub(r"[:]+$", "", p).strip()
+        return re.sub(r"\s+et\s+als?\.?$", "", p, flags=re.IGNORECASE).strip()
+
+    raw = [clean_seg(p) for p in re.split(r"[,;]", s)]
+    segs = [p for p in raw if p]
+    if segs:
+        # 1. Consolidation cut: a later segment that re-names the first party
+        # (same final token), contains its own " v. ", or introduces another
+        # party ("and Ace Garage" — unless it ends the entity's own name,
+        # "…, and Paperhangers of America") starts a different case/party.
+        first_last_tok = segs[0].split()[-1].rstrip(".,").lower() if segs[0].split() else ""
+        cut = len(segs)
+        for i in range(1, len(segs)):
+            seg = segs[i]
+            toks = [t.rstrip(".,").lower() for t in seg.split()]
+            # An "and X" segment continues the entity's own name only when it
+            # ends in an organization word and is not itself a complete
+            # company ("…, and Paperhangers of America" continues; "…, and
+            # Midway Mfg. Co." is a co-plaintiff).
+            and_co_party = (
+                re.match(r"and\b", seg, re.IGNORECASE)
+                and (not _ORG_TAIL_RE.search(seg)
+                     or any(_ENTITY_SUFFIX_RE.fullmatch(t.strip(".,"))
+                            or t.strip(".,").lower() in ("mfg", "mfrs")
+                            for t in seg.split()))
+            )
+            if (re.search(r"\s[vV]s?\.\s", f" {seg} ")
+                    or re.match(r"(?:et\s+als?\.?|successors?)\b", seg,
+                                re.IGNORECASE)
+                    or (first_last_tok and first_last_tok in toks)
+                    or and_co_party):
+                cut = i
+                break
+        segs = segs[:cut]
+        # 2. Designations / offices / suffixes strip from the right.
+        while len(segs) > 1 and _PARTY_DESIGNATION_RE.fullmatch(segs[-1]):
+            segs.pop()
+        # 3. A business-entity suffix continues the first segment's name.
+        kept = [segs[0]]
+        rest = segs[1:]
+        if rest and _ENTITY_SUFFIX_RE.fullmatch(rest[0]):
+            kept.append(rest.pop(0))
+        # 4. The remaining segments stay only when they read as one entity
+        # name; anything else is a co-party list, dropped as before.  Bare
+        # leftover suffixes ("…, LLC, Inc." from a consolidated caption)
+        # never extend the name a second time.
+        joined = ", ".join(kept + rest)
+        if rest and (
+            all(_ENTITY_SUFFIX_RE.fullmatch(p) for p in rest)
+            or not (len(rest) <= 3
+                    and _ORG_TAIL_RE.search(rest[-1])
+                    and len(joined) <= 72)
+        ):
+            rest = []
+        s = ", ".join(kept + rest)
+    else:
+        s = ""
+    s = s.strip().lstrip(".;").rstrip(";").strip()
+    s = re.sub(r"\s+et\s+als?\.?$", "", s, flags=re.IGNORECASE).strip()
+    # Repeated dotted abbreviations from consolidated captions ("United
+    # States U.S. U.S.") collapse to the first occurrence.
+    s = re.sub(r"\b((?:[A-Za-z]+\.)+)(\s+\1)+", r"\1", s)
+    s = re.sub(r"\b([Uu]nited\s+[Ss]tates)(?:\s+U\.?S\.?A?\.?)+", r"\1", s)
     # Drop a stray trailing period, but keep an entity abbreviation's period
     # ("Acme Co.", "Foo Corp.", "Bar Inc.").
     if s.endswith(".") and not _party_ends_in_abbrev(s):
         s = s[:-1].rstrip()
     tokens = s.split()
-    caps = [w for w in tokens if w.isupper() and len(w.strip(".,'")) > 1]
-    if caps and len(caps) < len(tokens):
-        s = " ".join(caps)
-    return _titlecase_caps(s)
+    # The all-caps-run heuristic ("Brent BREWBAKER" → "BREWBAKER") fires only
+    # when (a) some all-caps token is a real *name* (not just an "LLC"/"INC."
+    # suffix — "Tedford's Tenancy, LLC" is not a mixed-case caption), and
+    # (b) every token it would drop is given-name-shaped (pure alpha or an
+    # initial) — a dropped "Records," means a corporate name in mixed case
+    # ("A&M Records, Inc."), not given names.  "&", numerals and entity
+    # suffixes then ride along with the caps run ("FENNER & SMITH",
+    # "LOCAL 174", "…OIL CO., Inc.") even though str.isupper() is False.
+    keep = [w for w in tokens
+            if (w.isupper() and len(w.strip(".,'")) > 1)
+            or w == "&" or w.rstrip(".,").isdigit()
+            or _ENTITY_SUFFIX_RE.fullmatch(w.rstrip(","))]
+    namey = [w for w in keep
+             if w.isupper() and len(w.strip(".,'")) > 1
+             and not _ENTITY_SUFFIX_RE.fullmatch(w.strip(",."))]
+    dropped = [w for w in tokens if w not in keep]
+    if (namey and len(keep) < len(tokens)
+            and all(re.fullmatch(r"[A-Za-z'’-]+|[A-Za-z]\.", w)
+                    for w in dropped)):
+        s = " ".join(keep)
+    return _titlecase_caps(s).strip(" ,;&")
 
 
 _CIRCUIT_ORDINALS = {
@@ -7337,6 +7703,9 @@ class _ScholarTextWindow:
             self._parts = segment_blocks(self._blocks)
             self._cl_parts = None
             self._cl_blocks = None
+        # Kept for the History dropdown: reopening replays this constructor
+        # with the original ingredients (no refetch).
+        self._history_html = "" if self._cl_primary else opinion_html
         self._current_part: Optional[int] = None  # None = full opinion
         # Page in effect at the start of each part, for pin cites when a
         # single part is displayed (no preceding star marker on screen).
@@ -7435,6 +7804,56 @@ class _ScholarTextWindow:
         # a missing year — from CourtListener in the background, then refresh the
         # title.  The window opens immediately on the best-effort citation.
         self._enrich_citation()
+        self._record_history()
+
+    # ------------------------------------------------------------------
+    # Case-view history
+    # ------------------------------------------------------------------
+
+    def _history_key(self) -> str:
+        """Identity of this case for the History dropdown (a re-view of the
+        same case replaces its entry instead of duplicating it)."""
+        if self._scholar_url:
+            return f"scholar:{self._scholar_url}"
+        cluster = self._item.get("cluster_id") or self._item.get("id")
+        if cluster:
+            return f"cl:{cluster}"
+        return f"case:{self._history_label()}"
+
+    def _history_label(self) -> str:
+        try:
+            return self._title_citation() or self._win.title()
+        except Exception:
+            return self._win.title()
+
+    def _record_history(self) -> None:
+        """Register this view in the app-wide History dropdown.  The reopen
+        callable replays this constructor with the stored ingredients, so a
+        pick from the menu is instant (no refetch)."""
+        app = self._app
+        if app is None or not hasattr(app, "record_case_view"):
+            return
+        item = dict(self._item)
+        if self._cl_primary:
+            parts, blocks = self._cl_parts, self._cl_blocks
+            text = self._cl_text
+            prefetch = self._prefetch_ok
+
+            def reopen(app=app, item=item, parts=parts, blocks=blocks,
+                       text=text, prefetch=prefetch) -> None:
+                _ScholarTextWindow(app.root, app, "", "", item=item,
+                                   cl_text=text, cl_parts=parts,
+                                   cl_blocks=blocks, prefetch_pdf=prefetch)
+        else:
+            url, html = self._scholar_url, self._history_html
+            prefetch = self._prefetch_ok
+
+            def reopen(app=app, url=url, html=html, item=item,
+                       prefetch=prefetch) -> None:
+                _ScholarTextWindow(app.root, app, url, html, item=item,
+                                   prefetch_pdf=prefetch)
+
+        app.record_case_view(self._history_key(), self._history_label(), reopen)
 
     # ------------------------------------------------------------------
     # UI
@@ -7591,6 +8010,10 @@ class _ScholarTextWindow:
             width=168,
         )
 
+        # Last-15-cases dropdown, shared across every case window.
+        hist_btn = _history_button(self._app, btn_frame)
+        if hist_btn is not None:
+            hist_btn.pack(side="left", padx=(0, 8))
         # Size controls: text size in the reader, PDF zoom in the PDF view
         # (also Ctrl +/−/0 and Ctrl+mouse wheel).
         self._zoom_out_btn = _ui_button(
@@ -9082,14 +9505,19 @@ class _ScholarTextWindow:
                 break
         if match_cands and first_star is not None:
             # The reporter whose first page the stars fall just past (within a
-            # volume's worth of pages) is the one being paginated.
+            # volume's worth of pages) is the one being paginated.  Parallel
+            # cites can tie exactly — an early SCOTUS case prints "5 U.S. 299"
+            # and "1 Cranch 299", the same page in both — so break ties toward
+            # the recognized national reporter ("5 U.S. 299"): it's the
+            # Bluebook form, and the nominative form is ambiguous downstream
+            # (CourtListener resolves "1 Cranch 299" to two different cases).
             fits = [
-                (first_star - p, c)
+                (first_star - p, 0 if _TEXT_CITE_RE.fullmatch(c) else 1, c)
                 for c, p in match_cands
                 if 0 <= first_star - p <= 400
             ]
             if fits:
-                cite = min(fits)[1]
+                cite = min(fits)[2]
         if not cite and cands:
             cite = next(
                 (c for c, _p in cands if _TEXT_CITE_RE.fullmatch(c)),
@@ -9159,13 +9587,54 @@ class _ScholarTextWindow:
                     r"announced the judgment of the Court", bt, re.IGNORECASE
                 ):
                     return "plurality opinion"
+            # CourtListener sub-opinion parts carry the signal in the label.
+            if re.search(r"\(per\s+curiam\)", part.label or "", re.IGNORECASE):
+                return "per curiam"
             return ""
         if part.kind not in ("concurrence", "dissent") or not part.blocks:
             return ""
         t = block_text(part.blocks[0])
         m = re.search(r"\b(?:concurring|dissenting)\b", t, re.IGNORECASE)
         if not m:
-            return ""
+            # A CourtListener sub-opinion part: the opinion body has no byline
+            # to parse — the type and author live in the label the assembler
+            # built from the cluster ("Dissent (Brandeis)", "Concurrence in
+            # Part (O'Connor)").  Same data CourtListener uses for its own
+            # color-coding.
+            lm = re.match(
+                r"(Concurrence\s+in\s+Part|Concurrence|Dissent)\b"
+                r"(?:.*?\(([^)]+)\))?\s*$",
+                part.label or "",
+            )
+            if not lm:
+                # A bare attribution heading ("MR. JUSTICE HOLMES:",
+                # "Statement of Justice Souter.") never says which way the
+                # author voted, so guessing "concurring"/"dissenting" could
+                # misdescribe it — Bluebook's neutral forms are "(opinion of
+                # Holmes, J.)" and "(statement of Souter, J.)".
+                jm = re.match(
+                    r"(Statement\s+of\s+)?(?:MR\.\s+|MRS\.\s+|MS\.\s+)?"
+                    r"(?:CHIEF\s+)?JUSTICE\s+([A-Z][\w.'’-]+?)\s*[.:]?\s*$",
+                    part.label or "", re.IGNORECASE,
+                )
+                if jm:
+                    surname = _fix_name_case(jm.group(2).replace("’", "'"))
+                    form = "statement of" if jm.group(1) else "opinion of"
+                    return f"{form} {surname}, J."
+                return ""
+            phrase = {
+                "concurrence": "concurring",
+                "concurrence in part": "concurring in part",
+                "dissent": "dissenting",
+            }[re.sub(r"\s+", " ", lm.group(1)).lower()]
+            author = (lm.group(2) or "").strip()
+            if not author:
+                return ""
+            if re.search(r"per\s+curiam", author, re.IGNORECASE):
+                return f"per curiam, {phrase}"
+            surname = _fix_name_case(
+                author.split(",")[0].split()[-1].replace("’", "'"))
+            return f"{surname}, J., {phrase}"
         phrase = t[m.start():].rstrip(" .:;")
         phrase = re.sub(r"\s*\[[^\]]{1,6}\]$", "", phrase)  # trailing footnote marker
         head = t[: m.start()].strip().rstrip(", ")
@@ -9317,6 +9786,7 @@ class _ScholarTextWindow:
         if not self._app._token_var.get().strip():
             return  # no CourtListener token to ask
         cite = bb["cite"]
+        case_name = bb.get("name", "")
         item = dict(self._item)
 
         def run() -> None:
@@ -9324,7 +9794,8 @@ class _ScholarTextWindow:
             if client is None:
                 return
             try:
-                court_id, year = self._cl_court_and_year(client, cite, item)
+                court_id, year = self._cl_court_and_year(
+                    client, cite, item, name=case_name)
             except Exception as exc:
                 print(f"[bb-enrich] CourtListener lookup failed: {exc}")
                 return
@@ -9340,13 +9811,15 @@ class _ScholarTextWindow:
         threading.Thread(target=run, daemon=True).start()
 
     @staticmethod
-    def _cl_court_and_year(client, cite: str, item: dict) -> tuple[str, str]:
+    def _cl_court_and_year(client, cite: str, item: dict,
+                           name: str = "") -> tuple[str, str]:
         """(court_id, year) for the case from CourtListener — the cluster's
         date and its docket's court — locating the cluster by id or, failing
-        that, by the reporter citation."""
+        that, by the reporter citation (disambiguated by ``name`` when the
+        citation is ambiguous, e.g. "1 Cranch 299")."""
         cluster_id = item.get("cluster_id") or item.get("id")
         if not cluster_id:
-            t = _cl_item_for_citation(client, cite)
+            t = _cl_item_for_citation(client, cite, name=name)
             cluster_id = (t or {}).get("cluster_id")
         if not cluster_id:
             return "", ""
@@ -9373,6 +9846,11 @@ class _ScholarTextWindow:
             title = self._title_citation()
             if title and self._win.winfo_exists():
                 self._win.title(title)
+                # Keep the History dropdown's label in step with the
+                # enriched citation (court/year), without re-promoting it.
+                app = self._app
+                if app is not None and hasattr(app, "retitle_case_view"):
+                    app.retitle_case_view(self._history_key(), title)
         except tk.TclError:
             pass
 
@@ -9555,16 +10033,20 @@ class _ScholarTextWindow:
                 if (selected and scholar_like)
                 else None
             )
+            # The writer parenthetical ("Brandeis, J., dissenting") applies in
+            # every parts-aware view — the CourtListener sub-opinion view knows
+            # each part's type and author even without star pagination.
             writer = ""
-            if scholar_like and self._parts:
+            parts = getattr(self, "_rendered_parts", None) or self._parts
+            if parts:
                 pi = self._current_part
                 if pi is None and selected:
                     for rs, rend, p in self._part_regions:
                         if txt.compare(start, ">=", rs) and txt.compare(start, "<", rend):
                             pi = p
                             break
-                if pi is not None:
-                    writer = self._writer_parenthetical(self._parts[pi])
+                if pi is not None and pi < len(parts):
+                    writer = self._writer_parenthetical(parts[pi])
             plain_cite, rtf_cite = self._bluebook_citation(pin, writer)
         body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map())
         rtf = _rtf_document(body + rtf_cite)
@@ -9811,7 +10293,7 @@ class _ScholarTextWindow:
                     if not cid:
                         if not cite:
                             raise RuntimeError("no citation to locate the case")
-                        target = _cl_item_for_citation(client, cite)
+                        target = _cl_item_for_citation(client, cite, name=name)
                         if not target:
                             raise RuntimeError("case not found on CourtListener")
                         cid = target.get("cluster_id")
@@ -10047,7 +10529,8 @@ class _ScholarTextWindow:
             _open_statute_pdf(self._win, value, self._status_var.set)
             return
         if kind == "engrep":
-            _open_eng_rep(self._win, value, self._status_var.set)
+            _open_eng_rep(self._win, value, self._status_var.set,
+                          app=self._app)
             return
         # A Scholar case URL may carry a pincite, a reporter cite, and the case
         # name ("<url>\tpin=565\tcite=…\tname=…") so a failed/blocked fetch can
@@ -10084,7 +10567,7 @@ class _ScholarTextWindow:
                 self._status_var.set(f"Opening {cite} (case.law)…")
                 _PdfWindow(self._win, appx,
                            cite + (f" at {pin}" if pin else ""),
-                           self._status_var.set)
+                           self._status_var.set, app=self._app, is_case=True)
                 return
         fetcher = self._app._get_scholar()
         label = cite if kind == "cite" else "cited case"
@@ -10198,11 +10681,12 @@ class _ScholarTextWindow:
                 # nominative SCOTUS cite — by its modern "U.S." form; then the
                 # citation-keyed case.law PDF; and only as a last resort the
                 # (fuzzy) case name.
-                target = _cl_item_for_citation(client, cite) if cite else None
+                target = (_cl_item_for_citation(client, cite, name=name)
+                          if cite else None)
                 if target is None and cite:
                     alt = _us_reports_cite(cite)
                     if alt:
-                        target = _cl_item_for_citation(client, alt)
+                        target = _cl_item_for_citation(client, alt, name=name)
                 if target is None and cite:
                     # CourtListener has no cluster at this exact citation.
                     # Prefer the citation-keyed static.case.law PDF — the
@@ -10247,7 +10731,7 @@ class _ScholarTextWindow:
         self._status_var.set(f"Opening {cite} (case.law PDF)…")
         _PdfWindow(
             self._win, url, cite + (f" at {pin}" if pin else ""),
-            self._status_var.set,
+            self._status_var.set, app=self._app, is_case=True,
         )
 
     def _on_link_ready(self, result: Optional[tuple[str, str]],
@@ -10365,6 +10849,7 @@ class _ScholarTextWindow:
         self._status_var.set("Fetching CourtListener text…")
         item = dict(self._item)
         cite = self._bb["cite"]
+        case_name = self._bb.get("name", "")
 
         def run() -> None:
             try:
@@ -10374,7 +10859,7 @@ class _ScholarTextWindow:
                         raise RuntimeError(
                             "No citation available to locate this case on CourtListener."
                         )
-                    target = _cl_item_for_citation(client, cite)
+                    target = _cl_item_for_citation(client, cite, name=case_name)
                     if not target:
                         raise RuntimeError(f"No CourtListener match for {cite!r}.")
                 parts, blocks, plain, cluster = _assemble_case_parts(
@@ -11129,10 +11614,13 @@ class _PdfWindow:
     the browser when the PDF libraries are missing or the fetch fails."""
 
     def __init__(self, parent: tk.Misc, url: str, title: str,
-                 status=lambda _s: None) -> None:
+                 status=lambda _s: None, *, app=None,
+                 is_case: bool = False) -> None:
         self._url = url
         self._title = title
         self._ext_status = status
+        self._app = app          # for the History dropdown (may be None)
+        self._is_case = is_case  # case scan (case.law) vs statute scan
         self._bytes: Optional[bytes] = None
         self._pane: Optional[_PdfPane] = None
 
@@ -11160,6 +11648,9 @@ class _PdfWindow:
                    command=lambda: self._zoom(-1)).pack(side="left")
         _ui_button(btns, "+", width=42,
                    command=lambda: self._zoom(+1)).pack(side="left", padx=(6, 10))
+        hist_btn = _history_button(self._app, btns)
+        if hist_btn is not None:
+            hist_btn.pack(side="left", padx=(0, 8))
         self._status_var = tk.StringVar(value="Loading PDF…")
         _ui_label(btns, muted=True, anchor="w",
                   textvariable=self._status_var).pack(
@@ -11174,7 +11665,22 @@ class _PdfWindow:
             self._win.bind(seq, lambda _e: self._zoom(-1))
         self._win.bind("<Control-0>", lambda _e: self._zoom(0))
 
+        entry = self._history_entry()
+        if entry is not None and self._app is not None and hasattr(
+                self._app, "record_case_view"):
+            self._app.record_case_view(*entry)
+
         self._fetch()
+
+    def _history_entry(self) -> "Optional[tuple[str, str, object]]":
+        """(key, label, reopen) for the History dropdown, or None when this
+        PDF isn't a case (a statute scan).  Subclasses override."""
+        if not (self._is_case and self._app is not None):
+            return None
+        app, url, title = self._app, self._url, self._title
+        return (f"pdf:{url}", title,
+                lambda: _PdfWindow(app.root, url, title, app=app,
+                                   is_case=True))
 
     def _post(self, fn, *args) -> None:
         try:
@@ -11326,10 +11832,19 @@ class _EngRepPdfWindow(_PdfWindow):
     shows a hand-off panel that opens the case in Firefox and offers Retry."""
 
     def __init__(self, parent: tk.Misc, case: "eng_rep.ERCase",
-                 status=lambda _s: None) -> None:
+                 status=lambda _s: None, *, app=None) -> None:
         self._case = case
         name = case.name if len(case.name) <= 60 else case.name[:57] + "…"
-        super().__init__(parent, case.pdf_url, f"{name} — {case.er_cite}", status)
+        super().__init__(parent, case.pdf_url, f"{name} — {case.er_cite}",
+                         status, app=app)
+
+    def _history_entry(self):  # overrides _PdfWindow
+        app, case = self._app, self._case
+        if app is None:
+            return None
+        return (f"engrep:{case.year}:{case.num}",
+                f"{case.name} — {case.er_cite}",
+                lambda: _EngRepPdfWindow(app.root, case, app=app))
 
     def _fetch(self) -> None:  # overrides _PdfWindow._fetch
         try:
@@ -11520,11 +12035,12 @@ def _choose_eng_rep_case(parent: tk.Misc,
 
 
 def _open_eng_rep(parent: tk.Misc, spec: str,
-                  status=lambda _s: None) -> None:
+                  status=lambda _s: None, app=None) -> None:
     """Open an English Reports citation ("<vol>:<page>" spec): resolve it to the
     CommonLII case(s), let the user pick when a page holds several, and show the
     scan in-app (cached, with the CloudFlare hand-off) — or, when in-app fetching
-    isn't available and it isn't cached, open it in the browser."""
+    isn't available and it isn't cached, open it in the browser.  ``app`` (when
+    the caller has one) enables the History dropdown on the viewer."""
     cases = eng_rep.resolve(spec)
     if not cases:
         vp = eng_rep.parse_spec(spec)
@@ -11538,11 +12054,11 @@ def _open_eng_rep(parent: tk.Misc, spec: str,
     case = cases[0] if len(cases) == 1 else _choose_eng_rep_case(parent, cases)
     if case is None:
         return
-    _open_eng_rep_case(parent, case, status)
+    _open_eng_rep_case(parent, case, status, app=app)
 
 
 def _open_eng_rep_case(parent: tk.Misc, case: "eng_rep.ERCase",
-                       status=lambda _s: None) -> None:
+                       status=lambda _s: None, app=None) -> None:
     """Show one already-resolved English Reports case in the in-app scan viewer.
     Used when the exact case is known (a name-search hit from the spotlight, or
     a citation link), so it skips the same-page chooser :func:`_open_eng_rep`
@@ -11550,7 +12066,7 @@ def _open_eng_rep_case(parent: tk.Misc, case: "eng_rep.ERCase",
     fetch, the CloudFlare/Firefox hand-off, and the browser fall-back — so the
     spotlight and a clicked link reach English Reports exactly the same way."""
     status(f"Opening {case.name[:40]} ({case.er_cite})…")
-    _EngRepPdfWindow(parent, case, status)
+    _EngRepPdfWindow(parent, case, status, app=app)
 
 
 # ---------------------------------------------------------------------------
@@ -11619,7 +12135,7 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
         _open_statute_action(parent, action, status)
         return
     if kind == "engrep":
-        _open_eng_rep(parent, value, status)
+        _open_eng_rep(parent, value, status, app=app)
         return
     if kind != "cite":
         status("Don't know how to open that citation.")
