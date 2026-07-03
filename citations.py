@@ -78,6 +78,12 @@ BROAD_CITE_CAPTURE_RE = re.compile(
 )
 _NONCASE_REPORTERS = {
     "usc", "usca", "uscs", "cfr", "fr", "fedr", "fedreg",
+    # English Reports ("156 Eng. Rep. 145", "95 E.R. 807"): real case cites,
+    # but ones Google Scholar / CourtListener / case.law cannot open — the
+    # eng_rep pass links them to the CommonLII scan instead, so the broad case
+    # regex must not claim them first (a Scholar lookup by an E.R. cite lands
+    # on an unrelated case).
+    "engrep", "er",
 }
 _PLAIN_CASE_REPORTERS = {
     "alaska", "idaho", "iowa", "ohio", "utah", "vermont", "wyoming",
@@ -116,7 +122,10 @@ def norm_reporter(rep: str) -> str:
 
 
 def _reporter_key(rep: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", rep or "").lower()
+    # Lowercase *before* stripping: the character class is lowercase-only, so
+    # stripping first would delete every capital letter ("Eng. Rep." → "ngep")
+    # and no key would ever match the reporter sets below.
+    return re.sub(r"[^a-z0-9]+", "", (rep or "").lower())
 
 
 def _valid_case_reporter(rep: str) -> bool:
@@ -464,6 +473,22 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     base, _pin = cite_target_from_text("5 Johns. (N.Y.) 37", {})
     if base != "5 Johns. 37":
         print("cite_target_from_text kept the paren:", repr(base))
+        sys.exit(1)
+
+    # English Reports cites must route to the CommonLII viewer ("engrep"), not
+    # become Scholar case links (a Scholar lookup by an E.R. cite lands on an
+    # unrelated case) — in the Bluebook "Eng. Rep." form, the "E.R." form, and
+    # never via the short form either.
+    er = detect_links(
+        "Hadley v. Baxendale, 156 Eng. Rep. 145, 151 (1854); Wain v. "
+        "Warlters, 102 E.R. 972.  See 156 Eng. Rep. at 151."
+    )
+    for want in (("engrep", "156:145"), ("engrep", "102:972")):
+        if not any(a == want for _, _, a in er):
+            print("Eng. Rep. cite did not route to engrep:", want, er)
+            sys.exit(1)
+    if any(a[0] == "cite" for _, _, a in er):
+        print("Eng. Rep. cite leaked into a Scholar case link:", er)
         sys.exit(1)
 
     print("\nOK:", len(found), "links;", sorted(kinds))
