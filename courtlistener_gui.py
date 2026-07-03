@@ -361,6 +361,26 @@ def _ui_button(parent, text: str, command=None, primary: bool = False,
     return btn
 
 
+def _style_ui_button(button, primary: bool = False) -> None:
+    """Restyle an existing shared button as primary or secondary."""
+    try:
+        if _CTK_AVAILABLE:
+            if primary:
+                button.configure(
+                    fg_color=_UI["accent"], hover_color=_UI["accent_dim"],
+                    text_color="#ffffff", border_width=0,
+                    font=_ui_font(13, "bold"),
+                )
+            else:
+                button.configure(
+                    fg_color=_UI["surface"], hover_color=_UI["surface_alt"],
+                    text_color=_UI["text"], border_width=1,
+                    border_color=_UI["border"], font=_ui_font(13, "normal"),
+                )
+    except Exception:
+        pass
+
+
 def _history_button(app, parent_frame):
     """The "History ▾" button case windows share: drops the app-wide list of
     the last 15 viewed cases (see ``CourtListenerGUI.record_case_view``).
@@ -490,22 +510,45 @@ from court_catalog import (
 _CONFIG_PATH = Path.home() / ".config" / "courtlistener" / "config.json"
 
 
+def _load_config() -> dict:
+    """Return the saved app config, or an empty dict if it is missing/broken."""
+    try:
+        data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_config(data: dict) -> None:
+    """Persist the app config.  Failures are non-fatal."""
+    try:
+        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _json_ready(value):
+    """Convert nested values to something json can persist."""
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 def _load_saved_token() -> str:
     """Return the token saved in the config file, or '' if none."""
-    try:
-        data = json.loads(_CONFIG_PATH.read_text())
-        return data.get("api_token", "")
-    except Exception:
-        return ""
+    return _load_config().get("api_token", "")
 
 
 def _save_token(token: str) -> None:
     """Persist *token* to the config file."""
-    try:
-        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CONFIG_PATH.write_text(json.dumps({"api_token": token}))
-    except Exception:
-        pass  # Non-fatal – token simply won't persist
+    data = _load_config()
+    data["api_token"] = token
+    _save_config(data)
 
 
 # Persistent session for third-party hosts (LOC, GovInfo, static.case.law).
@@ -2422,7 +2465,7 @@ class CourtListenerGUI:
         # Recently viewed cases, most recent first, for the "History ▾"
         # dropdown every case window carries: {"key", "label", "reopen"}.
         # Deduped by key (a re-view moves the case to the front), capped.
-        self._case_history: list[dict] = []
+        self._case_history: list[dict] = self._load_case_history()
 
         self._build_ui()
         self._setup_global_hotkey()
@@ -2434,16 +2477,146 @@ class CourtListenerGUI:
 
     _CASE_HISTORY_MAX = 15
 
-    def record_case_view(self, key: str, label: str, reopen) -> None:
+    def _load_case_history(self) -> list[dict]:
+        saved = _load_config().get("case_history", [])
+        if not isinstance(saved, list):
+            return []
+        entries: list[dict] = []
+        for raw in saved[:self._CASE_HISTORY_MAX]:
+            if not isinstance(raw, dict):
+                continue
+            key = str(raw.get("key") or "").strip()
+            label = re.sub(r"\s+", " ", str(raw.get("label") or "")).strip()
+            payload = raw.get("payload")
+            opener = self._history_opener_from_payload(payload, label)
+            if key and label and opener is not None:
+                entries.append({
+                    "key": key, "label": label, "reopen": opener,
+                    "payload": payload,
+                })
+        return entries
+
+    def _save_case_history(self) -> None:
+        data = _load_config()
+        saved: list[dict] = []
+        for entry in self._case_history[:self._CASE_HISTORY_MAX]:
+            payload = entry.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            saved.append({
+                "key": entry.get("key", ""),
+                "label": entry.get("label", ""),
+                "payload": _json_ready(payload),
+            })
+        data["case_history"] = saved
+        _save_config(data)
+
+    def _history_opener_from_payload(self, payload, label: str):
+        if not isinstance(payload, dict):
+            return None
+        kind = payload.get("type")
+        if kind == "cl":
+            item = dict(payload.get("item") or {})
+            prefetch = bool(payload.get("prefetch_pdf", True))
+            return lambda: self._open_history_cl(item, label, prefetch)
+        if kind == "scholar":
+            url = str(payload.get("url") or "").strip()
+            if not url:
+                return None
+            item = dict(payload.get("item") or {})
+            cite = str(payload.get("cite") or "").strip()
+            prefetch = bool(payload.get("prefetch_pdf", True))
+            return lambda: self._open_history_scholar(
+                url, item, cite, label, prefetch
+            )
+        if kind == "pdf":
+            url = str(payload.get("url") or "").strip()
+            title = str(payload.get("title") or label or url).strip()
+            if not url:
+                return None
+            return lambda: self._open_history_pdf(url, title)
+        return None
+
+    def _open_history_cl(
+        self, item: dict, label: str, prefetch_pdf: bool = True,
+    ) -> None:
+        client = self._get_client() if self._token_var.get().strip() else None
+        if client is None:
+            self._status_var.set(
+                "History needs a CourtListener API token for that case."
+            )
+            return
+        self._status_var.set(f"Opening {label} from history...")
+
+        def run() -> None:
+            target = dict(item)
+            if not (target.get("cluster_id") or target.get("id")):
+                cite = _pick_citation(target.get("citation", []))
+                if cite:
+                    found = _cl_item_for_citation(client, cite)
+                    if found:
+                        target = found
+            if not (target.get("cluster_id") or target.get("id")):
+                self._post_root(
+                    self._status_var.set,
+                    "Could not reopen that history item from CourtListener.",
+                )
+                return
+            self._assemble_and_open_cl(
+                target, client, prefetch_pdf, lambda: None,
+                search=False,
+            )
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _open_history_scholar(
+        self, url: str, item: dict, cite: str, label: str,
+        prefetch_pdf: bool = True,
+    ) -> None:
+        fetcher = self._get_scholar()
+        if fetcher is None:
+            return
+        self._status_var.set(f"Opening {label} from history...")
+
+        def run() -> None:
+            try:
+                result = fetcher.fetch_by_url(url)
+            except Exception as exc:
+                print(f"[history] Scholar reopen failed for {url!r}: {exc}")
+                result = None
+            if result:
+                r_url, html = result
+                self._post_root(
+                    self._open_scholar_window, r_url, html, item or None,
+                    None, "opened from history", prefetch_pdf,
+                )
+            else:
+                self._post_root(
+                    self._scholar_case_fallback, url, cite, "", prefetch_pdf
+                )
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _open_history_pdf(self, url: str, title: str) -> None:
+        self._status_var.set(f"Opening {title} from history...")
+        _PdfWindow(self.root, url, title, self._status_var.set,
+                   app=self, is_case=True)
+
+    def record_case_view(
+        self, key: str, label: str, reopen, payload: Optional[dict] = None,
+    ) -> None:
         """Remember a viewed case for the History dropdowns.  ``key``
         identifies the case (so a re-view moves it to the front instead of
         duplicating it); ``reopen`` is a no-argument callable that shows the
         case again the same way it was shown before."""
         label = re.sub(r"\s+", " ", label or "").strip() or key
         self._case_history = [e for e in self._case_history if e["key"] != key]
-        self._case_history.insert(0,
-                                  {"key": key, "label": label, "reopen": reopen})
+        entry = {"key": key, "label": label, "reopen": reopen}
+        if payload is not None:
+            entry["payload"] = _json_ready(payload)
+        self._case_history.insert(0, entry)
         del self._case_history[self._CASE_HISTORY_MAX:]
+        self._save_case_history()
 
     def retitle_case_view(self, key: str, label: str) -> None:
         """Update a history entry's label in place (e.g. once the Bluebook
@@ -2454,6 +2627,8 @@ class CourtListenerGUI:
         for e in self._case_history:
             if e["key"] == key:
                 e["label"] = label
+                self._save_case_history()
+                break
 
     def post_history_menu(self, widget: tk.Misc) -> None:
         """Drop the last-viewed-cases menu below *widget* (a History button)."""
@@ -7838,6 +8013,11 @@ class _ScholarTextWindow:
             parts, blocks = self._cl_parts, self._cl_blocks
             text = self._cl_text
             prefetch = self._prefetch_ok
+            payload = {
+                "type": "cl",
+                "item": item,
+                "prefetch_pdf": bool(prefetch),
+            }
 
             def reopen(app=app, item=item, parts=parts, blocks=blocks,
                        text=text, prefetch=prefetch) -> None:
@@ -7847,13 +8027,23 @@ class _ScholarTextWindow:
         else:
             url, html = self._scholar_url, self._history_html
             prefetch = self._prefetch_ok
+            payload = {
+                "type": "scholar",
+                "url": url,
+                "item": item,
+                "cite": self._bb.get("cite", ""),
+                "prefetch_pdf": bool(prefetch),
+            }
 
             def reopen(app=app, url=url, html=html, item=item,
                        prefetch=prefetch) -> None:
                 _ScholarTextWindow(app.root, app, url, html, item=item,
                                    prefetch_pdf=prefetch)
 
-        app.record_case_view(self._history_key(), self._history_label(), reopen)
+        app.record_case_view(
+            self._history_key(), self._history_label(), reopen,
+            payload=payload,
+        )
 
     # ------------------------------------------------------------------
     # UI
@@ -8764,8 +8954,10 @@ class _ScholarTextWindow:
         self._source_var.set(self._scholar_url)
         # From the Scholar view, offer the official PDF (the CourtListener text
         # is invariably worse, so it's no longer offered here).
-        self._toggle_btn.configure(text="View PDF", command=self._view_pdf,
-                                state="normal")
+        _style_ui_button(self._toggle_btn, primary=True)
+        self._toggle_btn.configure(
+            text="Finding PDF...", command=self._view_pdf, state="disabled",
+        )
         self._hide_pdf_button()  # Scholar view uses the toggle for the PDF
         self._show_cl_button()   # …and offers a switch to the CourtListener text
         self._export_btn.configure(text="Export RTF…", command=self._export_rtf)
@@ -8787,6 +8979,8 @@ class _ScholarTextWindow:
             f"{len(self._scholar_text):,} characters | Google Scholar version{extra}"
         )
         self._finder.refresh()
+        self._refresh_pdf_button()
+        self._locate_pdf()
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
@@ -9383,13 +9577,15 @@ class _ScholarTextWindow:
         txt.config(state="disabled")
         self._mode = "courtlistener"
         self._source_var.set("CourtListener (REST API)")
-        toggle_label = (
-            "Google Scholar Text" if self._scholar_url else "Scholar unavailable"
-        )
+        _style_ui_button(self._toggle_btn, primary=False)
         self._toggle_btn.configure(
-            text=toggle_label, command=self._toggle_source,
+            text="Google Scholar Text", command=self._toggle_source,
             state="normal" if self._scholar_url else "disabled",
         )
+        self._export_btn.configure(text="Export RTF…", command=self._export_rtf)
+        self._print_btn.pack_forget()
+        self._zoom_out_btn.configure(text="A−")
+        self._zoom_in_btn.configure(text="A+")
         if len(parts) > 1:
             self._part_combo.config(state="readonly")
         else:
@@ -9423,8 +9619,15 @@ class _ScholarTextWindow:
         txt.config(state="disabled")
         self._mode = "courtlistener"
         self._source_var.set("CourtListener (assembled from the REST API)")
-        self._toggle_btn.configure(text="Google Scholar Text",
-                                command=self._toggle_source, state="normal")
+        _style_ui_button(self._toggle_btn, primary=False)
+        self._toggle_btn.configure(
+            text="Google Scholar Text", command=self._toggle_source,
+            state="normal" if self._scholar_url else "disabled",
+        )
+        self._export_btn.configure(text="Export RTF…", command=self._export_rtf)
+        self._print_btn.pack_forget()
+        self._zoom_out_btn.configure(text="A−")
+        self._zoom_in_btn.configure(text="A+")
         self._hide_cl_button()
         self._part_combo.config(state="disabled")
         self._view_label_var.set("CourtListener text")
@@ -10960,6 +11163,7 @@ class _ScholarTextWindow:
         # (If the PDF is up, its button is left alone — the Scholar text is
         # picked up when the reader returns to the text view.)
         if self._mode == "courtlistener":
+            _style_ui_button(self._toggle_btn, primary=False)
             self._toggle_btn.configure(
                 text="Google Scholar Text", command=self._toggle_source,
                 state="normal",
@@ -11081,14 +11285,28 @@ class _ScholarTextWindow:
     # CourtListener-view "View PDF" button
     # ------------------------------------------------------------------
 
+    def _pack_courtlistener_action_buttons(self) -> None:
+        """Pack Scholar then PDF actions so PDF sits to the right of Scholar."""
+        scholar = getattr(self, "_toggle_btn", None)
+        pdf = getattr(self, "_pdf_btn", None)
+        if scholar is None or pdf is None:
+            return
+        for btn in (scholar, pdf):
+            try:
+                if btn.winfo_ismapped():
+                    btn.pack_forget()
+            except tk.TclError:
+                return
+        pdf.pack(side="right", padx=4)
+        scholar.pack(side="right", padx=4)
+
     def _show_pdf_button(self) -> None:
         """Reveal the View PDF button (CourtListener text view), kicking off the
         background PDF search the first time so it ends up enabled or greyed."""
-        btn = getattr(self, "_pdf_btn", None)
+        btn = self._active_pdf_button()
         if btn is None:
             return
-        if not btn.winfo_ismapped():
-            btn.pack(side="right", padx=4)
+        self._pack_courtlistener_action_buttons()
         self._refresh_pdf_button()
         self._locate_pdf()
 
@@ -11113,6 +11331,7 @@ class _ScholarTextWindow:
         btn = getattr(self, "_cl_btn", None)
         if btn is None:
             return
+        _style_ui_button(btn, primary=False)
         if self._can_show_courtlistener():
             if not btn.winfo_ismapped():
                 btn.pack(side="right", padx=4)
@@ -11124,17 +11343,25 @@ class _ScholarTextWindow:
         if btn is not None and btn.winfo_ismapped():
             btn.pack_forget()
 
+    def _active_pdf_button(self):
+        if getattr(self, "_mode", None) == "scholar":
+            return getattr(self, "_toggle_btn", None)
+        return getattr(self, "_pdf_btn", None)
+
     def _refresh_pdf_button(self) -> None:
-        btn = getattr(self, "_pdf_btn", None)
+        btn = self._active_pdf_button()
         if btn is None:
             return
         try:
             if self._pdf_located is True or self._pdf_prefetch is not None:
+                _style_ui_button(btn, primary=True)
                 btn.configure(state="normal", text="View PDF")
             elif self._pdf_located is False:
+                _style_ui_button(btn, primary=False)
                 btn.configure(state="disabled", text="No PDF")
             else:
-                btn.configure(state="disabled", text="Finding PDF…")
+                _style_ui_button(btn, primary=False)
+                btn.configure(state="disabled", text="Finding PDF...")
         except tk.TclError:
             pass
 
@@ -11200,7 +11427,7 @@ class _ScholarTextWindow:
         Scholar view opens, caching the bytes so a later 'View PDF' is instant.
         Best-effort: any failure is swallowed and the on-demand path still runs.
         Skipped when the PDF libraries aren't installed."""
-        if self._pdf_prefetch_started:
+        if self._pdf_prefetch_started or self._pdf_locate_started:
             return
         self._pdf_prefetch_started = True
         try:
@@ -11223,6 +11450,7 @@ class _ScholarTextWindow:
                 data = resp.content
                 if data.startswith(b"%PDF"):
                     self._pdf_prefetch = (data, url)
+                    self._post(self._on_pdf_located, True)
             except Exception as exc:
                 print(f"[prefetch] PDF prefetch failed: {exc}")
 
@@ -11324,6 +11552,7 @@ class _ScholarTextWindow:
             back_state = ("disabled"
                           if self._fed_appx and not self._scholar_has_text
                           else "normal")
+        _style_ui_button(self._toggle_btn, primary=True)
         self._toggle_btn.configure(
             text=back_label, command=self._back_from_pdf, state=back_state)
         self._hide_cl_button()
@@ -11406,8 +11635,9 @@ class _ScholarTextWindow:
             # rather than turning the Scholar toggle into a "View PDF".
             self._refresh_pdf_button()
         else:
-            self._toggle_btn.configure(text="View PDF", command=self._view_pdf,
-                                    state="normal")
+            if not self._pdf_url:
+                self._pdf_located = False
+            self._refresh_pdf_button()
         self._status_var.set(f"PDF: {msg}")
         if self._pdf_url and messagebox.askyesno(
             "PDF", f"{msg}\n\nOpen the PDF in your web browser instead?",
@@ -11678,9 +11908,11 @@ class _PdfWindow:
         if not (self._is_case and self._app is not None):
             return None
         app, url, title = self._app, self._url, self._title
+        payload = {"type": "pdf", "url": url, "title": title}
         return (f"pdf:{url}", title,
                 lambda: _PdfWindow(app.root, url, title, app=app,
-                                   is_case=True))
+                                   is_case=True),
+                payload)
 
     def _post(self, fn, *args) -> None:
         try:
