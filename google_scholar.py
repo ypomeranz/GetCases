@@ -22,6 +22,8 @@ Requires:
 
 from __future__ import annotations
 
+import json
+import random
 import re
 import sqlite3
 import threading
@@ -43,17 +45,160 @@ except ImportError as exc:  # pragma: no cover
 
 SCHOLAR_BASE = "https://scholar.google.com"
 
+# ---------------------------------------------------------------------------
+# Browser impersonation
+# ---------------------------------------------------------------------------
+# Google Scholar's bot detection keys on the *TLS fingerprint*, not just the
+# User-Agent header: plain `requests` announces itself in the handshake no
+# matter what UA string it sends, and the mismatch is what triggers the
+# "/sorry/ unusual traffic" challenge.  So requests go out through curl_cffi,
+# which impersonates a real browser's TLS + HTTP/2 fingerprint, with a
+# User-Agent matched to the impersonated version — a coherent "persona".
+#
+# One persona is pinned per session (a stable identity, like a real browser);
+# on a challenge the fetcher rotates to the next and rebuilds the session.
+# Which personas pass drifts as Google updates its challenge list and
+# curl_cffi adds profiles (the newest Chrome profiles get challenged first) —
+# _CANNED_PERSONAS lists proven targets, best first.  When Firefox is
+# installed, the user's *real* Firefox identity leads: its exact UA and its
+# google.com cookies (read like eng_rep_pdf reads CommonLII's CloudFlare
+# clearance), so after the user solves a Scholar CAPTCHA in Firefox once, the
+# GOOGLE_ABUSE_EXEMPTION cookie it earns is reused here automatically.
+try:  # optional: everything degrades to plain requests without it
+    from curl_cffi import requests as _curl_requests
+except ImportError:  # pragma: no cover - dependency present in the app env
+    _curl_requests = None
+
+_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
 _HEADERS = {
-    # Realistic browser UA to avoid trivial blocks
+    # Fallback headers for the no-curl_cffi path (still a realistic browser).
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
+        "Gecko/20100101 Firefox/144.0"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": _ACCEPT,
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-_DEFAULT_DELAY = 3.0  # seconds between outbound requests
+# (curl_cffi target, User-Agent matching that version, Accept-Language).
+# Order = preference; verified against live Scholar 2026-06-25 (chrome133a+
+# were challenged; these passed).  Re-probe and prune when blocks return.
+_CANNED_PERSONAS: list[tuple[str, str, str]] = [
+    ("chrome131",
+     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+     "en-US,en;q=0.9"),
+    ("chrome124",
+     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+     "en-US,en;q=0.9"),
+    ("chrome120",
+     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+     "en-US,en;q=0.9"),
+    ("chrome116",
+     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+     "en-US,en;q=0.9"),
+    ("firefox144",
+     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
+     "Gecko/20100101 Firefox/144.0",
+     "en-US,en;q=0.5"),
+    ("safari184",
+     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+     "(KHTML, like Gecko) Version/18.4 Safari/605.1.15",
+     "en-US,en;q=0.9"),
+    ("edge101",
+     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36 "
+     "Edg/101.0.1210.47",
+     "en-US,en;q=0.9"),
+]
+
+
+@dataclass(frozen=True)
+class _Persona:
+    target: str  # curl_cffi impersonation target; "" = plain requests
+    ua: str
+    accept_language: str
+
+
+def _available_targets() -> set:
+    """Impersonation targets this curl_cffi build actually offers."""
+    if _curl_requests is None:
+        return set()
+    try:
+        import typing as _t
+        from curl_cffi.requests.impersonate import BrowserTypeLiteral
+        return set(_t.get_args(BrowserTypeLiteral))
+    except Exception:  # pragma: no cover - very old curl_cffi
+        return {t for t, _u, _l in _CANNED_PERSONAS}
+
+
+def _build_personas() -> list[_Persona]:
+    """Personas to try, best first.  The user's real Firefox identity leads
+    when Firefox is installed (it matches the borrowed cookies); plain
+    requests is the last resort when curl_cffi is missing entirely."""
+    if _curl_requests is None:
+        return [_Persona("", _HEADERS["User-Agent"], "en-US,en;q=0.5")]
+    avail = _available_targets()
+    personas: list[_Persona] = []
+    try:
+        import eng_rep_pdf
+        if eng_rep_pdf.firefox_available():
+            ff = sorted(
+                (t for t in avail if re.fullmatch(r"firefox\d+", str(t))),
+                key=lambda t: int(str(t)[7:]),
+            )
+            if ff:
+                personas.append(_Persona(
+                    str(ff[-1]), eng_rep_pdf.firefox_user_agent(),
+                    "en-US,en;q=0.5",
+                ))
+    except Exception:  # pragma: no cover - eng_rep_pdf optional
+        pass
+    for target, ua, lang in _CANNED_PERSONAS:
+        if target in avail:
+            personas.append(_Persona(target, ua, lang))
+    return personas or [_Persona("", _HEADERS["User-Agent"], "en-US,en;q=0.5")]
+
+
+def _browser_google_cookies() -> dict:
+    """google.com cookies from the user's Firefox profile (via eng_rep_pdf's
+    profile hunter) — the returning-browser identity Scholar throttles less,
+    including the ``GOOGLE_ABUSE_EXEMPTION`` cookie Google sets once the user
+    solves a Scholar CAPTCHA in Firefox.  ``{}`` when unavailable.  Host-only
+    cookies (``__Host-*``) are skipped: they may not carry a Domain attribute,
+    so they cannot be replayed for another host."""
+    try:
+        import eng_rep_pdf
+    except ImportError:
+        return {}
+    out: dict = {}
+    try:
+        for db in eng_rep_pdf._firefox_cookie_dbs():
+            cookies = eng_rep_pdf._read_cookies_sqlite(db, "google") or {}
+            for name, value in cookies.items():
+                if not name.startswith("__Host-"):
+                    out.setdefault(name, value)
+    except Exception as exc:  # pragma: no cover - cookie DB quirks
+        print(f"[scholar] Firefox cookie read failed: {exc}")
+    return out
+
+
+_DEFAULT_DELAY = 3.0  # base seconds between outbound requests (jittered)
+_BLOCK_COOLDOWN = 180.0  # seconds to fail fast after every persona is challenged
+_RETRY_STATUSES = {500, 502, 503}  # transient Google hiccups, retried once
 _CACHE_PATH = Path.home() / ".cache" / "courtlistener_scholar.db"
+_COOKIE_STORE = Path.home() / ".cache" / "courtlistener_scholar_state.json"
+
+_CAPTCHA_TIP = (
+    "[scholar] Google Scholar is challenging this computer (its 'unusual "
+    "traffic' page). Open https://scholar.google.com in Firefox, run any "
+    "search, solve the CAPTCHA — the app reuses Firefox's clearance "
+    "automatically on the next try."
+)
 
 
 class ScholarError(Exception):
@@ -834,8 +979,33 @@ class GoogleScholarFetcher:
         self._name_scorer = name_scorer
         self._name_min = name_min
 
-        self._session = requests.Session()
-        self._session.headers.update(_HEADERS)
+        # Browser personas (TLS fingerprint + matching UA), pinned per session
+        # and rotated on a challenge.  The persona that worked last run is
+        # restored from the state file, so a known-good identity leads.
+        self._personas = _build_personas()
+        self._persona_ix = 0
+        self._blocked_until = 0.0  # monotonic deadline of the fail-fast window
+        self._warmed = False       # homepage visited this session
+        state = self._load_state()
+        saved_target = state.get("persona")
+        for i, p in enumerate(self._personas):
+            if p.target == saved_target:
+                self._persona_ix = i
+                break
+        self._stored_cookies: dict = dict(state.get("cookies") or {})
+        # A hard block survives an app restart: honor the persisted cooldown
+        # so a relaunch doesn't immediately re-probe every fingerprint.
+        try:
+            remaining = float(state.get("blocked_until_wall", 0)) - time.time()
+        except (TypeError, ValueError):
+            remaining = 0.0
+        if remaining > 0:
+            self._blocked_until = time.monotonic() + min(
+                remaining, _BLOCK_COOLDOWN)
+            print(f"[scholar] resuming block cooldown ({int(remaining)}s left)")
+        self._session = self._build_session()
+        print(f"[scholar] browser persona: "
+              f"{self._personas[self._persona_ix].target or 'plain requests'}")
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(cache_path), check_same_thread=False)
@@ -865,6 +1035,10 @@ class GoogleScholarFetcher:
         # by take_post_search_failure() so a caller can fall back to
         # CourtListener and retry this exact opinion in the background.
         self._post_search_failure: Optional[str] = None
+
+        # The most recent results-page URL, sent as the Referer when a case
+        # page is fetched — the way a browser navigates from a search.
+        self._last_search_url: str = ""
 
         # Back up any opinions that were cached before they were stored in the
         # opinion database (e.g. served from the query cache, which short-circuits
@@ -952,6 +1126,7 @@ class GoogleScholarFetcher:
         print(f"[scholar] searching {search_url}")
         try:
             resp = self._get(search_url)
+            self._last_search_url = search_url
         except Exception as exc:
             print(f"[scholar] search request failed: {exc}")
             return None
@@ -1005,6 +1180,7 @@ class GoogleScholarFetcher:
         print(f"[scholar] searching {search_url}")
         try:
             resp = self._get(search_url)
+            self._last_search_url = search_url
         except Exception as exc:
             print(f"[scholar] search request failed: {exc}")
             return None
@@ -1053,6 +1229,7 @@ class GoogleScholarFetcher:
         print(f"[scholar] searching {url}")
         try:
             resp = self._get(url)
+            self._last_search_url = url
             results = self._parse_results(resp.text)
             print(f"[scholar] parsed {len(results)} case results")
         except Exception as exc:
@@ -1291,17 +1468,145 @@ class GoogleScholarFetcher:
         except Exception as exc:
             print(f"[scholar] opinion-DB store failed: {exc}")
 
+    # ------------------------------------------------------------------
+    # Fetch layer: browser persona, pacing, block rotation
+    # ------------------------------------------------------------------
+
+    def _persona(self) -> _Persona:
+        return self._personas[self._persona_ix % len(self._personas)]
+
+    def _build_session(self):
+        """A fresh session wearing the current persona: curl_cffi impersonates
+        the browser's TLS/HTTP2 fingerprint, the headers match its version,
+        and the jar carries our persisted cookies plus whatever google.com
+        cookies the user's Firefox holds (a returning-browser identity — and
+        the CAPTCHA-exemption cookie once the user has cleared one)."""
+        p = self._persona()
+        if _curl_requests is not None and p.target:
+            session = _curl_requests.Session(impersonate=p.target)
+        else:
+            session = requests.Session()
+        session.headers.update({
+            "User-Agent": p.ua,
+            "Accept": _ACCEPT,
+            "Accept-Language": p.accept_language,
+        })
+        merged = dict(self._stored_cookies)
+        merged.update(_browser_google_cookies())
+        for name, value in merged.items():
+            try:
+                session.cookies.set(name, value, domain=".google.com")
+            except Exception:
+                pass
+        return session
+
+    def _load_state(self) -> dict:
+        try:
+            with open(_COOKIE_STORE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_state(self) -> None:
+        """Persist the working persona and the session's cookie jar, so the
+        next run resumes as the same returning browser."""
+        try:
+            cookies = self._session.cookies.get_dict()
+        except Exception:
+            cookies = {}
+        self._stored_cookies.update(cookies or {})
+        remaining = self._blocked_until - time.monotonic()
+        try:
+            _COOKIE_STORE.parent.mkdir(parents=True, exist_ok=True)
+            with open(_COOKIE_STORE, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "persona": self._persona().target,
+                    "cookies": self._stored_cookies,
+                    "blocked_until_wall": (
+                        time.time() + remaining if remaining > 0 else 0
+                    ),
+                }, fh)
+        except Exception:
+            pass  # persistence is best-effort
+
+    def _rotate_persona(self) -> None:
+        """Switch to the next browser fingerprint and rebuild the session —
+        re-reading Firefox's google.com cookies, so a CAPTCHA the user just
+        solved there takes effect immediately."""
+        self._persona_ix = (self._persona_ix + 1) % len(self._personas)
+        p = self._persona()
+        print(f"[scholar] rotating browser fingerprint -> "
+              f"{p.target or 'plain requests'}")
+        self._session = self._build_session()
+
+    @staticmethod
+    def _looks_blocked(resp) -> bool:
+        """Google's bot challenge: a redirect to /sorry/ or a 403/429."""
+        try:
+            final_url = str(getattr(resp, "url", "") or "")
+        except Exception:
+            final_url = ""
+        return "/sorry/" in final_url or resp.status_code in (403, 429)
+
     def _throttle(self) -> None:
+        """Human-ish pacing: the base delay plus jitter, so requests don't
+        tick metronomically."""
+        wait = self._delay * random.uniform(1.0, 1.5)
         elapsed = time.monotonic() - self._last_request
-        if elapsed < self._delay:
-            time.sleep(self._delay - elapsed)
+        if elapsed < wait:
+            time.sleep(wait - elapsed)
         self._last_request = time.monotonic()
 
-    def _get(self, url: str) -> requests.Response:
-        self._throttle()
-        resp = self._session.get(url, timeout=20)
-        resp.raise_for_status()
-        return resp
+    def _warm_up(self) -> None:
+        """Visit the Scholar homepage once per session before the first
+        search — acquiring the ordinary first-party cookies and giving the
+        search request a natural referer chain, the way a browser arrives."""
+        if self._warmed:
+            return
+        self._warmed = True
+        try:
+            self._throttle()
+            self._session.get(SCHOLAR_BASE + "/", timeout=20,
+                              allow_redirects=True)
+        except Exception:
+            pass  # best-effort; the search itself will tell the real story
+
+    def _get(self, url: str, referer: str = ""):
+        """GET through the persona session.  On a challenge, rotate through
+        the remaining browser fingerprints (rebuilding the session each time);
+        when every persona is challenged, start a fail-fast cooldown so the
+        local-database / CourtListener fallbacks answer instantly instead of
+        hammering Google, and point the user at the one-time Firefox CAPTCHA
+        clearance."""
+        now = time.monotonic()
+        if now < self._blocked_until:
+            raise ScholarError(
+                f"blocked (cooling down {int(self._blocked_until - now)}s; "
+                "solve the CAPTCHA in Firefox to clear)")
+        self._warm_up()
+        headers = {"Referer": referer or (SCHOLAR_BASE + "/")}
+        last_status = "challenge"
+        for _ in range(len(self._personas)):
+            self._throttle()
+            resp = self._session.get(url, headers=headers, timeout=20,
+                                     allow_redirects=True)
+            if self._looks_blocked(resp):
+                last_status = f"HTTP {resp.status_code}"
+                print(f"[scholar] {self._persona().target or 'plain requests'}"
+                      f" challenged ({last_status})")
+                self._rotate_persona()
+                continue
+            if resp.status_code in _RETRY_STATUSES:
+                time.sleep(2.0)
+                continue  # transient Google hiccup — same persona, one retry
+            resp.raise_for_status()
+            self._save_state()
+            return resp
+        self._blocked_until = time.monotonic() + _BLOCK_COOLDOWN
+        self._save_state()  # the cooldown survives an app restart
+        print(_CAPTCHA_TIP)
+        raise ScholarError(f"{last_status} blocked")
 
     def _first_case_url(self, html: str) -> Optional[str]:
         """Return the first scholar_case href found in a Scholar results page."""
@@ -1319,7 +1624,9 @@ class GoogleScholarFetcher:
         """Fetch a scholar_case page and extract the opinion HTML."""
         print(f"[scholar] fetching case page {url}")
         try:
-            resp = self._get(url)
+            # A browser reaches a case page from a results page — send that
+            # Referer when we have one.
+            resp = self._get(url, referer=self._last_search_url)
         except Exception as exc:
             print(f"[scholar] case page request failed: {exc}")
             return None
@@ -1369,6 +1676,71 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
         if not cond:
             failures.append(msg)
         print(("ok   " if cond else "FAIL ") + msg)
+
+    # --- browser personas & block handling (offline) ---
+    from types import SimpleNamespace
+
+    personas = _build_personas()
+    check(bool(personas), f"personas built: {[p.target for p in personas]}")
+    if _curl_requests is not None:
+        check(all(p.target for p in personas),
+              "every persona impersonates a real browser")
+        family = {"chrome": "Chrome/", "firefox": "Firefox/",
+                  "safari": "Safari/", "edge": "Edg/"}
+        ok_ua = all(
+            family[re.match(r"[a-z]+", p.target).group(0)] in p.ua
+            for p in personas
+        )
+        check(ok_ua, "each persona's UA matches its TLS fingerprint family")
+
+    def fake(status=200, url="https://scholar.google.com/scholar?q=x"):
+        return SimpleNamespace(status_code=status, url=url)
+
+    lb = GoogleScholarFetcher._looks_blocked
+    check(not lb(fake(200)), "200 results page is not a block")
+    check(lb(fake(429)), "429 is a block")
+    check(lb(fake(403)), "403 is a block")
+    check(lb(fake(200, "https://www.google.com/sorry/index?continue=x")),
+          "/sorry/ redirect is a block even at 200")
+
+    ck = _browser_google_cookies()
+    check(isinstance(ck, dict) and not any(k.startswith("__Host-") for k in ck),
+          f"browser cookies readable ({len(ck)}) and __Host-* filtered")
+
+    # Rotation exhausts every persona, then a cooldown fails fast without
+    # touching the network.
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        f = GoogleScholarFetcher(cache_path=Path(_td) / "t.db", delay=0)
+        f._warmed = True
+        calls = {"n": 0}
+
+        class _StubSession:
+            headers: dict = {}
+            cookies = SimpleNamespace(
+                set=lambda *a, **k: None, get_dict=lambda: {})
+
+            def get(self, url, **kw):
+                calls["n"] += 1
+                return fake(429)
+
+        f._session = _StubSession()
+        f._build_session = lambda: _StubSession()  # type: ignore[assignment]
+        try:
+            f._get("https://scholar.google.com/scholar?q=test")
+            check(False, "blocked _get should raise")
+        except ScholarError as exc:
+            check("blocked" in str(exc), f"exhausted personas raise: {exc}")
+        check(calls["n"] == len(f._personas),
+              f"one attempt per persona ({calls['n']})")
+        before = calls["n"]
+        try:
+            f._get("https://scholar.google.com/scholar?q=test")
+            check(False, "cooldown _get should raise")
+        except ScholarError as exc:
+            check("cooling down" in str(exc), f"cooldown fails fast: {exc}")
+        check(calls["n"] == before, "cooldown makes no network attempts")
+        f._db.close()
 
     # CourtListener marks reporter page breaks with
     # <span class="star-pagination">*N</span>, sometimes twice in a row.
@@ -1524,6 +1896,9 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
         f2._get = _boom  # type: ignore[assignment]
         check(f2.search_cases("Roe v. Wade") == [],
               "blocked search with no DB returns empty")
+        # Close the sqlite handles so Windows lets the TemporaryDirectory go.
+        f._db.close()
+        f2._db.close()
 
     if failures:
         print(f"\n{len(failures)} FAILED")
