@@ -33,6 +33,7 @@ except ImportError as exc:  # pragma: no cover
 HOME_URL = "https://www.supremecourt.gov/"
 _BASE = "https://www.supremecourt.gov/"
 _CACHE_PATH = Path.home() / ".cache" / "courtlistener_scotus_recent.json"
+_CACHE_VERSION = 2
 _CACHE_TTL = 6 * 3600  # seconds; the homepage updates on decision days only
 _TIMEOUT = 25
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
@@ -144,6 +145,8 @@ def parse_recent_decisions(html: str) -> list[RecentDecision]:
 def _read_cache() -> "Optional[list[RecentDecision]]":
     try:
         blob = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
+        if blob.get("version") != _CACHE_VERSION:
+            return None
         if time.time() - blob.get("fetched_at", 0) > _CACHE_TTL:
             return None
         items = blob.get("items") or []
@@ -156,6 +159,7 @@ def _write_cache(items: list[RecentDecision]) -> None:
     try:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         _CACHE_PATH.write_text(json.dumps({
+            "version": _CACHE_VERSION,
             "fetched_at": time.time(),
             "items": [it.to_dict() for it in items],
         }), encoding="utf-8")
