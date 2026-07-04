@@ -9,6 +9,16 @@ Strategy:
   3. Scrape the #gs_opinion div from that page, keeping its HTML.
   4. Cache everything in a local SQLite database to avoid re-fetching.
 
+Anti-blocking (see the "Browser impersonation" section below and
+:mod:`scholar_browser`): Google Scholar detects scripted clients by their TLS
+handshake.  Requests go out through curl_cffi impersonating a real browser
+(fingerprint + matching User-Agent), pinned per session and rotated on a
+challenge; when every fingerprint is challenged — a hard IP flag on the search
+endpoint — the fetch falls back to driving the user's *actual* Firefox, whose
+genuine handshake plus their google.com cookies is the only thing that gets
+through.  Everything degrades gracefully: no curl_cffi → plain requests; no
+Selenium/Firefox → the local opinion DB and CourtListener answer instead.
+
 The raw opinion HTML can be turned into a lightweight structured document
 with ``parse_opinion_blocks``, which preserves paragraphs, centering,
 italics, footnote markers, the embedded scholar_case citation links, and
@@ -18,6 +28,8 @@ no separator, so sentences don't acquire stray gaps around formatting.
 
 Requires:
     pip install requests beautifulsoup4
+    pip install curl_cffi        # browser TLS impersonation (recommended)
+    pip install selenium         # real-Firefox fallback for a hard IP block
 """
 
 from __future__ import annotations
@@ -124,6 +136,20 @@ class _Persona:
     accept_language: str
 
 
+class _BrowserResponse:
+    """A minimal ``requests.Response`` stand-in for a page fetched through the
+    real Firefox (:mod:`scholar_browser`), so it drops into the same parsing
+    code the curl_cffi responses use."""
+
+    def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+        self.text = text
+        self.url = url
+        self.status_code = status_code
+
+    def raise_for_status(self) -> None:  # always a successful fetch
+        return None
+
+
 def _available_targets() -> set:
     """Impersonation targets this curl_cffi build actually offers."""
     if _curl_requests is None:
@@ -189,15 +215,16 @@ def _browser_google_cookies() -> dict:
 
 _DEFAULT_DELAY = 3.0  # base seconds between outbound requests (jittered)
 _BLOCK_COOLDOWN = 180.0  # seconds to fail fast after every persona is challenged
+_BROWSER_FIRST_TTL = 6 * 3600.0  # how long to prefer the real browser after a block
 _RETRY_STATUSES = {500, 502, 503}  # transient Google hiccups, retried once
 _CACHE_PATH = Path.home() / ".cache" / "courtlistener_scholar.db"
 _COOKIE_STORE = Path.home() / ".cache" / "courtlistener_scholar_state.json"
 
 _CAPTCHA_TIP = (
-    "[scholar] Google Scholar is challenging this computer (its 'unusual "
-    "traffic' page). Open https://scholar.google.com in Firefox, run any "
-    "search, solve the CAPTCHA — the app reuses Firefox's clearance "
-    "automatically on the next try."
+    "[scholar] Google Scholar is challenging this computer and the real "
+    "Firefox fallback isn't available (install `selenium` + Firefox to enable "
+    "it). Meanwhile the app serves results from the local opinion database and "
+    "CourtListener; the block clears on its own in a while."
 )
 
 
@@ -986,6 +1013,14 @@ class GoogleScholarFetcher:
         self._persona_ix = 0
         self._blocked_until = 0.0  # monotonic deadline of the fail-fast window
         self._warmed = False       # homepage visited this session
+        # Real-Firefox fallback (scholar_browser): the only channel that beats
+        # a hard IP flag on the search endpoint.  Started lazily, reused, and
+        # preferred once curl_cffi has proven blocked this session.
+        self._browser = None
+        self._browser_lock = threading.Lock()
+        self._browser_first = False
+        self._browser_dead = False  # selenium/Firefox unavailable — stop trying
+        self._browser_first_wall = 0.0  # wall-clock end of the browser-first window
         state = self._load_state()
         saved_target = state.get("persona")
         for i, p in enumerate(self._personas):
@@ -1003,6 +1038,18 @@ class GoogleScholarFetcher:
             self._blocked_until = time.monotonic() + min(
                 remaining, _BLOCK_COOLDOWN)
             print(f"[scholar] resuming block cooldown ({int(remaining)}s left)")
+        # Restore the browser-first window: while curl_cffi is known-blocked,
+        # skip the futile persona rotation (and the 8 doomed requests it fires
+        # at Google) and go straight to the real Firefox on the first fetch.
+        try:
+            self._browser_first_wall = float(
+                state.get("browser_first_until_wall", 0))
+        except (TypeError, ValueError):
+            self._browser_first_wall = 0.0
+        if time.time() < self._browser_first_wall:
+            self._browser_first = True
+            print("[scholar] curl_cffi recently blocked — using real Firefox "
+                  "first this session")
         self._session = self._build_session()
         print(f"[scholar] browser persona: "
               f"{self._personas[self._persona_ix].target or 'plain requests'}")
@@ -1526,6 +1573,7 @@ class GoogleScholarFetcher:
                     "blocked_until_wall": (
                         time.time() + remaining if remaining > 0 else 0
                     ),
+                    "browser_first_until_wall": self._browser_first_wall,
                 }, fh)
         except Exception:
             pass  # persistence is best-effort
@@ -1539,6 +1587,16 @@ class GoogleScholarFetcher:
         print(f"[scholar] rotating browser fingerprint -> "
               f"{p.target or 'plain requests'}")
         self._session = self._build_session()
+
+    def close(self) -> None:
+        """Release the headless Firefox, if one was started.  Safe to call
+        more than once; the app may call it on shutdown."""
+        browser, self._browser = self._browser, None
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _looks_blocked(resp) -> bool:
@@ -1572,18 +1630,68 @@ class GoogleScholarFetcher:
         except Exception:
             pass  # best-effort; the search itself will tell the real story
 
+    def _browser_get(self, url: str):
+        """Fetch *url* through the user's real Firefox (:mod:`scholar_browser`)
+        — a genuine Gecko TLS handshake plus their google.com cookies, the one
+        combination that beats a hard IP flag on the search endpoint.  Returns
+        a :class:`_BrowserResponse`, or ``None`` when the browser is
+        unavailable or itself challenged (so the caller falls back further)."""
+        if self._browser_dead:
+            return None
+        try:
+            import scholar_browser
+        except ImportError:
+            self._browser_dead = True
+            return None
+        if not scholar_browser.available():
+            self._browser_dead = True
+            print("[scholar] real-Firefox fallback unavailable "
+                  "(needs `pip install selenium` and Firefox)")
+            return None
+        try:
+            with self._browser_lock:
+                if self._browser is None:
+                    self._browser = scholar_browser.ScholarBrowser()
+                html, final_url = self._browser.fetch(url)
+            return _BrowserResponse(html, final_url)
+        except scholar_browser.BrowserBlocked:
+            print("[scholar] real Firefox was also challenged — solve the "
+                  "CAPTCHA once in your normal Firefox, then retry.")
+            return None
+        except scholar_browser.BrowserUnavailable as exc:
+            print(f"[scholar] real-Firefox fallback unavailable: {exc}")
+            self._browser_dead = True
+            return None
+        except Exception as exc:
+            print(f"[scholar] real-Firefox fetch failed: {exc}")
+            return None
+
     def _get(self, url: str, referer: str = ""):
-        """GET through the persona session.  On a challenge, rotate through
-        the remaining browser fingerprints (rebuilding the session each time);
-        when every persona is challenged, start a fail-fast cooldown so the
-        local-database / CourtListener fallbacks answer instantly instead of
-        hammering Google, and point the user at the one-time Firefox CAPTCHA
-        clearance."""
+        """GET a Scholar page, in order of increasing weight:
+
+          1. the curl_cffi persona session (rotating fingerprints on a
+             challenge);
+          2. the user's real Firefox, when every persona is challenged — the
+             only channel that beats a hard IP flag;
+          3. a fail-fast cooldown, so the local-DB / CourtListener fallbacks
+             answer instantly instead of hammering Google.
+
+        Once the browser becomes the working channel (curl_cffi blocked, or a
+        cooldown is in effect), it is used *first* so a blocked run doesn't pay
+        the slow persona rotation on every fetch."""
         now = time.monotonic()
-        if now < self._blocked_until:
-            raise ScholarError(
-                f"blocked (cooling down {int(self._blocked_until - now)}s; "
-                "solve the CAPTCHA in Firefox to clear)")
+        browser_preferred = self._browser_first or now < self._blocked_until
+        if browser_preferred:
+            resp = self._browser_get(url)
+            if resp is not None:
+                self._mark_browser_working()
+                return resp
+            if now < self._blocked_until:
+                # Still cooling down and the browser can't help — fail fast.
+                raise ScholarError(
+                    f"blocked (cooling down {int(self._blocked_until - now)}s; "
+                    "solve the CAPTCHA in Firefox to clear)")
+
         self._warm_up()
         headers = {"Referer": referer or (SCHOLAR_BASE + "/")}
         last_status = "challenge"
@@ -1603,10 +1711,28 @@ class GoogleScholarFetcher:
             resp.raise_for_status()
             self._save_state()
             return resp
+
+        # Every fingerprint challenged — the real browser is the way through.
+        resp = self._browser_get(url)
+        if resp is not None:
+            print("[scholar] fetched via real Firefox (curl_cffi was blocked)")
+            self._mark_browser_working()
+            return resp
+
         self._blocked_until = time.monotonic() + _BLOCK_COOLDOWN
         self._save_state()  # the cooldown survives an app restart
         print(_CAPTCHA_TIP)
         raise ScholarError(f"{last_status} blocked")
+
+    def _mark_browser_working(self) -> None:
+        """Record that the real Firefox is the working channel: prefer it for
+        the rest of this session and, for a while, across restarts — so a
+        flagged IP doesn't re-pay the persona rotation (or re-fire 8 doomed
+        requests at Google) on every launch.  The window auto-expires, after
+        which curl_cffi is retried in case the flag has cleared."""
+        self._browser_first = True
+        self._browser_first_wall = time.time() + _BROWSER_FIRST_TTL
+        self._save_state()
 
     def _first_case_url(self, html: str) -> Optional[str]:
         """Return the first scholar_case href found in a Scholar results page."""
@@ -1713,6 +1839,7 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     with _tf.TemporaryDirectory() as _td:
         f = GoogleScholarFetcher(cache_path=Path(_td) / "t.db", delay=0)
         f._warmed = True
+        f._browser_dead = True  # don't launch Firefox in the offline test
         calls = {"n": 0}
 
         class _StubSession:
