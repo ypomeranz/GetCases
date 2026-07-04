@@ -66,6 +66,7 @@ def _ensure_dependencies() -> None:
                 ("customtkinter", "customtkinter"),  # modern spotlight / window chrome
                 ("curl_cffi", "curl_cffi"),  # English Reports scan fetch (CloudFlare)
                 ("browser_cookie3", "browser_cookie3"),  # reads Firefox clearance cookie
+                ("selenium","selenium"),
             )
             if importlib.util.find_spec(module) is None
         ]
@@ -509,6 +510,7 @@ import statutes_at_large
 import us_code
 import brief_reader
 import oyez
+import slip_opinion
 from citations import (
     PINCITE_AFTER_RE as _PINCITE_AFTER_RE,
     TEXT_CITE_RE as _TEXT_CITE_RE,
@@ -7214,13 +7216,24 @@ class _PdfPane(ttk.Frame):
     _ZOOM_MIN_W = 240   # narrowest page render width (px)
     _ZOOM_MAX_W = 3200  # widest page render width (px)
 
+    #: Glyph color used for citation links in ``link_style="recolor"`` mode —
+    #: a light, readable blue standing in for the black ink.
+    _RECOLOR_RGB = (47, 111, 214)
+
     def __init__(self, parent: tk.Misc, pdf_bytes: bytes, width: int = 800,
-                 margin: Optional[int] = None) -> None:
+                 margin: Optional[int] = None,
+                 link_style: str = "tint") -> None:
         super().__init__(parent)
         import pypdfium2 as pdfium
         from PIL import ImageTk  # noqa: F401  (availability check at construct)
 
         self._pdf_bytes = pdf_bytes   # kept for the lossless text-preserving export
+        # How citation links are shown: "tint" draws translucent highlight
+        # boxes (the brief viewer); "recolor" repaints the citation's own
+        # glyphs light blue and adds no box at all — the slip-opinion viewer,
+        # where highlights would be intrusive.  Clicks in recolor mode are
+        # hit-tested at the canvas level, since there is no overlay item.
+        self._link_style = link_style
         self._doc = pdfium.PdfDocument(pdf_bytes)
         # White margin drawn around each cropped page; US Reports scans get a
         # roomier margin (their official typography sits in a small block).
@@ -7466,6 +7479,9 @@ class _PdfPane(ttk.Frame):
         W, H = full.size
         content = full.crop((int(fl * W), int(ft * H),
                              int(round(fr * W)), int(round(fb * H))))
+        if self._link_style == "recolor" and self._cite_links.get(i):
+            content = self._recolor_citations(content, i, scale,
+                                              int(fl * W), int(ft * H))
         # Snap to the exact content box so every page lines up with a uniform
         # margin, then mount it on a white page of the slot's size.
         inner_h = max(1, slot_h - 2 * self._margin)
@@ -7492,12 +7508,105 @@ class _PdfPane(ttk.Frame):
         to ``[(rect_pts, action, snippet), …]`` (see
         :func:`_detect_pdf_citation_links`).  ``on_left(action, snippet)`` fires
         on a left click, ``on_right(action, snippet)`` on a right click.  Redraws
-        the overlays on every page currently on screen."""
+        the overlays on every page currently on screen (in recolor mode the
+        pages themselves are re-rendered, since the link color is baked into
+        the page image)."""
         self._cite_links = page_links or {}
         self._cite_on_left = on_left
         self._cite_on_right = on_right
+        if self._link_style == "recolor":
+            self._bind_recolor_events()
+            c = self._canvas
+            for i in list(self._img_ids):   # drop stale renders; re-render blue
+                c.delete(self._img_ids.pop(i))
+                self._photos.pop(i, None)
+            self._render_visible()
+            return
         for i in list(self._img_ids):
             self._draw_overlays(i)
+
+    def _recolor_citations(self, content, i: int, scale: float,
+                           crop_x: int, crop_y: int):
+        """Repaint the ink of page *i*'s citation spans light blue on the
+        cropped page image.  Only dark (glyph) pixels inside each citation
+        rectangle are recolored, so the shapes stay crisp and the paper stays
+        white — the text simply *is* blue, with no highlight box."""
+        from PIL import Image
+        _w_pt, h_pt, _frac = self._meta[i]
+        if content.mode != "RGB":
+            content = content.convert("RGB")
+        W, H = content.size
+        blue = Image.new("RGB", (1, 1), self._RECOLOR_RGB)
+        for rect, _action, _snippet in self._cite_links.get(i, ()):
+            l, b, r, t = rect
+            x0 = int(l * scale) - crop_x - 1
+            x1 = int(round(r * scale)) - crop_x + 1
+            y0 = int((h_pt - t) * scale) - crop_y - 1
+            y1 = int(round((h_pt - b) * scale)) - crop_y + 1
+            x0, y0 = max(0, x0), max(0, y0)
+            x1, y1 = min(W, x1), min(H, y1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            box = (x0, y0, x1, y1)
+            region = content.crop(box)
+            mask = region.convert("L").point(
+                lambda p: 255 if p < 160 else 0)
+            content.paste(blue.resize(region.size), box, mask)
+        return content
+
+    def _bind_recolor_events(self) -> None:
+        """Canvas-level hover/click dispatch for recolor mode, where the links
+        have no overlay items to bind to."""
+        if getattr(self, "_recolor_bound", False):
+            return
+        self._recolor_bound = True
+        c = self._canvas
+        c.bind("<Motion>", self._on_recolor_motion, add="+")
+        c.bind("<Button-1>", lambda e: self._on_recolor_click(e, left=True),
+               add="+")
+        c.bind("<Button-3>", lambda e: self._on_recolor_click(e, left=False),
+               add="+")
+
+    def _link_at(self, event) -> "Optional[tuple]":
+        """The (action, snippet) under a mouse event, or None."""
+        try:
+            x = self._canvas.canvasx(event.x)
+            y = self._canvas.canvasy(event.y)
+        except tk.TclError:
+            return None
+        for i in list(self._img_ids):
+            for rect, action, snippet in self._cite_links.get(i, ()):
+                x0, y0, x1, y1 = self._rect_to_canvas(i, rect)
+                if x0 - 1 <= x <= x1 + 1 and y0 - 1 <= y <= y1 + 1:
+                    return action, snippet
+        return None
+
+    def _on_recolor_motion(self, event) -> None:
+        try:
+            self._canvas.config(
+                cursor="hand2" if self._link_at(event) else "")
+        except tk.TclError:
+            pass
+
+    def _on_recolor_click(self, event, left: bool):
+        hit = self._link_at(event)
+        if not hit:
+            return None
+        cb = self._cite_on_left if left else self._cite_on_right
+        if cb is not None:
+            cb(*hit)
+        return "break"
+
+    def scroll_to_page(self, i: int) -> None:
+        """Scroll so page *i* starts at the top of the view."""
+        if not (0 <= i < len(self._slots)) or self._content_h <= 0:
+            return
+        try:
+            self._canvas.yview_moveto(
+                max(0.0, (self._slots[i][0] - self._PAD) / self._content_h))
+        except tk.TclError:
+            pass
+        self._render_visible()
 
     def _rect_to_canvas(self, i: int, rect: tuple) -> tuple:
         """Map a PDF-point box ``(l, b, r, t)`` on page *i* to canvas coordinates
@@ -7513,7 +7622,10 @@ class _PdfPane(ttk.Frame):
 
     def _draw_overlays(self, i: int) -> None:
         """(Re)draw the clickable citation rectangles for page *i* on top of its
-        rendered image."""
+        rendered image.  Recolor mode draws nothing — the links are painted
+        into the page image and clicks are canvas-level."""
+        if self._link_style == "recolor":
+            return
         c = self._canvas
         for oid in self._overlay_ids.pop(i, []):
             c.delete(oid)
@@ -10477,20 +10589,22 @@ class _ScholarTextWindow:
 
     def _set_details(self, lines: list[tuple]) -> None:
         """Render the details pane.  Each line is ``(style, text)`` or, for a
-        clickable link, ``(style, text, url)`` — the latter is underlined and
-        opens *url* in the browser when clicked."""
+        clickable link, ``(style, text, target)`` — underlined; *target* is a
+        URL opened in the browser, or a callable invoked directly (an in-app
+        opener, e.g. the slip-opinion viewer)."""
         body = self._details_text
         body.config(state="normal")
         body.delete("1.0", "end")
         link_n = 0
         for item in lines:
             if len(item) == 3:
-                style, text, url = item
+                style, text, target = item
                 tag = f"olink{link_n}"
                 link_n += 1
                 body.tag_bind(
                     tag, "<Button-1>",
-                    lambda _e, u=url: self._open_details_link(u),
+                    lambda _e, t=target: (
+                        t() if callable(t) else self._open_details_link(t)),
                 )
                 tags = ("olink", tag)
                 if style:
@@ -10512,17 +10626,12 @@ class _ScholarTextWindow:
         self._status_var.set("Opened in your browser.")
 
     def _load_details(self) -> None:
-        """Fetch authorship/join data from CourtListener (author_str /
-        joined_by_str per sub-opinion — well populated for SCOTUS); when
-        that yields nothing, fall back to what the Scholar text itself
-        says (the syllabus line-up paragraph and separator headers)."""
+        """Fill the details panel: the Oyez line-up/summary for a Supreme
+        Court case; when Oyez has nothing, the Court's own recent decisions
+        (supremecourt.gov) with in-app slip-opinion links; last, whatever
+        authorship the open text itself reveals."""
         self._details_loaded = True
         self._set_details([("lbl", "Loading case details…")])
-        client = (
-            self._app._get_client()
-            if self._app._token_var.get().strip() else None
-        )
-        item = dict(self._item)
         cite = self._bb["cite"]
         is_scotus = self._is_scotus
         oyez_cites = [c for c in ([cite] + list(self._header_cites)) if c]
@@ -10534,8 +10643,7 @@ class _ScholarTextWindow:
             lines: list[tuple] = []
             # Supreme Court cases: Oyez first — its majority/dissent line-up,
             # plain-English summary and oral-argument audio are far richer than
-            # CourtListener's authorship strings.  Any failure falls through to
-            # the CourtListener / Scholar paths below.
+            # anything else.  Any failure falls through to the paths below.
             if is_scotus:
                 try:
                     case = oyez.lookup(cites=oyez_cites, name=name, year=year)
@@ -10545,34 +10653,19 @@ class _ScholarTextWindow:
                             title = "Supreme Court · Oyez"
                 except Exception as exc:
                     print(f"[details] oyez: {exc}")
+            # No Oyez entry (a case too recent or too obscure for it, or a
+            # lower-court case): show what's new at One First Street instead —
+            # the Court's most recent decisions from supremecourt.gov, each
+            # with its holding and a link opening the slip opinion in-app.
             if not lines:
                 try:
-                    if client is None:
-                        raise RuntimeError("no CourtListener token configured")
-                    cid = item.get("cluster_id") or item.get("id")
-                    if not cid:
-                        if not cite:
-                            raise RuntimeError("no citation to locate the case")
-                        target = _cl_item_for_citation(client, cite, name=name)
-                        if not target:
-                            raise RuntimeError("case not found on CourtListener")
-                        cid = target.get("cluster_id")
-                    cluster = client.get_cluster(
-                        int(cid), fields="judges,sub_opinions")
-                    ops = []
-                    for url in cluster.get("sub_opinions") or []:
-                        try:
-                            ops.append(client._get_url(url, {
-                                "fields": "ordering_key,type,author_str,"
-                                          "joined_by_str,per_curiam",
-                            }))
-                        except Exception as exc:
-                            print(f"[details] sub-opinion fetch failed: {exc}")
-                    ops.sort(key=lambda o: (o.get("ordering_key") is None,
-                                            o.get("ordering_key") or 0))
-                    lines = self._details_lines_cl(cluster, ops)
+                    import scotus_recent
+                    decisions = scotus_recent.fetch_recent_decisions()
+                    if decisions:
+                        title = "Recent Supreme Court Decisions"
+                        lines = self._details_lines_recent(decisions)
                 except Exception as exc:
-                    print(f"[details] {exc}")
+                    print(f"[details] recent decisions: {exc}")
             if not lines:
                 lines = self._details_lines_parts()
             if not lines:
@@ -10582,32 +10675,29 @@ class _ScholarTextWindow:
 
         threading.Thread(target=run, daemon=True).start()
 
-    @staticmethod
-    def _details_lines_cl(cluster: dict, ops: list[dict]
-                          ) -> list[tuple[str, str]]:
-        lines: list[tuple[str, str]] = []
-        judges = _strip_html(cluster.get("judges") or "").strip()
-        if judges:
-            lines += [("h", "Panel"), ("", judges)]
-        any_data = bool(judges)
-        for op in ops:
-            label = _OPINION_TYPE_LABELS.get(op.get("type") or "",
-                                             "Opinion")
-            author = (op.get("author_str") or "").strip()
-            joined = (op.get("joined_by_str") or "").strip()
-            if op.get("per_curiam") and not author:
-                author = "Per curiam"
-            lines.append(("h", label))
-            if author:
-                lines.append(("", f"Author: {author}"))
-            if joined:
-                lines.append(("", f"Joined by: {joined}"))
-            if author or joined:
-                any_data = True
-            else:
-                lines.append(("lbl", "No authorship data"))
-        # all-empty CourtListener data -> let the Scholar fallback try
-        return lines if any_data else []
+    def _details_lines_recent(self, decisions: list) -> list[tuple]:
+        """The recent-decisions panel: each case's name, decision date and
+        docket, the holding summary from the Court's homepage, and a link
+        opening the slip opinion in the in-app viewer."""
+        lines: list[tuple] = [
+            ("lbl", "The Court's latest opinions, from supremecourt.gov."),
+        ]
+        for d in decisions[:12]:
+            lines.append(("h", d.name))
+            sub = " · ".join(p for p in (
+                d.date, f"No. {d.docket}" if d.docket else "") if p)
+            if sub:
+                lines.append(("lbl", sub))
+            if d.description:
+                lines.append(("", d.description))
+            lines.append((
+                "", "Open the slip opinion",
+                lambda d=d: _SlipOpinionWindow(
+                    self._win, d.opinion_url, d.name,
+                    self._status_var.set, app=self._app,
+                    description=d.description),
+            ))
+        return lines
 
     def _details_lines_parts(self) -> list[tuple[str, str]]:
         """Authorship gleaned from the Scholar text: the syllabus
@@ -12323,6 +12413,354 @@ def _choose_eng_rep_case(parent: tk.Misc,
         pass
     parent.wait_window(dlg)
     return chosen["case"]
+
+
+class _SlipTextWindow:
+    """The copyable-text view of a slip opinion: the PDF converted to clean
+    text (running heads and page numbers stripped, paragraphs rebuilt — see
+    :func:`slip_opinion.to_clean_text`) in a selectable Text widget, for the
+    copy-paste convenience a rendered PDF page can't give."""
+
+    def __init__(self, parent: tk.Misc, title: str, text: str) -> None:
+        win = _ui_toplevel(parent)
+        _ensure_modern_ttk_styles(win)
+        win.title(f"{title} — Text")
+        win.geometry(_fit_toplevel_geometry(win, 760, 680,
+                                            min_width=420, min_height=300))
+        win.minsize(420, 300)
+        self._win = win
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        body = tk.Text(frame, wrap="word", font=("Georgia", _OPINION_FONT_PT),
+                       padx=14, pady=10, undo=False)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=body.yview)
+        body.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        body.pack(side="left", fill="both", expand=True)
+        body.insert("1.0", text)
+        body.config(state="disabled")  # selectable & copyable, not editable
+        self._text = body
+
+        btns = _ui_frame(win)
+        btns.pack(fill="x", padx=12, pady=(0, 10))
+        _ui_button(btns, "Copy All", primary=True, width=100,
+                   command=self._copy_all).pack(side="right")
+        self._status_var = tk.StringVar(value=f"{len(text):,} characters")
+        _ui_label(btns, muted=True, anchor="w",
+                  textvariable=self._status_var).pack(
+            side="left", fill="x", expand=True)
+        win.bind("<Control-a>", self._select_all)
+
+    def _select_all(self, _e=None) -> str:
+        self._text.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def _copy_all(self) -> None:
+        try:
+            self._win.clipboard_clear()
+            self._win.clipboard_append(self._text.get("1.0", "end-1c"))
+            self._status_var.set("Copied the full text to the clipboard.")
+        except tk.TclError:
+            pass
+
+
+class _SlipOpinionWindow:
+    """Viewer for a Supreme Court slip opinion straight from supremecourt.gov.
+
+    Shows the official PDF in the cropped, zoomable pane.  Citations in the
+    text are made clickable, styled as light-blue *text* rather than highlight
+    boxes (``link_style="recolor"``) — the same actions as everywhere else
+    (cases via Scholar/CourtListener, statutes in the statute viewer).  The
+    opinion's parts (Syllabus, Opinion of the Court, each concurrence and
+    dissent) are detected from the slip's running heads and listed in a strip
+    on the right for one-click jumps; "Show as Text" opens the copyable-text
+    conversion."""
+
+    def __init__(self, parent: tk.Misc, url: str, title: str,
+                 status=lambda _s: None, *, app=None,
+                 description: str = "") -> None:
+        self._url = url
+        self._title = title
+        self._description = description
+        self._app = app
+        self._ext_status = status
+        self._bytes: Optional[bytes] = None
+        self._pages: Optional[list] = None   # extracted glyph data
+        self._clean_text: Optional[str] = None
+        self._pane: Optional[_PdfPane] = None
+
+        win = _ui_toplevel(parent)
+        _ensure_modern_ttk_styles(win)
+        win.title(f"{title} — Slip Opinion")
+        win.geometry(_fit_toplevel_geometry(win, 980, 900,
+                                            min_width=560, min_height=360))
+        win.minsize(560, 360)
+        self._win = win
+
+        top = _ui_frame(win)
+        top.pack(fill="x", padx=12, pady=(12, 4))
+        _ui_label(top, title, size=14, weight="bold", anchor="w").pack(
+            side="left", fill="x", expand=True)
+
+        btns = _ui_frame(win)
+        btns.pack(fill="x", side="bottom", padx=12, pady=(0, 10))
+        _ui_button(btns, "Download PDF", primary=True, width=124,
+                   command=self._download).pack(side="right")
+        _ui_button(btns, "Show as Text…", width=124,
+                   command=self._show_text).pack(side="right", padx=(0, 6))
+        _ui_button(btns, "Print…", width=90,
+                   command=self._print).pack(side="right", padx=(0, 6))
+        _ui_button(btns, "−", width=42,
+                   command=lambda: self._zoom(-1)).pack(side="left")
+        _ui_button(btns, "+", width=42,
+                   command=lambda: self._zoom(+1)).pack(side="left",
+                                                        padx=(6, 10))
+        hist_btn = _history_button(app, btns)
+        if hist_btn is not None:
+            hist_btn.pack(side="left", padx=(0, 8))
+        self._status_var = tk.StringVar(value="Loading the slip opinion…")
+        _ui_label(btns, muted=True, anchor="w",
+                  textvariable=self._status_var).pack(
+            side="left", fill="x", expand=True, padx=(10, 0))
+
+        body = _ui_frame(win)
+        body.pack(fill="both", expand=True)
+        self._body = body
+        # The parts strip is packed on the right once sections are detected.
+        self._nav: Optional[ttk.Frame] = None
+
+        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            win.bind(seq, lambda _e: self._zoom(+1))
+        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
+            win.bind(seq, lambda _e: self._zoom(-1))
+        win.bind("<Control-0>", lambda _e: self._zoom(0))
+
+        if app is not None and hasattr(app, "record_case_view"):
+            def reopen(app=app, url=url, title=title, description=description):
+                _SlipOpinionWindow(app.root, url, title, app=app,
+                                   description=description)
+            app.record_case_view(f"slip:{url}", f"{title} (slip op.)", reopen)
+
+        self._fetch()
+
+    # -- shell plumbing ------------------------------------------------------
+
+    def _post(self, fn, *args) -> None:
+        try:
+            self._win.after(0, fn, *args)
+        except tk.TclError:
+            pass
+
+    def _zoom(self, delta: int) -> None:
+        if self._pane is not None:
+            self._pane.zoom(delta)
+            self._status_var.set(f"Zoom: {self._pane.zoom_percent()}%")
+
+    def _download(self) -> None:
+        if not self._bytes:
+            return
+        safe = re.sub(r"[^\w.-]+", "_", self._title).strip("_") or "slip_opinion"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            initialfile=f"{safe}.pdf", title="Download PDF", parent=self._win,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "wb") as fh:
+                fh.write(self._bytes)  # the official file, unmodified
+            self._status_var.set(f"Saved PDF to {path}")
+        except Exception as exc:
+            messagebox.showerror("Download PDF", str(exc), parent=self._win)
+
+    def _print(self) -> None:
+        if not self._bytes:
+            return
+        fd, path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        with open(path, "wb") as fh:
+            fh.write(self._bytes)
+        _print_pdf_file(self._win, path, self._status_var.set)
+
+    # -- load / analyze ------------------------------------------------------
+
+    def _fetch(self) -> None:
+        try:
+            import pypdfium2  # noqa: F401
+            from PIL import ImageTk  # noqa: F401
+        except ImportError:
+            if messagebox.askyesno(
+                "PDF viewer not installed",
+                "Viewing PDFs inside the app needs two Python packages:\n\n"
+                "    pip install pypdfium2 Pillow\n\n"
+                "Open the slip opinion in your web browser instead?",
+                parent=self._win,
+            ):
+                webbrowser.open(self._url)
+            self._win.destroy()
+            return
+
+        def run() -> None:
+            try:
+                resp = _anon_session.get(self._url, timeout=45)
+                resp.raise_for_status()
+                data = resp.content
+                if data[:4] != b"%PDF":
+                    raise RuntimeError("supremecourt.gov did not return a PDF")
+            except Exception as exc:
+                self._post(self._error, f"Could not load the opinion: {exc}")
+                return
+            self._post(self._show, data)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _error(self, msg: str) -> None:
+        self._status_var.set(msg)
+        try:
+            if messagebox.askyesno(
+                "Slip opinion", msg + "\n\nOpen it in your browser instead?",
+                parent=self._win,
+            ):
+                webbrowser.open(self._url)
+        except tk.TclError:
+            pass
+
+    def _show(self, data: bytes) -> None:
+        self._bytes = data
+        try:
+            width = max(560, self._win.winfo_width() - 220)
+        except tk.TclError:
+            width = 800
+        try:
+            pane = _PdfPane(self._body, data, width=width,
+                            link_style="recolor")
+        except Exception as exc:
+            self._error(f"Could not render the PDF: {exc}")
+            return
+        self._pane = pane
+        pane.pack(side="left", fill="both", expand=True, padx=8, pady=4)
+        self._status_var.set(
+            "Scanning for citations and separate opinions…")
+        threading.Thread(target=self._analyze, args=(data,),
+                         daemon=True).start()
+
+    def _analyze(self, data: bytes) -> None:
+        """Worker: extract the text layer once; build citation links and the
+        section list from it."""
+        try:
+            pages = _extract_pdf_text_pages(data)
+        except Exception as exc:
+            print(f"[slip] text extraction failed: {exc}")
+            pages = []
+        links: dict = {}
+        sections: list = []
+        if pages:
+            try:
+                links = _citation_links_from_pages(pages)
+            except Exception as exc:
+                print(f"[slip] citation scan failed: {exc}")
+            try:
+                sections = slip_opinion.detect_sections(pages)
+            except Exception as exc:
+                print(f"[slip] section detection failed: {exc}")
+        self._post(self._analyzed, pages, links, sections)
+
+    def _analyzed(self, pages: list, links: dict, sections: list) -> None:
+        if self._pane is None:
+            return
+        self._pages = pages
+        self._pane.enable_find(pages)
+        if links:
+            self._pane.set_citation_links(
+                links, self._open_cite, self._open_cite_browser)
+        self._build_nav(sections)
+        n = sum(len(v) for v in links.values())
+        bits = []
+        if n:
+            bits.append(f"{n} citation link{'s' if n != 1 else ''} "
+                        "(shown in blue)")
+        if len(sections) > 1:
+            bits.append(f"{len(sections)} opinion parts")
+        if pages:
+            bits.append("Ctrl-F to search")
+        self._status_var.set("; ".join(bits) or "Slip opinion loaded.")
+
+    def _build_nav(self, sections: list) -> None:
+        """The right-hand strip listing the opinion's parts; clicking one
+        scrolls the PDF to that part's first page."""
+        if len(sections) < 2 or self._pane is None:
+            return
+        nav = ttk.Frame(self._body, padding=(6, 4))
+        ttk.Label(nav, text="Parts", font=("TkDefaultFont", 9, "bold"),
+                  anchor="w").pack(fill="x", pady=(2, 4))
+        colors = {"syllabus": "#555555", "majority": "#1a3e72",
+                  "concurrence": "#1a7a3c", "dissent": "#a31515",
+                  "separate": "#6a4d9f"}
+        for sec in sections:
+            lbl = tk.Label(
+                nav, text=sec.label, anchor="w", justify="left",
+                wraplength=150, cursor="hand2",
+                foreground=colors.get(sec.kind, "#333333"),
+                font=("TkDefaultFont", 9, "underline"),
+            )
+            lbl.pack(fill="x", pady=2)
+            lbl.bind("<Button-1>",
+                     lambda _e, p=sec.start_page: self._goto_page(p))
+            page_no = tk.Label(nav, text=f"p. {sec.start_page + 1}",
+                               anchor="w", foreground="#999999",
+                               font=("TkDefaultFont", 8))
+            page_no.pack(fill="x", padx=(8, 0))
+        nav.pack(side="right", fill="y", padx=(0, 8), pady=4)
+        self._nav = nav
+
+    def _goto_page(self, page: int) -> None:
+        if self._pane is not None:
+            self._pane.scroll_to_page(page)
+
+    # -- citation dispatch ----------------------------------------------------
+
+    def _open_cite(self, action: tuple, snippet: str) -> None:
+        if self._app is not None:
+            _follow_brief_action(self._app, self._win, action,
+                                 self._status_var.set)
+        else:
+            _open_citation_in_browser(action, snippet)
+
+    def _open_cite_browser(self, action: tuple, snippet: str) -> None:
+        _open_citation_in_browser(action, snippet)
+
+    # -- text view -------------------------------------------------------------
+
+    def _show_text(self) -> None:
+        if self._clean_text is not None:
+            _SlipTextWindow(self._win, self._title, self._clean_text)
+            return
+        if not self._pages:
+            self._status_var.set(
+                "The text layer isn't ready yet — try again in a moment.")
+            return
+        self._status_var.set("Converting the PDF to text…")
+
+        def run() -> None:
+            try:
+                text = slip_opinion.to_clean_text(self._pages)
+            except Exception as exc:
+                self._post(self._status_var.set, f"Text conversion failed: {exc}")
+                return
+            if self._description:
+                text = (f"{self._title}\n\n{self._description}\n\n"
+                        f"{'—' * 30}\n\n{text}")
+            self._clean_text = text
+            self._post(self._open_text_window)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _open_text_window(self) -> None:
+        self._status_var.set("Text ready.")
+        if self._clean_text is not None:
+            _SlipTextWindow(self._win, self._title, self._clean_text)
 
 
 def _open_eng_rep(parent: tk.Misc, spec: str,
