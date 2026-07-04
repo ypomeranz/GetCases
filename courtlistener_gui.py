@@ -8169,24 +8169,24 @@ class _ScholarTextWindow:
         # (Copy-with-citation lives on Ctrl-C / Cmd-C; no button needed.)
         # In text view this exports RTF; in PDF view it becomes "Download PDF".
         self._export_btn = _ui_button(
-            btn_frame, "Export RTF…", command=self._export_rtf, width=120
+            btn_frame, "Export RTF…", command=self._export_rtf, width=104
         )
         self._export_btn.pack(side="right", padx=(6, 0))
         # Print: only meaningful in the PDF view, so it's packed there and
         # hidden again in the text view.
         self._print_btn = _ui_button(
-            btn_frame, "Print…", command=self._print_pdf, width=96
+            btn_frame, "Print…", command=self._print_pdf, width=86
         )
         self._toggle_btn = _ui_button(
             btn_frame, "CourtListener Text", command=self._toggle_source,
-            primary=True, width=168,
+            primary=True, width=150,
         )
         self._toggle_btn.pack(side="right", padx=(6, 0))
         # The CourtListener text view gets its own "View PDF" button (the
         # Scholar view reuses the toggle for that).  Packed in _render_cl_blocks
         # / _show_courtlistener, hidden elsewhere; enabled once a PDF is located.
         self._pdf_btn = _ui_button(
-            btn_frame, "View PDF", command=self._view_pdf, width=110
+            btn_frame, "View PDF", command=self._view_pdf, width=84
         )
         try:
             self._pdf_btn.configure(state="disabled")
@@ -8197,7 +8197,7 @@ class _ScholarTextWindow:
         # _render_scholar, hidden in the CL and PDF views.
         self._cl_btn = _ui_button(
             btn_frame, "CourtListener Text", command=self._toggle_source,
-            width=168,
+            width=150,
         )
 
         # Last-15-cases dropdown, shared across every case window.
@@ -8266,20 +8266,45 @@ class _ScholarTextWindow:
             self._toggle_details()
 
     def _on_button_bar_configure(self, event) -> None:
-        compact = event.width < 680
+        compact = event.width < 760
         if compact == self._button_bar_compact:
             return
         self._button_bar_compact = compact
         self._apply_button_bar_compact()
 
+    def _button_text(self, button) -> str:
+        try:
+            return str(button.cget("text") or "")
+        except Exception:
+            return ""
+
+    def _source_or_pdf_widths(self, button) -> tuple[int, int]:
+        text = self._button_text(button)
+        if text in ("View PDF", "No PDF"):
+            return 84, 70
+        if text.startswith("Finding PDF"):
+            return 104, 90
+        if text == "Back to Text":
+            return 106, 88
+        return 150, 118
+
+    def _export_widths(self) -> tuple[int, int]:
+        text = self._button_text(self._export_btn)
+        if "Download" in text:
+            return 112, 92
+        return 104, 82
+
     def _apply_button_bar_compact(self) -> None:
         compact = bool(getattr(self, "_button_bar_compact", False))
+        toggle_normal, toggle_small = self._source_or_pdf_widths(self._toggle_btn)
+        pdf_normal, pdf_small = self._source_or_pdf_widths(self._pdf_btn)
+        export_normal, export_small = self._export_widths()
         widths = (
-            (self._export_btn, 120, 86),
-            (self._print_btn, 96, 68),
-            (self._toggle_btn, 168, 118),
-            (self._pdf_btn, 110, 78),
-            (self._cl_btn, 168, 118),
+            (self._export_btn, export_normal, export_small),
+            (self._print_btn, 86, 64),
+            (self._toggle_btn, toggle_normal, toggle_small),
+            (self._pdf_btn, pdf_normal, pdf_small),
+            (self._cl_btn, 150, 118),
             (self._zoom_out_btn, 42, 34),
             (self._zoom_in_btn, 42, 34),
         )
@@ -11362,6 +11387,7 @@ class _ScholarTextWindow:
             else:
                 _style_ui_button(btn, primary=False)
                 btn.configure(state="disabled", text="Finding PDF...")
+            self._apply_button_bar_compact()
         except tk.TclError:
             pass
 
@@ -11562,6 +11588,7 @@ class _ScholarTextWindow:
         self._print_btn.pack(side="right", padx=4)
         self._zoom_out_btn.configure(text="−")
         self._zoom_in_btn.configure(text="+")
+        self._apply_button_bar_compact()
         self._status_var.set("Showing the official PDF of the opinion.")
 
     def _download_pdf(self) -> None:
