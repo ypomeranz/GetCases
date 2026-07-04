@@ -392,6 +392,27 @@ def _history_button(app, parent_frame):
     return btn
 
 
+def _install_history_menubar(app, win: tk.Toplevel):
+    """Attach a top History menu to case windows."""
+    if app is None or not hasattr(app, "populate_history_menu"):
+        return None
+    menubar = tk.Menu(win)
+    history_menu = tk.Menu(menubar, tearoff=0)
+    try:
+        history_menu.configure(
+            postcommand=lambda m=history_menu: app.populate_history_menu(m)
+        )
+    except tk.TclError:
+        pass
+    app.populate_history_menu(history_menu)
+    menubar.add_cascade(label="History", menu=history_menu)
+    try:
+        win.config(menu=menubar)
+    except tk.TclError:
+        return None
+    return menubar
+
+
 def _ui_checkbox(parent, text: str, variable, command=None):
     if _CTK_AVAILABLE:
         return ctk.CTkCheckBox(parent, text=text, variable=variable,
@@ -2629,6 +2650,20 @@ class CourtListenerGUI:
                 e["label"] = label
                 self._save_case_history()
                 break
+
+    def populate_history_menu(self, menu: tk.Menu) -> None:
+        """Fill *menu* with the current case-history entries."""
+        try:
+            menu.delete(0, "end")
+        except tk.TclError:
+            return
+        if not self._case_history:
+            menu.add_command(label="No cases viewed yet", state="disabled")
+        for e in self._case_history:
+            label = e["label"]
+            if len(label) > 72:
+                label = label[:69] + "..."
+            menu.add_command(label=label, command=e["reopen"])
 
     def post_history_menu(self, widget: tk.Misc) -> None:
         """Drop the last-viewed-cases menu below *widget* (a History button)."""
@@ -7948,6 +7983,7 @@ class _ScholarTextWindow:
                 else "Google Scholar Opinion Text"
             )
         )
+        self._history_menubar = _install_history_menubar(self._app, self._win)
         # SCOTUS cases open the Oyez "Case details" panel by default (wired up
         # in _build_ui); widen the window by the panel's width so the opinion
         # text keeps its usual room with the panel added to the right of it.
@@ -8200,10 +8236,6 @@ class _ScholarTextWindow:
             width=150,
         )
 
-        # Last-15-cases dropdown, shared across every case window.
-        hist_btn = _history_button(self._app, btn_frame)
-        if hist_btn is not None:
-            hist_btn.pack(side="left", padx=(0, 8))
         # Size controls: text size in the reader, PDF zoom in the PDF view
         # (also Ctrl +/−/0 and Ctrl+mouse wheel).
         self._zoom_out_btn = _ui_button(
@@ -11883,6 +11915,9 @@ class _PdfWindow:
 
         self._win = _ui_toplevel(parent)
         self._win.title(title)
+        self._history_menubar = _install_history_menubar(
+            self._app if self._is_case else None, self._win
+        )
         self._win.geometry(
             _fit_toplevel_geometry(
                 self._win, 820, 900, min_width=500, min_height=320,
@@ -11905,9 +11940,6 @@ class _PdfWindow:
                    command=lambda: self._zoom(-1)).pack(side="left")
         _ui_button(btns, "+", width=42,
                    command=lambda: self._zoom(+1)).pack(side="left", padx=(6, 10))
-        hist_btn = _history_button(self._app, btns)
-        if hist_btn is not None:
-            hist_btn.pack(side="left", padx=(0, 8))
         self._status_var = tk.StringVar(value="Loading PDF…")
         _ui_label(btns, muted=True, anchor="w",
                   textvariable=self._status_var).pack(
