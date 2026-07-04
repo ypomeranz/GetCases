@@ -66,6 +66,7 @@ def _ensure_dependencies() -> None:
                 ("customtkinter", "customtkinter"),  # modern spotlight / window chrome
                 ("curl_cffi", "curl_cffi"),  # English Reports scan fetch (CloudFlare)
                 ("browser_cookie3", "browser_cookie3"),  # reads Firefox clearance cookie
+                ("selenium","selenium"),
             )
             if importlib.util.find_spec(module) is None
         ]
