@@ -33,7 +33,7 @@ except ImportError as exc:  # pragma: no cover
 HOME_URL = "https://www.supremecourt.gov/"
 _BASE = "https://www.supremecourt.gov/"
 _CACHE_PATH = Path.home() / ".cache" / "courtlistener_scotus_recent.json"
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 _CACHE_TTL = 6 * 3600  # seconds; the homepage updates on decision days only
 _TIMEOUT = 25
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
@@ -78,16 +78,19 @@ def parse_recent_decisions(html: str) -> list[RecentDecision]:
     site lists them (newest first).  Only cases with an opinion PDF link are
     returned — the panel also carries order-list items, which have no opinion."""
     soup = BeautifulSoup(html or "", "html.parser")
-    panel = (soup.find(id="opinionsbyday")
-             or soup.find(id=lambda v: v and "RecentDecisions" in v)
-             or soup)
+    panels = soup.find_all(id="opinionsbyday")
+    if not panels:
+        panel = (soup.find(id=lambda v: v and "RecentDecisions" in v)
+                 or soup)
+        panels = [panel]
     out: list[RecentDecision] = []
     seen: set[tuple[str, str]] = set()
     current_date = ""
     # Walk the panel in document order: date headers (span.soday) set the
     # running date; each case is a casenamerow + following casedetail, with the
     # opinion PDF in the preceding buttonrow.
-    for el in panel.find_all(["span", "div"]):
+    nodes = (node for panel in panels for node in panel.find_all(["span", "div"]))
+    for el in nodes:
         classes = el.get("class") or []
         if "soday" in classes:
             current_date = _clean(el.get_text())
@@ -195,6 +198,8 @@ def _read_cache_stale() -> "Optional[list[RecentDecision]]":
     a day-old list than by nothing."""
     try:
         blob = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
+        if blob.get("version") != _CACHE_VERSION:
+            return None
         return [RecentDecision(**it) for it in (blob.get("items") or [])]
     except Exception:
         return None

@@ -3047,6 +3047,8 @@ class CourtListenerGUI:
         if not _HOTKEY_AVAILABLE:
             return
         if self._hotkey_listener is not None:
+            if sys.platform == "darwin":
+                return
             try:
                 self._hotkey_listener.stop()
             except Exception:
@@ -4530,6 +4532,8 @@ class CourtListenerGUI:
     def _stop_global_hotkey(self) -> None:
         if self._hotkey_listener is None:
             return
+        if sys.platform == "darwin":
+            return
         try:
             self._hotkey_listener.stop()
         except Exception:
@@ -4570,6 +4574,9 @@ class CourtListenerGUI:
     def _apply_spotlight_hotkey(self, hotkey: str) -> bool:
         old = getattr(self, "_spotlight_hotkey", _default_spotlight_hotkey())
         self._spotlight_hotkey = hotkey
+        if sys.platform == "darwin" and self._hotkey_listener is not None:
+            _save_spotlight_hotkey(hotkey)
+            return True
         self._setup_global_hotkey()
         if _HOTKEY_AVAILABLE and self._hotkey_listener is None:
             self._spotlight_hotkey = old
@@ -4587,7 +4594,8 @@ class CourtListenerGUI:
             )
             return
 
-        self._stop_global_hotkey()
+        if sys.platform != "darwin":
+            self._stop_global_hotkey()
         dlg = _ui_toplevel(self.root)
         dlg.title("Spotlight Shortcut")
         dlg.geometry("500x190" if _CTK_AVAILABLE else "480x170")
@@ -4610,7 +4618,12 @@ class CourtListenerGUI:
         _ui_label(outer, size=12, anchor="w", textvariable=current_var).pack(
             fill="x", pady=(0, 6)
         )
-        status_var = tk.StringVar(value="Waiting for keys...")
+        status_var = tk.StringVar(
+            value=(
+                "Waiting for keys... On macOS, changes apply after relaunch."
+                if sys.platform == "darwin" else "Waiting for keys..."
+            )
+        )
         _ui_label(outer, size=11, muted=True, anchor="w",
                   textvariable=status_var).pack(fill="x")
 
@@ -4638,9 +4651,10 @@ class CourtListenerGUI:
                 status_var.set("Use Ctrl, Alt, Shift, Cmd, or a function key.")
                 return "break"
             if self._apply_spotlight_hotkey(hotkey):
-                self._status_var.set(
-                    f"Spotlight shortcut: {_display_hotkey(hotkey)}"
-                )
+                msg = f"Spotlight shortcut: {_display_hotkey(hotkey)}"
+                if sys.platform == "darwin":
+                    msg += " (after relaunch)"
+                self._status_var.set(msg)
                 close(restart=False)
             else:
                 status_var.set("That shortcut could not be registered.")
