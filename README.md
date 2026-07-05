@@ -94,7 +94,7 @@ For English Reports PDFs, if the app can’t fetch them directly, it will open a
 
 All text viewers support copy with Bluebook citation (Ctrl+C / Cmd+C) – the copied text includes a properly formatted citation appended at the end.
 
-You can export opinions as RTF (two‑column, with running heads) for word processors.
+You can export opinions from the Export ▾ menu: as RTF (two‑column, with running heads) for word processors; as a print‑ready PDF typeset with LaTeX (single column, justified, Century Schoolbook, footnotes at the foot of the page that cites them, and a running head showing the reporter page range visible on each sheet) if a LaTeX installation (TeX Live, MiKTeX, or Tectonic) is available; or as Markdown with footnotes and star pagination preserved – offered automatically when LaTeX isn’t installed.
 
 Troubleshooting
 “Missing Token” – go to Settings → API Token… and paste your CourtListener token.

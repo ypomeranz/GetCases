@@ -22,6 +22,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,7 +32,7 @@ import tkinter as tk
 import urllib.parse
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import replace as _dc_replace
+from dataclasses import dataclass, field, replace as _dc_replace
 
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
@@ -6796,6 +6797,459 @@ def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:
     return "".join(out)
 
 
+# ---------------------------------------------------------------------------
+# PDF (LaTeX) + Markdown export.  Both writers share a formatting-preserving
+# dump of the reader's Tk Text widget (_dump_export_paragraphs) that mirrors
+# _dump_to_rtf's tag handling: on-screen justification fragments are dropped,
+# the hidden hyphenation originals are kept.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ExpRun:
+    """One styled run of exported opinion text."""
+
+    text: str
+    italic: bool = False
+    bold: bool = False
+    small: bool = False
+    sup: bool = False
+    underline: bool = False
+    pagenum: bool = False   # reporter star-pagination marker, e.g. "*123"
+    fnref: str = ""         # footnote anchor id of an in-text reference
+    fndef: str = ""         # footnote anchor id opening a footnote body
+
+    def same_style(self, other: "_ExpRun") -> bool:
+        return (
+            self.italic, self.bold, self.small, self.sup, self.underline,
+            self.pagenum, self.fnref, self.fndef,
+        ) == (
+            other.italic, other.bold, other.small, other.sup,
+            other.underline, other.pagenum, other.fnref, other.fndef,
+        )
+
+
+@dataclass
+class _ExpPara:
+    """One paragraph of exported opinion text."""
+
+    kind: str = "para"      # para | center | blockquote | heading | fnhead
+    runs: list = field(default_factory=list)
+
+
+def _tk_ix(index: str) -> tuple[int, int]:
+    """A Tk Text index string ("line.char") as a comparable tuple."""
+    line, _, char = index.partition(".")
+    return int(line), int(char)
+
+
+def _dump_export_paragraphs(
+    txt: tk.Text,
+    ranges: list[tuple[str, str]],
+    fn_links: dict[str, tuple[str, str]],
+) -> list[_ExpPara]:
+    """Convert Tk Text ranges (with the Scholar window's tags) into styled
+    paragraphs — the shared source for the LaTeX and Markdown exports."""
+    paras: list[_ExpPara] = []
+    for start, end in ranges:
+        active: set[str] = set(txt.tag_names(start))
+        active.discard("sel")
+        cur: Optional[_ExpPara] = None
+
+        def para_kind() -> str:
+            for k in ("fnhead", "center", "blockquote", "heading"):
+                if k in active:
+                    return k
+            return "para"
+
+        def styled(seg: str) -> _ExpRun:
+            r = _ExpRun(text=seg)
+            for t in active:
+                if len(t) == 8 and t[:4] in ("fnt_", "fna_"):
+                    r.italic, r.bold, r.small, r.sup = (
+                        c == "1" for c in t[4:]
+                    )
+                elif t == "underline":
+                    r.underline = True
+                elif t == "pagenum":
+                    r.pagenum = True
+                elif t in fn_links:
+                    side, fid = fn_links[t]
+                    if side == "fnref":
+                        r.fnref = fid
+                    else:
+                        r.fndef = fid
+            return r
+
+        for key, value, _index in txt.dump(start, end, text=True, tag=True):
+            if key == "tagon":
+                active.add(value)
+            elif key == "tagoff":
+                active.discard(value)
+            elif key == "text":
+                if "justify-pad" in active:
+                    continue
+                for i, seg in enumerate(value.split("\n")):
+                    if i and cur is not None:
+                        paras.append(cur)
+                        cur = None
+                    if seg:
+                        if cur is None:
+                            cur = _ExpPara(kind=para_kind())
+                        run = styled(seg)
+                        if cur.runs and cur.runs[-1].same_style(run):
+                            cur.runs[-1].text += seg
+                        else:
+                            cur.runs.append(run)
+        if cur is not None:
+            paras.append(cur)
+    return paras
+
+
+def _strip_note_marker(paras: list[_ExpPara]) -> tuple[str, str]:
+    """Remove the leading footnote marker from a note body's paragraphs.
+    Returns (anchor id, marker text) — either may be empty."""
+    if not paras or not paras[0].runs:
+        return "", ""
+    runs = paras[0].runs
+    for j, r in enumerate(runs[:2]):
+        if r.fndef:
+            disp = r.text.strip()
+            del runs[j]
+            if j < len(runs):
+                runs[j].text = runs[j].text.lstrip()
+            return r.fndef, disp
+    t = runs[0].text
+    m = _FN_BODY_MARK_RE.match(t)
+    if m:
+        runs[0].text = t[m.end():].lstrip()
+        return "", (m.group(1) or m.group(2) or "").strip()
+    return "", ""
+
+
+def _section_body_ranges(
+    sec_start: str, sec_end: str, note_regions: list
+) -> list[tuple[str, str]]:
+    """The section's text ranges with its footnote-body regions cut out."""
+    ranges: list[tuple[str, str]] = []
+    cur = sec_start
+    for rs, rend, _num, _page in note_regions:
+        if _tk_ix(rs) > _tk_ix(cur):
+            ranges.append((cur, rs))
+        if _tk_ix(rend) > _tk_ix(cur):
+            cur = rend
+    if _tk_ix(sec_end) > _tk_ix(cur):
+        ranges.append((cur, sec_end))
+    return ranges
+
+
+# LaTeX escapes: specials, plus TeX idioms for the typographic characters
+# opinions use constantly (quotes, dashes, §, ¶) so every engine renders
+# them with proper kerning.
+_LATEX_CHAR_MAP = {
+    "\\": r"\textbackslash{}", "{": r"\{", "}": r"\}", "$": r"\$",
+    "&": r"\&", "#": r"\#", "_": r"\_", "%": r"\%",
+    "~": r"\textasciitilde{}", "^": r"\textasciicircum{}",
+    " ": "~",  # non-breaking space
+    "‘": "`", "’": "'",
+    "“": "``", "”": "''",
+    "–": "--", "—": "---",
+    "…": r"\ldots{}", "•": r"\textbullet{}",
+    "§": r"\S{}", "¶": r"\P{}",
+    "†": r"\dag{}", "‡": r"\ddag{}",
+}
+
+
+def _latex_escape(s: str) -> str:
+    return "".join(_LATEX_CHAR_MAP.get(ch, ch) for ch in s)
+
+
+def _latex_run(
+    run: _ExpRun,
+    notes: Optional[dict[str, tuple[str, str]]],
+    used: Optional[set[str]],
+    marks: bool = True,
+) -> str:
+    """One styled run as LaTeX.  `notes` maps footnote anchor ids to
+    (label, body-latex); the first reference to a note replaces its marker
+    with a real \\footnote so it lands at the bottom of that page."""
+    if run.pagenum:
+        text = run.text
+        lead = text[: len(text) - len(text.lstrip())]
+        trail = text[len(text.rstrip()):]
+        disp = _latex_escape(text.strip())
+        m = re.search(r"\d+", text)
+        if marks and m:
+            return lead + "\\starpage{%s}{%s}" % (m.group(0), disp) + trail
+        return lead + "\\starpagetext{%s}" % disp + trail
+    if run.fnref:
+        if notes and used is not None and run.fnref in notes \
+                and run.fnref not in used:
+            used.add(run.fnref)
+            label, body = notes[run.fnref]
+            return "\\opfootnote{%s}{%s}" % (_latex_escape(label), body)
+        # A repeated reference (or one whose body wasn't found): keep the
+        # superscript marker.
+        return "\\textsuperscript{%s}" % _latex_escape(run.text.strip())
+    if run.fndef:
+        return "\\textsuperscript{%s}" % _latex_escape(run.text.strip())
+    out = _latex_escape(run.text)
+    if run.underline:
+        out = "\\opuline{" + out + "}"
+    if run.bold:
+        out = "\\textbf{" + out + "}"
+    if run.italic:
+        out = "\\textit{" + out + "}"
+    if run.sup:
+        out = "\\textsuperscript{" + out + "}"
+    elif run.small:
+        # \small{} rather than "\small ": a control word would eat the
+        # run's own leading space ("…an {\small  inside}" → "aninside").
+        out = "{\\small{}" + out + "}"
+    return out
+
+
+def _latex_paragraphs(
+    paras: list[_ExpPara],
+    notes: Optional[dict[str, tuple[str, str]]] = None,
+    used: Optional[set[str]] = None,
+    title_block: bool = False,
+) -> str:
+    """Paragraphs as LaTeX body text.  With `title_block`, a leading centered
+    paragraph (the case caption) is set large and bold."""
+    out: list[str] = []
+    quote_open = False
+    title_pending = title_block
+
+    def close_quote() -> None:
+        nonlocal quote_open
+        if quote_open:
+            out.append("\\end{quote}\n\n")
+            quote_open = False
+
+    for p in paras:
+        if p.kind == "fnhead":
+            continue  # "Footnotes" label: notes are typeset at page bottoms
+        body = "".join(_latex_run(r, notes, used) for r in p.runs).strip()
+        if not body:
+            continue
+        if p.kind == "blockquote":
+            if not quote_open:
+                out.append("\\begin{quote}\n")
+                quote_open = True
+            out.append(body + "\n\n")
+            title_pending = False
+            continue
+        close_quote()
+        if p.kind == "center":
+            if title_pending:
+                body = "{\\large\\bfseries " + body + "}"
+            out.append("\\begin{center}\n" + body + "\n\\end{center}\n\n")
+        elif p.kind == "heading":
+            out.append("\\medskip\\noindent\\textbf{" + body + "}\n\n")
+        else:
+            out.append(body + "\n\n")
+        title_pending = False
+    close_quote()
+    return "".join(out)
+
+
+def _latex_footnote_body(paras: list[_ExpPara]) -> str:
+    """A footnote's paragraphs as the argument of \\footnote (page markers
+    inside a note stay visible but don't feed the running head)."""
+    chunks: list[str] = []
+    for p in paras:
+        if p.kind == "fnhead":
+            continue
+        body = "".join(
+            _latex_run(r, None, None, marks=False) for r in p.runs
+        ).strip()
+        if body:
+            chunks.append(body)
+    return "\\par ".join(chunks)
+
+
+# Single column, justified (LaTeX's default), first-line paragraph indents,
+# widow/orphan control — the layout of a printed reporter.  The face is
+# Century Schoolbook (the Supreme Court's own), falling back to Palatino,
+# then Times, then Computer Modern, whichever the local TeX carries.
+_LATEX_PREAMBLE = r"""\documentclass[11pt]{article}
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{textcomp}
+  \IfFileExists{tgschola.sty}{\usepackage{tgschola}}{%
+    \IfFileExists{tgpagella.sty}{\usepackage{tgpagella}}{%
+      \IfFileExists{mathptmx.sty}{\usepackage{mathptmx}}{}}}
+\else
+  \usepackage{fontspec}
+  \IfFontExistsTF{TeX Gyre Schola}{\setmainfont{TeX Gyre Schola}}{%
+    \IfFontExistsTF{TeX Gyre Pagella}{\setmainfont{TeX Gyre Pagella}}{}}
+\fi
+\IfFileExists{microtype.sty}{\usepackage{microtype}}{}
+\IfFileExists{ulem.sty}{\usepackage[normalem]{ulem}%
+  \newcommand{\opuline}[1]{\uline{#1}}}{%
+  \newcommand{\opuline}[1]{\underline{#1}}}
+\usepackage[letterpaper,margin=1.1in,headheight=15pt,footskip=0.55in]{geometry}
+\usepackage{fancyhdr}
+\setlength{\parindent}{1.4em}
+\setlength{\parskip}{0pt plus 1pt}
+\setlength{\emergencystretch}{1.5em}
+\clubpenalty=10000 \widowpenalty=10000
+\raggedbottom
+\setlength{\footnotesep}{0.85\baselineskip}
+\addtolength{\skip\footins}{0.4\baselineskip}
+% Star pagination: an inline reporter page marker that also feeds the
+% running head's page range through TeX's mark mechanism.
+\newcommand{\starpage}[2]{\markboth{#1}{#1}{\bfseries\footnotesize #2}}
+\newcommand{\starpagetext}[1]{{\bfseries\footnotesize #1}}
+% A footnote carrying the reporter's own number (or symbol).
+\newcommand{\opfootnote}[2]{\begingroup
+  \renewcommand{\thefootnote}{#1}\footnote{#2}\endgroup}
+% Reporter pages visible on the current sheet: first mark--last mark.
+\makeatletter
+\newcommand{\reporterrange}{%
+  \begingroup
+  \edef\rr@first{\rightmark}\edef\rr@last{\leftmark}%
+  \ifx\rr@first\rr@last \rr@first\else\rr@first--\rr@last\fi
+  \endgroup}
+\makeatother
+\newcommand{\opinionhead}{}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\itshape\opinionhead}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\small\thepage}%
+  \renewcommand{\headrulewidth}{0pt}}
+"""
+
+
+def _find_latex_engine() -> Optional[tuple[str, str]]:
+    """The first available LaTeX→PDF engine, as (name, executable path)."""
+    for name in ("pdflatex", "xelatex", "lualatex", "tectonic"):
+        exe = shutil.which(name)
+        if exe:
+            return name, exe
+    return None
+
+
+def _compile_latex(
+    tex: str, engine: tuple[str, str], out_pdf: str
+) -> tuple[bool, str]:
+    """Typeset *tex* with *engine* in a scratch directory and copy the PDF
+    to *out_pdf*.  Returns (ok, log tail when not ok)."""
+    name, exe = engine
+    with tempfile.TemporaryDirectory(prefix="opinion_tex_") as td:
+        src = os.path.join(td, "opinion.tex")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(tex)
+        if name == "tectonic":
+            cmd = [exe, "--outdir", td, src]
+        else:
+            # nonstopmode without -halt-on-error: a stray glyph the font
+            # lacks shouldn't sink the whole export.
+            cmd = [exe, "-interaction=nonstopmode", "opinion.tex"]
+        try:
+            proc = subprocess.run(
+                cmd, cwd=td, capture_output=True, text=True,
+                errors="replace", timeout=300,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, str(exc)
+        pdf = os.path.join(td, "opinion.pdf")
+        if os.path.exists(pdf):
+            try:
+                shutil.copyfile(pdf, out_pdf)
+            except OSError as exc:
+                return False, str(exc)
+            return True, ""
+        log = ""
+        log_path = os.path.join(td, "opinion.log")
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, encoding="utf-8", errors="replace") as f:
+                    log = f.read()
+            except OSError:
+                pass
+        if not log:
+            log = (proc.stdout or "") + (proc.stderr or "")
+        lines = [ln for ln in log.splitlines() if ln.strip()]
+        return False, "\n".join(lines[-15:])
+
+
+# Markdown escapes: emphasis/link specials always; list/quote/heading
+# markers only where they'd start a block.
+_MD_SPECIAL_RE = re.compile(r"([\\`*_\[\]])")
+_MD_LINE_START_RE = re.compile(r"^(\s*)([#>+\-])")
+_MD_ORDERED_RE = re.compile(r"^(\s*\d+)\.")
+
+
+def _md_escape(s: str) -> str:
+    return _MD_SPECIAL_RE.sub(r"\\\1", s)
+
+
+def _md_block_guard(s: str) -> str:
+    s = _MD_LINE_START_RE.sub(r"\1\\\2", s)
+    return _MD_ORDERED_RE.sub(r"\1\\.", s)
+
+
+def _md_run(run: _ExpRun, ref_ids: dict[str, str]) -> str:
+    """One styled run as Markdown.  `ref_ids` maps footnote anchor ids to
+    Markdown footnote ids ([^id])."""
+    if run.pagenum:
+        text = run.text
+        lead = text[: len(text) - len(text.lstrip())]
+        trail = text[len(text.rstrip()):]
+        return lead + "**" + _md_escape(text.strip()) + "**" + trail
+    if run.fnref:
+        rid = ref_ids.get(run.fnref)
+        if rid:
+            return f"[^{rid}]"
+        return "<sup>" + _md_escape(run.text.strip()) + "</sup>"
+    if run.fndef:
+        return "**" + _md_escape(run.text.strip()) + "**"
+    text = run.text
+    core = text.strip()
+    if not core or not (run.bold or run.italic or run.sup):
+        return _md_escape(text)
+    lead = text[: len(text) - len(text.lstrip())]
+    trail = text[len(text.rstrip()):]
+    core = _md_escape(core)
+    if run.bold and run.italic:
+        core = f"***{core}***"
+    elif run.bold:
+        core = f"**{core}**"
+    elif run.italic:
+        core = f"*{core}*"
+    if run.sup:
+        core = f"<sup>{core}</sup>"
+    return lead + core + trail
+
+
+def _md_paragraphs(
+    paras: list[_ExpPara], ref_ids: Optional[dict[str, str]] = None
+) -> list[str]:
+    """Paragraphs as Markdown blocks (no trailing newlines)."""
+    ref_ids = ref_ids or {}
+    blocks: list[str] = []
+    for p in paras:
+        if p.kind == "fnhead":
+            continue
+        body = "".join(_md_run(r, ref_ids) for r in p.runs).strip()
+        if not body:
+            continue
+        body = _md_block_guard(body)
+        if p.kind == "blockquote":
+            blocks.append("> " + body)
+        elif p.kind == "heading":
+            blocks.append("#### " + body)
+        else:
+            blocks.append(body)
+    return blocks
+
+
 def _copy_rich_clipboard(widget: tk.Misc, rtf: str, plain: str) -> str:
     """
     Put *rtf* on the system clipboard (with *plain* as fallback where the
@@ -8168,7 +8622,9 @@ class _ScholarTextWindow:
     Scholar in a new window), and offers:
       • Copy + Cite — copies selection (or all) with formatting and appends
         a Bluebook citation pin-cited from the star pagination,
-      • Export RTF — two-column RTF named after the Bluebook caption,
+      • Export ▾ — RTF (two-column), PDF typeset with LaTeX (single column,
+        bottom-of-page footnotes, reporter page range in the running head),
+        or Markdown, each named after the Bluebook caption,
       • View PDF — the official opinion PDF, shown in-app (Download PDF there),
       • a toggle to the CourtListener version of the text.
     """
@@ -8532,9 +8988,10 @@ class _ScholarTextWindow:
         btn_frame.pack(fill="x", padx=12, pady=(2, 10))
         self._btn_frame = btn_frame  # PDF/text panes pack just above this
         # (Copy-with-citation lives on Ctrl-C / Cmd-C; no button needed.)
-        # In text view this exports RTF; in PDF view it becomes "Download PDF".
+        # In text view this drops the export menu (RTF / PDF via LaTeX /
+        # Markdown); in PDF view it becomes "Download PDF".
         self._export_btn = _ui_button(
-            btn_frame, "Export RTF…", command=self._export_rtf, width=104
+            btn_frame, "Export ▾", command=self._post_export_menu, width=104
         )
         self._export_btn.pack(side="right", padx=(6, 0))
         # Print: only meaningful in the PDF view, so it's packed there and
@@ -9386,7 +9843,7 @@ class _ScholarTextWindow:
         )
         self._hide_pdf_button()  # Scholar view uses the toggle for the PDF
         self._show_cl_button()   # …and offers a switch to the CourtListener text
-        self._export_btn.configure(text="Export RTF…", command=self._export_rtf)
+        self._export_btn.configure(text="Export ▾", command=self._post_export_menu)
         self._print_btn.pack_forget()  # text view: no Print button
         self._zoom_out_btn.configure(text="A−")
         self._zoom_in_btn.configure(text="A+")
@@ -10009,7 +10466,7 @@ class _ScholarTextWindow:
             text="Google Scholar Text", command=self._toggle_source,
             state="normal" if self._scholar_url else "disabled",
         )
-        self._export_btn.configure(text="Export RTF…", command=self._export_rtf)
+        self._export_btn.configure(text="Export ▾", command=self._post_export_menu)
         self._print_btn.pack_forget()
         self._zoom_out_btn.configure(text="A−")
         self._zoom_in_btn.configure(text="A+")
@@ -10051,7 +10508,7 @@ class _ScholarTextWindow:
             text="Google Scholar Text", command=self._toggle_source,
             state="normal" if self._scholar_url else "disabled",
         )
-        self._export_btn.configure(text="Export RTF…", command=self._export_rtf)
+        self._export_btn.configure(text="Export ▾", command=self._post_export_menu)
         self._print_btn.pack_forget()
         self._zoom_out_btn.configure(text="A−")
         self._zoom_in_btn.configure(text="A+")
@@ -10707,6 +11164,43 @@ class _ScholarTextWindow:
             "court": bb["court"],
         }
 
+    def _export_section_list(self) -> list[tuple[str, str, str, str]]:
+        """
+        Sections for a full-document export, as (running-head label, start,
+        end, kind): the header and majority share the first section, then
+        each concurrence/dissent follows as its own.  Without parts (a plain
+        text view) the whole widget is one section.
+        """
+        txt = self._text
+        parts = getattr(self, "_rendered_parts", None) or self._parts
+        regions = self._part_region_indices()
+        if not parts or not regions:
+            return [("", "1.0", txt.index("end-1c"), "majority")]
+        main_end = -1
+        for i, (_rs, _re, pi) in enumerate(regions):
+            if parts[pi].kind in ("header", "majority"):
+                main_end = i
+            else:
+                break
+        main_regions = regions[: main_end + 1]
+        rest_regions = regions[main_end + 1:]
+
+        # (author label, start, end, kind)
+        sections: list[tuple[str, str, str, str]] = []
+        if main_regions:
+            maj = next(
+                (parts[pi] for _rs, _re, pi in main_regions
+                 if parts[pi].kind == "majority"),
+                None,
+            )
+            label = self._majority_author(maj) if maj is not None else ""
+            sections.append((label, main_regions[0][0], main_regions[-1][1],
+                             "majority"))
+        for rs, rend, pi in rest_regions:
+            sections.append((self._writer_parenthetical(parts[pi]), rs,
+                             rend, parts[pi].kind))
+        return sections
+
     def _build_export_rtf(self) -> str:
         """
         Two-column RTF of the full opinion, one section per separate
@@ -10719,31 +11213,7 @@ class _ScholarTextWindow:
         """
         txt = self._text
         case_line = self._bluebook_citation(None)[0].rstrip(".")
-
-        regions = self._part_region_indices()
-        main_end = -1
-        for i, (_rs, _re, pi) in enumerate(regions):
-            if self._parts[pi].kind in ("header", "majority"):
-                main_end = i
-            else:
-                break
-        main_regions = regions[: main_end + 1]
-        rest_regions = regions[main_end + 1:]
-
-        # (author label, start, end, kind)
-        sections: list[tuple[str, str, str, str]] = []
-        if main_regions:
-            maj = next(
-                (self._parts[pi] for _rs, _re, pi in main_regions
-                 if self._parts[pi].kind == "majority"),
-                None,
-            )
-            label = self._majority_author(maj) if maj is not None else ""
-            sections.append((label, main_regions[0][0], main_regions[-1][1],
-                             "majority"))
-        for rs, rend, pi in rest_regions:
-            sections.append((self._writer_parenthetical(self._parts[pi]), rs,
-                             rend, self._parts[pi].kind))
+        sections = self._export_section_list()
 
         # Colour only the running heading by opinion kind (dissent red,
         # concurrence green); the body text of every opinion stays black.
@@ -10797,6 +11267,303 @@ class _ScholarTextWindow:
         self._status_var.set(f"Exported RTF: {path}")
         if messagebox.askyesno(
             "Export Complete", f"RTF saved to:\n{path}\n\nOpen it now?", parent=self._win
+        ):
+            CourtListenerGUI._open_file(path)
+
+    # ------------------------------------------------------------------
+    # PDF (LaTeX) and Markdown export
+    # ------------------------------------------------------------------
+
+    def _post_export_menu(self) -> None:
+        """Drop the export-format menu under the Export button."""
+        menu = tk.Menu(self._win, tearoff=0)
+        menu.add_command(label="Rich Text (.rtf) — two columns…",
+                         command=self._export_rtf)
+        menu.add_command(label="PDF (.pdf) — typeset with LaTeX…",
+                         command=self._export_pdf_latex)
+        menu.add_command(label="Markdown (.md)…",
+                         command=self._export_markdown)
+        btn = self._export_btn
+        try:
+            menu.tk_popup(btn.winfo_rootx(),
+                          btn.winfo_rooty() + btn.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _with_full_view(self, build):
+        """Run *build* with the full opinion rendered, restoring a
+        single-part view afterwards (the same dance _export_rtf does)."""
+        prev = self._current_part
+        rerender = None
+        if prev is not None:
+            if self._mode == "scholar" and self._parts:
+                rerender = self._render_scholar
+            elif self._mode == "courtlistener" and (
+                getattr(self, "_cl_parts", None)
+                or getattr(self, "_cl_blocks", None)
+            ):
+                rerender = self._render_cl_blocks
+        if rerender is None:
+            return build()
+        self._current_part = None
+        rerender()
+        try:
+            return build()
+        finally:
+            self._current_part = prev
+            rerender()
+
+    def _section_note_map(
+        self,
+        sec_start: str,
+        sec_end: str,
+        fn_links: dict[str, tuple[str, str]],
+    ) -> tuple[list, list[tuple[str, str, list[_ExpPara]]]]:
+        """
+        The footnote-body regions inside a section, plus each note parsed
+        into (anchor id, label, body paragraphs) with its leading marker
+        stripped — shared by the LaTeX and Markdown writers.
+        """
+        txt = self._text
+        regions = sorted(
+            (r for r in getattr(self, "_fn_regions", []) or []
+             if _tk_ix(sec_start) <= _tk_ix(r[0]) < _tk_ix(sec_end)),
+            key=lambda r: _tk_ix(r[0]),
+        )
+        parsed: list[tuple[str, str, list[_ExpPara]]] = []
+        for nrs, nre, num, _page in regions:
+            paras = _dump_export_paragraphs(txt, [(nrs, nre)], fn_links)
+            fid, disp = _strip_note_marker(paras)
+            label = (num or disp).strip().strip("[]").rstrip(".") or "*"
+            parsed.append((fid, label, paras))
+        return regions, parsed
+
+    def _build_export_latex(self) -> str:
+        """
+        A complete LaTeX document of the opinion: single column, justified,
+        Century Schoolbook (or the closest installed face), footnotes at
+        the bottom of the page that cites them, star pagination kept inline
+        and echoed as a reporter page range in the running head, a page
+        number in the footer, and each separate opinion starting on a fresh
+        page under its own running head.
+        """
+        txt = self._text
+        fn_links = self._fn_link_map()
+        case_line = self._bluebook_citation(None)[0].rstrip(".")
+        sections = self._export_section_list()
+
+        has_marks = bool(txt.tag_ranges("pagenum"))
+        reporter_prefix = ""
+        first_page: Optional[int] = None
+        m = _CITE_PARSE_RE.match(self._bb["cite"] or "")
+        if m:
+            reporter_prefix = f"{m.group(1)} {m.group(2)}"
+            first_page = int(m.group(3))
+        if has_marks and first_page is None:
+            rng = txt.tag_nextrange("pagenum", "1.0")
+            if rng:
+                pm = re.search(r"\d+", txt.get(*rng))
+                if pm:
+                    first_page = int(pm.group(0))
+
+        doc: list[str] = [_LATEX_PREAMBLE]
+        if has_marks and reporter_prefix:
+            doc.append("\\fancyhead[R]{\\small %s \\reporterrange}\n"
+                       % _latex_escape(reporter_prefix))
+        doc.append("\\begin{document}\n\\thispagestyle{plain}%\n")
+        if has_marks and first_page is not None:
+            doc.append("\\markboth{%d}{%d}%%\n" % (first_page, first_page))
+        for i, (label, rs, rend, _kind) in enumerate(sections):
+            if i:
+                doc.append("\\clearpage\n")
+            head = _latex_escape(case_line)
+            if label:
+                head += " --- " + _latex_escape(label)
+            doc.append("\\renewcommand{\\opinionhead}{%s}%%\n" % head)
+            doc.append(self._latex_section_body(
+                rs, rend, fn_links, title_block=(i == 0)))
+        doc.append("\\end{document}\n")
+        return "".join(doc)
+
+    def _latex_section_body(
+        self,
+        sec_start: str,
+        sec_end: str,
+        fn_links: dict[str, tuple[str, str]],
+        title_block: bool,
+    ) -> str:
+        """One export section as LaTeX: its text with each footnote moved
+        inline (as a real \\footnote) at its in-text reference."""
+        txt = self._text
+        regions, parsed = self._section_note_map(sec_start, sec_end, fn_links)
+        notes: dict[str, tuple[str, str]] = {}
+        ordered: list[tuple[str, str, str]] = []
+        for fid, label, paras in parsed:
+            body = _latex_footnote_body(paras)
+            if fid and fid not in notes:
+                notes[fid] = (label, body)
+            ordered.append((fid, label, body))
+
+        body_paras = _dump_export_paragraphs(
+            txt, _section_body_ranges(sec_start, sec_end, regions), fn_links
+        )
+        used: set[str] = set()
+        out = [_latex_paragraphs(body_paras, notes, used,
+                                 title_block=title_block)]
+        leftovers = [(label, body) for fid, label, body in ordered
+                     if (not fid or fid not in used) and body]
+        if leftovers:
+            # Notes that were never referenced in this section's text (or
+            # whose in-text anchor wasn't found) stay at the section's end.
+            out.append(
+                "\\bigskip\\noindent\\rule{2in}{0.4pt}\\par\\smallskip\n"
+                "\\begin{footnotesize}\n"
+            )
+            for label, body in leftovers:
+                out.append("\\noindent\\textsuperscript{%s} %s\\par\\smallskip\n"
+                           % (_latex_escape(label), body))
+            out.append("\\end{footnotesize}\n")
+        return "".join(out)
+
+    def _export_pdf_latex(self) -> None:
+        engine = _find_latex_engine()
+        if engine is None:
+            if messagebox.askyesno(
+                "LaTeX Not Found",
+                "Exporting to PDF needs a LaTeX installation (pdflatex, "
+                "xelatex, lualatex or tectonic), and none was found on "
+                "this system.\n\nExport a Markdown (.md) file instead?",
+                parent=self._win,
+            ):
+                self._export_markdown()
+            return
+        tex = self._with_full_view(self._build_export_latex)
+        default = _build_default_filename(self._filename_item())
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF", "*.pdf"), ("All files", "*.*")],
+            initialfile=f"{default}.pdf",
+            title="Export Opinion as PDF (typeset with LaTeX)",
+            parent=self._win,
+        )
+        if not path:
+            return
+        self._status_var.set(f"Typesetting PDF with {engine[0]}…")
+        try:
+            self._win.update_idletasks()
+        except tk.TclError:
+            pass
+        ok, err = _compile_latex(tex, engine, path)
+        if not ok:
+            tex_path = os.path.splitext(path)[0] + ".tex"
+            try:
+                with open(tex_path, "w", encoding="utf-8") as f:
+                    f.write(tex)
+            except OSError:
+                tex_path = ""
+            self._status_var.set("PDF export failed.")
+            messagebox.showerror(
+                "PDF Export Failed",
+                f"{engine[0]} could not build the PDF."
+                + (f"\n\nThe LaTeX source was saved to:\n{tex_path}"
+                   if tex_path else "")
+                + (f"\n\n{err.strip()}" if err.strip() else ""),
+                parent=self._win,
+            )
+            return
+        self._status_var.set(f"Exported PDF: {path}")
+        if messagebox.askyesno(
+            "Export Complete", f"PDF saved to:\n{path}\n\nOpen it now?",
+            parent=self._win,
+        ):
+            CourtListenerGUI._open_file(path)
+
+    def _build_export_markdown(self) -> str:
+        """
+        The full opinion as Markdown: title and Bluebook citation up top, a
+        horizontal rule and heading before each separate opinion, bold
+        star-pagination markers inline, and footnotes as Markdown footnotes
+        ([^4]) collected at the end of the opinion that cites them.
+        """
+        txt = self._text
+        fn_links = self._fn_link_map()
+        bb = self._bb
+        case_line = self._bluebook_citation(None)[0]
+        sections = self._export_section_list()
+
+        blocks: list[str] = []
+        name = (bb["name"] or "").replace("'", "’")
+        if name:
+            blocks.append("# " + _md_escape(name))
+            if case_line.startswith(name):
+                blocks.append("*" + _md_escape(name) + "*"
+                              + _md_escape(case_line[len(name):]))
+            else:
+                blocks.append(_md_escape(case_line))
+        elif case_line.rstrip("."):
+            blocks.append("# " + _md_escape(case_line.rstrip(".")))
+
+        used_ids: set[str] = set()
+        for i, (label, rs, rend, kind) in enumerate(sections):
+            regions, parsed = self._section_note_map(rs, rend, fn_links)
+            ref_ids: dict[str, str] = {}
+            defs: list[tuple[str, list[str]]] = []
+            leftovers: list[tuple[str, list[str]]] = []
+            for fid, note_label, paras in parsed:
+                note_blocks = _md_paragraphs(paras)
+                if not note_blocks:
+                    continue
+                if fid:
+                    base = re.sub(r"\W+", "", note_label) or "sym"
+                    rid, n = base, 2
+                    while rid in used_ids:
+                        rid = f"{base}-{n}"
+                        n += 1
+                    used_ids.add(rid)
+                    ref_ids[fid] = rid
+                    defs.append((rid, note_blocks))
+                else:
+                    leftovers.append((note_label, note_blocks))
+
+            if i:
+                blocks.append("---")
+                blocks.append("## " + _md_escape(label or kind.title()))
+            body_paras = _dump_export_paragraphs(
+                txt, _section_body_ranges(rs, rend, regions), fn_links
+            )
+            blocks.extend(_md_paragraphs(body_paras, ref_ids))
+            for rid, note_blocks in defs:
+                first = note_blocks[0]
+                cont = "".join(
+                    "\n\n    " + b.replace("\n", "\n    ")
+                    for b in note_blocks[1:]
+                )
+                blocks.append(f"[^{rid}]: {first}{cont}")
+            if leftovers:
+                blocks.append("**Footnotes**")
+                for note_label, note_blocks in leftovers:
+                    body = "\n\n".join(note_blocks)
+                    blocks.append(f"**{_md_escape(note_label)}.** {body}")
+        return "\n\n".join(blocks) + "\n"
+
+    def _export_markdown(self) -> None:
+        md = self._with_full_view(self._build_export_markdown)
+        default = _build_default_filename(self._filename_item())
+        path = filedialog.asksaveasfilename(
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md"), ("All files", "*.*")],
+            initialfile=f"{default}.md",
+            title="Export Opinion as Markdown",
+            parent=self._win,
+        )
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(md)
+        self._status_var.set(f"Exported Markdown: {path}")
+        if messagebox.askyesno(
+            "Export Complete", f"Markdown saved to:\n{path}\n\nOpen it now?",
+            parent=self._win,
         ):
             CourtListenerGUI._open_file(path)
 
