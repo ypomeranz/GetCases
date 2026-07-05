@@ -574,6 +574,44 @@ def _save_token(token: str) -> None:
     _save_config(data)
 
 
+def _default_spotlight_hotkey() -> str:
+    return "<cmd>+<space>" if sys.platform == "darwin" else "<ctrl>+<space>"
+
+
+def _load_saved_spotlight_hotkey() -> str:
+    key = _load_config().get("spotlight_hotkey")
+    return key if isinstance(key, str) and key.strip() else _default_spotlight_hotkey()
+
+
+def _save_spotlight_hotkey(hotkey: str) -> None:
+    data = _load_config()
+    data["spotlight_hotkey"] = hotkey
+    _save_config(data)
+
+
+def _display_hotkey(hotkey: str) -> str:
+    names = {
+        "ctrl": "Ctrl", "cmd": "Cmd", "alt": "Alt", "shift": "Shift",
+        "space": "Space", "enter": "Enter", "esc": "Esc", "tab": "Tab",
+        "backspace": "Backspace", "delete": "Delete", "up": "Up",
+        "down": "Down", "left": "Left", "right": "Right",
+        "home": "Home", "end": "End", "page_up": "Page Up",
+        "page_down": "Page Down",
+    }
+    parts: list[str] = []
+    for raw in re.findall(r"<[^>]+>|[^+]+", hotkey or ""):
+        token = raw.strip().strip("<>").lower()
+        if not token:
+            continue
+        if re.fullmatch(r"f\d{1,2}", token):
+            parts.append(token.upper())
+        elif len(token) == 1:
+            parts.append(token.upper())
+        else:
+            parts.append(names.get(token, token.replace("_", " ").title()))
+    return "+".join(parts) or _display_hotkey(_default_spotlight_hotkey())
+
+
 # Persistent session for third-party hosts (LOC, GovInfo, static.case.law).
 # Uses a full browser-like header set; government CDNs reset connections when
 # they see Python's default User-Agent or missing Accept/Sec-Fetch headers.
@@ -2483,6 +2521,7 @@ class CourtListenerGUI:
 
         self._quick_popup: Optional[tk.Toplevel] = None
         self._hotkey_listener = None
+        self._spotlight_hotkey = _load_saved_spotlight_hotkey()
         self._root_hidden = False
 
         # Recently viewed cases, most recent first, for the "History ▾"
@@ -2700,6 +2739,10 @@ class CourtListenerGUI:
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
         settings_menu.add_command(label="API Token…", command=self._show_settings_dialog)
+        settings_menu.add_command(
+            label="Spotlight Shortcut…",
+            command=self._show_spotlight_shortcut_dialog,
+        )
         lookup_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Look Up", menu=lookup_menu)
         lookup_menu.add_command(
@@ -2977,7 +3020,9 @@ class CourtListenerGUI:
     def _print_background_help(self, closed: bool = False) -> None:
         """Tell the user how to drive the background process — Ctrl+Space to
         search, 's' to open the full window, 'q' to quit."""
-        hotkey = "Cmd+Space" if sys.platform == "darwin" else "Ctrl+Space"
+        hotkey = _display_hotkey(getattr(
+            self, "_spotlight_hotkey", _default_spotlight_hotkey()
+        ))
         intro = (
             "Window closed — GetCases is still running in the background."
             if closed
@@ -3001,7 +3046,17 @@ class CourtListenerGUI:
     def _setup_global_hotkey(self) -> None:
         if not _HOTKEY_AVAILABLE:
             return
-        hotkey = "<cmd>+<space>" if sys.platform == "darwin" else "<ctrl>+<space>"
+        if self._hotkey_listener is not None:
+            if sys.platform == "darwin":
+                return
+            try:
+                self._hotkey_listener.stop()
+            except Exception:
+                pass
+            self._hotkey_listener = None
+        hotkey = getattr(
+            self, "_spotlight_hotkey", _default_spotlight_hotkey()
+        )
         try:
             self._hotkey_listener = _pynput_keyboard.GlobalHotKeys(
                 {hotkey: self._on_global_hotkey}
@@ -4460,6 +4515,167 @@ class CourtListenerGUI:
             )
             return
         _BriefTextWindow(self.root, self, name, text)
+
+    _HOTKEY_MODIFIERS = {
+        "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+        "Meta_L", "Meta_R", "Command", "Command_L", "Command_R", "Win_L",
+        "Win_R",
+    }
+    _HOTKEY_SPECIAL_KEYS = {
+        "space": "space", "Return": "enter", "Escape": "esc",
+        "BackSpace": "backspace", "Tab": "tab", "Delete": "delete",
+        "Up": "up", "Down": "down", "Left": "left", "Right": "right",
+        "Home": "home", "End": "end", "Prior": "page_up",
+        "Next": "page_down", "Insert": "insert",
+    }
+
+    def _stop_global_hotkey(self) -> None:
+        if self._hotkey_listener is None:
+            return
+        if sys.platform == "darwin":
+            return
+        try:
+            self._hotkey_listener.stop()
+        except Exception:
+            pass
+        self._hotkey_listener = None
+
+    def _hotkey_from_event(self, event) -> Optional[str]:
+        keysym = getattr(event, "keysym", "") or ""
+        if keysym in self._HOTKEY_MODIFIERS:
+            return None
+        state = int(getattr(event, "state", 0) or 0)
+        mods: list[str] = []
+        if state & 0x0004:
+            mods.append("<ctrl>")
+        if state & 0x0008:
+            mods.append("<alt>")
+        # Tk reports Command/Windows as Mod2/Mod4 depending on platform/theme.
+        if state & (0x0010 if sys.platform == "darwin" else 0x0040):
+            mods.append("<cmd>")
+        if state & 0x0001:
+            mods.append("<shift>")
+
+        if re.fullmatch(r"F\d{1,2}", keysym):
+            key = f"<{keysym.lower()}>"
+        elif keysym in self._HOTKEY_SPECIAL_KEYS:
+            key = f"<{self._HOTKEY_SPECIAL_KEYS[keysym]}>"
+        elif len(keysym) == 1 and keysym.isalnum():
+            key = keysym.lower()
+        else:
+            ch = getattr(event, "char", "") or ""
+            key = ch.lower() if len(ch) == 1 and ch.isprintable() else ""
+        if not key:
+            return ""
+        if not mods and not re.fullmatch(r"<f\d{1,2}>", key):
+            return ""
+        return "+".join(mods + [key])
+
+    def _apply_spotlight_hotkey(self, hotkey: str) -> bool:
+        old = getattr(self, "_spotlight_hotkey", _default_spotlight_hotkey())
+        self._spotlight_hotkey = hotkey
+        if sys.platform == "darwin" and self._hotkey_listener is not None:
+            _save_spotlight_hotkey(hotkey)
+            return True
+        self._setup_global_hotkey()
+        if _HOTKEY_AVAILABLE and self._hotkey_listener is None:
+            self._spotlight_hotkey = old
+            self._setup_global_hotkey()
+            return False
+        _save_spotlight_hotkey(hotkey)
+        return True
+
+    def _show_spotlight_shortcut_dialog(self) -> None:
+        if not _HOTKEY_AVAILABLE:
+            messagebox.showinfo(
+                "Spotlight Shortcut",
+                "Global shortcuts need the pynput package.",
+                parent=self.root,
+            )
+            return
+
+        if sys.platform != "darwin":
+            self._stop_global_hotkey()
+        dlg = _ui_toplevel(self.root)
+        dlg.title("Spotlight Shortcut")
+        dlg.geometry("500x190" if _CTK_AVAILABLE else "480x170")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.root)
+
+        outer = _ui_frame(dlg)
+        outer.pack(fill="both", expand=True, padx=16, pady=14)
+        _ui_label(outer, "Press the new shortcut", size=14, weight="bold",
+                  anchor="w").pack(fill="x")
+        _ui_label(
+            outer,
+            "Use a modifier combo such as Ctrl+Alt+K, or a function key.",
+            size=11, muted=True, anchor="w",
+        ).pack(fill="x", pady=(2, 10))
+        current_var = tk.StringVar(
+            value=f"Current: {_display_hotkey(self._spotlight_hotkey)}"
+        )
+        _ui_label(outer, size=12, anchor="w", textvariable=current_var).pack(
+            fill="x", pady=(0, 6)
+        )
+        status_var = tk.StringVar(
+            value=(
+                "Waiting for keys... On macOS, changes apply after relaunch."
+                if sys.platform == "darwin" else "Waiting for keys..."
+            )
+        )
+        _ui_label(outer, size=11, muted=True, anchor="w",
+                  textvariable=status_var).pack(fill="x")
+
+        def close(restart: bool = True) -> None:
+            try:
+                dlg.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                dlg.destroy()
+            except tk.TclError:
+                pass
+            if restart:
+                self._setup_global_hotkey()
+
+        def on_key(event) -> str:
+            modifier_bits = 0x0001 | 0x0004 | 0x0008 | 0x0010 | 0x0040
+            if event.keysym == "Escape" and not (event.state & modifier_bits):
+                close()
+                return "break"
+            hotkey = self._hotkey_from_event(event)
+            if hotkey is None:
+                return "break"
+            if not hotkey:
+                status_var.set("Use Ctrl, Alt, Shift, Cmd, or a function key.")
+                return "break"
+            if self._apply_spotlight_hotkey(hotkey):
+                msg = f"Spotlight shortcut: {_display_hotkey(hotkey)}"
+                if sys.platform == "darwin":
+                    msg += " (after relaunch)"
+                self._status_var.set(msg)
+                close(restart=False)
+            else:
+                status_var.set("That shortcut could not be registered.")
+            return "break"
+
+        btn_frame = _ui_frame(dlg)
+        btn_frame.pack(fill="x", padx=16, pady=(0, 14))
+        _ui_button(
+            btn_frame, "Reset to Default", width=132,
+            command=lambda: (
+                self._apply_spotlight_hotkey(_default_spotlight_hotkey()),
+                close(restart=False),
+            ),
+        ).pack(side="left")
+        _ui_button(btn_frame, "Cancel", command=close, width=88).pack(
+            side="right"
+        )
+
+        dlg.bind("<KeyPress>", on_key, add="+")
+        dlg.protocol("WM_DELETE_WINDOW", close)
+        dlg.after(50, dlg.focus_force)
 
     def _show_settings_dialog(self) -> None:
         dlg = _ui_toplevel(self.root)
@@ -8058,6 +8274,7 @@ class _ScholarTextWindow:
         self._pre_pdf_mode = "scholar"  # text view to return to from the PDF
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
+        self._part_region_marks: list[str] = []
         # (volume, reporter) → first pages, so short forms ("410 U.S. at 152")
         # link back to the full citation's case.  Rebuilt on each render.
         self._short_cite_index: dict[tuple[str, str], list[int]] = {}
@@ -8362,7 +8579,7 @@ class _ScholarTextWindow:
         # window was widened to fit it.  _toggle_details is fired below.
         self._details_var = tk.BooleanVar(value=self._is_scotus)
         _ui_checkbox(
-            btn_frame, "Case details", self._details_var, self._toggle_details,
+            btn_frame, "Side panel", self._details_var, self._toggle_details,
         ).pack(side="left", padx=(0, 10))
         # When checked (default), Ctrl-C appends the Bluebook citation (with the
         # pin cite) to the copied text; unchecked, it copies the selection alone.
@@ -9057,9 +9274,49 @@ class _ScholarTextWindow:
         self._last_cite_action = self._link_actions.get(
             link_tag, self._last_cite_action)
 
+    def _clear_part_region_marks(self) -> None:
+        txt = getattr(self, "_text", None)
+        names = list(getattr(self, "_part_region_marks", []))
+        self._part_region_marks = []
+        if txt is None:
+            return
+        for name in names:
+            try:
+                txt.mark_unset(name)
+            except tk.TclError:
+                pass
+
+    def _record_part_region(self, start: str, end: str, part_index: int) -> None:
+        txt = self._text
+        serial = len(self._part_region_marks) // 2
+        start_mark = f"part_region_{serial}_start"
+        end_mark = f"part_region_{serial}_end"
+        txt.mark_set(start_mark, start)
+        txt.mark_gravity(start_mark, "left")
+        txt.mark_set(end_mark, end)
+        txt.mark_gravity(end_mark, "right")
+        self._part_region_marks.extend([start_mark, end_mark])
+        self._part_regions.append((start_mark, end_mark, part_index))
+
+    def _part_region_indices(self) -> list[tuple[str, str, int]]:
+        txt = getattr(self, "_text", None)
+        if txt is None:
+            return []
+        regions: list[tuple[str, str, int]] = []
+        for start_mark, end_mark, part_index in getattr(self, "_part_regions", []):
+            try:
+                start = txt.index(start_mark)
+                end = txt.index(end_mark)
+                if txt.compare(start, "<", end):
+                    regions.append((start, end, part_index))
+            except tk.TclError:
+                continue
+        return regions
+
     def _render_scholar(self) -> None:
         txt = self._text
         txt.config(state="normal")
+        self._clear_part_region_marks()
         txt.delete("1.0", "end")
         self._hide_fn_tip()
         self._link_actions.clear()
@@ -9112,7 +9369,7 @@ class _ScholarTextWindow:
                     txt.insert("end", "Footnotes\n\n", ("fnhead",))
                     self._render_footnotes(part.footnotes, None)
                 part_end = txt.index("end-1c")
-                self._part_regions.append((part_start, part_end, pi))
+                self._record_part_region(part_start, part_end, pi)
                 if self._current_part is None:
                     box = self._PART_BOX_TAGS.get(part.kind)
                     if box:  # light tint behind concurrences/dissents
@@ -9177,7 +9434,7 @@ class _ScholarTextWindow:
         if getattr(self, "_current_part", None) is not None:
             return
         parts = getattr(self, "_rendered_parts", None)
-        regions = getattr(self, "_part_regions", None)
+        regions = self._part_region_indices()
         if not parts or not regions:
             return
         txt = self._text
@@ -9589,7 +9846,7 @@ class _ScholarTextWindow:
         self._partmap_rows = []
         canvas.delete("all")
         parts = getattr(self, "_rendered_parts", None)
-        regions = getattr(self, "_part_regions", None)
+        regions = self._part_region_indices()
         if (self._mode == "pdf" or getattr(self, "_current_part", None) is not None
                 or not parts or not regions):
             canvas.config(width=0)
@@ -9698,6 +9955,7 @@ class _ScholarTextWindow:
             self._part_combo.current(0)
         txt = self._text
         txt.config(state="normal")
+        self._clear_part_region_marks()
         txt.delete("1.0", "end")
         self._hide_fn_tip()
         self._link_actions.clear()
@@ -9737,7 +9995,7 @@ class _ScholarTextWindow:
                     txt.insert("end", "Footnotes\n\n", ("fnhead",))
                     self._render_footnotes(part.footnotes, None)
                 part_end = txt.index("end-1c")
-                self._part_regions.append((part_start, part_end, pi))
+                self._record_part_region(part_start, part_end, pi)
                 if self._current_part is None:
                     box = self._PART_BOX_TAGS.get(part.kind)
                     if box:  # light tint behind concurrences/dissents
@@ -10413,7 +10671,7 @@ class _ScholarTextWindow:
             if parts:
                 pi = self._current_part
                 if pi is None and selected:
-                    for rs, rend, p in self._part_regions:
+                    for rs, rend, p in self._part_region_indices():
                         if txt.compare(start, ">=", rs) and txt.compare(start, "<", rend):
                             pi = p
                             break
@@ -10462,14 +10720,15 @@ class _ScholarTextWindow:
         txt = self._text
         case_line = self._bluebook_citation(None)[0].rstrip(".")
 
+        regions = self._part_region_indices()
         main_end = -1
-        for i, (_rs, _re, pi) in enumerate(self._part_regions):
+        for i, (_rs, _re, pi) in enumerate(regions):
             if self._parts[pi].kind in ("header", "majority"):
                 main_end = i
             else:
                 break
-        main_regions = self._part_regions[: main_end + 1]
-        rest_regions = self._part_regions[main_end + 1:]
+        main_regions = regions[: main_end + 1]
+        rest_regions = regions[main_end + 1:]
 
         # (author label, start, end, kind)
         sections: list[tuple[str, str, str, str]] = []
@@ -10682,7 +10941,7 @@ class _ScholarTextWindow:
         lines: list[tuple] = [
             ("lbl", "The Court's latest opinions, from supremecourt.gov."),
         ]
-        for d in decisions[:12]:
+        for d in decisions:
             lines.append(("h", d.name))
             sub = " · ".join(p for p in (
                 d.date, f"No. {d.docket}" if d.docket else "") if p)
