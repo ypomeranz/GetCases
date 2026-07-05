@@ -8274,6 +8274,7 @@ class _ScholarTextWindow:
         self._pre_pdf_mode = "scholar"  # text view to return to from the PDF
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
+        self._part_region_marks: list[str] = []
         # (volume, reporter) → first pages, so short forms ("410 U.S. at 152")
         # link back to the full citation's case.  Rebuilt on each render.
         self._short_cite_index: dict[tuple[str, str], list[int]] = {}
@@ -9273,9 +9274,49 @@ class _ScholarTextWindow:
         self._last_cite_action = self._link_actions.get(
             link_tag, self._last_cite_action)
 
+    def _clear_part_region_marks(self) -> None:
+        txt = getattr(self, "_text", None)
+        names = list(getattr(self, "_part_region_marks", []))
+        self._part_region_marks = []
+        if txt is None:
+            return
+        for name in names:
+            try:
+                txt.mark_unset(name)
+            except tk.TclError:
+                pass
+
+    def _record_part_region(self, start: str, end: str, part_index: int) -> None:
+        txt = self._text
+        serial = len(self._part_region_marks) // 2
+        start_mark = f"part_region_{serial}_start"
+        end_mark = f"part_region_{serial}_end"
+        txt.mark_set(start_mark, start)
+        txt.mark_gravity(start_mark, "left")
+        txt.mark_set(end_mark, end)
+        txt.mark_gravity(end_mark, "right")
+        self._part_region_marks.extend([start_mark, end_mark])
+        self._part_regions.append((start_mark, end_mark, part_index))
+
+    def _part_region_indices(self) -> list[tuple[str, str, int]]:
+        txt = getattr(self, "_text", None)
+        if txt is None:
+            return []
+        regions: list[tuple[str, str, int]] = []
+        for start_mark, end_mark, part_index in getattr(self, "_part_regions", []):
+            try:
+                start = txt.index(start_mark)
+                end = txt.index(end_mark)
+                if txt.compare(start, "<", end):
+                    regions.append((start, end, part_index))
+            except tk.TclError:
+                continue
+        return regions
+
     def _render_scholar(self) -> None:
         txt = self._text
         txt.config(state="normal")
+        self._clear_part_region_marks()
         txt.delete("1.0", "end")
         self._hide_fn_tip()
         self._link_actions.clear()
@@ -9328,7 +9369,7 @@ class _ScholarTextWindow:
                     txt.insert("end", "Footnotes\n\n", ("fnhead",))
                     self._render_footnotes(part.footnotes, None)
                 part_end = txt.index("end-1c")
-                self._part_regions.append((part_start, part_end, pi))
+                self._record_part_region(part_start, part_end, pi)
                 if self._current_part is None:
                     box = self._PART_BOX_TAGS.get(part.kind)
                     if box:  # light tint behind concurrences/dissents
@@ -9393,7 +9434,7 @@ class _ScholarTextWindow:
         if getattr(self, "_current_part", None) is not None:
             return
         parts = getattr(self, "_rendered_parts", None)
-        regions = getattr(self, "_part_regions", None)
+        regions = self._part_region_indices()
         if not parts or not regions:
             return
         txt = self._text
@@ -9805,7 +9846,7 @@ class _ScholarTextWindow:
         self._partmap_rows = []
         canvas.delete("all")
         parts = getattr(self, "_rendered_parts", None)
-        regions = getattr(self, "_part_regions", None)
+        regions = self._part_region_indices()
         if (self._mode == "pdf" or getattr(self, "_current_part", None) is not None
                 or not parts or not regions):
             canvas.config(width=0)
@@ -9914,6 +9955,7 @@ class _ScholarTextWindow:
             self._part_combo.current(0)
         txt = self._text
         txt.config(state="normal")
+        self._clear_part_region_marks()
         txt.delete("1.0", "end")
         self._hide_fn_tip()
         self._link_actions.clear()
@@ -9953,7 +9995,7 @@ class _ScholarTextWindow:
                     txt.insert("end", "Footnotes\n\n", ("fnhead",))
                     self._render_footnotes(part.footnotes, None)
                 part_end = txt.index("end-1c")
-                self._part_regions.append((part_start, part_end, pi))
+                self._record_part_region(part_start, part_end, pi)
                 if self._current_part is None:
                     box = self._PART_BOX_TAGS.get(part.kind)
                     if box:  # light tint behind concurrences/dissents
@@ -10629,7 +10671,7 @@ class _ScholarTextWindow:
             if parts:
                 pi = self._current_part
                 if pi is None and selected:
-                    for rs, rend, p in self._part_regions:
+                    for rs, rend, p in self._part_region_indices():
                         if txt.compare(start, ">=", rs) and txt.compare(start, "<", rend):
                             pi = p
                             break
@@ -10678,14 +10720,15 @@ class _ScholarTextWindow:
         txt = self._text
         case_line = self._bluebook_citation(None)[0].rstrip(".")
 
+        regions = self._part_region_indices()
         main_end = -1
-        for i, (_rs, _re, pi) in enumerate(self._part_regions):
+        for i, (_rs, _re, pi) in enumerate(regions):
             if self._parts[pi].kind in ("header", "majority"):
                 main_end = i
             else:
                 break
-        main_regions = self._part_regions[: main_end + 1]
-        rest_regions = self._part_regions[main_end + 1:]
+        main_regions = regions[: main_end + 1]
+        rest_regions = regions[main_end + 1:]
 
         # (author label, start, end, kind)
         sections: list[tuple[str, str, str, str]] = []
