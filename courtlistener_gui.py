@@ -8579,7 +8579,7 @@ class _ScholarTextWindow:
         # window was widened to fit it.  _toggle_details is fired below.
         self._details_var = tk.BooleanVar(value=self._is_scotus)
         _ui_checkbox(
-            btn_frame, "Case details", self._details_var, self._toggle_details,
+            btn_frame, "Side panel", self._details_var, self._toggle_details,
         ).pack(side="left", padx=(0, 10))
         # When checked (default), Ctrl-C appends the Bluebook citation (with the
         # pin cite) to the copied text; unchecked, it copies the selection alone.
