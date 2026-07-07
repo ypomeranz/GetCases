@@ -8001,6 +8001,12 @@ class _PdfPane(ttk.Frame):
         self._search_cur: int = -1
         self._search_ids: dict[int, list] = {}
         self._find_bar = None
+        # Mouse text selection (enabled with the text layer, see enable_find):
+        # the anchor and range are (page_index, char_index) pairs.
+        self._sel_bound = False
+        self._sel_anchor: Optional[tuple[int, int]] = None
+        self._sel_range: Optional[tuple] = None
+        self._sel_ids: dict[int, list] = {}
 
         # The canvas lives in a body frame so a find bar can sit above it.
         body = ttk.Frame(self)
@@ -8114,6 +8120,7 @@ class _PdfPane(ttk.Frame):
         self._img_ids.clear()
         self._overlay_ids.clear()
         self._search_ids.clear()
+        self._sel_ids.clear()
         self._inner_w = max(1, self._target_w - 2 * self._margin)
         self._page_x = self._page_left()
         y = self._PAD
@@ -8146,6 +8153,9 @@ class _PdfPane(ttk.Frame):
                 for oid in ids:
                     self._canvas.move(oid, dx, 0)
             for ids in self._search_ids.values():
+                for oid in ids:
+                    self._canvas.move(oid, dx, 0)
+            for ids in self._sel_ids.values():
                 for oid in ids:
                     self._canvas.move(oid, dx, 0)
         self._update_scrollregion()
@@ -8210,6 +8220,8 @@ class _PdfPane(ttk.Frame):
                     c.delete(oid)
                 for oid in self._search_ids.pop(i, []):
                     c.delete(oid)
+                for oid in self._sel_ids.pop(i, []):
+                    c.delete(oid)
 
     def _render_page(self, i: int) -> None:
         from PIL import Image, ImageTk
@@ -8238,9 +8250,11 @@ class _PdfPane(ttk.Frame):
         self._photos[i] = photo
         self._img_ids[i] = self._canvas.create_image(
             self._page_x, y, anchor="nw", image=photo)
-        # Search highlights sit just above the page image; citation overlays are
-        # drawn last so they stay clickable on top of any overlapping highlight.
+        # Search highlights and the text selection sit just above the page
+        # image; citation overlays are drawn last so they stay clickable on
+        # top of any overlapping highlight.
         self._draw_search(i)
+        self._draw_selection(i)
         self._draw_overlays(i)
 
     # ------------------------------------------------------------------
@@ -8411,14 +8425,22 @@ class _PdfPane(ttk.Frame):
     _SEARCH_FILL = "#fff15a"        # all matches: pale yellow
     _SEARCH_FILL_CUR = "#ff9632"    # current match: orange
 
-    def enable_find(self, pages: list) -> None:
-        """Turn on Ctrl-F text search using ``pages`` (the extracted per-page
-        char data from :func:`_extract_pdf_text_pages`).  Binds the find keys on
-        the containing window; a no-op when ``pages`` is empty (a scan with no
-        text layer)."""
+    def enable_find(self, pages: list, bind_keys: bool = True) -> None:
+        """Turn on the text layer using ``pages`` (the extracted per-page
+        char data from :func:`_extract_pdf_text_pages`): Ctrl-F text search
+        and mouse text selection (drag to select, Ctrl-C to copy).  A no-op
+        when ``pages`` is empty (a scan with no text layer).
+
+        ``bind_keys=False`` skips binding Ctrl-F/F3 on the containing window
+        — for panes embedded in a window whose find keys already belong to
+        its text view (the opinion reader) — while selection, which binds
+        only on the pane's own canvas, stays on."""
         if not pages:
             return
         self._search_pages = pages
+        self._enable_selection()
+        if not bind_keys:
+            return
         top = self.winfo_toplevel()
         top.bind("<Control-f>", lambda _e: self._open_find())
         top.bind("<F3>", lambda _e: self._find_step(1))
@@ -8582,6 +8604,145 @@ class _PdfPane(ttk.Frame):
         self._canvas.yview_moveto(min(1.0, target / max(1, self._content_h)))
         self._render_visible()
         self._redraw_search()
+
+    # ------------------------------------------------------------------
+    # Text selection (drag over the page to select; Ctrl-C copies) — uses
+    # the same extracted char boxes as the find bar, so it's available
+    # whenever the PDF has a text layer.
+    # ------------------------------------------------------------------
+
+    _SEL_FILL = "#4a90e2"   # translucent (stippled) selection blue
+
+    def _enable_selection(self) -> None:
+        if self._sel_bound:
+            return
+        self._sel_bound = True
+        c = self._canvas
+        c.bind("<Button-1>", self._on_sel_press, add="+")
+        c.bind("<B1-Motion>", self._on_sel_drag, add="+")
+        c.bind("<Control-c>", self._copy_selection, add="+")
+
+    def _on_sel_press(self, event) -> None:
+        # Take keyboard focus so Ctrl-C reaches the canvas binding.
+        try:
+            self._canvas.focus_set()
+        except tk.TclError:
+            pass
+        if self._sel_range is not None:
+            self._sel_range = None
+            self._redraw_selection()
+        # A press on a citation link is a click, not a selection start.
+        self._sel_anchor = None if self._link_at(event) else self._char_at(event)
+
+    def _on_sel_drag(self, event) -> None:
+        if self._sel_anchor is None:
+            return
+        cur = self._char_at(event)
+        if cur is None:
+            return
+        a, b = self._sel_anchor, cur
+        self._sel_range = (a, b) if a <= b else (b, a)
+        self._redraw_selection()
+
+    def _char_at(self, event) -> Optional[tuple[int, int]]:
+        """The (page index, char index) nearest a mouse event — same line
+        preferred, then nearest horizontally — or None without a text layer."""
+        pages = self._search_pages
+        if not pages or not self._slots:
+            return None
+        try:
+            x = self._canvas.canvasx(event.x)
+            y = self._canvas.canvasy(event.y)
+        except tk.TclError:
+            return None
+        pi, best_d = 0, None
+        for i, (sy, slot_h, _frac, _scale) in enumerate(self._slots):
+            if i >= len(pages):
+                break
+            if sy <= y <= sy + slot_h:
+                pi = i
+                break
+            d = min(abs(y - sy), abs(y - (sy + slot_h)))
+            if best_d is None or d < best_d:
+                pi, best_d = i, d
+        if pi >= len(pages):
+            return None
+        # Canvas point -> PDF points on page `pi` (inverse of _rect_to_canvas)
+        sy, _slot_h, frac, scale = self._slots[pi]
+        fl, ft, _fr, _fb = frac
+        w_pt, h_pt, _ = self._meta[pi]
+        x_off = self._page_x + self._margin - scale * fl * w_pt
+        y_off = sy + self._margin + scale * h_pt * (1.0 - ft)
+        x_pt = (x - x_off) / scale
+        y_pt = (y_off - y) / scale
+        best = None
+        best_key = None
+        for idx, (ch, box) in enumerate(pages[pi]):
+            if box is None or (ch and ch in "\r\n"):
+                continue
+            l, b, r, t = box
+            dy = 0.0 if b <= y_pt <= t else min(abs(y_pt - b), abs(y_pt - t))
+            dx = 0.0 if l <= x_pt <= r else min(abs(x_pt - l), abs(x_pt - r))
+            key = (dy, dx)
+            if best_key is None or key < best_key:
+                best_key, best = key, (pi, idx)
+        return best
+
+    def _draw_selection(self, i: int) -> None:
+        c = self._canvas
+        for oid in self._sel_ids.pop(i, []):
+            c.delete(oid)
+        rng = self._sel_range
+        if rng is None or i >= len(self._slots) or not self._search_pages:
+            return
+        (p0, i0), (p1, i1) = rng
+        if not (p0 <= i <= p1) or i >= len(self._search_pages):
+            return
+        chars = self._search_pages[i]
+        lo = i0 if i == p0 else 0
+        hi = i1 if i == p1 else len(chars) - 1
+        boxes = [b for ch, b in chars[lo:hi + 1]
+                 if b is not None and (not ch or ch not in "\r\n")]
+        ids: list = []
+        for rect in _union_line_runs(boxes):
+            x0, y0, x1, y1 = self._rect_to_canvas(i, rect)
+            ids.append(c.create_rectangle(
+                x0, y0, x1, y1, width=0, fill=self._SEL_FILL,
+                stipple="gray50"))
+        if ids:
+            self._sel_ids[i] = ids
+        c.tag_raise("cite_ov")
+
+    def _redraw_selection(self) -> None:
+        for i in list(self._img_ids):
+            self._draw_selection(i)
+
+    def selected_text(self) -> str:
+        """The currently selected text, page breaks as newlines; "" without
+        a selection."""
+        rng = self._sel_range
+        if rng is None or not self._search_pages:
+            return ""
+        (p0, i0), (p1, i1) = rng
+        parts: list[str] = []
+        for pi in range(p0, min(p1, len(self._search_pages) - 1) + 1):
+            chars = self._search_pages[pi]
+            lo = i0 if pi == p0 else 0
+            hi = i1 if pi == p1 else len(chars) - 1
+            parts.append("".join(ch for ch, _b in chars[lo:hi + 1] if ch))
+        text = "\n".join(parts).replace("\r\n", "\n").replace("\r", "\n")
+        return text
+
+    def _copy_selection(self, _event=None):
+        text = self.selected_text()
+        if not text.strip():
+            return None   # nothing selected: let the window's Ctrl-C run
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except tk.TclError:
+            return None
+        return "break"
 
     def export_pdf(self, path: str, dpi: int = 150) -> None:
         """Write a PDF that matches what's shown — each page cropped to its
@@ -12812,6 +12973,30 @@ class _ScholarTextWindow:
         self._pdf_url = url
         self._pdf_bytes = data
         self._mode = "pdf"
+
+        # Extract the text layer in the background so text on the page can be
+        # selected with the mouse and copied with Ctrl-C.  The find keys are
+        # NOT rebound — Ctrl-F in this window belongs to the text view's
+        # finder — so only the pane-local selection is enabled.
+        def extract_text(d=data, p=pane) -> None:
+            try:
+                pages = _extract_pdf_text_pages(d)
+            except Exception as exc:
+                print(f"[pdf-text] extraction failed: {exc}")
+                return
+            if not any(pages or []):
+                return  # scan-only PDF: no text layer to select
+
+            def apply() -> None:
+                try:
+                    if p.winfo_exists():
+                        p.enable_find(pages, bind_keys=False)
+                except tk.TclError:
+                    pass
+
+            self._post(apply)
+
+        threading.Thread(target=extract_text, daemon=True).start()
         self._hide_pdf_button()  # the toggle below is the way back from the PDF
         self._part_combo.config(state="disabled")
         self._view_label_var.set("PDF of opinion")
@@ -13244,6 +13429,28 @@ class _PdfWindow:
         self._pane = pane
         self._bytes = data
         self._status_var.set(self._title)
+
+        # Background text-layer extraction: enables Ctrl-F search and mouse
+        # text selection (Ctrl-C copies) when the PDF carries text.
+        def extract_text(d=data, p=pane) -> None:
+            try:
+                pages = _extract_pdf_text_pages(d)
+            except Exception as exc:
+                print(f"[pdf-text] extraction failed: {exc}")
+                return
+            if not any(pages or []):
+                return
+
+            def apply() -> None:
+                try:
+                    if p.winfo_exists():
+                        p.enable_find(pages)
+                except tk.TclError:
+                    pass
+
+            self._post(apply)
+
+        threading.Thread(target=extract_text, daemon=True).start()
 
     def _error(self, msg: str) -> None:
         self._status_var.set(f"PDF: {msg}")
@@ -13813,7 +14020,7 @@ class _SlipOpinionWindow:
         if len(sections) > 1:
             bits.append(f"{len(sections)} opinion parts")
         if pages:
-            bits.append("Ctrl-F to search")
+            bits.append("Ctrl-F to search; drag to select text")
         self._status_var.set("; ".join(bits) or "Slip opinion loaded.")
 
     def _build_nav(self, sections: list) -> None:
@@ -14131,9 +14338,10 @@ class _BriefTextWindow:
 
 class _LinkedPdfWindow:
     """Show an imported PDF *as a PDF* (the zoomable, cropped pane) with every
-    detected citation drawn as a clickable highlight on the page — cases open in
-    the Scholar reader, statutes/rules/regulations/Constitution in the statute
-    viewer, right-click opens in the browser.
+    detected citation clickable, styled as light-blue *text* rather than
+    highlight boxes (``link_style="recolor"``, the slip-opinion viewer's
+    approach) — cases open in the Scholar reader, statutes/rules/regulations/
+    Constitution in the statute viewer, right-click opens in the browser.
 
     The citation scan runs on a background thread; PDFium access (here and in the
     pane's rendering) is serialized through ``_PDFIUM_LOCK`` so the scan and the
@@ -14162,13 +14370,11 @@ class _LinkedPdfWindow:
 
         legend = _ui_frame(self._win)
         legend.pack(fill="x", padx=12, pady=(12, 0))
+        # Links are recolored blue in place (no category highlight boxes), so
+        # the legend is a single line rather than the brief reader's swatches.
         self._legend_lbl = _ui_label(legend, "Scanning for citations…",
                                      muted=True)
         self._legend_lbl.pack(side="left")
-        for cat, label in (("case", "Cases"), ("statute", "Statutes / Rules"),
-                           ("const", "Constitution")):
-            tk.Label(legend, text=f" {label} ", background=_BRIEF_TINTS[cat],
-                     foreground="#222222").pack(side="left", padx=(8, 0))
 
         self._body = _ui_frame(self._win)
         self._body.pack(fill="both", expand=True)
@@ -14223,7 +14429,10 @@ class _LinkedPdfWindow:
             self._app._open_brief_from_bytes(self._bytes, name)
             return
         try:
-            pane = _PdfPane(self._body, self._bytes, width=780)
+            # Citation links are painted as light-blue text on the page (the
+            # slip-opinion viewer's style) — no highlight boxes.
+            pane = _PdfPane(self._body, self._bytes, width=780,
+                            link_style="recolor")
         except Exception as exc:
             messagebox.showerror("Import PDF", str(exc), parent=self._win)
             self._win.destroy()
@@ -14254,13 +14463,13 @@ class _LinkedPdfWindow:
         n = sum(len(v) for v in links.values())
         has_text = any(pages)
         self._legend_lbl.configure(
-            text=("Citations are highlighted and clickable:" if n
-                  else "No citations detected:"))
+            text=("Citations are shown in blue and clickable." if n
+                  else "No citations detected."))
         msg = (f"{n} citation link{'' if n == 1 else 's'} — left-click to open, "
                "right-click for the browser." if n
                else "No citations detected in this PDF's text layer.")
         if has_text:
-            msg += "    Ctrl-F to search the text."
+            msg += "    Ctrl-F searches; drag selects text (Ctrl+C copies)."
         self._status_var.set(msg)
 
     def _open_cite(self, action: tuple, snippet: str) -> None:
