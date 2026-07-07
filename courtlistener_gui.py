@@ -3520,14 +3520,27 @@ class CourtListenerGUI:
             for i, r in enumerate(result_rows):
                 self._spot_highlight_row(r, i == idx)
 
+        # Keyboard-selection guard: Return opens the highlighted row only
+        # while the entry still shows the text these results answered — or
+        # the text as it stood when the user last pressed Up/Down (a
+        # deliberate signal they're choosing among the rows on screen, even
+        # mid-edit).  Once the text is changed without arrow navigation,
+        # Return runs a fresh search instead; only a mouse click (or renewed
+        # Up/Down) picks from the now-stale list.  This keeps a row that
+        # merely streamed in under the resting pointer (hover selects) from
+        # hijacking a re-typed search.
+        nav_text = [query]
+
         def _on_key(event) -> None:
             if not result_rows:
                 return
             if event.keysym == "Down":
+                nav_text[0] = entry.get().strip()
                 selected_idx[0] = min(selected_idx[0] + 1,
                                       len(result_rows) - 1)
                 _highlight(selected_idx[0])
             elif event.keysym == "Up":
+                nav_text[0] = entry.get().strip()
                 selected_idx[0] = max(selected_idx[0] - 1, 0)
                 _highlight(selected_idx[0])
             elif event.keysym == "Return":
@@ -3540,16 +3553,19 @@ class CourtListenerGUI:
         entry.bind("<Up>", _on_key)
         # Override Return to select from dropdown once results exist
         def _entry_return(_e=None) -> None:
-            if result_rows and selected_idx[0] >= 0:
-                # A result is highlighted — open it.
+            current = entry.get().strip()
+            if (result_rows and selected_idx[0] >= 0
+                    and current in (query, nav_text[0])):
+                # A result is highlighted and the text hasn't been changed
+                # since the search (or the last arrow-key move) — open it.
                 self._spotlight_empty_returns = 0
                 _on_key(type("E", (), {"keysym": "Return"})())
                 return
-            current = entry.get().strip()
             if current:
-                # New (or re-typed) query with no selection: retract the
-                # current dropdown and run a fresh search in the spotlight
-                # interface rather than jumping to the main window.
+                # New (or edited) query, or no still-valid selection: retract
+                # the current dropdown and run a fresh search in the spotlight
+                # interface rather than opening a stale row or jumping to the
+                # main window.
                 self._spotlight_empty_returns = 0
                 self._show_spotlight_dropdown(popup, border, entry, current)
                 return
