@@ -1694,7 +1694,7 @@ def _case_fingerprints(name: str, cite: str, year: str,
 # one of its results duplicates a case already shown by another source, the
 # next-best result takes the slot and the source still shows its full quota.
 _BUCKET_CAPS: dict[str, int] = {
-    "scholar": 2,     # Google Scholar
+    "scholar": 4,     # Google Scholar (best of the first results page)
     "exact": 3,       # strict AND match of two distinctive parties
     "ranked": 4,      # CourtListener name matches, ranked by citation count
     "reversed": 2,    # heavily-cited swapped-caption ("Texas v. United States")
@@ -3651,18 +3651,31 @@ class CourtListenerGUI:
                 # Google Scholar's own relevance order (top few).
                 results = results[:3]
             else:
-                # Just a name: Google Scholar, like CourtListener, ranks on the
-                # whole opinion text, so re-rank its hits by how closely their
-                # title (the case name) matches the query and show the best two.
-                # A couple of spares are kept past the two shown so a duplicate
+                # Just a name: Google Scholar, like CourtListener, ranks on
+                # the whole opinion text, so rank the entire first page of
+                # its results the way the CourtListener name passes are
+                # ranked (see _cl_name_search): score each title's closeness
+                # to the query and drop the weak ones, order by match tier
+                # (the caption as typed beats a swapped caption beats a
+                # one-party match) then by closeness — Scholar's own
+                # relevance order stands in for CourtListener's
+                # citation-count tiebreak — and keep only the best tier
+                # present, as _filter_to_best_tier does across the pooled CL
+                # passes.  Up to the best four are shown (the scholar bucket
+                # cap); a couple of spares are kept past those so a duplicate
                 # of a case another source already listed can be replaced.
                 scored = [
-                    (_name_match_score(query, getattr(r, "title", "") or ""), r)
-                    for r in results
+                    (_match_tier(query, getattr(r, "title", "") or ""),
+                     _name_match_score(query, getattr(r, "title", "") or ""),
+                     i, r)
+                    for i, r in enumerate(results)
                 ]
-                scored = [(s, r) for s, r in scored if s >= _NAME_MATCH_MIN]
-                scored.sort(key=lambda x: x[0], reverse=True)
-                results = [r for _s, r in scored[:4]]
+                scored = [t for t in scored if t[1] >= _NAME_MATCH_MIN]
+                scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
+                best_tier = scored[0][0] if scored else -1
+                results = [r for tier, _s, _i, r in scored
+                           if tier == best_tier]
+                results = results[:_BUCKET_CAPS["scholar"] + 2]
             for r in results:
                 court_id = _scholar_source_to_court_id(r.source)
                 year = _scholar_source_year(r.source)
