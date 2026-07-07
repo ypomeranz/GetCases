@@ -2466,6 +2466,7 @@ def _assemble_case_text(client, item: dict) -> str:
 try:
     from google_scholar import (
         GoogleScholarFetcher,
+        bears_citation as _scholar_bears_citation,
         blocks_to_text,
         educate_quotes,
         parse_opinion_blocks,
@@ -3961,9 +3962,19 @@ class CourtListenerGUI:
             try:
                 result = fetcher.fetch_by_citation(cite)
                 if not result and name:
-                    hits = fetcher.search_cases(f"{name} {cite}", limit=1)
-                    if hits:
-                        result = fetcher.fetch_by_url(hits[0].url)
+                    # Accept a name+cite search hit only when the *result*
+                    # itself is this case — bearing the cite in its title or
+                    # byline, or matching the case name — never merely
+                    # because the search query found something (any opinion
+                    # quoting the cite also matches the query).
+                    hits = fetcher.search_cases(f"{name} {cite}", limit=3)
+                    for hit in hits:
+                        if _scholar_bears_citation(hit, cite) or (
+                            _name_match_score(name, hit.title or "")
+                            >= _NAME_MATCH_MIN
+                        ):
+                            result = fetcher.fetch_by_url(hit.url)
+                            break
             except Exception as exc:
                 print(f"[citelist] scholar {cite!r}: {exc}")
             if result:

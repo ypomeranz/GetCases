@@ -5,7 +5,10 @@ Fetches US case law opinion text from Google Scholar.
 
 Strategy:
   1. Search scholar.google.com/scholar?q="citation"&as_sdt=4 for the citation.
-  2. Pull the first scholar_case link from results.
+  2. Pick the first result that itself *bears* the citation (in its title or
+     byline) — a quoted-phrase search also returns every opinion that merely
+     cites it, so the first scholar_case link on the page is not necessarily
+     the cited case.
   3. Scrape the #gs_opinion div from that page, keeping its HTML.
   4. Cache everything in a local SQLite database to avoid re-fetching.
 
@@ -272,6 +275,50 @@ class ScholarResult:
     url: str
     source: str = ""   # the green byline, e.g. "Supreme Court, 1973"
     snippet: str = ""
+
+
+# A reporter citation ("410 U.S. 113", "529 NW 2d 155", "8 F.4th 557") for
+# loose comparison across the punctuation/spacing variants Scholar and the
+# opinions use.
+_CITE_KEY_RE = re.compile(
+    r"\b(\d{1,4})\s+([A-Za-z][A-Za-z0-9 .'’&-]*?)\s+(\d{1,5})\b"
+)
+
+
+def _cite_keys(text: str) -> set[tuple[str, str, str]]:
+    """Every (volume, normalized reporter, page) citation key found in
+    *text*.  "410 U. S. 113", "410 US 113" and "410 U.S. 113" all produce
+    the same key."""
+    out: set[tuple[str, str, str]] = set()
+    for m in _CITE_KEY_RE.finditer(text or ""):
+        rep = re.sub(r"[^a-z0-9]", "", m.group(2).lower())
+        if rep:
+            out.add((m.group(1), rep, m.group(3)))
+    return out
+
+
+_NAME_STOPWORDS = frozenset("v vs the of and in re ex parte et al no".split())
+
+
+def _name_tokens(name: str) -> set[str]:
+    """Significant lowercase tokens of a case caption, for the token-overlap
+    name test used when no fuzzy scorer is injected."""
+    return {
+        w for w in re.findall(r"[a-z0-9]+", (name or "").lower())
+        if len(w) > 1 and w not in _NAME_STOPWORDS
+    }
+
+
+def bears_citation(result: "ScholarResult", citation: str) -> bool:
+    """True when a Scholar search *result* itself carries *citation* — in
+    its title or its byline's citation segment.  The snippet doesn't count:
+    a full-text phrase search matches every opinion that merely quotes the
+    citation, and their snippets all contain it."""
+    keys = _cite_keys(citation)
+    if not keys:
+        return False
+    head = f"{result.title} ; {result.source}"
+    return bool(keys & _cite_keys(head))
 
 
 @dataclass
@@ -1148,7 +1195,12 @@ class GoogleScholarFetcher:
         Result is cached permanently on success.
         """
         self._post_search_failure = None
-        key = f"cite:{citation.strip()}"
+        # "cite2:" (not the old "cite:"): earlier versions accepted the first
+        # scholar_case link on the results page without checking it was the
+        # cited case, so old "cite:" entries can hold an opinion that merely
+        # cites the query.  A new prefix sidelines them rather than serving
+        # them forever.
+        key = f"cite2:{citation.strip()}"
         cached = self._cache_get(key)
         if cached:
             print(f"[scholar] cache hit for {key!r}")
@@ -1178,9 +1230,15 @@ class GoogleScholarFetcher:
             print(f"[scholar] search request failed: {exc}")
             return None
 
-        case_url = self._first_case_url(resp.text)
+        # Take the first result that itself bears the citation — never just
+        # the first scholar_case link on the page.  A quoted-phrase search
+        # also returns every opinion *citing* the phrase, so when Scholar
+        # lacks the case the top link is some other case that quotes it;
+        # returning None instead lets the caller fall back to CourtListener,
+        # which resolves by citation exactly.
+        case_url = self._matching_case_url(resp.text, citation)
         if not case_url:
-            print("[scholar] no scholar_case link found in results page")
+            print("[scholar] no result bearing this citation on results page")
             return None
 
         # Even after searching Scholar, prefer the database copy if we already
@@ -1210,7 +1268,9 @@ class GoogleScholarFetcher:
         """
         self._post_search_failure = None
         q = f"{case_name} {year}".strip() if year else case_name
-        key = f"name:{q}"
+        # "name2:" — see fetch_by_citation: the old "name:" entries predate
+        # result verification and may hold the wrong case.
+        key = f"name2:{q}"
         cached = self._cache_get(key)
         if cached:
             print(f"[scholar] cache hit for {key!r}")
@@ -1232,9 +1292,12 @@ class GoogleScholarFetcher:
             print(f"[scholar] search request failed: {exc}")
             return None
 
-        case_url = self._first_case_url(resp.text)
+        # Take the first result whose *title* is this case — never just the
+        # first scholar_case link, which for a name Scholar lacks is some
+        # other opinion that mentions the parties.
+        case_url = self._matching_name_url(resp.text, case_name)
         if not case_url:
-            print("[scholar] no scholar_case link found in results page")
+            print("[scholar] no result titled like this case on results page")
             return None
 
         db_hit = self._db_by_url(case_url)
@@ -1734,16 +1797,33 @@ class GoogleScholarFetcher:
         self._browser_first_wall = time.time() + _BROWSER_FIRST_TTL
         self._save_state()
 
-    def _first_case_url(self, html: str) -> Optional[str]:
-        """Return the first scholar_case href found in a Scholar results page."""
-        soup = BeautifulSoup(html, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href: str = a["href"]
-            if "scholar_case" in href:
-                if href.startswith("/"):
-                    href = SCHOLAR_BASE + href
-                print(f"[scholar] found case url: {href}")
-                return href
+    def _matching_case_url(self, html: str, citation: str) -> Optional[str]:
+        """The scholar_case URL of the first result on a results page that
+        itself bears *citation* (title or byline — see ``bears_citation``),
+        or None when no result is verifiably the cited case."""
+        for r in self._parse_results(html):
+            if bears_citation(r, citation):
+                print(f"[scholar] found case url: {r.url} ({r.title!r})")
+                return r.url
+        return None
+
+    def _matching_name_url(self, html: str, case_name: str) -> Optional[str]:
+        """The scholar_case URL of the first result on a results page whose
+        title matches *case_name* (via the injected fuzzy scorer when one is
+        set, else a token-overlap test), or None."""
+        for r in self._parse_results(html):
+            title = (r.title or "").strip()
+            if not title:
+                continue
+            if self._name_scorer is not None:
+                if self._name_scorer(case_name, title) >= self._name_min:
+                    print(f"[scholar] found case url: {r.url} ({title!r})")
+                    return r.url
+                continue
+            qt = _name_tokens(case_name)
+            if qt and len(qt & _name_tokens(title)) / len(qt) >= 0.6:
+                print(f"[scholar] found case url: {r.url} ({title!r})")
+                return r.url
         return None
 
     def _fetch_case_page(self, url: str) -> Optional[tuple[str, str]]:
@@ -1932,6 +2012,43 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
                      for s in b.spans if s.fnref)
     check(fnrefs2 == fnrefs, "link_footnotes_by_marker is idempotent")
 
+    # Result verification: a quoted-phrase citation search also returns
+    # opinions merely *citing* the phrase; only a result bearing the cite in
+    # its own title/byline may be opened (snippets don't count).
+    check(_cite_keys("410 U. S. 113") == _cite_keys("410 US 113")
+          == {("410", "us", "113")}, "cite keys normalize spacing/periods")
+    check(("8", "f4th", "557") in _cite_keys("8 F.4th 557"), "F.4th key")
+    check(("529", "nw2d", "155") in _cite_keys("529 NW 2d 155"), "NW 2d key")
+    _r_citing = ScholarResult(
+        title="Doe v. Citing Case", url="u1",
+        source="555 F. 2d 100 - Court of Appeals, 2d Circuit, 1977",
+        snippet="… quoting Roe v. Wade, 410 U.S. 113, 93 S. Ct. 705 …",
+    )
+    _r_roe = ScholarResult(
+        title="Roe v. Wade", url="u2",
+        source="410 US 113, 93 S. Ct. 705 - Supreme Court, 1973",
+        snippet="Jane Roe instituted this action …",
+    )
+    check(not bears_citation(_r_citing, "410 U.S. 113"),
+          "snippet-only mention of the cite doesn't count")
+    check(bears_citation(_r_roe, "410 U.S. 113"),
+          "byline cite counts (US vs U.S. normalized)")
+    check(bears_citation(_r_roe, "93 S.Ct. 705"),
+          "parallel byline cite counts")
+
+    _results_html = (
+        '<div class="gs_r"><h3 class="gs_rt">'
+        '<a href="/scholar_case?case=111">Doe v. Citing Case</a></h3>'
+        '<div class="gs_a">555 F. 2d 100 - Court of Appeals, 2d Circuit, '
+        "1977</div>"
+        '<div class="gs_rs">… quoting Roe v. Wade, 410 U.S. 113 …</div></div>'
+        '<div class="gs_r"><h3 class="gs_rt">'
+        '<a href="/scholar_case?case=222">Roe v. Wade</a></h3>'
+        '<div class="gs_a">410 US 113, 93 S. Ct. 705 - Supreme Court, '
+        "1973</div>"
+        '<div class="gs_rs">Jane Roe instituted this action …</div></div>'
+    )
+
     # search_cases falls back to the local opinion database when Google Scholar
     # is unreachable/blocking (the request raises or the page parses empty).  A
     # tiny stub stands in for opinion_db.OpinionDB.find() so this stays offline.
@@ -2018,11 +2135,42 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
         check(f.search_cases("nonesuch matter", limit=10) == [],
               "blocked search with no DB match returns empty")
 
+        # The result pickers skip the citing-only first result and land on
+        # the one bearing the cite / titled as the case.
+        m_url = f._matching_case_url(_results_html, "410 U.S. 113")
+        check(bool(m_url) and m_url.endswith("case=222"),
+              f"citation match is to the result, not the page: {m_url}")
+        check(f._matching_case_url(_results_html, "999 U.S. 1") is None,
+              "no result bearing the cite -> None (fall back to CL)")
+        n_url = f._matching_name_url(_results_html, "Roe v. Wade")
+        check(bool(n_url) and n_url.endswith("case=222"),
+              f"name match is to the result title: {n_url}")
+
+        # End-to-end: fetch_by_citation must select the bearing result (the
+        # case page fetch then fails offline, leaving it as the post-search
+        # failure URL), and must reject a page with no bearing result.
+        class _CannedResults:
+            status_code = 200
+            url = SCHOLAR_BASE + "/scholar?q=x"
+            text = _results_html
+
+        f._get = lambda url, **kw: _CannedResults()  # type: ignore[assignment]
+        check(f.fetch_by_citation("419 U.S. 345") is None
+              and f.take_post_search_failure() is None,
+              "fetch_by_citation rejects a results page of citing cases")
+        got = f.fetch_by_citation("410 U.S. 113")
+        psf = f.take_post_search_failure() or ""
+        check(got is None and psf.endswith("case=222"),
+              f"fetch_by_citation picks the result bearing the cite: {psf}")
+
         # With no database attached, a blocked search degrades to empty cleanly.
         f2 = GoogleScholarFetcher(cache_path=Path(_d) / "c2.db", delay=0.0, db=None)
         f2._get = _boom  # type: ignore[assignment]
         check(f2.search_cases("Roe v. Wade") == [],
               "blocked search with no DB returns empty")
+        n2 = f2._matching_name_url(_results_html, "Roe v. Wade")
+        check(bool(n2) and n2.endswith("case=222"),
+              "name match works without an injected scorer (token overlap)")
         # Close the sqlite handles so Windows lets the TemporaryDirectory go.
         f._db.close()
         f2._db.close()
