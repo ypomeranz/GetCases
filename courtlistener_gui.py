@@ -840,6 +840,41 @@ def _is_paginable_cite(c: str) -> bool:
     return not re.search(r"\b(?:LEXIS|WL|Westlaw)\b", rep, re.IGNORECASE)
 
 
+def _scholar_parallel_cites(client, item: dict, exclude: str) -> list[str]:
+    """A CourtListener case's parallel *standard-reporter* citations — the
+    same set the window title shows (print reporters only: no Lexis/Westlaw
+    or neutral cites, no annotation/looseleaf series) — excluding *exclude*
+    (the cite that already failed on Google Scholar).  Used to retry Scholar
+    under an alternate cite when the clicked one found nothing."""
+    def key(c: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (c or "").lower())
+
+    raw = item.get("citation", [])
+    cites = list(raw) if isinstance(raw, list) else [raw] if raw else []
+    cluster_id = item.get("cluster_id") or item.get("id")
+    if client is not None and cluster_id:
+        try:
+            rec = client.get_cluster(int(cluster_id), fields="citations")
+            cites += _cluster_citations_to_strings(rec.get("citations"))
+        except Exception as exc:
+            print(f"[scholar-alt] cluster citations fetch failed: {exc}")
+
+    seen = {key(exclude)}
+    out: list[str] = []
+    for c in cites:
+        c = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(c))).strip()
+        if (not c or not _is_paginable_cite(c)
+                or _NOISE_CITE_RE.search(c)
+                or _NONSTANDARD_CITE_RE.search(c)):
+            continue
+        k = key(c)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
+    return out[:4]
+
+
 
 # Strip reporter series designators ("2d", "4th") and volume/page digits
 # before comparing reporter words against a court abbreviation.
@@ -12395,17 +12430,45 @@ class _ScholarTextWindow:
         attempts: int = 3, delay: float = 4.0,
     ) -> None:
         """This window opened on the CourtListener text because a Google Scholar
-        link failed.  Retry the Scholar fetch ``attempts`` more times,
-        ``delay`` seconds apart; if it comes through, wire it in and light up
-        the "Google Scholar Text" button (via ``_attach_scholar_version``).
+        link failed.  First try the case's *parallel* standard-reporter
+        citations — Google Scholar often holds an opinion under the regional
+        or S. Ct. reporter when the cite clicked (an official state reporter,
+        an old nominative form) finds nothing.  ``fetch_by_citation`` only
+        accepts a result bearing the queried cite, and a parallel cite of
+        this very cluster identifies exactly this case, so a hit counts as a
+        verified match: it is cached under the cluster's verified key and
+        wired in via ``_attach_scholar_version``, lighting up the "Google
+        Scholar Text" button.  Failing that, retry the original fetch
+        ``attempts`` more times, ``delay`` seconds apart.
 
         (``name`` is unused — it's accepted so the shared ``retry`` tuple
         ``(cite, pin, url, name)`` unpacks cleanly.)"""
         fetcher = self._app._get_scholar()
         if fetcher is None or not (url_val or cite):
             return
+        client = self._app._get_client()
+        item = dict(self._item) if self._item else {}
+
+        def attach(url: str, html: str, note: str) -> None:
+            cluster_id = item.get("cluster_id") or item.get("id")
+            if cluster_id:
+                try:
+                    fetcher.put_cached(
+                        f"verified:cluster:{cluster_id}", url, html)
+                except Exception:
+                    pass
+            self._post(self._attach_scholar_version, url, html, note)
 
         def run() -> None:
+            for alt in _scholar_parallel_cites(client, item, cite):
+                try:
+                    result = fetcher.fetch_by_citation(alt)
+                except Exception:
+                    result = None
+                if result:
+                    attach(*result,
+                           f"Google Scholar version found at {alt}")
+                    return
             for _ in range(attempts):
                 time.sleep(delay)
                 try:
