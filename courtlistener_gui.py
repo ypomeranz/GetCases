@@ -5276,20 +5276,12 @@ class CourtListenerGUI:
 
                 self.root.after(0, self._status_var.set, f"Downloading… {pdf_url}")
                 print(f"[download] fetching {pdf_url}")
-                # Only send the CourtListener API key to CourtListener itself.
-                # Use a browser-like UA for all other hosts; government CDNs
-                # (LOC, GovInfo) reject Python's default User-Agent.
-                if "courtlistener.com" in pdf_url:
-                    response = client._session.get(pdf_url, timeout=60, stream=True)
-                else:
-                    response = _anon_session.get(pdf_url, timeout=60, stream=True)
-                ct = response.headers.get("content-type", "")
-                print(f"[download] HTTP {response.status_code}  content-type: {ct}")
-                response.raise_for_status()
-
+                fetched = _fetch_pdf_bytes(pdf_url, client=client, timeout=60)
+                if fetched is None:
+                    raise RuntimeError("The source returned something that isn't a PDF.")
+                data, pdf_url = fetched
                 with open(save_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                    f.write(data)
 
                 self.root.after(0, self._on_download_done, save_path)
             except Exception as exc:
@@ -8032,11 +8024,31 @@ def _pdf_get(url: str, client=None, timeout: int = 30):
         else _anon_session
     )
     headers = dict(_anon_session.headers)
+    headers["Accept"] = "application/pdf,text/html,*/*;q=0.8"
+    # storage.courtlistener.com can return PDFs with Content-Encoding: br when
+    # br is advertised.  If the local requests stack lacks Brotli support, the
+    # body remains compressed and no longer starts with %PDF.  Ask for the file
+    # bytes as-is so sniffing and pdfium both see a real PDF.
+    headers["Accept-Encoding"] = "identity"
     if session is not _anon_session:
         auth = getattr(session, "headers", {}).get("Authorization")
         if auth:
             headers["Authorization"] = auth
     return session.get(url, timeout=timeout, allow_redirects=True, headers=headers)
+
+
+def _maybe_decode_pdf_response(data: bytes, encoding: str) -> bytes:
+    """Best-effort decode when a server ignores our identity encoding request."""
+    enc = (encoding or "").lower()
+    if "br" not in enc or _normalize_pdf_bytes(data) is not None:
+        return data
+    for mod_name in ("brotli", "brotlicffi"):
+        try:
+            mod = __import__(mod_name)
+            return mod.decompress(data)
+        except Exception:
+            continue
+    return data
 
 
 def _fetch_pdf_bytes(
@@ -8057,10 +8069,12 @@ def _fetch_pdf_bytes(
         resp = _pdf_get(cur, client=client, timeout=timeout)
         resp.raise_for_status()
         final_url = getattr(resp, "url", None) or cur
-        data = _normalize_pdf_bytes(resp.content)
+        content = _maybe_decode_pdf_response(
+            resp.content, resp.headers.get("Content-Encoding", ""))
+        data = _normalize_pdf_bytes(content)
         if data is not None:
             return data, final_url
-        for nxt in _pdf_link_candidates_from_html(resp.content, final_url):
+        for nxt in _pdf_link_candidates_from_html(content, final_url):
             if nxt not in seen and nxt not in queue:
                 queue.append(nxt)
     return None
@@ -16051,14 +16065,12 @@ class _CitingOpinionsWindow:
                     return
 
                 self._win.after(0, self._status_var.set, f"Downloading… {pdf_url}")
-                if "courtlistener.com" in pdf_url:
-                    resp = client._session.get(pdf_url, timeout=60, stream=True)
-                else:
-                    resp = _anon_session.get(pdf_url, timeout=60, stream=True)
-                resp.raise_for_status()
+                fetched = _fetch_pdf_bytes(pdf_url, client=client, timeout=60)
+                if fetched is None:
+                    raise RuntimeError("The source returned something that isn't a PDF.")
+                data, pdf_url = fetched
                 with open(save_path, "wb") as f:
-                    for chunk in resp.iter_content(8192):
-                        f.write(chunk)
+                    f.write(data)
                 self._win.after(0, self._on_dl_done, save_path, False)
             except Exception as exc:
                 self._win.after(0, self._status_var.set, f"Download failed: {exc}")
