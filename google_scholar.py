@@ -334,6 +334,7 @@ class OpinionPart:
 _WS_RE = re.compile(r"\s+")
 # Google's promo line at the foot of every scholar_case page
 _SAVE_TREES_RE = re.compile(r"^save trees\b", re.IGNORECASE)
+_LEADING_CONTROL_MARK_RE = re.compile(r"^<\s*\d{1,12}\s*$")
 _H_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _BLOCK_TAGS = _H_TAGS | {
     "p", "div", "blockquote", "center", "pre", "table", "tbody", "thead",
@@ -395,6 +396,28 @@ def _educate_block_quotes(block: "Block") -> None:
         end = pos + len(s.text)
         s.text = fixed[pos:end]
         pos = end
+
+
+def _visible_block_text(block: "Block") -> str:
+    return _WS_RE.sub(
+        " ", "".join(s.text for s in block.spans if not s.pagenum)
+    ).strip()
+
+
+def _drop_leading_control_marks(blocks: list[Block]) -> list[Block]:
+    """Remove Scholar's occasional escaped internal id before the caption.
+
+    Some stored Scholar pages begin ``&lt;179928`` (or similar ``<digits``)
+    before the first real caption/citation block.  BeautifulSoup turns that
+    into a text paragraph, but it is not opinion text.
+    """
+    first_real = 0
+    while first_real < len(blocks):
+        if _LEADING_CONTROL_MARK_RE.match(_visible_block_text(blocks[first_real])):
+            first_real += 1
+            continue
+        break
+    return blocks[first_real:] if first_real else blocks
 
 
 def parse_opinion_blocks(html: str) -> list[Block]:
@@ -583,6 +606,7 @@ def parse_opinion_blocks(html: str) -> list[Block]:
     walk(root, {}, "para")
     flush("para")
     blocks = [b for b in blocks if not _SAVE_TREES_RE.match(b.text().strip())]
+    blocks = _drop_leading_control_marks(blocks)
     for block in blocks:
         _educate_block_quotes(block)
     return blocks
@@ -767,7 +791,7 @@ def _content_text(b: Block) -> str:
     """Block text without page markers, whitespace-normalized — page
     markers can open a block ("*116 MR. JUSTICE BLACKMUN delivered…") and
     would defeat the start-anchored classification patterns."""
-    return _WS_RE.sub(" ", "".join(s.text for s in b.spans if not s.pagenum)).strip()
+    return _visible_block_text(b)
 
 
 def _split_footnote_run(blocks: list[Block]) -> tuple[list[Block], list[Block]]:
@@ -1983,6 +2007,18 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     spages = [s.text for b in parse_opinion_blocks(sch_html)
               for s in b.spans if s.pagenum]
     check(spages == ["*152"], f"Scholar gsl_pagenum still works: {spages}")
+
+    # Stored Scholar pages can begin with an escaped internal marker like
+    # "&lt;179928" before the caption.  It is not part of the opinion.
+    noisy_html = (
+        '<div id="gs_opinion"><html><head>&lt;179928\r\n\r\n'
+        '<center><h3 id="gsl_case_name">TRUMP,<br/>v.<br/>COOK</h3></center>'
+        '<p>ON APPLICATION FOR STAY.</p></head></html></div>'
+    )
+    noisy_blocks = parse_opinion_blocks(noisy_html)
+    noisy_texts = [b.text().strip() for b in noisy_blocks[:3]]
+    check(noisy_texts and noisy_texts[0].startswith("TRUMP"),
+          f"leading Scholar control marker dropped: {noisy_texts}")
 
     # link_footnotes_by_marker: a <sup>[N]</sup> reference and a [N]-led body
     # (CourtListener's combined-opinion style) get matching anchor ids so the

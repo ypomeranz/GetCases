@@ -47,7 +47,7 @@ from typing import Optional
 import citations
 from bluebook_names import abbreviate_case_name
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 # Word tokens too generic to help narrow a party search.
 _PARTY_STOP = {
