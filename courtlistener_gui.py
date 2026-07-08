@@ -4651,13 +4651,14 @@ class CourtListenerGUI:
                 parent=self.root,
             )
             return
-        if not data[:1024].lstrip().startswith(b"%PDF"):
+        pdf_data = _normalize_pdf_bytes(data)
+        if pdf_data is None:
             messagebox.showerror(
                 "Import PDF", "That doesn't look like a PDF file.",
                 parent=self.root,
             )
             return
-        _LinkedPdfWindow(self.root, self, data, os.path.basename(path))
+        _LinkedPdfWindow(self.root, self, pdf_data, os.path.basename(path))
 
     def _open_brief_from_bytes(self, data: bytes, name: str) -> None:
         """Text-reader fallback for an imported PDF when the in-app PDF viewer
@@ -7925,6 +7926,22 @@ class _TextFinder:
 # "import a PDF and link its citations" feature, which crashed because the page
 # render and the text scan ran in parallel.
 _PDFIUM_LOCK = threading.RLock()
+_PDF_HEADER_RE = re.compile(br"%PDF-\d")
+
+
+def _normalize_pdf_bytes(data: bytes) -> Optional[bytes]:
+    """Return PDF bytes, trimming a small non-PDF prefix when present.
+
+    Some court storage endpoints prepend whitespace, a byte-order mark, or a
+    short transport artifact before the real ``%PDF-`` header.  Treat those as
+    PDFs so they still open in the in-app viewer; otherwise return ``None``.
+    """
+    if not data:
+        return None
+    m = _PDF_HEADER_RE.search(data[:8192])
+    if not m:
+        return None
+    return data[m.start():] if m.start() else data
 
 
 def _page_content_box_pts(page) -> Optional[tuple]:
@@ -8211,7 +8228,8 @@ class _PdfPane(ttk.Frame):
 
     def __init__(self, parent: tk.Misc, pdf_bytes: bytes, width: int = 800,
                  margin: Optional[int] = None,
-                 link_style: str = "tint") -> None:
+                 link_style: str = "tint",
+                 uniform_crop: bool = False) -> None:
         super().__init__(parent)
         import pypdfium2 as pdfium
         from PIL import ImageTk  # noqa: F401  (availability check at construct)
@@ -8282,6 +8300,8 @@ class _PdfPane(ttk.Frame):
                 finally:
                     page.close()
                 self._meta.append((w_pt, h_pt, frac))
+        if uniform_crop:
+            self._apply_uniform_crop()
 
         self._rect_ids: list[int] = []
         self._slots: list[tuple] = []  # (y, slot_h, frac_box, render_scale)
@@ -8437,6 +8457,31 @@ class _PdfPane(ttk.Frame):
         if (fr - fl) < 0.15 or (fb - ft) < 0.15:
             return full
         return (fl, ft, fr, fb)
+
+    def _apply_uniform_crop(self) -> None:
+        """Use one shared crop box for same-template opinion PDFs."""
+        if len(self._meta) < 2:
+            return
+        widths = [m[0] for m in self._meta]
+        heights = [m[1] for m in self._meta]
+        max_w, max_h = max(widths), max(heights)
+        if max_w <= 0 or max_h <= 0:
+            return
+        if ((max_w - min(widths)) / max_w > 0.03
+                or (max_h - min(heights)) / max_h > 0.03):
+            return
+        full = (0.0, 0.0, 1.0, 1.0)
+        boxes = [m[2] for m in self._meta if m[2] != full]
+        if not boxes:
+            return
+        fl = max(0.0, min(b[0] for b in boxes))
+        ft = max(0.0, min(b[1] for b in boxes))
+        fr = min(1.0, max(b[2] for b in boxes))
+        fb = min(1.0, max(b[3] for b in boxes))
+        if (fr - fl) < 0.15 or (fb - ft) < 0.15:
+            return
+        common = (fl, ft, fr, fb)
+        self._meta = [(w_pt, h_pt, common) for w_pt, h_pt, _ in self._meta]
 
     def _on_yview(self, first: str, last: str) -> None:
         self._vsb.set(first, last)
@@ -13104,8 +13149,8 @@ class _ScholarTextWindow:
                     from PIL import ImageTk  # noqa: F401
                     resp = _anon_session.get(url, timeout=30)
                     resp.raise_for_status()
-                    data = resp.content
-                    if data.startswith(b"%PDF"):
+                    data = _normalize_pdf_bytes(resp.content)
+                    if data is not None:
                         self._pdf_prefetch = (data, url)
                 except ImportError:
                     pass  # no render libs; View PDF will offer the browser
@@ -13151,8 +13196,8 @@ class _ScholarTextWindow:
                     return
                 resp = _anon_session.get(url, timeout=30)
                 resp.raise_for_status()
-                data = resp.content
-                if data.startswith(b"%PDF"):
+                data = _normalize_pdf_bytes(resp.content)
+                if data is not None:
                     self._pdf_prefetch = (data, url)
                     self._post(self._on_pdf_located, True)
             except Exception as exc:
@@ -13208,8 +13253,8 @@ class _ScholarTextWindow:
                 self._pdf_url = url  # so a fetch failure can offer the browser
                 resp = _anon_session.get(url, timeout=30)
                 resp.raise_for_status()
-                data = resp.content
-                if not data.startswith(b"%PDF"):
+                data = _normalize_pdf_bytes(resp.content)
+                if data is None:
                     self._post(self._on_pdf_error,
                                "The source returned something that isn't a PDF.")
                     return
@@ -13227,7 +13272,10 @@ class _ScholarTextWindow:
         # US Reports scans get a roughly 3× margin (see _is_us_reports_pdf).
         margin = _PdfPane._MARGIN * 3 if _is_us_reports_pdf(url) else None
         try:
-            pane = _PdfPane(self._win, data, width=width, margin=margin)
+            pane = _PdfPane(
+                self._win, data, width=width, margin=margin,
+                link_style="recolor", uniform_crop=True,
+            )
         except Exception as exc:  # pragma: no cover - render/lib failure
             self._on_pdf_error(str(exc))
             return
@@ -13250,13 +13298,33 @@ class _ScholarTextWindow:
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
                 return
+            links = {}
             if not any(pages or []):
                 return  # scan-only PDF: no text layer to select
+            try:
+                links = _citation_links_from_pages(pages)
+            except Exception as exc:
+                print(f"[pdf-links] citation scan failed: {exc}")
 
             def apply() -> None:
                 try:
-                    if p.winfo_exists():
+                    if p.winfo_exists() and self._pdf_pane is p:
+                        if links:
+                            p.set_citation_links(
+                                links,
+                                self._open_pdf_cite,
+                                self._open_pdf_cite_browser,
+                            )
                         p.enable_find(pages, bind_keys=False)
+                        bits = []
+                        n = sum(len(v) for v in links.values())
+                        if n:
+                            bits.append(
+                                f"{n} citation link{'s' if n != 1 else ''} "
+                                "shown in blue"
+                            )
+                        bits.append("drag to select text; Ctrl+C copies")
+                        self._status_var.set("; ".join(bits) + ".")
                 except tk.TclError:
                     pass
 
@@ -13294,10 +13362,7 @@ class _ScholarTextWindow:
         self._status_var.set("Showing the official PDF of the opinion.")
 
     def _download_pdf(self) -> None:
-        """Save the PDF currently being viewed to a file the user chooses,
-        cropped to remove the wide blank margins — losslessly (keeping the
-        selectable text) when the PDF has a text layer, otherwise the raster
-        crop — and falling back to the original bytes if that fails."""
+        """Save the original PDF currently being viewed."""
         data = getattr(self, "_pdf_bytes", None)
         if not data:
             return
@@ -13312,18 +13377,11 @@ class _ScholarTextWindow:
         if not path:
             return
         try:
-            if self._pdf_pane is not None:
-                self._pdf_pane.export_best(path)
-            else:
-                with open(path, "wb") as fh:
-                    fh.write(data)
+            with open(path, "wb") as fh:
+                fh.write(data)
         except Exception as exc:
-            try:  # re-spacing failed → save the original scan instead
-                with open(path, "wb") as fh:
-                    fh.write(data)
-            except Exception:
-                messagebox.showerror("Download PDF", str(exc), parent=self._win)
-                return
+            messagebox.showerror("Download PDF", str(exc), parent=self._win)
+            return
         self._status_var.set(f"Saved PDF to {path}")
 
     def _print_pdf(self) -> None:
@@ -13336,7 +13394,7 @@ class _ScholarTextWindow:
         os.close(fd)
         try:
             if self._pdf_pane is not None:
-                self._pdf_pane.export_best(path)
+                self._pdf_pane.export_pdf(path)
             else:
                 with open(path, "wb") as fh:
                     fh.write(data)
@@ -13344,6 +13402,16 @@ class _ScholarTextWindow:
             with open(path, "wb") as fh:
                 fh.write(data)
         _print_pdf_file(self._win, path, self._status_var.set)
+
+    def _open_pdf_cite(self, action: tuple, snippet: str) -> None:
+        if self._app is not None:
+            _follow_brief_action(self._app, self._win, action,
+                                 self._status_var.set)
+        else:
+            _open_citation_in_browser(action, snippet)
+
+    def _open_pdf_cite_browser(self, action: tuple, snippet: str) -> None:
+        _open_citation_in_browser(action, snippet)
 
     def _back_from_pdf(self) -> None:
         """Return from the PDF to the text view it was opened from — the Google
@@ -13675,8 +13743,8 @@ class _PdfWindow:
                 resp = _anon_session.get(self._url, timeout=30,
                                          allow_redirects=True)
                 resp.raise_for_status()
-                data = resp.content
-                if not data.startswith(b"%PDF"):
+                data = _normalize_pdf_bytes(resp.content)
+                if data is None:
                     raise ValueError("the source returned something that "
                                      "isn't a PDF")
                 self._post(self._show, data)
@@ -13687,7 +13755,11 @@ class _PdfWindow:
 
     def _show(self, data: bytes) -> None:
         try:
-            pane = _PdfPane(self._body, data, width=760)
+            pane = _PdfPane(
+                self._body, data, width=760,
+                link_style="recolor" if self._is_case else "tint",
+                uniform_crop=self._is_case,
+            )
         except Exception as exc:  # pragma: no cover - render/lib failure
             self._error(str(exc))
             return
@@ -13704,13 +13776,32 @@ class _PdfWindow:
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
                 return
+            links = {}
             if not any(pages or []):
                 return
+            if self._is_case:
+                try:
+                    links = _citation_links_from_pages(pages)
+                except Exception as exc:
+                    print(f"[pdf-links] citation scan failed: {exc}")
 
             def apply() -> None:
                 try:
-                    if p.winfo_exists():
+                    if p.winfo_exists() and self._pane is p:
+                        if links:
+                            p.set_citation_links(
+                                links,
+                                self._open_cite,
+                                self._open_cite_browser,
+                            )
                         p.enable_find(pages)
+                        n = sum(len(v) for v in links.values())
+                        if n:
+                            self._status_var.set(
+                                f"{n} citation link"
+                                f"{'' if n == 1 else 's'} shown in blue; "
+                                "drag to select text."
+                            )
                 except tk.TclError:
                     pass
 
@@ -13735,7 +13826,7 @@ class _PdfWindow:
         os.close(fd)
         try:
             if self._pane is not None:
-                self._pane.export_best(path)
+                self._pane.export_pdf(path)
             else:
                 with open(path, "wb") as fh:
                     fh.write(data)
@@ -13759,19 +13850,22 @@ class _PdfWindow:
         if not path:
             return
         try:
-            if self._pane is not None:
-                self._pane.export_best(path)
-            else:
-                with open(path, "wb") as fh:
-                    fh.write(data)
-        except Exception:
-            try:  # re-spacing failed → save the original scan
-                with open(path, "wb") as fh:
-                    fh.write(data)
-            except Exception as exc:
-                messagebox.showerror("Download PDF", str(exc), parent=self._win)
-                return
+            with open(path, "wb") as fh:
+                fh.write(data)
+        except Exception as exc:
+            messagebox.showerror("Download PDF", str(exc), parent=self._win)
+            return
         self._status_var.set(f"Saved PDF to {path}")
+
+    def _open_cite(self, action: tuple, snippet: str) -> None:
+        if self._app is not None:
+            _follow_brief_action(self._app, self._win, action,
+                                 self._status_var.set)
+        else:
+            _open_citation_in_browser(action, snippet)
+
+    def _open_cite_browser(self, action: tuple, snippet: str) -> None:
+        _open_citation_in_browser(action, snippet)
 
 
 def _print_pdf_file(parent: tk.Misc, path: str,
@@ -14182,8 +14276,15 @@ class _SlipOpinionWindow:
             return
         fd, path = tempfile.mkstemp(suffix=".pdf")
         os.close(fd)
-        with open(path, "wb") as fh:
-            fh.write(self._bytes)
+        try:
+            if self._pane is not None:
+                self._pane.export_pdf(path)
+            else:
+                with open(path, "wb") as fh:
+                    fh.write(self._bytes)
+        except Exception:
+            with open(path, "wb") as fh:
+                fh.write(self._bytes)
         _print_pdf_file(self._win, path, self._status_var.set)
 
     # -- load / analyze ------------------------------------------------------
@@ -14208,8 +14309,8 @@ class _SlipOpinionWindow:
             try:
                 resp = _anon_session.get(self._url, timeout=45)
                 resp.raise_for_status()
-                data = resp.content
-                if data[:4] != b"%PDF":
+                data = _normalize_pdf_bytes(resp.content)
+                if data is None:
                     raise RuntimeError("supremecourt.gov did not return a PDF")
             except Exception as exc:
                 self._post(self._error, f"Could not load the opinion: {exc}")
@@ -14236,8 +14337,10 @@ class _SlipOpinionWindow:
         except tk.TclError:
             width = 800
         try:
-            pane = _PdfPane(self._body, data, width=width,
-                            link_style="recolor")
+            pane = _PdfPane(
+                self._body, data, width=width,
+                link_style="recolor", uniform_crop=True,
+            )
         except Exception as exc:
             self._error(f"Could not render the PDF: {exc}")
             return
