@@ -7276,8 +7276,19 @@ _LATEX_PREAMBLE = r"""\documentclass[11pt]{article}
 \setlength{\footnotesep}{0.85\baselineskip}
 \addtolength{\skip\footins}{0.4\baselineskip}
 % Star pagination: an inline reporter page marker that also feeds the
-% running head's page range through TeX's mark mechanism.
-\newcommand{\starpage}[2]{\markboth{#1}{#1}{\bfseries\footnotesize #2}}
+% running head's page range through TeX's mark mechanism.  Marks store
+% {last reporter page visible}{first reporter page visible}.  If a marker
+% appears after text has already landed on the sheet, that sheet began on
+% the previous reporter page; when the marker is truly at the top, it begins
+% on the marked page itself.
+\newcommand{\opprevpage}[1]{\ifnum#1>1\number\numexpr#1-1\relax\else#1\fi}
+\newcommand{\starpage}[2]{%
+  \ifdim\pagetotal>0pt
+    \markboth{#1}{\opprevpage{#1}}%
+  \else
+    \markboth{#1}{#1}%
+  \fi
+  {\bfseries\footnotesize #2}}
 \newcommand{\starpagetext}[1]{{\bfseries\footnotesize #1}}
 % A footnote carrying the reporter's own number (or symbol).
 \newcommand{\opfootnote}[2]{\begingroup
@@ -7321,10 +7332,84 @@ _LATEX_PREAMBLE = r"""\documentclass[11pt]{article}
 """
 
 
+_LATEX_ENGINE_NAMES = ("pdflatex", "xelatex", "lualatex", "tectonic")
+
+
+def _is_executable_file(path: str) -> bool:
+    return bool(path and os.path.isfile(path) and os.access(path, os.X_OK))
+
+
+def _mac_latex_search_paths() -> list[str]:
+    """Common TeX/MiKTeX locations missed by GUI-launched macOS apps."""
+    if sys.platform != "darwin":
+        return []
+    home = str(Path.home())
+    paths = [
+        "/Library/TeX/texbin",
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+        "/usr/texbin",
+        os.path.join(home, "bin"),
+        os.path.join(home, ".local", "bin"),
+        "/Applications/MiKTeX Console.app/Contents/bin",
+        "/Applications/MiKTeX Console.app/Contents/MacOS",
+        os.path.join(home, "Applications", "MiKTeX Console.app",
+                     "Contents", "bin"),
+        os.path.join(home, "Applications", "MiKTeX Console.app",
+                     "Contents", "MacOS"),
+    ]
+    for parent in (
+        Path(home) / "Library" / "Application Support" / "MiKTeX"
+        / "texmfs" / "install" / "miktex" / "bin",
+        Path("/Library/Application Support/MiKTeX/texmfs/install/miktex/bin"),
+    ):
+        try:
+            paths.extend(str(p) for p in parent.glob("*-darwin") if p.is_dir())
+        except OSError:
+            pass
+    return paths
+
+
+def _which_from_login_shell(name: str) -> Optional[str]:
+    """Find TeX binaries from the user's login shell on macOS."""
+    if sys.platform != "darwin":
+        return None
+    shells = [
+        os.environ.get("SHELL", ""),
+        "/bin/zsh",
+        "/bin/bash",
+    ]
+    seen: set[str] = set()
+    for shell in shells:
+        if not shell or shell in seen or not os.path.exists(shell):
+            continue
+        seen.add(shell)
+        try:
+            proc = subprocess.run(
+                [shell, "-lc", f"command -v {name}"],
+                capture_output=True, text=True, errors="replace", timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in (proc.stdout or "").splitlines():
+            path = line.strip()
+            if os.path.isabs(path) and _is_executable_file(path):
+                return path
+    return None
+
+
 def _find_latex_engine() -> Optional[tuple[str, str]]:
     """The first available LaTeX→PDF engine, as (name, executable path)."""
-    for name in ("pdflatex", "xelatex", "lualatex", "tectonic"):
+    extra_path = os.pathsep.join(_mac_latex_search_paths())
+    for name in _LATEX_ENGINE_NAMES:
         exe = shutil.which(name)
+        if exe:
+            return name, exe
+        if extra_path:
+            exe = shutil.which(name, path=extra_path)
+            if exe:
+                return name, exe
+        exe = _which_from_login_shell(name)
         if exe:
             return name, exe
     return None
@@ -7525,6 +7610,45 @@ _SCHOLAR_MATCH_THRESHOLD = 0.60
 _OPINION_FONT_PT = 11
 _OPINION_FONT_MIN = 7
 _OPINION_FONT_MAX = 24
+
+
+def _screen_text_scale(widget: tk.Misc) -> float:
+    """Conservative type nudge for dense/high-resolution displays.
+
+    Tk point sizes normally follow OS scaling, but GUI apps launched outside a
+    shell on macOS can still land with very small side-panel text on 4K/5K
+    screens.  Keep the main reader user-controlled and scale only supporting
+    panels that otherwise have fixed 9 pt labels.
+    """
+    scale = 1.0
+    try:
+        width = int(widget.winfo_screenwidth())
+        height = int(widget.winfo_screenheight())
+        long_side, short_side = max(width, height), min(width, height)
+        if long_side >= 5000 or short_side >= 2800:
+            scale = 1.45
+        elif long_side >= 3800 or short_side >= 2100:
+            scale = 1.33
+        elif long_side >= 3000 or short_side >= 1700:
+            scale = 1.22
+        elif long_side >= 2500 or short_side >= 1400:
+            scale = 1.12
+    except Exception:
+        pass
+    try:
+        dpi = float(widget.winfo_fpixels("1i"))
+        if dpi >= 180:
+            scale = max(scale, 1.22)
+        elif dpi >= 135:
+            scale = max(scale, 1.12)
+    except Exception:
+        pass
+    return min(scale, 1.45)
+
+
+def _scaled_panel_font_size(widget: tk.Misc, base_size: int) -> int:
+    return max(base_size, min(base_size + 5,
+                              int(round(base_size * _screen_text_scale(widget)))))
 
 
 def _find_scholar_for_item(
@@ -9128,7 +9252,10 @@ class _ScholarTextWindow:
         # SCOTUS cases open the Oyez "Case details" panel by default (wired up
         # in _build_ui); widen the window by the panel's width so the opinion
         # text keeps its usual room with the panel added to the right of it.
-        win_w = 860 + (self._DETAILS_PANEL_W if self._is_scotus else 0)
+        self._details_panel_w = int(
+            round(self._DETAILS_PANEL_W * _screen_text_scale(self._win))
+        )
+        win_w = 860 + (self._details_panel_w if self._is_scotus else 0)
         self._win.geometry(
             _fit_toplevel_geometry(
                 self._win, win_w, 680, min_width=430, min_height=300
@@ -10115,7 +10242,10 @@ class _ScholarTextWindow:
         txt.mark_set(start_mark, start)
         txt.mark_gravity(start_mark, "left")
         txt.mark_set(end_mark, end)
-        txt.mark_gravity(end_mark, "right")
+        # Text.insert("end", ...) inserts at the same boundary later parts use.
+        # Left gravity keeps a finished part from absorbing the next separate
+        # opinion, which would duplicate dissents/concurrences during export.
+        txt.mark_gravity(end_mark, "left")
         self._part_region_marks.extend([start_mark, end_mark])
         self._part_regions.append((start_mark, end_mark, part_index))
 
@@ -11938,13 +12068,17 @@ class _ScholarTextWindow:
     def _details_panel(self) -> ttk.Frame:
         if self._details_frame is None:
             f = ttk.Frame(self._text_frame)
+            body_size = _scaled_panel_font_size(self._win, 9)
+            panel_title_size = _scaled_panel_font_size(self._win, 9)
+            content_title_size = _scaled_panel_font_size(self._win, 11)
             self._details_title_var = tk.StringVar(value="Opinions & Joins")
             ttk.Label(
                 f, textvariable=self._details_title_var, anchor="w",
-                font=("TkDefaultFont", 9, "bold"),
+                font=("TkDefaultFont", panel_title_size, "bold"),
             ).pack(fill="x", padx=6, pady=(4, 2))
             body = tk.Text(
-                f, width=38, wrap="word", font=("TkDefaultFont", 9),
+                f, width=38, wrap="word",
+                font=("TkDefaultFont", body_size),
                 state="disabled", padx=8, pady=4, relief="flat",
                 background="#f7f5ef", cursor="",
             )
@@ -11952,11 +12086,12 @@ class _ScholarTextWindow:
             body.configure(yscrollcommand=dvsb.set)
             dvsb.pack(side="right", fill="y")
             body.pack(side="left", fill="both", expand=True)
-            body.tag_configure("title", font=("TkDefaultFont", 11, "bold"),
+            body.tag_configure("title",
+                               font=("TkDefaultFont", content_title_size, "bold"),
                                spacing1=2, spacing3=2)
-            body.tag_configure("h", font=("TkDefaultFont", 9, "bold"),
+            body.tag_configure("h", font=("TkDefaultFont", body_size, "bold"),
                                spacing1=10)
-            body.tag_configure("lbl", font=("TkDefaultFont", 9, "italic"),
+            body.tag_configure("lbl", font=("TkDefaultFont", body_size, "italic"),
                                foreground="#666666")
             body.tag_configure("olink", foreground=self._LINK_COLOR,
                                underline=True)
