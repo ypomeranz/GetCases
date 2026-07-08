@@ -342,6 +342,50 @@ _STATE_OF_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Relator construction "<party> ex rel. <relator>" (rule 10.2.1(b)): "on the
+# relation of" and its synonyms are abbreviated "ex rel.".  The party named
+# ahead of the phrase — a State, the United States, "People", … — is a named
+# party to the suit, so rule 10.2.2 forbids abbreviating its geographic name:
+# the cite reads "Indiana ex rel. Anderson", never "Ind. ex rel. Anderson".
+# Matched case-insensitively and re-emitted in canonical lowercase form.
+_EX_REL_RE = re.compile(
+    r"[\s,]+(?:ex\s+rel(?:\.|atione)?|on\s+(?:the\s+)?relation\s+of)[\s,]+",
+    re.IGNORECASE,
+)
+
+
+def _norm_geo(s: str) -> str:
+    """Comparison key for a geographic abbreviation: letters only, uppercased
+    ("N.C." / "N. C." -> "NC", "Ind." -> "IND")."""
+    return re.sub(r"[^A-Za-z]", "", s).upper()
+
+
+# Reverse of the geographic abbreviations, to restore a named party that a
+# source (e.g. CourtListener) already abbreviated: rule 10.2.2 keeps the
+# party's full name, so "Ind. ex rel." must read "Indiana ex rel." and
+# "U.S. ex rel." must read "United States ex rel.".
+_GEO_EXPANSIONS: dict[str, str] = {
+    _norm_geo(_abbr): _full.title() for _full, _abbr in _T10_WORDS.items()
+}
+_GEO_EXPANSIONS.update({
+    _norm_geo(_abbr): _full for _abbr, _full in {
+        "D.C.": "District of Columbia", "N.H.": "New Hampshire",
+        "N.J.": "New Jersey", "N.M.": "New Mexico", "N.Y.": "New York",
+        "N.C.": "North Carolina", "N.D.": "North Dakota",
+        "P.R.": "Puerto Rico", "R.I.": "Rhode Island",
+        "S.C.": "South Carolina", "S.D.": "South Dakota",
+        "W. Va.": "West Virginia", "U.S.": "United States",
+    }.items()
+})
+
+
+def _expand_geo_party(head: str) -> str:
+    """Restore a geographic party a source abbreviated ("Ind." -> "Indiana",
+    "U.S." -> "United States") so the no-abbreviation rule for a named
+    geographic party (rule 10.2.2) applies; other heads pass through."""
+    return _GEO_EXPANSIONS.get(_norm_geo(head), head)
+
+
 # A municipal party — "City of New York", "Village of Arlington Heights" —
 # is itself a geographic unit: the place name is not abbreviated, only the
 # T6 word in the prefix ("Vill. of Arlington Heights", "Cnty. of
@@ -713,6 +757,21 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     p = re.sub(r"\bUnited States of America\b", "United States", p,
                flags=re.IGNORECASE)
     p = _STATE_OF_RE.sub("", p)  # "State of Washington" -> "Washington"
+
+    # Relator construction (rule 10.2.1(b)): split "<party> ex rel. <relator>".
+    # The named party keeps its full geographic name (rule 10.2.2) — restored
+    # if the source abbreviated it — while the relator abbreviates normally and
+    # its given name drops (rule 10.2.1(g)): "Ind. Ex Rel. John Anderson" ->
+    # "Indiana ex rel. Anderson".
+    rel_m = _EX_REL_RE.search(p)
+    if rel_m:
+        head = _expand_geo_party(p[:rel_m.start()].strip(" ,"))
+        tail = p[rel_m.end():].strip(" ,")
+        if head and tail:
+            lhs = _abbreviate_party(head, recognize_initials=recognize_initials)
+            rhs = _abbreviate_party(tail, recognize_initials=recognize_initials)
+            return f"{lhs} ex rel. {rhs}"
+
     if recognize_initials:  # rule 10.2.1(c): SEC, NLRB, FCC…
         initials = _recognized_initialism(p)
         if initials:
@@ -923,6 +982,23 @@ if __name__ == "__main__":
         ("Town of Greece v. Susan Galloway", "Town of Greece v. Galloway"),
         ("City of New York Department of Parks v. Doe",
          "City of N.Y. Dep't of Parks v. Doe"),
+        # Relator constructions (rule 10.2.1(b)): the named party ahead of
+        # "ex rel." keeps its full geographic name (rule 10.2.2), even when the
+        # source abbreviated it; the relator abbreviates normally.
+        ("Indiana ex rel. Anderson v. Brand",
+         "Indiana ex rel. Anderson v. Brand"),
+        ("NAACP v. Alabama ex rel. Patterson",
+         "NAACP v. Alabama ex rel. Patterson"),
+        ("Ind. Ex Rel. Anderson v. Brand", "Indiana ex rel. Anderson v. Brand"),
+        ("U.S. ex rel. John Turner v. Williams",
+         "United States ex rel. Turner v. Williams"),
+        ("United States ex rel. Skinner & Eddy Corp. v. McCarl",
+         "United States ex rel. Skinner & Eddy Corp. v. McCarl"),
+        ("State of Ohio ex rel. Smith v. Jones", "Ohio ex rel. Smith v. Jones"),
+        ("People of the State of New York ex rel. Spitzer v. Grasso",
+         "New York ex rel. Spitzer v. Grasso"),
+        ("W. Va. ex rel. Discover Fin. Servs. v. Nibert",
+         "West Virginia ex rel. Discover Fin. Servs. v. Nibert"),
         # Widely recognized initials (rule 10.2.1(c))
         ("Lorenzo v. Securities and Exchange Commission", "Lorenzo v. SEC"),
         ("Securities & Exchange Commission v. Edwards", "SEC v. Edwards"),
