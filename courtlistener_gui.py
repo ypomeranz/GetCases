@@ -7640,6 +7640,38 @@ _OPINION_FONT_PT = 11
 _OPINION_FONT_MIN = 7
 _OPINION_FONT_MAX = 24
 
+# Side (details) panel text zoom — a point offset the user sets with the
+# panel's own A−/A+ control.  Persisted to config so it carries across cases
+# and app launches.  This sidesteps auto-DPI detection, which can't see a
+# Retina Mac's true resolution (Tk reports logical points and 72 dpi there),
+# leaving the panel small until the user nudges it.
+_DETAILS_FONT_MIN_DELTA = -4
+_DETAILS_FONT_MAX_DELTA = 16
+_details_font_delta: Optional[int] = None
+
+
+def _clamp_details_delta(delta: int) -> int:
+    return max(_DETAILS_FONT_MIN_DELTA, min(_DETAILS_FONT_MAX_DELTA, delta))
+
+
+def _get_details_font_delta() -> int:
+    """The saved side-panel zoom offset (loaded once, then cached)."""
+    global _details_font_delta
+    if _details_font_delta is None:
+        raw = _load_config().get("details_font_delta", 0)
+        _details_font_delta = _clamp_details_delta(
+            int(raw) if isinstance(raw, (int, float)) else 0)
+    return _details_font_delta
+
+
+def _set_details_font_delta(delta: int) -> None:
+    """Update and persist the side-panel zoom offset."""
+    global _details_font_delta
+    _details_font_delta = _clamp_details_delta(delta)
+    data = _load_config()
+    data["details_font_delta"] = _details_font_delta
+    _save_config(data)
+
 
 def _screen_text_scale(widget: tk.Misc) -> float:
     """Conservative type nudge for dense/high-resolution displays.
@@ -12343,17 +12375,47 @@ class _ScholarTextWindow:
     def _details_panel(self) -> ttk.Frame:
         if self._details_frame is None:
             f = ttk.Frame(self._text_frame)
-            body_size = _scaled_panel_font_size(self._win, 9)
-            panel_title_size = _scaled_panel_font_size(self._win, 9)
-            content_title_size = _scaled_panel_font_size(self._win, 11)
+            base_family = tkfont.nametofont("TkDefaultFont").actual("family")
+            # Base point sizes (auto-scaled for dense displays); the panel's own
+            # A−/A+ control then layers a persisted offset on top of these.
+            self._details_font_bases = {
+                "body": _scaled_panel_font_size(self._win, 9),
+                "title": _scaled_panel_font_size(self._win, 9),
+                "h": _scaled_panel_font_size(self._win, 9),
+                "lbl": _scaled_panel_font_size(self._win, 9),
+                "ctitle": _scaled_panel_font_size(self._win, 11),
+            }
+            # Named Font objects so a zoom just reconfigures them and Tk
+            # restyles the heading, body and every tag at once.
+            def _mk(key, **kw):
+                return tkfont.Font(
+                    family=base_family, size=self._details_font_bases[key], **kw)
+            self._details_fonts = {
+                "body": _mk("body"),
+                "title": _mk("title", weight="bold"),
+                "h": _mk("h", weight="bold"),
+                "lbl": _mk("lbl", slant="italic"),
+                "ctitle": _mk("ctitle", weight="bold"),
+            }
             self._details_title_var = tk.StringVar(value="Opinions & Joins")
+
+            header = ttk.Frame(f)
+            header.pack(fill="x", padx=6, pady=(4, 2))
             ttk.Label(
-                f, textvariable=self._details_title_var, anchor="w",
-                font=("TkDefaultFont", panel_title_size, "bold"),
-            ).pack(fill="x", padx=6, pady=(4, 2))
+                header, textvariable=self._details_title_var, anchor="w",
+                font=self._details_fonts["title"],
+            ).pack(side="left", fill="x", expand=True)
+            # Text-size control for this panel, top-right opposite the heading —
+            # the side panel is otherwise fixed-size and can read small on
+            # high-resolution screens (e.g. a Retina Mac).
+            _ui_button(header, "A+", command=lambda: self._zoom_details(+1),
+                       width=40).pack(side="right")
+            _ui_button(header, "A−", command=lambda: self._zoom_details(-1),
+                       width=40).pack(side="right", padx=(0, 4))
+
             body = tk.Text(
                 f, width=38, wrap="word",
-                font=("TkDefaultFont", body_size),
+                font=self._details_fonts["body"],
                 state="disabled", padx=8, pady=4, relief="flat",
                 background="#f7f5ef", cursor="",
             )
@@ -12361,12 +12423,10 @@ class _ScholarTextWindow:
             body.configure(yscrollcommand=dvsb.set)
             dvsb.pack(side="right", fill="y")
             body.pack(side="left", fill="both", expand=True)
-            body.tag_configure("title",
-                               font=("TkDefaultFont", content_title_size, "bold"),
+            body.tag_configure("title", font=self._details_fonts["ctitle"],
                                spacing1=2, spacing3=2)
-            body.tag_configure("h", font=("TkDefaultFont", body_size, "bold"),
-                               spacing1=10)
-            body.tag_configure("lbl", font=("TkDefaultFont", body_size, "italic"),
+            body.tag_configure("h", font=self._details_fonts["h"], spacing1=10)
+            body.tag_configure("lbl", font=self._details_fonts["lbl"],
                                foreground="#666666")
             body.tag_configure("olink", foreground=self._LINK_COLOR,
                                underline=True)
@@ -12376,7 +12436,31 @@ class _ScholarTextWindow:
                           lambda _e: body.config(cursor=""))
             self._details_text = body
             self._details_frame = f
+            self._apply_details_fonts()   # honor the persisted zoom choice
         return self._details_frame
+
+    def _apply_details_fonts(self) -> None:
+        """Resize the side panel's fonts to their base size plus the saved zoom
+        offset.  Reconfiguring the shared Font objects restyles the heading,
+        body and every tag together."""
+        fonts = getattr(self, "_details_fonts", None)
+        if not fonts:
+            return
+        delta = _get_details_font_delta()
+        for name, font in fonts.items():
+            font.configure(
+                size=max(7, min(30, self._details_font_bases[name] + delta)))
+
+    def _zoom_details(self, delta: int) -> None:
+        """Grow/shrink the side panel's text with its A−/A+ control (delta 0
+        resets), persisting the choice across cases and launches."""
+        if not getattr(self, "_details_fonts", None):
+            return
+        _set_details_font_delta(0 if delta == 0 else
+                                _get_details_font_delta() + delta)
+        self._apply_details_fonts()
+        self._status_var.set(
+            f"Side panel text: {self._details_fonts['body'].cget('size')} pt")
 
     def _toggle_details(self) -> None:
         if self._details_var.get():
