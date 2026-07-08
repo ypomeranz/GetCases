@@ -8085,15 +8085,30 @@ def _page_has_scan_background(page) -> bool:
     import pypdfium2.raw as C
 
     try:
+        text_objs = 0
+        invisible_text_objs = 0
+        image_objs = 0
         mb = tuple(page.get_mediabox())
         page_w, page_h = mb[2] - mb[0], mb[3] - mb[1]
         page_area = max(1.0, page_w * page_h)
+        invisible_mode = getattr(C, "FPDF_TEXTRENDERMODE_INVISIBLE", 3)
         for obj in page.get_objects():
             try:
-                if C.FPDFPageObj_GetType(obj.raw) != C.FPDF_PAGEOBJ_IMAGE:
-                    continue
+                obj_type = C.FPDFPageObj_GetType(obj.raw)
             except Exception:
-                pass
+                obj_type = None
+            if obj_type == C.FPDF_PAGEOBJ_TEXT:
+                text_objs += 1
+                try:
+                    if C.FPDFTextObj_GetTextRenderMode(obj.raw) == invisible_mode:
+                        invisible_text_objs += 1
+                except Exception:
+                    pass
+                continue
+            if obj_type == C.FPDF_PAGEOBJ_IMAGE:
+                image_objs += 1
+            elif obj_type is not None:
+                continue
             try:
                 ol, ob, orr, ot = obj.get_pos()
             except Exception:
@@ -8105,6 +8120,10 @@ def _page_has_scan_background(page) -> bool:
                     and ow >= 0.70 * page_w
                     and oh >= 0.70 * page_h):
                 return True
+        if text_objs >= 10 and invisible_text_objs / text_objs >= 0.75:
+            return True
+        if image_objs and text_objs >= 10 and invisible_text_objs / text_objs >= 0.5:
+            return True
     except Exception:
         return False
     return False
