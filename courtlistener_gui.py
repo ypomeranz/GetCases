@@ -576,7 +576,7 @@ def _save_token(token: str) -> None:
 
 
 def _default_spotlight_hotkey() -> str:
-    return "<cmd>+<space>" if sys.platform == "darwin" else "<ctrl>+<space>"
+    return "<ctrl>+<space>" if sys.platform == "darwin" else "<ctrl>+<space>"
 
 
 def _load_saved_spotlight_hotkey() -> str:
