@@ -18,6 +18,7 @@ Token lookup order:
 from __future__ import annotations
 
 import difflib
+import html as _html
 import importlib.util
 import json
 import os
@@ -5323,7 +5324,17 @@ class CourtListenerGUI:
 
         def _head_ok(url: str, label: str) -> bool:
             try:
-                resp = _anon_session.head(url, timeout=10, allow_redirects=True)
+                session = (
+                    client._session if _is_courtlistener_url(url)
+                    else _anon_session
+                )
+                headers = dict(_anon_session.headers)
+                if session is not _anon_session:
+                    auth = getattr(session, "headers", {}).get("Authorization")
+                    if auth:
+                        headers["Authorization"] = auth
+                resp = session.head(
+                    url, timeout=10, allow_redirects=True, headers=headers)
                 if resp.status_code == 200:
                     return True
                 print(f"[resolve] {label} returned {resp.status_code}: {url}")
@@ -7144,6 +7155,7 @@ def _latex_run(
     notes: Optional[dict[str, tuple[str, str]]],
     used: Optional[set[str]],
     marks: bool = True,
+    has_prior_text: bool = False,
 ) -> str:
     """One styled run as LaTeX.  `notes` maps footnote anchor ids to
     (label, body-latex); the first reference to a note replaces its marker
@@ -7155,7 +7167,12 @@ def _latex_run(
         disp = _latex_escape(text.strip())
         m = re.search(r"\d+", text)
         if marks and m:
-            return lead + "\\starpage{%s}{%s}" % (m.group(0), disp) + trail
+            return (
+                lead
+                + "\\starpage{%s}{%s}{%d}"
+                % (m.group(0), disp, 1 if has_prior_text else 0)
+                + trail
+            )
         return lead + "\\starpagetext{%s}" % disp + trail
     if run.fnref:
         if notes and used is not None and run.fnref in notes \
@@ -7205,7 +7222,15 @@ def _latex_paragraphs(
     for p in paras:
         if p.kind == "fnhead":
             continue  # "Footnotes" label: notes are typeset at page bottoms
-        body = "".join(_latex_run(r, notes, used) for r in p.runs).strip()
+        pieces: list[str] = []
+        seen_text = False
+        for r in p.runs:
+            pieces.append(_latex_run(
+                r, notes, used, has_prior_text=seen_text))
+            if (not r.pagenum and not r.fnref and not r.fndef
+                    and r.text.strip()):
+                seen_text = True
+        body = "".join(pieces).strip()
         if not body:
             continue
         if p.kind == "blockquote":
@@ -7278,16 +7303,27 @@ _LATEX_PREAMBLE = r"""\documentclass[11pt]{article}
 \addtolength{\skip\footins}{0.4\baselineskip}
 % Star pagination: an inline reporter page marker that also feeds the
 % running head's page range through TeX's mark mechanism.  Marks store
-% {last reporter page visible}{first reporter page visible}.  If a marker
-% appears after text has already landed on the sheet, that sheet began on
-% the previous reporter page; when the marker is truly at the top, it begins
-% on the marked page itself.
-\newcommand{\opprevpage}[1]{\ifnum#1>1\number\numexpr#1-1\relax\else#1\fi}
-\newcommand{\starpage}[2]{%
-  \ifdim\pagetotal>0pt
-    \markboth{#1}{\opprevpage{#1}}%
+% {last reporter page visible}{first reporter page visible}.  A marker
+% such as *23 marks the break from reporter page 22 to 23, so a sheet that
+% contains actual text before that marker reports 22--23.  If the marker is
+% the first actual text on the sheet, the sheet begins on 23.
+\newcount\opfirstreporterpage
+\opfirstreporterpage=1
+\newcommand{\opfirstvisiblepage}[1]{%
+  \ifnum#1>\opfirstreporterpage
+    \number\numexpr#1-1\relax
   \else
-    \markboth{#1}{#1}%
+    #1%
+  \fi}
+\newcommand{\starpage}[3]{%
+  \ifnum#3>0
+    \markboth{#1}{\opfirstvisiblepage{#1}}%
+  \else
+    \ifdim\pagetotal>0pt
+      \markboth{#1}{\opfirstvisiblepage{#1}}%
+    \else
+      \markboth{#1}{#1}%
+    \fi
   \fi
   {\bfseries\footnotesize #2}}
 \newcommand{\starpagetext}[1]{{\bfseries\footnotesize #1}}
@@ -7927,6 +7963,10 @@ class _TextFinder:
 # render and the text scan ran in parallel.
 _PDFIUM_LOCK = threading.RLock()
 _PDF_HEADER_RE = re.compile(br"%PDF-\d")
+_PDF_LINK_ATTR_RE = re.compile(
+    r"""(?is)\b(?:href|src|data|data-url)=["']([^"']+)["']"""
+)
+_ABS_URL_RE = re.compile(r"""https?://[^\s"'<>]+""", re.IGNORECASE)
 
 
 def _normalize_pdf_bytes(data: bytes) -> Optional[bytes]:
@@ -7938,10 +7978,142 @@ def _normalize_pdf_bytes(data: bytes) -> Optional[bytes]:
     """
     if not data:
         return None
-    m = _PDF_HEADER_RE.search(data[:8192])
+    m = _PDF_HEADER_RE.search(data[:1024 * 1024])
     if not m:
         return None
     return data[m.start():] if m.start() else data
+
+
+def _is_courtlistener_url(url: str) -> bool:
+    host = (urllib.parse.urlparse(url or "").netloc or "").lower()
+    return host == "courtlistener.com" or host.endswith(".courtlistener.com")
+
+
+def _looks_like_pdf_url(url: str) -> bool:
+    p = urllib.parse.urlparse(url or "")
+    host = (p.netloc or "").lower()
+    path_q = (p.path + "?" + p.query).lower()
+    return (
+        path_q.endswith(".pdf")
+        or ".pdf?" in path_q
+        or host == "storage.courtlistener.com"
+        or (host.endswith(".courtlistener.com") and "/pdf" in path_q)
+    )
+
+
+def _pdf_link_candidates_from_html(data: bytes, base_url: str) -> list[str]:
+    """PDF-looking links found in a non-PDF response body."""
+    try:
+        text = data[:300_000].decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    found: list[str] = []
+
+    def add(raw: str) -> None:
+        raw = _html.unescape((raw or "").strip())
+        if not raw or raw.startswith(("javascript:", "mailto:", "#")):
+            return
+        url = urllib.parse.urljoin(base_url, raw)
+        if _looks_like_pdf_url(url) and url not in found:
+            found.append(url)
+
+    for raw in _PDF_LINK_ATTR_RE.findall(text):
+        add(raw)
+    for raw in _ABS_URL_RE.findall(text):
+        add(raw.rstrip(").,;"))
+    return found
+
+
+def _pdf_get(url: str, client=None, timeout: int = 30):
+    """GET *url* using the CourtListener session only for CourtListener hosts."""
+    session = (
+        client._session
+        if client is not None and _is_courtlistener_url(url)
+        else _anon_session
+    )
+    headers = dict(_anon_session.headers)
+    if session is not _anon_session:
+        auth = getattr(session, "headers", {}).get("Authorization")
+        if auth:
+            headers["Authorization"] = auth
+    return session.get(url, timeout=timeout, allow_redirects=True, headers=headers)
+
+
+def _fetch_pdf_bytes(
+    url: str,
+    *,
+    client=None,
+    timeout: int = 30,
+    max_hops: int = 3,
+) -> "Optional[tuple[bytes, str]]":
+    """Fetch *url* as a PDF, following a small HTML wrapper if necessary."""
+    queue = [url]
+    seen: set[str] = set()
+    while queue and len(seen) < max_hops:
+        cur = queue.pop(0)
+        if not cur or cur in seen:
+            continue
+        seen.add(cur)
+        resp = _pdf_get(cur, client=client, timeout=timeout)
+        resp.raise_for_status()
+        final_url = getattr(resp, "url", None) or cur
+        data = _normalize_pdf_bytes(resp.content)
+        if data is not None:
+            return data, final_url
+        for nxt in _pdf_link_candidates_from_html(resp.content, final_url):
+            if nxt not in seen and nxt not in queue:
+                queue.append(nxt)
+    return None
+
+
+def _page_has_scan_background(page) -> bool:
+    """True when a page appears to be an OCR layer over a full-page scan."""
+    import pypdfium2.raw as C
+
+    try:
+        mb = tuple(page.get_mediabox())
+        page_w, page_h = mb[2] - mb[0], mb[3] - mb[1]
+        page_area = max(1.0, page_w * page_h)
+        for obj in page.get_objects():
+            try:
+                if C.FPDFPageObj_GetType(obj.raw) != C.FPDF_PAGEOBJ_IMAGE:
+                    continue
+            except Exception:
+                pass
+            try:
+                ol, ob, orr, ot = obj.get_pos()
+            except Exception:
+                continue
+            ow, oh = orr - ol, ot - ob
+            if ow <= 0 or oh <= 0:
+                continue
+            if (ow * oh >= 0.80 * page_area
+                    and ow >= 0.70 * page_w
+                    and oh >= 0.70 * page_h):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _pdf_ocr_scan_pages(pdf_bytes: bytes) -> set[int]:
+    """Page indexes whose text layer likely comes from OCR over a scan."""
+    import pypdfium2 as pdfium
+
+    pages: set[int] = set()
+    with _PDFIUM_LOCK:
+        doc = pdfium.PdfDocument(pdf_bytes)
+        try:
+            for i in range(len(doc)):
+                page = doc[i]
+                try:
+                    if _page_has_scan_background(page):
+                        pages.add(i)
+                finally:
+                    page.close()
+        finally:
+            doc.close()
+    return pages
 
 
 def _page_content_box_pts(page) -> Optional[tuple]:
@@ -8153,7 +8325,10 @@ def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
             doc.close()
 
 
-def _citation_links_from_pages(pages: list) -> dict:
+def _citation_links_from_pages(
+    pages: list,
+    link_pages: Optional[set[int]] = None,
+) -> dict:
     """Build the per-page clickable-citation rectangles from extracted page char
     data (see :func:`_extract_pdf_text_pages`).  Pure — no PDFium, no tk — so it
     is cheap to run on the worker right after extraction:
@@ -8185,6 +8360,8 @@ def _citation_links_from_pages(pages: list) -> dict:
             pi, li = gmap[g]
             if pi is None:
                 continue
+            if link_pages is not None and pi not in link_pages:
+                continue
             bx = pages[pi][li][1]
             if bx is not None:
                 per_page.setdefault(pi, []).append(bx)
@@ -8199,6 +8376,17 @@ def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
     """Convenience wrapper: extract a PDF's text and return its citation
     rectangles (see :func:`_citation_links_from_pages`)."""
     return _citation_links_from_pages(_extract_pdf_text_pages(pdf_bytes))
+
+
+def _citation_links_from_visible_pdf_text(pdf_bytes: bytes, pages: list) -> dict:
+    """Citation rectangles only for born-digital text, not OCR-over-scan text."""
+    try:
+        ocr_pages = _pdf_ocr_scan_pages(pdf_bytes)
+    except Exception as exc:
+        print(f"[pdf-links] OCR scan check failed: {exc}")
+        ocr_pages = set()
+    link_pages = set(range(len(pages))) - ocr_pages
+    return _citation_links_from_pages(pages, link_pages=link_pages)
 
 
 class _PdfPane(ttk.Frame):
@@ -11906,7 +12094,12 @@ class _ScholarTextWindow:
             if rng:
                 pm = re.search(r"\d+", txt.get(*rng))
                 if pm:
-                    first_page = int(pm.group(0))
+                    marker_page = int(pm.group(0))
+                    first_page = (
+                        max(1, marker_page - 1)
+                        if txt.get("1.0", rng[0]).strip()
+                        else marker_page
+                    )
 
         doc: list[str] = [_LATEX_PREAMBLE]
         if has_marks and reporter_prefix:
@@ -11914,6 +12107,7 @@ class _ScholarTextWindow:
                        % _latex_escape(reporter_prefix))
         doc.append("\\begin{document}\n\\thispagestyle{plain}%\n")
         if has_marks and first_page is not None:
+            doc.append("\\opfirstreporterpage=%d\\relax%%\n" % first_page)
             doc.append("\\markboth{%d}{%d}%%\n" % (first_page, first_page))
         for i, (label, rs, rend, _kind) in enumerate(sections):
             if i:
@@ -13147,11 +13341,11 @@ class _ScholarTextWindow:
                 try:
                     import pypdfium2  # noqa: F401
                     from PIL import ImageTk  # noqa: F401
-                    resp = _anon_session.get(url, timeout=30)
-                    resp.raise_for_status()
-                    data = _normalize_pdf_bytes(resp.content)
-                    if data is not None:
-                        self._pdf_prefetch = (data, url)
+                    fetched = _fetch_pdf_bytes(url, client=client, timeout=30)
+                    if fetched is not None:
+                        data, final_url = fetched
+                        self._pdf_prefetch = (data, final_url)
+                        self._pdf_url = final_url
                 except ImportError:
                     pass  # no render libs; View PDF will offer the browser
                 except Exception as exc:
@@ -13194,11 +13388,11 @@ class _ScholarTextWindow:
                 url = self._app._resolve_pdf_url(client, item)
                 if not url:
                     return
-                resp = _anon_session.get(url, timeout=30)
-                resp.raise_for_status()
-                data = _normalize_pdf_bytes(resp.content)
-                if data is not None:
-                    self._pdf_prefetch = (data, url)
+                fetched = _fetch_pdf_bytes(url, client=client, timeout=30)
+                if fetched is not None:
+                    data, final_url = fetched
+                    self._pdf_prefetch = (data, final_url)
+                    self._pdf_url = final_url
                     self._post(self._on_pdf_located, True)
             except Exception as exc:
                 print(f"[prefetch] PDF prefetch failed: {exc}")
@@ -13251,14 +13445,14 @@ class _ScholarTextWindow:
                                "No PDF is available for this opinion.")
                     return
                 self._pdf_url = url  # so a fetch failure can offer the browser
-                resp = _anon_session.get(url, timeout=30)
-                resp.raise_for_status()
-                data = _normalize_pdf_bytes(resp.content)
-                if data is None:
+                fetched = _fetch_pdf_bytes(url, client=client, timeout=30)
+                if fetched is None:
                     self._post(self._on_pdf_error,
                                "The source returned something that isn't a PDF.")
                     return
-                self._post(self._show_pdf, data, url)
+                data, final_url = fetched
+                self._pdf_url = final_url
+                self._post(self._show_pdf, data, final_url)
             except Exception as exc:
                 self._post(self._on_pdf_error, str(exc))
 
@@ -13302,7 +13496,7 @@ class _ScholarTextWindow:
             if not any(pages or []):
                 return  # scan-only PDF: no text layer to select
             try:
-                links = _citation_links_from_pages(pages)
+                links = _citation_links_from_visible_pdf_text(d, pages)
             except Exception as exc:
                 print(f"[pdf-links] citation scan failed: {exc}")
 
@@ -13740,13 +13934,17 @@ class _PdfWindow:
 
         def run() -> None:
             try:
-                resp = _anon_session.get(self._url, timeout=30,
-                                         allow_redirects=True)
-                resp.raise_for_status()
-                data = _normalize_pdf_bytes(resp.content)
-                if data is None:
+                client = (
+                    getattr(self._app, "_client", None)
+                    if self._app is not None and _is_courtlistener_url(self._url)
+                    else None
+                )
+                fetched = _fetch_pdf_bytes(self._url, client=client, timeout=30)
+                if fetched is None:
                     raise ValueError("the source returned something that "
                                      "isn't a PDF")
+                data, final_url = fetched
+                self._url = final_url
                 self._post(self._show, data)
             except Exception as exc:
                 self._post(self._error, str(exc))
@@ -13781,7 +13979,7 @@ class _PdfWindow:
                 return
             if self._is_case:
                 try:
-                    links = _citation_links_from_pages(pages)
+                    links = _citation_links_from_visible_pdf_text(d, pages)
                 except Exception as exc:
                     print(f"[pdf-links] citation scan failed: {exc}")
 
@@ -14307,11 +14505,11 @@ class _SlipOpinionWindow:
 
         def run() -> None:
             try:
-                resp = _anon_session.get(self._url, timeout=45)
-                resp.raise_for_status()
-                data = _normalize_pdf_bytes(resp.content)
-                if data is None:
+                fetched = _fetch_pdf_bytes(self._url, timeout=45)
+                if fetched is None:
                     raise RuntimeError("supremecourt.gov did not return a PDF")
+                data, final_url = fetched
+                self._url = final_url
             except Exception as exc:
                 self._post(self._error, f"Could not load the opinion: {exc}")
                 return
@@ -14363,7 +14561,7 @@ class _SlipOpinionWindow:
         sections: list = []
         if pages:
             try:
-                links = _citation_links_from_pages(pages)
+                links = _citation_links_from_visible_pdf_text(data, pages)
             except Exception as exc:
                 print(f"[slip] citation scan failed: {exc}")
             try:
@@ -14814,7 +15012,7 @@ class _LinkedPdfWindow:
     def _scan(self) -> None:
         try:
             pages = _extract_pdf_text_pages(self._bytes)   # one extraction pass
-            links = _citation_links_from_pages(pages)
+            links = _citation_links_from_visible_pdf_text(self._bytes, pages)
         except Exception as exc:
             self._post(self._scan_failed, str(exc))
             return
