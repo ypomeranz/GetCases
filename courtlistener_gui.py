@@ -8297,7 +8297,10 @@ class _PdfPane(ttk.Frame):
                     lambda e: self.zoom(1 if e.delta > 0 else -1) or "break")
         canvas.bind("<Control-Button-4>", lambda _e: self.zoom(1) or "break")
         canvas.bind("<Control-Button-5>", lambda _e: self.zoom(-1) or "break")
-        canvas.bind("<Enter>", lambda _e: canvas.focus_set())
+        # Take keyboard focus only when the reader intentionally clicks in the
+        # PDF.  Focusing on hover can make some platforms raise this window just
+        # because the pointer crossed it.
+        canvas.bind("<Button-1>", lambda _e: canvas.focus_set(), add="+")
         self.after(60, self._render_visible)
 
     # ------------------------------------------------------------------
