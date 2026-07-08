@@ -7163,6 +7163,7 @@ _LATEX_PREAMBLE = r"""\documentclass[11pt]{article}
     \IfFontExistsTF{TeX Gyre Pagella}{\setmainfont{TeX Gyre Pagella}}{}}
 \fi
 \IfFileExists{microtype.sty}{\usepackage{microtype}}{}
+\usepackage{graphicx}
 \IfFileExists{ulem.sty}{\usepackage[normalem]{ulem}%
   \newcommand{\opuline}[1]{\uline{#1}}}{%
   \newcommand{\opuline}[1]{\underline{#1}}}
@@ -7191,9 +7192,29 @@ _LATEX_PREAMBLE = r"""\documentclass[11pt]{article}
   \endgroup}
 \makeatother
 \newcommand{\opinionhead}{}
+\newcommand{\reporterhead}{}
+\newlength{\opheadavail}
+% The header line is assembled by hand so the case line on the left can
+% never collide with the reporter page range on the right: both are
+% measured, and when the case line would intrude on the range (kept at
+% its natural width) it is scaled down just enough to fit beside it.
+\newcommand{\opheadline}{%
+  \sbox0{\small\itshape\opinionhead}%
+  \sbox1{\small\reporterhead}%
+  \setlength{\opheadavail}{\headwidth}%
+  \ifdim\wd1>0pt
+    \addtolength{\opheadavail}{-\wd1}%
+    \addtolength{\opheadavail}{-1.5em}%
+  \fi
+  \ifdim\wd0>\opheadavail
+    \resizebox{\opheadavail}{!}{\usebox0}%
+  \else
+    \usebox0%
+  \fi
+  \hfill\usebox1}
 \pagestyle{fancy}
 \fancyhf{}
-\fancyhead[L]{\small\itshape\opinionhead}
+\fancyhead[L]{\opheadline}
 \fancyfoot[C]{\small\thepage}
 \renewcommand{\headrulewidth}{0.4pt}
 \fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\small\thepage}%
@@ -11604,7 +11625,7 @@ class _ScholarTextWindow:
 
         doc: list[str] = [_LATEX_PREAMBLE]
         if has_marks and reporter_prefix:
-            doc.append("\\fancyhead[R]{\\small %s \\reporterrange}\n"
+            doc.append("\\renewcommand{\\reporterhead}{%s \\reporterrange}\n"
                        % _latex_escape(reporter_prefix))
         doc.append("\\begin{document}\n\\thispagestyle{plain}%\n")
         if has_marks and first_page is not None:

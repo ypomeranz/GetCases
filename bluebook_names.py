@@ -481,6 +481,16 @@ violet virgil virginia vivian wade wallace walter wanda warren wayne wendell
 wendy wesley wilbert wilbur wilfred willa willard william willie willis
 wilma winfield winifred winston woodrow yesenia yolanda yvette yvonne
 zachary zelda
+""".split()) | frozenset("""
+ahmed ahmad aharon akiva ali amit anil ari arjun aviva avi avram baruch
+boris chaim chana chaya devorah dimitri dmitri dov efraim eliezer elchanan
+esther ezriel fatima francois giovanni gitel hans hassan henri hiroshi
+hussein ibrahim igor jacques johan johanan jurgen kenji khalid klaus kofi
+kwame lars luigi malka meir menachem mendel mikhail minh mohamed mohammed
+moshe mordechai muhammad naftali nikolai olaf pierre pinchas priya rajesh
+ramesh reuven rivka sanjay sergei shira shlomo shmuel sunil svetlana takeshi
+tatiana tova tzvi vijay vladimir werner wolfgang yaakov yael yehuda yehoshua
+yisroel yitzchak yochanan yosef yuri zev
 """.split())
 
 def _plural(word: str, abbr: str) -> tuple[str, str] | None:
@@ -725,6 +735,17 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
                 and not re.search(r"\bof\b", place, re.IGNORECASE)):
             return f"{_WORD_MAP.get(prefix.lower(), prefix)} of {place}"
 
+    # Rule 10.2.1(a): only the first-listed party on a side is kept.  The
+    # split applies only when *every* '&'/'and'-joined segment reads as an
+    # individual's name ("Charles Ward & Mary Ward" → "Ward"), so a firm
+    # name containing '&' ("Jones & Laughlin Steel Corp.") or an
+    # institutional pairing stays intact.
+    segs = re.split(r"\s+(?:&|and)\s+", p, flags=re.IGNORECASE)
+    if len(segs) > 1:
+        surnames = [_strip_given_names(s) for s in segs]
+        if all(surnames):
+            return surnames[0]
+
     surname = _strip_given_names(p)
     if surname is not None:
         return surname
@@ -833,6 +854,15 @@ if __name__ == "__main__":
         ("National Labor Relations Board v. "
          "Jones and Laughlin Steel Corporation",
          "NLRB v. Jones & Laughlin Steel Corp."),
+        # Rule 10.2.1(a): only the first-listed party on each side is kept —
+        # but only when every '&'-joined segment reads as an individual, so
+        # firm names containing '&' stay whole.
+        ("Charles Ward & Mary Ward v. Johanan Zelikovsky",
+         "Ward v. Zelikovsky"),
+        ("Charles Ward and Mary Ward v. Johanan Zelikovsky",
+         "Ward v. Zelikovsky"),
+        ("John Smith & Acme Corp. v. Jane Doe",
+         "John Smith & Acme Corp. v. Doe"),
         ("United States v. Carolene Products Company",
          "United States v. Carolene Prods. Co."),
         ("Natural Resources Defense Council, Inc. v. "
