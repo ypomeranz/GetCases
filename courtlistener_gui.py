@@ -9738,6 +9738,14 @@ class _ScholarTextWindow:
         if nom:
             self._last_cite_action = ("engrep", nom[0][2])
             return ("engrep", nom[0][2])
+        # A CourtListener opinion link whose reporter cite we recognize: prefer
+        # our own citation handling (Google Scholar first, then CourtListener /
+        # case.law) over CourtListener's bare /opinion/N/ link, so where CL's
+        # link and ours would conflict, ours wins.  This routes the click the
+        # same way a citation we detected in plain text would go.  A cite we
+        # can't parse keeps CourtListener's link, so nothing stops working.
+        if ref and "courtlistener.com/opinion/" in href:
+            return ("cite", f"{ref}@{pin}" if pin else ref)
         # Open the Scholar opinion, carrying the pincite (so it jumps to the
         # right page), the reporter cite, and the case name so a failed/blocked
         # fetch still locates the case on CourtListener (by cite, or by name

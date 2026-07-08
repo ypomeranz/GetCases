@@ -40,6 +40,11 @@ from dataclasses import replace
 _CL_SECTION_RE = re.compile(r"^(?:[IVXLC]{1,7}|[A-Z]|\d{1,2})\.?$")
 _CL_STARS_RE = re.compile(r"^\*(?:\s*\*){1,4}$")  # a "* * *" break
 
+# A blank line inside a <pre class="inline"> chunk — the paragraph break the
+# plain text uses.  Splitting on it (and folding the single hard-wrap newlines
+# into spaces) reflows CourtListener's plain-text opinions like Scholar's.
+_CL_PARA_BREAK_RE = re.compile(r"\n[ \t]*\n\s*")
+
 
 def parse_cl_html(html: str, fn_prefix: str = ""):
     """Parse CourtListener opinion HTML/XML into ``(body_blocks, footnotes)``.
@@ -111,6 +116,22 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
             blocks.append(Block(kind=kind, spans=cur))
         cur = []
 
+    def emit_pre(text: str, fmt: dict, link: str, kind: str) -> None:
+        """Emit text from a ``<pre class="inline">`` chunk.  Blank lines become
+        paragraph breaks (a flush); every other whitespace run — including the
+        single hard-wrap newlines inside a paragraph — folds into a space via
+        :func:`emit`.  CourtListener builds ``html_with_citations`` for
+        plain-text opinions (recent slip opinions especially) out of a chain of
+        ``<pre class="inline">`` chunks split by ``<span class="citation">``
+        links; the chunks are ``display:inline`` in CL's own CSS, so they must
+        flow as running text rather than each becoming its own block (which
+        stranded every citation on a line of its own, boxed by blank lines)."""
+        parts = _CL_PARA_BREAK_RE.split(text)
+        for i, part in enumerate(parts):
+            if i:
+                flush(kind)  # a blank line in the source → a paragraph break
+            emit(part, fmt, link=link)
+
     def emit_pagenum(page: str) -> None:
         """Emit a reporter page marker ("*279") as a page span — rendered in
         the gutter, not inline — de-duping a marker repeated back-to-back."""
@@ -180,12 +201,16 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
             footnotes.append(Block(kind="para",
                                    spans=[marker, Span(text=" ")] + note))
 
-    def walk(node, fmt: dict, kind: str, link: str = "") -> None:
+    def walk(node, fmt: dict, kind: str, link: str = "",
+             pre_inline: bool = False) -> None:
         for child in node.children:
             if isinstance(child, Comment):
                 continue
             if isinstance(child, NavigableString):
-                emit(str(child), fmt, link=link)
+                if pre_inline:
+                    emit_pre(str(child), fmt, link, kind)
+                else:
+                    emit(str(child), fmt, link=link)
                 continue
             if not isinstance(child, Tag):
                 continue
@@ -216,9 +241,9 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
                     # Citation link — clickable like Scholar's.
                     if not href.startswith("http"):
                         href = "https://www.courtlistener.com" + href
-                    walk(child, fmt, kind, link=href)
+                    walk(child, fmt, kind, link=href, pre_inline=pre_inline)
                     continue
-                walk(child, fmt, kind, link=link)
+                walk(child, fmt, kind, link=link, pre_inline=pre_inline)
                 continue
             if name == "page-number" or (
                 name == "span" and "star-pagination" in cls
@@ -233,6 +258,14 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
                 ).strip().lstrip("*").strip()
                 if page:
                     emit_pagenum(page)
+                continue
+            if name == "pre" and "inline" in cls:
+                # CourtListener wraps plain-text opinions in a chain of
+                # <pre class="inline"> chunks split by <span class="citation">
+                # links.  These are display:inline in CL's CSS — running text,
+                # not blocks — so walk them inline (no surrounding flush) and let
+                # emit_pre turn their blank lines into the real paragraph breaks.
+                walk(child, fmt, kind, link=link, pre_inline=True)
                 continue
             if name in _BLOCK_TAGS:
                 flush(kind)
@@ -250,17 +283,22 @@ def parse_cl_html(html: str, fn_prefix: str = ""):
                 flush(child_kind)
                 continue
             if name in ("i", "em", "cite"):
-                walk(child, {**fmt, "italic": True}, kind, link=link)
+                walk(child, {**fmt, "italic": True}, kind, link=link,
+                     pre_inline=pre_inline)
             elif name in ("b", "strong"):
-                walk(child, {**fmt, "bold": True}, kind, link=link)
+                walk(child, {**fmt, "bold": True}, kind, link=link,
+                     pre_inline=pre_inline)
             elif name == "u":
-                walk(child, {**fmt, "underline": True}, kind, link=link)
+                walk(child, {**fmt, "underline": True}, kind, link=link,
+                     pre_inline=pre_inline)
             elif name == "small":
-                walk(child, {**fmt, "small": True}, kind, link=link)
+                walk(child, {**fmt, "small": True}, kind, link=link,
+                     pre_inline=pre_inline)
             elif name in ("sup", "sub"):
-                walk(child, {**fmt, "sup": True}, kind, link=link)
+                walk(child, {**fmt, "sup": True}, kind, link=link,
+                     pre_inline=pre_inline)
             else:
-                walk(child, fmt, kind, link=link)
+                walk(child, fmt, kind, link=link, pre_inline=pre_inline)
 
     walk(soup, {}, "para")
     flush("para")
@@ -407,5 +445,61 @@ if __name__ == "__main__":
     nb, _ = parse_cl_html(nostar)
     check(not any(s.pagenum for b in nb for s in b.spans),
           "scattered *N (no 3-in-a-row) left as text, not pages")
+
+    # CourtListener's plain-text opinion format (recent slip opinions): a chain
+    # of <pre class="inline"> chunks split by sibling <span class="citation">
+    # links.  These are display:inline in CL's CSS, so they must reflow as
+    # running text — not, as before, strand every citation on its own line boxed
+    # by blank lines.  Blank lines inside the chunks are the real paragraph
+    # breaks; single hard-wrap newlines fold into spaces.
+    pre_sample = (
+        '<pre class="inline">JUSTICE KAGAN delivered the opinion of the '
+        'Court.\n\nWe consider whether the statute applies. In </pre>'
+        '<span class="citation" data-id="111">'
+        '<a href="/opinion/111/roe/">410 U.S. 113</a></span>'
+        '<pre class="inline">, the Court so held; see also </pre>'
+        '<span class="citation" data-id="222">'
+        '<a href="/opinion/222/casey/">505 U.S. 833</a></span>'
+        '<pre class="inline">.\n\nWe now turn to the merits.</pre>'
+    )
+    pb, _ = parse_cl_html(pre_sample)
+    kinds_texts = [(b.kind, b.text().strip()) for b in pb]
+    check(len(pb) == 3, f"pre.inline chunks reflow into 3 paras, not 5 blocks: {len(pb)}")
+    # No citation is stranded as its own block.
+    check(not any(t in ("410 U.S. 113", "505 U.S. 833")
+                  for _k, t in kinds_texts),
+          f"citations no longer boxed on their own line: {kinds_texts}")
+    # Both citations sit inline, mid-paragraph, still carrying CL's links.
+    linked = {s.text: s.link for b in pb for s in b.spans if s.link}
+    check(linked.get("410 U.S. 113", "").endswith("/opinion/111/roe/")
+          and linked.get("505 U.S. 833", "").endswith("/opinion/222/casey/"),
+          f"citation links preserved inline: {linked}")
+    body_para = next((b for b in pb if "410 U.S. 113" in b.text()), None)
+    check(body_para is not None
+          and body_para.text().startswith("We consider")
+          and "505 U.S. 833" in body_para.text(),
+          f"prose + both cites flow in one paragraph: "
+          f"{body_para.text() if body_para else None!r}")
+    # The paragraph break the plain text marks with a blank line survives.
+    check(any(b.text().strip() == "We now turn to the merits." for b in pb),
+          f"blank-line paragraph break preserved: {[b.text() for b in pb]}")
+
+    # Structure A: one <pre class="inline"> holding the citations inline still
+    # splits on its blank lines into real paragraphs.
+    pre_one = (
+        '<pre class="inline">First paragraph.\n\nSecond cites '
+        '<span class="citation"><a href="/opinion/9/x/">1 U.S. 1</a></span> '
+        'and goes on.</pre>'
+    )
+    pa, _ = parse_cl_html(pre_one)
+    check([b.text().strip() for b in pa]
+          == ["First paragraph.", "Second cites 1 U.S. 1 and goes on."],
+          f"single inline <pre> splits on blank lines: {[b.text() for b in pa]}")
+
+    # A genuine (non-inline) <pre> is still a block of its own.
+    block_pre = '<opinion><p>Intro.</p><pre>  col1  col2\n  a     b</pre></opinion>'
+    bp, _ = parse_cl_html(block_pre)
+    check(any("col1" in b.text() for b in bp),
+          "non-inline <pre> still parsed as a block")
 
     raise SystemExit(1 if failed else 0)
