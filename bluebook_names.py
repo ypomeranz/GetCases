@@ -756,10 +756,12 @@ def _format_anonymous_initials(party: str) -> str | None:
     return "".join(f"{c}." for c in letters)
 
 
-# Procedural captions naming an anonymized party by initials ("In re J.W.",
-# "Ex parte D.L.").  The remainder after the prefix is reformatted like any
-# other anonymized-initials party; the prefix is kept in canonical Bluebook
-# form (rule 10.2.1(b): "In re", "Ex parte").
+# Procedural captions (rule 10.2.1(b)): "In re", "Ex parte", "In the Matter
+# of".  The prefix is normalized to canonical Bluebook form regardless of the
+# source's casing ("Ex Parte Young" -> "Ex parte Young"), and "Matter of" /
+# "In the Matter of" fold to "In re".  The party after the prefix is
+# abbreviated normally, so an anonymized party still reformats to initials
+# ("In re JW" -> "In re J.W.").
 _PROCEDURAL_PREFIX_RE = re.compile(
     r"^(in\s+re|ex\s+parte|in\s+the\s+matter\s+of|matter\s+of)\b[\s,:]*",
     re.IGNORECASE,
@@ -772,19 +774,19 @@ _PROCEDURAL_CANON = {
 }
 
 
-def _format_procedural_initials(party: str) -> str | None:
-    """Anonymized party by initials behind a procedural prefix —
-    "In re JW" -> "In re J.W.", "Ex parte D. L." -> "Ex parte D.L.".
-    Returns None when there's no procedural prefix or the remainder isn't a
-    bare run of initials ("In re Gault" is left to the ordinary path)."""
+def _format_procedural(party: str, *, recognize_initials: bool) -> str | None:
+    """Canonicalize a procedural-phrase prefix and abbreviate the party that
+    follows: "Ex Parte Young" -> "Ex parte Young", "In Re JW" -> "In re J.W.",
+    "In the Matter of Smith" -> "In re Smith".  Returns None when the party
+    carries no such prefix."""
     m = _PROCEDURAL_PREFIX_RE.match(party)
     if not m:
         return None
-    anon = _format_anonymous_initials(party[m.end():])
-    if anon is None:
+    rest = party[m.end():].strip()
+    if not rest:
         return None
     prefix = _PROCEDURAL_CANON[re.sub(r"\s+", " ", m.group(1).lower())]
-    return f"{prefix} {anon}"
+    return f"{prefix} {_abbreviate_party(rest, recognize_initials=recognize_initials)}"
 
 
 def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
@@ -816,9 +818,9 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     anon = _format_anonymous_initials(p)
     if anon is not None:
         return anon
-    anon_prefixed = _format_procedural_initials(p)
-    if anon_prefixed is not None:
-        return anon_prefixed
+    procedural = _format_procedural(p, recognize_initials=recognize_initials)
+    if procedural is not None:
+        return procedural
     if p.strip(" ,.").lower() in _GEO_PARTIES:
         return p
 
@@ -1084,6 +1086,15 @@ if __name__ == "__main__":
          "Youngstown Sheet & Tube Co. v. Sawyer"),
         ("Pennsylvania Coal Co.", "Pa. Coal Co."),
         ("In re J.G.G.", "In re J.G.G."),
+        # Procedural-phrase prefix normalized to canonical form (rule
+        # 10.2.1(b)) regardless of the source's casing.
+        ("Ex Parte Young", "Ex parte Young"),
+        ("In Re Gault", "In re Gault"),
+        ("In Re Winship", "In re Winship"),
+        ("Ex Parte Merryman.", "Ex parte Merryman"),
+        ("In Re Gerald Gault", "In re Gault"),
+        ("Matter of Standard Jury Instructions",
+         "In re Standard Jury Instructions"),
         # Widely recognized initials (rule 10.2.1(c))
         ("Lorenzo v. Securities and Exchange Commission", "Lorenzo v. SEC"),
         ("Securities & Exchange Commission v. Edwards", "SEC v. Edwards"),
