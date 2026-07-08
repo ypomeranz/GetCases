@@ -2812,6 +2812,17 @@ class CourtListenerGUI:
         # --- Menubar ---
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
+        # History first (far left) — the same recently-viewed-cases menu the
+        # case windows carry, refreshed each time it opens.
+        history_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="History", menu=history_menu)
+        try:
+            history_menu.configure(
+                postcommand=lambda m=history_menu: self.populate_history_menu(m)
+            )
+        except tk.TclError:
+            pass
+        self.populate_history_menu(history_menu)
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
         settings_menu.add_command(label="API Token…", command=self._show_settings_dialog)
