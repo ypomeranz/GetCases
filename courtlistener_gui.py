@@ -2604,6 +2604,8 @@ class CourtListenerGUI:
 
         self._build_ui()
         self._setup_global_hotkey()
+        if sys.platform == "darwin":
+            self._macos_keepalive()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
     # ------------------------------------------------------------------
@@ -3115,6 +3117,49 @@ class CourtListenerGUI:
     # ------------------------------------------------------------------
     # Global hotkey (Ctrl+Space / Cmd+Space) → quick search popup
     # ------------------------------------------------------------------
+
+    def _macos_keepalive(self) -> None:
+        """macOS: keep background work flowing when no window is visible.
+
+        Opening a case from the spotlight destroys the popup — often the
+        app's only visible window — and fetches the opinion on a worker
+        thread.  With the app active but window-less, macOS App Nap
+        throttles the process and the Aqua Tcl notifier can sit in its
+        event wait without draining the timer/idle queues, so the fetched
+        case window doesn't appear until some UI event (reopening the
+        spotlight) wakes the loop.  Two measures, both cheap:
+
+        * an NSActivity opts the process out of App Nap for as long as the
+          app runs (PyObjC ships wherever pynput's hotkey works; the
+          "allowing idle system sleep" level doesn't keep the Mac awake);
+        * a low-frequency self-rescheduling after() tick keeps the Tcl
+          event loop cycling, so callbacks posted by worker threads are
+          dispatched promptly even with no window events arriving.
+        """
+        try:
+            from Foundation import NSProcessInfo
+            try:
+                from Foundation import (
+                    NSActivityUserInitiatedAllowingIdleSystemSleep as _opts,
+                )
+            except ImportError:
+                _opts = 0x00FFFFFF  # UserInitiatedAllowingIdleSystemSleep
+            # Keep a reference — ending the activity re-enables App Nap.
+            self._macos_activity = (
+                NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
+                    _opts, "CourtListener spotlight hotkey stays responsive"
+                )
+            )
+        except Exception as exc:
+            print(f"[macos] App Nap opt-out unavailable: {exc}")
+
+        def tick() -> None:
+            try:
+                self.root.after(250, tick)
+            except tk.TclError:
+                pass  # app shutting down
+
+        tick()
 
     def _setup_global_hotkey(self) -> None:
         if not _HOTKEY_AVAILABLE:
