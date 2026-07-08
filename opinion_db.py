@@ -332,6 +332,13 @@ def _default_dir() -> Path:
     return Path(__file__).resolve().parent / "data"
 
 
+def data_dir() -> Path:
+    """Directory holding ``opinions.jsonl`` / ``opinions.index.db`` — the same
+    location :class:`OpinionDB` uses by default.  Public so the self-updater can
+    back up and restore the opinions file without opening the database."""
+    return _default_dir()
+
+
 class OpinionDB:
     """JSONL store of opinions plus a derived SQLite search index.
 

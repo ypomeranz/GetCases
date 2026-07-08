@@ -2608,6 +2608,9 @@ class CourtListenerGUI:
         if sys.platform == "darwin":
             self._macos_keepalive()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_window)
+        # If we just restarted from an update, fold the pre-update opinions
+        # backup back in (shortly, so the window comes up first).
+        self.root.after(100, self._apply_pending_update_merge)
 
     # ------------------------------------------------------------------
     # Case-view history (the "History ▾" dropdown on case windows)
@@ -2829,6 +2832,10 @@ class CourtListenerGUI:
         settings_menu.add_command(
             label="Spotlight Shortcut…",
             command=self._show_spotlight_shortcut_dialog,
+        )
+        settings_menu.add_separator()
+        settings_menu.add_command(
+            label="Check for Updates…", command=self._check_for_updates,
         )
         lookup_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Look Up", menu=lookup_menu)
@@ -5498,6 +5505,150 @@ class CourtListenerGUI:
                 print(f"[db] opinion database unavailable: {exc}")
                 self._opinion_db_failed = True
         return self._opinion_db
+
+    # ------------------------------------------------------------------
+    # Software update  (Settings ▸ Check for Updates…)
+    # ------------------------------------------------------------------
+
+    def _check_for_updates(self) -> None:
+        """Ask GitHub whether the main branch is newer than the installed
+        version and, if so, offer to download it and restart."""
+        self._status_var.set("Checking for updates…")
+
+        def run() -> None:
+            try:
+                import updater
+                res = updater.check(_load_config().get("installed_commit"))
+            except Exception as exc:
+                res = {"ok": False, "error": f"Update check failed: {exc}"}
+            self.root.after(0, lambda: self._on_update_check(res))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_update_check(self, res: dict) -> None:
+        if not res.get("ok"):
+            self._status_var.set("Update check failed.")
+            messagebox.showerror(
+                "Check for Updates",
+                res.get("error") or "Could not check for updates.")
+            return
+        if not res.get("update"):
+            self._status_var.set("GetCases is up to date.")
+            messagebox.showinfo(
+                "Check for Updates",
+                res.get("reason") or "You're running the latest version.")
+            return
+        date = (res.get("latest_date") or "")[:10]
+        msg = (
+            (res.get("reason") or "A newer version is available.")
+            + (f"\nLatest change: {date}" if date else "")
+            + "\n\nUpdate now? GetCases will download the latest files from "
+            "GitHub and restart.\n\nYour saved opinions will be preserved."
+        )
+        if messagebox.askyesno("Update Available", msg):
+            self._perform_update(res.get("latest_sha") or "")
+
+    def _perform_update(self, latest_sha: str) -> None:
+        """Back up saved opinions, download and install the latest files,
+        record a pending merge, then relaunch.  Runs off the UI thread; every
+        file is verified before anything on disk is overwritten."""
+        self._status_var.set("Downloading update…")
+
+        def run() -> None:
+            import opinion_db
+            import updater
+            staging = None
+            try:
+                # 1) Back up the local opinions file *outside* the app dir, so
+                #    the file replacement below cannot touch it.
+                backup = None
+                jsonl = opinion_db.data_dir() / "opinions.jsonl"
+                if jsonl.is_file():
+                    _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    backup = (_CONFIG_PATH.parent
+                              / f"opinions.pre-update-{int(time.time())}.jsonl")
+                    shutil.copy2(jsonl, backup)
+                    # Record the pending merge *before* any file is overwritten,
+                    # so even a partial failure still restores saved opinions on
+                    # the next launch (the merge is a harmless no-op if the file
+                    # was never actually replaced).
+                    data = _load_config()
+                    data["pending_opinions_merge"] = str(backup)
+                    _save_config(data)
+                # 2) Download + verify the latest tree, then copy it over the
+                #    install (download_and_stage validates before we overwrite).
+                staging = Path(tempfile.mkdtemp(prefix="getcases_update_"))
+                root = updater.download_and_stage(staging)
+                updater.apply_over(root, updater.app_dir())
+                # 3) Drop the derived search index so it rebuilds cleanly from
+                #    the new opinions.jsonl on next launch.
+                for name in ("opinions.index.db", "opinions.index.db-wal",
+                             "opinions.index.db-shm"):
+                    try:
+                        (opinion_db.data_dir() / name).unlink()
+                    except OSError:
+                        pass
+                # 4) Record the new version now that the install is in place.
+                data = _load_config()
+                data["installed_commit"] = latest_sha
+                _save_config(data)
+                self.root.after(0, self._finish_update_relaunch)
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self._update_failed(e))
+            finally:
+                if staging is not None:
+                    shutil.rmtree(staging, ignore_errors=True)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _finish_update_relaunch(self) -> None:
+        self._status_var.set("Update installed — restarting…")
+        import updater
+        try:
+            updater.relaunch()
+        finally:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+
+    def _update_failed(self, exc: Exception) -> None:
+        self._status_var.set("Update failed.")
+        messagebox.showerror(
+            "Update Failed",
+            f"The update could not be completed:\n\n{exc}\n\n"
+            "Your saved opinions were not changed.")
+
+    def _apply_pending_update_merge(self) -> None:
+        """After an update+restart, merge the pre-update opinions backup into
+        the freshly downloaded opinions.jsonl so locally saved cases survive,
+        then delete the backup.  Non-fatal — retried next launch on failure."""
+        data = _load_config()
+        backup = data.get("pending_opinions_merge")
+        if not backup:
+            return
+        backup_path = Path(backup)
+        try:
+            if backup_path.is_file():
+                db = self._get_opinion_db()
+                if db is None:
+                    return  # DB unavailable now; keep flag and retry next launch
+                stats = db.merge_from(backup_path)
+                print(f"[update] restored saved opinions: {stats}")
+                self._status_var.set(
+                    f"Update complete — {stats.get('added', 0)} saved "
+                    "opinion(s) preserved.")
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
+            # Clear the flag (merged, or the backup is already gone).
+            data = _load_config()
+            data.pop("pending_opinions_merge", None)
+            _save_config(data)
+        except Exception as exc:
+            print(f"[update] post-update merge failed "
+                  f"(will retry next launch): {exc}")
 
     def _on_scholar_search_results(self, results: list) -> None:
         self._scholar_results = results
