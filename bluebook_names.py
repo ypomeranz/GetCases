@@ -620,6 +620,43 @@ def _strip_given_names(p: str) -> str | None:
     return " ".join(tokens[i:])
 
 
+# A comma-separated appositive beginning with one of these corporate or
+# organizational designators marks the party as a firm whose name merely ends
+# in that designator ("Sara Lee, Inc."; "Dean Witter Reynolds, Inc.") rather
+# than a natural person followed by a title, so the surname reduction below is
+# suppressed.  Compared after stripping every non-letter ("L.L.C." -> "llc").
+_APPOSITIVE_ENTITY_TERMS = {
+    "inc", "incorporated", "corp", "corporation", "co", "cos", "company",
+    "companies", "llc", "llp", "lllp", "lp", "pllc", "plc", "pc", "pa",
+    "na", "fsb", "ltd", "limited", "gmbh", "ag", "sa", "nv",
+    "assn", "assoc", "assocs", "associates", "association",
+    "bros", "brothers", "sons", "partners", "partnership",
+    "group", "grp", "holding", "holdings", "trust", "bank", "fund",
+    "foundation",
+}
+
+
+def _office_holder_surname(p: str) -> str | None:
+    """Surname of a natural person named with a following office or descriptive
+    title — "Gayle Franzen, Dir., Dep't of Corr., State of Ill." -> "Franzen".
+    A named individual is cited by surname alone: given names drop (rule
+    10.2.1(g)), the office describes the person and is omitted (10.2.1(e)), and
+    only the first party is kept (10.2.1(a)).  Returns None when the text
+    before the first comma is not a personal name, or when the appositive
+    begins with a corporate designator that is really part of a firm's name
+    ("Sara Lee, Inc."; "Dean Witter Reynolds, Inc.")."""
+    head, sep, rest = p.partition(",")
+    if not sep:
+        return None
+    surname = _strip_given_names(head)
+    if surname is None:
+        return None
+    lead = re.search(r"[A-Za-z][\w'’.&-]*", rest)
+    if lead and re.sub(r"[^a-z]", "", lead.group(0).lower()) in _APPOSITIVE_ENTITY_TERMS:
+        return None
+    return surname
+
+
 # Bluebook rule 10.2.1(c): the name of a widely recognized institution is
 # abbreviated to its initials.  Google Scholar prints the full name, so map
 # the formal long form back to the initials practitioners actually use.  Keyed
@@ -809,6 +846,10 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     if surname is not None:
         return surname
 
+    office_surname = _office_holder_surname(p)
+    if office_surname is not None:
+        return office_surname
+
     p = _PHRASE_RE.sub(
         lambda m: _PHRASE_MAP[re.sub(r"\s+", " ", m.group(0).lower())], p
     )
@@ -889,6 +930,30 @@ def _drop_redundant_entity(name: str) -> str:
     return " ".join(kept).strip().rstrip(",")
 
 
+# Abbreviation tokens that legitimately end in a period ("Co.", "Corp.",
+# "Inc.", "No.", "Ala."…), taken straight from the T6/T10 tables and the
+# multi-word phrase abbreviations, so a trailing period following one of them
+# is kept rather than mistaken for stray punctuation.
+_ABBR_PERIOD_TOKENS = (
+    {v.lower() for v in _WORD_MAP.values() if v.endswith(".")}
+    | {v.lower() for v in _PHRASE_MAP.values() if v.endswith(".")}
+)
+
+
+def _strip_trailing_period(name: str) -> str:
+    """Drop the stray sentence-ending period some sources append to a case
+    name ("Ex parte Young." -> "Ex parte Young"), while keeping a period that
+    belongs to a trailing abbreviation ("Pennsylvania Coal Co.") or an
+    initialism ("In re J.G.G.", "Doe v. J.")."""
+    if not name.endswith("."):
+        return name
+    tok = name.rsplit(None, 1)[-1]  # last whitespace-delimited token
+    stem = tok[:-1]
+    if "." in stem or len(stem) == 1 or tok.lower() in _ABBR_PERIOD_TOKENS:
+        return name  # initialism, single initial, or real abbreviation
+    return name[:-1]
+
+
 def abbreviate_case_name(name: str) -> str:
     """Abbreviate a case name for use in a citation or filename per
     Bluebook rule 10.2.2 (= Indigo Book R8.3), dropping given names of
@@ -898,9 +963,10 @@ def abbreviate_case_name(name: str) -> str:
     if not name:
         return name
     parts = _V_SPLIT_RE.split(name, maxsplit=1)
-    return " v. ".join(
+    joined = " v. ".join(
         _drop_redundant_entity(_abbreviate_party(p)) for p in parts
     )
+    return _strip_trailing_period(joined)
 
 
 if __name__ == "__main__":
@@ -999,6 +1065,25 @@ if __name__ == "__main__":
          "New York ex rel. Spitzer v. Grasso"),
         ("W. Va. ex rel. Discover Fin. Servs. v. Nibert",
          "West Virginia ex rel. Discover Fin. Servs. v. Nibert"),
+        # A natural person named with an office/title is cited by surname alone
+        # (rules 10.2.1(g), (e)); a firm ending in a corporate designator is
+        # left intact.
+        ("United States ex rel. Roger Grundset v. Gayle Franzen, "
+         "Director, Department of Corrections, State of Illinois",
+         "United States ex rel. Grundset v. Franzen"),
+        ("Janet Reno, Attorney General v. American Civil Liberties Union",
+         "Reno v. ACLU"),
+        ("Sara Lee, Inc. v. Kraft Foods", "Sara Lee, Inc. v. Kraft Foods"),
+        ("Dean Witter Reynolds, Inc. v. Byrd",
+         "Dean Witter Reynolds, Inc. v. Byrd"),
+        # Stray trailing period from the source is dropped; a period that
+        # belongs to a trailing abbreviation or initialism is kept.
+        ("Ex parte Young.", "Ex parte Young"),
+        ("Ex parte Merryman.", "Ex parte Merryman"),
+        ("Youngstown Sheet & Tube Co. v. Sawyer.",
+         "Youngstown Sheet & Tube Co. v. Sawyer"),
+        ("Pennsylvania Coal Co.", "Pa. Coal Co."),
+        ("In re J.G.G.", "In re J.G.G."),
         # Widely recognized initials (rule 10.2.1(c))
         ("Lorenzo v. Securities and Exchange Commission", "Lorenzo v. SEC"),
         ("Securities & Exchange Commission v. Edwards", "SEC v. Edwards"),
