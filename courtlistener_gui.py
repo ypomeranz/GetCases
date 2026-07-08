@@ -2533,6 +2533,42 @@ def _stdin_is_tty() -> bool:
         return False
 
 
+def _mac_activate_app(allow_osascript: bool = True) -> bool:
+    """Bring this Python process to the foreground on macOS.
+
+    Tk's ``focus_force`` moves focus only between this app's own windows;
+    when the spotlight hotkey fires while another application is frontmost,
+    macOS keeps sending keystrokes to that application until ours is
+    activated.  An app may always activate *itself*, so no extra privacy
+    permission is needed for the AppKit path.  pynput's macOS backend
+    already depends on PyObjC, so AppKit is normally importable whenever
+    the global hotkey works; the osascript fallback (which may prompt for
+    Automation permission once) covers the rest."""
+    try:
+        from AppKit import (
+            NSApplicationActivateIgnoringOtherApps,
+            NSRunningApplication,
+        )
+        NSRunningApplication.currentApplication().activateWithOptions_(
+            NSApplicationActivateIgnoringOtherApps
+        )
+        return True
+    except Exception:
+        pass
+    if not allow_osascript:
+        return False
+    try:
+        subprocess.Popen(
+            ["osascript", "-e",
+             'tell application "System Events" to set frontmost of '
+             f"the first process whose unix id is {os.getpid()} to true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
 class CourtListenerGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -3137,7 +3173,19 @@ class CourtListenerGUI:
         self._spotlight_empty_returns = 0
         self._spotlight_generation = 0
         self._spotlight_results_frame = None
-        popup.overrideredirect(True)
+        # Borderless spotlight window.  On macOS an overrideredirect window
+        # can never become the *key* window under Aqua Tk — the insertion
+        # cursor blinks but every keystroke still goes to the previous app —
+        # so the borderless look comes from the (unsupported-but-stable)
+        # "plain" Mac window style instead, which does accept key focus.
+        if sys.platform == "darwin":
+            try:
+                popup.tk.call("::tk::unsupported::MacWindowStyle",
+                              "style", popup._w, "plain", "none")
+            except tk.TclError:
+                popup.overrideredirect(True)
+        else:
+            popup.overrideredirect(True)
         popup.attributes("-topmost", True)
 
         entry_var = tk.StringVar()
@@ -3284,6 +3332,12 @@ class CourtListenerGUI:
                 # so go through the Win32 API on the real top-level HWND.
                 if sys.platform == "win32":
                     self._win_force_foreground(popup)
+                elif sys.platform == "darwin":
+                    # The hotkey fires while another app is frontmost, and
+                    # focus_force only moves focus *within* this app — the
+                    # Python app itself must be activated or the popup's
+                    # cursor blinks without receiving a single keystroke.
+                    _mac_activate_app(allow_osascript=(attempt == 0))
                 popup.focus_force()
                 # `focus_target` is the real Tk entry — for a CustomTkinter
                 # field that is the internal widget wrapped by CTkEntry, which is
