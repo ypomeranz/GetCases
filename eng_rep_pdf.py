@@ -138,15 +138,31 @@ def _detect_firefox_major() -> Optional[str]:
     return None
 
 
+def _ua_platform() -> str:
+    """The platform token real Firefox puts in its User-Agent on this OS.
+    Firefox freezes these strings for anti-fingerprinting, so they don't vary
+    with the OS point release or CPU: macOS always reports "Intel Mac OS X
+    10.15" (even on Apple Silicon) and 64-bit Linux always "X11; Linux
+    x86_64"."""
+    if sys.platform == "win32":
+        return "Windows NT 10.0; Win64; x64"
+    if sys.platform == "darwin":
+        return "Macintosh; Intel Mac OS X 10.15"
+    return "X11; Linux x86_64"
+
+
 def firefox_user_agent() -> str:
-    """The user's real Firefox UA, derived from the install/profile version so it
-    matches the UA Firefox used to obtain ``cf_clearance`` (CloudFlare ties the
-    clearance to the exact UA).  Falls back to a recent UA if unreadable."""
+    """The user's real Firefox UA for *this* OS, derived from the install/profile
+    version so it matches the UA Firefox used to obtain ``cf_clearance``.
+    CloudFlare ties the clearance to the exact UA -- including the platform
+    token -- so a Windows UA hard-coded on every OS made the borrowed clearance
+    work on Windows but fail on macOS and Linux.  Falls back to a recent version
+    if the installed version is unreadable."""
     global _UA_CACHE
     if _UA_CACHE:
         return _UA_CACHE
     major = _detect_firefox_major() or "128"
-    _UA_CACHE = (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{major}.0) "
+    _UA_CACHE = (f"Mozilla/5.0 ({_ua_platform()}; rv:{major}.0) "
                  f"Gecko/20100101 Firefox/{major}.0")
     return _UA_CACHE
 
