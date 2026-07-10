@@ -84,6 +84,7 @@ Federal Rules	Civil, Criminal, Evidence, Appellate, Bankruptcy – from Cornell 
 U.S. Constitution	Full text with article/amendment navigation; detects both formal citations and prose references.
 California & Florida Statutes	Official texts from the state legislatures (CA LegInfo, FL Senate). More states can be added.
 Statutes at Large	U.S. Statutes at Large (GovInfo PDFs) – cited as 88 Stat. 1932.
+US Reports PDFs	Official Supreme Court opinion scans: GPO’s GovInfo (vols 2–583) first, the Library of Congress CDN (vols 1–542) as fallback; for vols 584+ the app downloads the Court’s own bound‑volume / preliminary‑print PDF from supremecourt.gov into the “US Reports” folder (once per volume) and carves the cited opinion out of it.
 English Reports	Pre‑1865 English case law from CommonLII – offline index + CloudFlare‑aware PDF download (via Firefox cookies or Playwright).
 Oyez	Supreme Court case summaries, question presented, holdings, justice vote splits, and oral argument audio links.
 Brief Reader	Extracts text from PDF, Word, RTF, and plain text briefs; highlights every citation and makes them clickable.

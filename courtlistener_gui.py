@@ -510,6 +510,7 @@ import fed_rules
 import state_statutes
 import statutes_at_large
 import us_code
+import us_reports_pdf
 import brief_reader
 import oyez
 import slip_opinion
@@ -636,13 +637,16 @@ _anon_session.headers.update({
     "Sec-Fetch-User": "?1",
 })
 
-# URL routing for official US Reports PDFs:
-#   vols 1-542  → LOC CDN per-opinion PDFs (volume and page both 3-digit zero-padded)
-#              If LOC fails, fall back to GovInfo (available from vol 2 onward).
-#   vols 543-582 → GovInfo link service only (redirects to per-opinion PDF)
-#   vols 583+   → not available on GovInfo; skip
+# URL routing for official US Reports PDFs (GPO's GovInfo edition preferred):
+#   vols 2-583  → GovInfo (link service, then direct per-opinion PDF)
+#   vols 1-542  → LOC CDN per-opinion PDFs when GovInfo fails (volume and page
+#                 both 3-digit zero-padded); also covers vol 1, which GovInfo lacks
+#   vols 584+   → us_reports_pdf carves the opinion out of the Court's own
+#                 bound-volume / preliminary-print PDF, downloaded from
+#                 supremecourt.gov into the "US Reports" folder on first use
+#                 and reused from there after
 _LOC_CUTOFF = 542
-_GOVINFO_MAX = 582
+_GOVINFO_MAX = 583
 _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 
 # Regex to parse a standard legal citation: "volume reporter page"
@@ -5441,8 +5445,11 @@ class CourtListenerGUI:
         Attempt to find a PDF URL for the selected search result.
 
         Strategy (local_path always preferred over download_url):
-        0. US Reports citation in LOC collection (vols 1-542) → LOC CDN PDF.
-           Vols 543+ skip this step and fall through to local_path.
+        0. US Reports citation → GovInfo (vols 2-583), then LOC CDN
+           (vols 1-542), then an opinion carved from the Court's own volume
+           PDF (vols 584+; fetched from supremecourt.gov once and kept in
+           the "US Reports" folder).  Volumes on none of those fall through
+           to local_path.
         0.5. Non-SCOTUS cases: try static.case.law (Harvard CAP) first.
              Only falls through if the URL returns a non-200 response.
         1. local_path from the search result (if already present).
@@ -5484,15 +5491,14 @@ class CourtListenerGUI:
         print(f"[resolve] citations to try: {all_cites}")
 
         # 0. Official US Reports PDF — try every U.S.-Reports cite among them.
-        #    vols 1-542 → LOC CDN; otherwise GovInfo (link service + direct PDF).
+        #    GPO's GovInfo first (vols 2-583), then the LOC CDN (vols 1-542),
+        #    then an opinion carved out of the Court's bound-volume/
+        #    preliminary-print PDF (vols 584+; downloaded from
+        #    supremecourt.gov on first use, reused from the "US Reports"
+        #    folder after).
         for cite in all_cites:
-            loc_url = _us_reports_loc_url(cite)
             gov = _us_reports_govinfo_url(cite)
-            if not loc_url and not gov:
-                continue
-            if loc_url and _head_ok(loc_url, "LOC US Reports"):
-                print(f"[resolve] using LOC US Reports PDF: {loc_url}")
-                return loc_url
+            loc_url = _us_reports_loc_url(cite)
             if gov:
                 link_url, direct_url = gov
                 if _head_ok(link_url, "GovInfo link"):
@@ -5501,6 +5507,14 @@ class CourtListenerGUI:
                 if _head_ok(direct_url, "GovInfo direct PDF"):
                     print(f"[resolve] using GovInfo direct PDF URL: {direct_url}")
                     return direct_url
+            if loc_url and _head_ok(loc_url, "LOC US Reports"):
+                print(f"[resolve] using LOC US Reports PDF: {loc_url}")
+                return loc_url
+            local_pdf = us_reports_pdf.extract_citation(cite)
+            if local_pdf is not None:
+                url = local_pdf.as_uri()
+                print(f"[resolve] using local US Reports volume: {url}")
+                return url
 
         # 0.5. Non-SCOTUS: the Harvard CAP static.case.law copy.  Try every
         #      parallel cite before giving up.
@@ -8399,7 +8413,9 @@ def _fetch_pdf_bytes(
     timeout: int = 30,
     max_hops: int = 3,
 ) -> "Optional[tuple[bytes, str]]":
-    """Fetch *url* as a PDF, following a small HTML wrapper if necessary."""
+    """Fetch *url* as a PDF, following a small HTML wrapper if necessary.
+    file:// URLs (opinions extracted from local US Reports volumes) are read
+    straight from disk."""
     queue = [url]
     seen: set[str] = set()
     while queue and len(seen) < max_hops:
@@ -8407,6 +8423,17 @@ def _fetch_pdf_bytes(
         if not cur or cur in seen:
             continue
         seen.add(cur)
+        if cur.startswith("file:"):
+            from urllib.request import url2pathname
+            try:
+                local = Path(url2pathname(urllib.parse.urlparse(cur).path))
+                data = _normalize_pdf_bytes(local.read_bytes())
+            except Exception as exc:
+                print(f"[pdf] local file read failed ({exc}): {cur}")
+                continue
+            if data is not None:
+                return data, cur
+            continue
         resp = _pdf_get(cur, client=client, timeout=timeout)
         resp.raise_for_status()
         final_url = getattr(resp, "url", None) or cur
