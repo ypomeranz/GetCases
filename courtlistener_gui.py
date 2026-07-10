@@ -1705,11 +1705,16 @@ def _case_fingerprints(name: str, cite: str, year: str,
     both.  Reporter spelling is normalized so "410 U.S. 113" and "410 US 113"
     collapse to one key.
 
-    The name key is an order-insensitive token set, so "A v. B" and "B v. A"
-    share it and collapse to one row.  Pass ``include_name=False`` for a
-    deliberately-shown reverse-caption match so it de-duplicates only by
-    citation and can sit beside the as-captioned case rather than being eaten
-    by it."""
+    The name key is an order-insensitive token set plus the decision year, so
+    "A v. B" and "B v. A" of the same year share it and collapse to one row,
+    while two different cases that merely share a caption stay apart — a common
+    caption ("McGuire v. McGuire" exists in Nebraska (1953), Wyoming (1980),
+    Virginia (1990), …) would otherwise have its first-shown case suppress every
+    other as a false duplicate.  The same case reported by two sources carries
+    the same year, so genuine cross-source de-duplication is unaffected.  Pass
+    ``include_name=False`` for a deliberately-shown reverse-caption match so it
+    de-duplicates only by citation and can sit beside the as-captioned case
+    rather than being eaten by it."""
     fps: set[str] = set()
     m = _CITE_PARSE_RE.match(re.sub(r"<[^>]+>", "", cite or "").strip())
     if m:
@@ -1721,7 +1726,11 @@ def _case_fingerprints(name: str, cite: str, year: str,
     if include_name:
         toks = _name_tokens(name)
         if toks:
-            fps.add("n:" + " ".join(sorted(set(toks))))
+            key = "n:" + " ".join(sorted(set(toks)))
+            yr = re.sub(r"\D", "", year or "")
+            if yr:
+                key += ":" + yr
+            fps.add(key)
     return fps
 
 
