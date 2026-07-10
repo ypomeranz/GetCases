@@ -7921,11 +7921,33 @@ def _copy_rich_clipboard(widget: tk.Misc, rtf: str, plain: str) -> str:
 # opinions score near zero.
 _SCHOLAR_MATCH_THRESHOLD = 0.60
 
-# Opinion-text font size (pt), remembered across windows within a session
-# so a reader's A+/A− choice carries over to the next case they open.
-_OPINION_FONT_PT = 11
+# Opinion-text font size (pt).  Remembered across windows *and* app restarts on
+# this computer (persisted to config), so a reader's A+/A− choice carries over
+# to the next case they open — this run or a future one.
 _OPINION_FONT_MIN = 7
 _OPINION_FONT_MAX = 24
+
+
+def _clamp_opinion_font_pt(pt) -> int:
+    """Coerce a stored/parsed value to an int within the allowed reader range."""
+    try:
+        pt = int(pt)
+    except (TypeError, ValueError):
+        pt = 11
+    return max(_OPINION_FONT_MIN, min(_OPINION_FONT_MAX, pt))
+
+
+def _save_opinion_font_pt(pt: int) -> None:
+    """Persist the reader text size so the next opinion/statute window — this
+    run or a future one — opens at the size last chosen on this computer."""
+    data = _load_config()
+    if data.get("opinion_font_pt") != pt:
+        data["opinion_font_pt"] = pt
+        _save_config(data)
+
+
+_OPINION_FONT_PT = _clamp_opinion_font_pt(
+    _load_config().get("opinion_font_pt", 11))
 
 # Side (details) panel text zoom — a point offset the user sets with the
 # panel's own A−/A+ control.  Persisted to config so it carries across cases
@@ -10234,6 +10256,7 @@ class _ScholarTextWindow:
             return
         self._base_size = new
         _OPINION_FONT_PT = new
+        _save_opinion_font_pt(new)
         for name, f in self._fonts.items():
             if name == "base":
                 f.configure(size=new)
@@ -15922,6 +15945,7 @@ class _StatuteWindow:
             return
         self._base_size = new
         _OPINION_FONT_PT = new
+        _save_opinion_font_pt(new)
         self._fonts["base"].configure(size=new)
         self._fonts["bold"].configure(size=new)
         self._fonts["sechead"].configure(size=new + 2)
