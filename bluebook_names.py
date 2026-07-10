@@ -803,6 +803,26 @@ def _format_procedural(party: str, *, recognize_initials: bool) -> str | None:
     return f"{prefix} {_abbreviate_party(rest, recognize_initials=recognize_initials)}"
 
 
+def _is_bare_place(place: str) -> bool:
+    """Whether a municipal unit's place part ("<Unit> of <place>") is just the
+    place's proper name rather than a place followed by an institution.  A
+    trailing institution shows up as a nested "… of …" phrase ("Department of
+    Parks") or as a T6 word sitting after the place name — i.e. after a word
+    that is not itself a T6 word ("New York Police Department").  A T6 word that
+    *leads* the name is part of the place, not a descriptor, and is kept:
+    "Commerce" (the city), "Central Falls"."""
+    if re.search(r"\bof\b", place, re.IGNORECASE):
+        return False
+    seen_plain = False
+    for w in place.split():
+        if w.replace("’", "'").lower().rstrip(".,'") in _T6_WORDS:
+            if seen_plain:
+                return False
+        else:
+            seen_plain = True
+    return True
+
+
 def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     p = re.sub(r"\s+", " ", party).strip()
     p = _ET_AL_RE.sub("", p)
@@ -839,23 +859,18 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
         return p
 
     m = _MUNICIPAL_RE.match(p)
-    if m:
-        prefix, place = m.group(1), m.group(2)
-        place_words = [w.replace("’", "'").lower().rstrip(".,'")
-                       for w in place.split()]
-        if (not any(w in _T6_WORDS for w in place_words)
-                and not re.search(r"\bof\b", place, re.IGNORECASE)):
-            return f"{prefix} of {place}"
+    if m and _is_bare_place(m.group(2)):
+        return f"{m.group(1)} of {m.group(2)}"
 
-    # A municipal unit in suffix form ("Cook County", "New York City") is the
-    # entire geographic party (_GEO_SUFFIX_RE): left whole unless a T6 word in
-    # front marks it as part of a larger institutional name.
-    m = _GEO_SUFFIX_RE.match(p)
-    if m:
-        place_words = [w.replace("’", "'").lower().rstrip(".,'")
-                       for w in m.group(1).split()]
-        if not any(w in _T6_WORDS for w in place_words):
-            return p
+    # A municipal unit in suffix form ("Cook County", "New York City",
+    # "Atlantic City") is the entire geographic party: its trailing unit word is
+    # what identifies it, so the words ahead are always the place's proper name
+    # — a T6 word among them ("Atlantic", "Central") belongs to that name, not
+    # to an institution — and the whole party stays whole.  A larger entity puts
+    # the unit word mid-name ("Cook County Bd. of Review"), where the '$' anchor
+    # no longer matches and normal abbreviation applies.
+    if _GEO_SUFFIX_RE.match(p):
+        return p
 
     # Rule 10.2.1(a): only the first-listed party on a side is kept.  The
     # split applies only when *every* '&'/'and'-joined segment reads as an
@@ -1085,10 +1100,23 @@ if __name__ == "__main__":
         ("Willingboro Township v. Doe", "Willingboro Township v. Doe"),
         ("New York City v. Doe", "New York City v. Doe"),
         ("Kansas City v. Doe", "Kansas City v. Doe"),
+        # A T6 word inside the place's own proper name ("Atlantic", "Central",
+        # "National", "Commerce") is part of the name, not a descriptor, so the
+        # whole unit still stays whole rather than shortening to "Atl. City".
+        ("Atlantic City v. Doe", "Atlantic City v. Doe"),
+        ("Central City v. Doe", "Central City v. Doe"),
+        ("National City v. Doe", "National City v. Doe"),
+        ("City of Commerce v. Doe", "City of Commerce v. Doe"),
+        ("City of Central Falls v. Doe", "City of Central Falls v. Doe"),
         # The unit word does abbreviate when an institution follows it and the
-        # party is a larger entity rather than the bare place.
+        # party is a larger entity rather than the bare place — whether the
+        # institution is joined by "of" or trails the place directly.
         ("City of New York Department of Parks v. Doe",
          "City of N.Y. Dep't of Parks v. Doe"),
+        ("City of New York Police Department v. Doe",
+         "City of N.Y. Police Dep't v. Doe"),
+        ("Atlantic City Board of Education v. Doe",
+         "Atl. City Bd. of Educ. v. Doe"),
         ("Cook County Board of Review v. Smith",
          "Cook Cnty. Bd. of Review v. Smith"),
         ("Doe v. Cook County Department of Corrections",
