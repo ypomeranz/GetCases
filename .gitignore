@@ -10,3 +10,8 @@ _engr_build/
 # via GitHub), but the local SQLite search index is derived from it and rebuilt
 # on demand, so it is never tracked.
 *.index.db
+
+# US Reports bound-volume / preliminary-print PDFs (vols 584+): big binaries
+# that us_reports_pdf.py downloads from supremecourt.gov on demand (and
+# carves per-opinion PDFs out of), so never tracked.
+US Reports/
