@@ -396,6 +396,16 @@ _MUNICIPAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The suffix mirror of a municipal party: "Cook County", "Jefferson Parish"
+# name a county-level unit whose words together are the place's proper name,
+# so the party is a geographic unit entire and rule 10.2.2 leaves it whole
+# ("Soldal v. Cook County", never "Cook Cnty.").  This is the converse of the
+# "County of Sacramento" prefix, where "County" is a stand-alone descriptor and
+# does abbreviate.  The '$' anchor limits the rule to a trailing unit word:
+# when an institution follows ("Cook County Bd. of Review") the larger party
+# abbreviates normally.
+_GEO_SUFFIX_RE = re.compile(r"^(.+?)\s+(?:County|Parish)$", re.IGNORECASE)
+
 # Personal-name suffixes, dropped along with the given name
 _NAME_SUFFIX_RE = re.compile(r",?\s+(?:jr|sr|ii|iii|iv)\.?\s*$", re.IGNORECASE)
 
@@ -833,6 +843,16 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
                 and not re.search(r"\bof\b", place, re.IGNORECASE)):
             return f"{_WORD_MAP.get(prefix.lower(), prefix)} of {place}"
 
+    # A county- or parish-level unit in suffix form ("Cook County") is the
+    # entire geographic party (_GEO_SUFFIX_RE): left whole unless a T6 word in
+    # front marks it as part of a larger institutional name.
+    m = _GEO_SUFFIX_RE.match(p)
+    if m:
+        place_words = [w.replace("’", "'").lower().rstrip(".,'")
+                       for w in m.group(1).split()]
+        if not any(w in _T6_WORDS for w in place_words):
+            return p
+
     # Rule 10.2.1(a): only the first-listed party on a side is kept.  The
     # split applies only when *every* '&'/'and'-joined segment reads as an
     # individual's name ("Charles Ward & Mary Ward" → "Ward"), so a firm
@@ -1050,6 +1070,17 @@ if __name__ == "__main__":
         ("Town of Greece v. Susan Galloway", "Town of Greece v. Galloway"),
         ("City of New York Department of Parks v. Doe",
          "City of N.Y. Dep't of Parks v. Doe"),
+        # A county- or parish-level unit named in suffix form is the entire
+        # geographic party and stays whole (rule 10.2.2); "County" abbreviates
+        # only when an institutional entity follows it.
+        ("Soldal v. Cook County", "Soldal v. Cook County"),
+        ("Los Angeles County v. Humphries", "Los Angeles County v. Humphries"),
+        ("Washington County v. Gunther", "Washington County v. Gunther"),
+        ("Jefferson Parish v. Hyde", "Jefferson Parish v. Hyde"),
+        ("Cook County Board of Review v. Smith",
+         "Cook Cnty. Bd. of Review v. Smith"),
+        ("Doe v. Cook County Department of Corrections",
+         "Doe v. Cook Cnty. Dep't of Corr."),
         # Relator constructions (rule 10.2.1(b)): the named party ahead of
         # "ex rel." keeps its full geographic name (rule 10.2.2), even when the
         # source abbreviated it; the relator abbreviates normally.
