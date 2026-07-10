@@ -24,9 +24,11 @@ The network/decision helpers are side-effect free and unit-tested in
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -47,6 +49,42 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+@functools.lru_cache(maxsize=1)
+def _ssl_context() -> ssl.SSLContext:
+    """A TLS context with a usable CA trust store on every platform.
+
+    Windows and most Linux Pythons verify HTTPS out of the box, but the macOS
+    python.org build ships a private OpenSSL that ignores the system keychain:
+    its default context has no root certificates, so ``urllib`` fails with
+    ``CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate`` unless
+    the user has run the installer's "Install Certificates.command".  Rather
+    than require that manual step, augment the default context with whatever
+    trusted roots we can find -- certifi's bundle (present whenever
+    ``requests``/pip are installed) and, failing that on macOS, the system roots
+    read straight from the keychain.  Verification stays on; on platforms that
+    already trust the system store these are simply harmless extra roots.
+    Cached because building it may shell out to ``security`` on macOS."""
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+        return ctx
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        try:
+            pem = subprocess.run(
+                ["security", "find-certificate", "-a", "-p",
+                 "/System/Library/Keychains/SystemRootCertificates.keychain"],
+                capture_output=True, text=True, timeout=15,
+            ).stdout
+            if pem.strip():
+                ctx.load_verify_locations(cadata=pem)
+        except Exception:
+            pass
+    return ctx
+
+
 # ---------------------------------------------------------------------------
 # GitHub queries
 # ---------------------------------------------------------------------------
@@ -56,7 +94,8 @@ def _api_get_json(url: str) -> dict:
         "User-Agent": _UA,
         "Accept": "application/vnd.github+json",
     })
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=_TIMEOUT,
+                                context=_ssl_context()) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -179,7 +218,8 @@ def download_and_stage(dest_dir: Optional[Path] = None) -> Path:
     tar_path = dest_dir / "main.tar.gz"
     url = f"https://codeload.github.com/{REPO_SLUG}/tar.gz/refs/heads/{BRANCH}"
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp, \
+    with urllib.request.urlopen(req, timeout=_TIMEOUT,
+                                context=_ssl_context()) as resp, \
             open(tar_path, "wb") as fh:
         shutil.copyfileobj(resp, fh)
     extract_dir = dest_dir / "extract"
@@ -236,6 +276,12 @@ if __name__ == "__main__":
         failed += not ok
         print(("ok   " if ok else "FAIL ") + label
               + ("" if ok else f"  (got {got!r}, want {want!r})"))
+
+    # _ssl_context builds a verifying context and never raises --------------
+    _ctx = _ssl_context()
+    check_eq(isinstance(_ctx, ssl.SSLContext), True, "ssl context built")
+    check_eq(_ctx.verify_mode, ssl.CERT_REQUIRED, "ssl verification stays on")
+    check_eq(_ctx.check_hostname, True, "ssl hostname check stays on")
 
     # decide_update ---------------------------------------------------------
     check_eq(decide_update("abc", "abc", None)["update"], False, "same sha")
