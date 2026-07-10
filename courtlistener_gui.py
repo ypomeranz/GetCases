@@ -649,6 +649,11 @@ _LOC_CUTOFF = 542
 _GOVINFO_MAX = 583
 _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 
+# The Supreme Court Reporter ("93 S. Ct. 705", or "S.Ct." closed up as Google
+# Scholar prints it).  Only SCOTUS opinions carry this reporter, so a match is a
+# reliable "this is a Supreme Court case" signal even when court_id is blank.
+_SCT_CITE_RE = re.compile(r"\d+\s+S\.\s?Ct\.\s+\d+")
+
 # Regex to parse a standard legal citation: "volume reporter page"
 # Examples: "410 F.2d 1234", "12 F. Supp. 2d 567", "100 Cal. 400"
 _CITE_PARSE_RE = re.compile(r"^(\d+)\s+(.+)\s+(\d+)")
@@ -1430,6 +1435,42 @@ def _cl_item_for_citation(client, cite: str, name: str = "") -> Optional[dict]:
                     str(it.get("court_id") or ""),
                 ),
             )
+    return None
+
+
+def _us_reports_cite_via_courtlistener(
+    client, cites: list[str]
+) -> Optional[str]:
+    """The U.S. Reports parallel cite ("410 U.S. 113") for a SCOTUS opinion that
+    only carries a Supreme Court Reporter ("S. Ct.") cite, looked up on
+    CourtListener; ``None`` when a U.S. cite is already present, there's no
+    S. Ct. cite to resolve, or CourtListener knows no U.S. parallel.
+
+    Google Scholar frequently prints only the S. Ct. cite for a Supreme Court
+    case ("93 S. Ct. 705", no "410 U.S. 113"), which leaves the official-PDF
+    paths — all keyed on the U.S. Reports cite — with nothing to work from.
+    CourtListener's citation-lookup resolves the S. Ct. cite to the cluster that
+    bears it (via :func:`_cl_item_for_citation`, which only accepts a cluster
+    whose own citations include the one asked for), and that cluster's parallel
+    citations carry the U.S. cite.  Returning it lets the caller pull the
+    official opinion scan behind the "View PDF" button."""
+    if client is None:
+        return None
+    # A U.S. Reports cite is already in hand — the PDF paths can use it directly.
+    if any(_US_CITE_RE.search(c) for c in cites):
+        return None
+    sct = next((c for c in cites if _SCT_CITE_RE.search(c)), None)
+    if not sct:
+        return None
+    try:
+        item = _cl_item_for_citation(client, sct)
+    except Exception as exc:
+        print(f"[resolve] S. Ct. -> U.S. lookup failed for {sct!r}: {exc}")
+        return None
+    for c in (item or {}).get("citation") or []:
+        m = _US_CITE_RE.search(re.sub(r"<[^>]+>", "", str(c)))
+        if m:
+            return f"{m.group(1)} U.S. {m.group(2)}"
     return None
 
 
@@ -5489,6 +5530,17 @@ class CourtListenerGUI:
         # parallel U.S./F. cite that finds a PDF lives on the cluster record.
         all_cites = _gather_all_citations(client, item)
         print(f"[resolve] citations to try: {all_cites}")
+
+        # A SCOTUS opinion opened from Google Scholar sometimes carries only its
+        # Supreme Court Reporter ("S. Ct.") cite, not the "U.S." cite every
+        # official-PDF path below keys on.  Ask CourtListener whether that
+        # S. Ct. cite has a parallel U.S. Reports cite and, if so, try it too —
+        # that's what lets "View PDF" reach the official opinion scan.
+        us_from_sct = _us_reports_cite_via_courtlistener(client, all_cites)
+        if us_from_sct and us_from_sct not in all_cites:
+            print(f"[resolve] S. Ct. cite resolved to U.S. Reports cite: "
+                  f"{us_from_sct}")
+            all_cites.append(us_from_sct)
 
         # 0. Official US Reports PDF — try every U.S.-Reports cite among them.
         #    GPO's GovInfo first (vols 2-583), then the LOC CDN (vols 1-542),
