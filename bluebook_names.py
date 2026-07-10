@@ -386,25 +386,29 @@ def _expand_geo_party(head: str) -> str:
     return _GEO_EXPANSIONS.get(_norm_geo(head), head)
 
 
-# A municipal party — "City of New York", "Village of Arlington Heights" —
-# is itself a geographic unit: the place name is not abbreviated, only the
-# T6 word in the prefix ("Vill. of Arlington Heights", "Cnty. of
-# Sacramento").  When more follows the place ("City of New York Department
-# of Education") the party is a larger entity and abbreviates normally.
+# A municipal party named "<Unit> of <Place>" — "City of New York", "Village
+# of Arlington Heights", "County of Sacramento" — is itself one geographic
+# unit and the entire party, so rule 10.2.2 leaves the whole name unabbreviated,
+# the unit word included: "Village of Arlington Heights", not "Vill. of …".
+# (This keeps Village/County/Township/Parish, which table T6 would otherwise
+# shorten, consistent with City/Town/Borough, which no table abbreviates.)
+# When more follows the place ("City of New York Department of Education") the
+# party is a larger entity and abbreviates normally.
 _MUNICIPAL_RE = re.compile(
     r"^(City|Town|Township|Village|Borough|County|Parish)\s+of\s+(.+)$",
     re.IGNORECASE,
 )
 
-# The suffix mirror of a municipal party: "Cook County", "Jefferson Parish"
-# name a county-level unit whose words together are the place's proper name,
-# so the party is a geographic unit entire and rule 10.2.2 leaves it whole
-# ("Soldal v. Cook County", never "Cook Cnty.").  This is the converse of the
-# "County of Sacramento" prefix, where "County" is a stand-alone descriptor and
-# does abbreviate.  The '$' anchor limits the rule to a trailing unit word:
-# when an institution follows ("Cook County Bd. of Review") the larger party
+# The suffix mirror of the same rule: "Cook County", "Jefferson Parish", "New
+# York City" name a unit whose words together are the place's proper name, so
+# the whole party stays unabbreviated ("Soldal v. Cook County", never "Cook
+# Cnty.").  The '$' anchor limits the rule to a trailing unit word: when an
+# institution follows ("Cook County Bd. of Review") the larger party
 # abbreviates normally.
-_GEO_SUFFIX_RE = re.compile(r"^(.+?)\s+(?:County|Parish)$", re.IGNORECASE)
+_GEO_SUFFIX_RE = re.compile(
+    r"^(.+?)\s+(?:City|Town|Township|Village|Borough|County|Parish)$",
+    re.IGNORECASE,
+)
 
 # Personal-name suffixes, dropped along with the given name
 _NAME_SUFFIX_RE = re.compile(r",?\s+(?:jr|sr|ii|iii|iv)\.?\s*$", re.IGNORECASE)
@@ -841,9 +845,9 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
                        for w in place.split()]
         if (not any(w in _T6_WORDS for w in place_words)
                 and not re.search(r"\bof\b", place, re.IGNORECASE)):
-            return f"{_WORD_MAP.get(prefix.lower(), prefix)} of {place}"
+            return f"{prefix} of {place}"
 
-    # A county- or parish-level unit in suffix form ("Cook County") is the
+    # A municipal unit in suffix form ("Cook County", "New York City") is the
     # entire geographic party (_GEO_SUFFIX_RE): left whole unless a T6 word in
     # front marks it as part of a larger institutional name.
     m = _GEO_SUFFIX_RE.match(p)
@@ -1061,22 +1065,30 @@ if __name__ == "__main__":
         # Geographic parties (rules 10.2.1(f), 10.2.2)
         ("State of Washington v. Glucksberg", "Washington v. Glucksberg"),
         ("People of the State of Illinois v. Gates", "Illinois v. Gates"),
+        # A municipal unit that is the entire party keeps its full name in
+        # either word order (rule 10.2.2): the unit word — City/County/Village/
+        # Township/Parish — is not abbreviated, matching City/Town/Borough,
+        # which no table abbreviates anyway.
         ("City of New York v. United States Department of Defense",
          "City of New York v. U.S. Dep't of Def."),
         ("Village of Arlington Heights v. "
          "Metropolitan Housing Development Corporation",
-         "Vill. of Arlington Heights v. Metro. Hous. Dev. Corp."),
-        ("County of Sacramento v. Lewis", "Cnty. of Sacramento v. Lewis"),
+         "Village of Arlington Heights v. Metro. Hous. Dev. Corp."),
+        ("County of Sacramento v. Lewis", "County of Sacramento v. Lewis"),
+        ("Township of Willingboro v. Doe", "Township of Willingboro v. Doe"),
+        ("Parish of Jefferson v. Doe", "Parish of Jefferson v. Doe"),
         ("Town of Greece v. Susan Galloway", "Town of Greece v. Galloway"),
-        ("City of New York Department of Parks v. Doe",
-         "City of N.Y. Dep't of Parks v. Doe"),
-        # A county- or parish-level unit named in suffix form is the entire
-        # geographic party and stays whole (rule 10.2.2); "County" abbreviates
-        # only when an institutional entity follows it.
         ("Soldal v. Cook County", "Soldal v. Cook County"),
         ("Los Angeles County v. Humphries", "Los Angeles County v. Humphries"),
         ("Washington County v. Gunther", "Washington County v. Gunther"),
         ("Jefferson Parish v. Hyde", "Jefferson Parish v. Hyde"),
+        ("Willingboro Township v. Doe", "Willingboro Township v. Doe"),
+        ("New York City v. Doe", "New York City v. Doe"),
+        ("Kansas City v. Doe", "Kansas City v. Doe"),
+        # The unit word does abbreviate when an institution follows it and the
+        # party is a larger entity rather than the bare place.
+        ("City of New York Department of Parks v. Doe",
+         "City of N.Y. Dep't of Parks v. Doe"),
         ("Cook County Board of Review v. Smith",
          "Cook Cnty. Bd. of Review v. Smith"),
         ("Doe v. Cook County Department of Corrections",
