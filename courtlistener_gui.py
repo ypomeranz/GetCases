@@ -1695,43 +1695,62 @@ def _filter_to_best_tier(query: str,
     return out
 
 
-def _case_fingerprints(name: str, cite: str, year: str,
-                       *, include_name: bool = True) -> set[str]:
-    """Identity keys for a case, used to recognize the same case across
-    sources (Google Scholar, CourtListener, English Reports).  Two results are
-    the same case when any fingerprint matches, so each result carries both a
-    citation key (when it has a reporter cite) and a name key — a Scholar hit
-    with only a name still de-duplicates against a CourtListener hit that has
-    both.  Reporter spelling is normalized so "410 U.S. 113" and "410 US 113"
-    collapse to one key.
+def _case_signature(name: str, cite: str, year: str, court: str = "",
+                    *, include_name: bool = True) -> dict:
+    """Structured identity of a case for spotlight de-duplication:
 
-    The name key is an order-insensitive token set plus the decision year, so
-    "A v. B" and "B v. A" of the same year share it and collapse to one row,
-    while two different cases that merely share a caption stay apart — a common
-    caption ("McGuire v. McGuire" exists in Nebraska (1953), Wyoming (1980),
-    Virginia (1990), …) would otherwise have its first-shown case suppress every
-    other as a false duplicate.  The same case reported by two sources carries
-    the same year, so genuine cross-source de-duplication is unaffected.  Pass
-    ``include_name=False`` for a deliberately-shown reverse-caption match so it
-    de-duplicates only by citation and can sit beside the as-captioned case
-    rather than being eaten by it."""
-    fps: set[str] = set()
-    m = _CITE_PARSE_RE.match(re.sub(r"<[^>]+>", "", cite or "").strip())
-    if m:
-        vol = m.group(1)
-        rep = re.sub(r"[^a-z0-9]", "", m.group(2).lower())
-        page = m.group(3)
-        if rep:
-            fps.add(f"c:{vol}:{rep}:{page}")
+    * ``cites``  — exact reporter citations as (series, volume, page) tuples;
+    * ``series`` — the reporter series those citations belong to;
+    * ``nk``     — a name key (order-insensitive party tokens + the decision
+      year), or ``None`` when the name is suppressed (a reverse-caption match);
+    * ``court``  — the normalized court id, or "" when the source doesn't say.
+
+    Reporter spelling is normalized ("410 U.S. 113" and "410 US 113" collapse),
+    and a citation string carrying parallel cites ("59 N.W.2d 336, 157 Neb.
+    226") contributes all of them.  :func:`_same_case` compares two signatures."""
+    cites: set[tuple[str, str, str]] = set()
+    series: set[str] = set()
+    for part in re.split(r"[;,]", re.sub(r"<[^>]+>", "", cite or "")):
+        m = _CITE_PARSE_RE.match(part.strip())
+        if m:
+            rep = re.sub(r"[^a-z0-9]", "", m.group(2).lower())
+            if rep:
+                cites.add((rep, m.group(1), m.group(3)))
+                series.add(rep)
+    nk = None
     if include_name:
         toks = _name_tokens(name)
         if toks:
-            key = "n:" + " ".join(sorted(set(toks)))
+            nk = "n:" + " ".join(sorted(set(toks)))
             yr = re.sub(r"\D", "", year or "")
             if yr:
-                key += ":" + yr
-            fps.add(key)
-    return fps
+                nk += ":" + yr
+    return {
+        "nk": nk, "cites": cites, "series": series,
+        "court": re.sub(r"[^a-z0-9]", "", (court or "").lower()),
+    }
+
+
+def _same_case(a: dict, b: dict) -> bool:
+    """Whether two case signatures (see :func:`_case_signature`) denote one
+    case.  An exact shared reporter citation settles it outright.  Otherwise the
+    names-with-year must match *and* the two must not actively disagree: two
+    known-but-different courts, or two distinct citations within the same
+    reporter series, mark genuinely different cases (a common caption like
+    "McGuire v. McGuire" recurs across jurisdictions and even years).  A court
+    known to one side but not the other is not a disagreement — the cases may
+    still be one, so name-and-year still merges them.  Parallel citations in
+    different series ("59 N.W.2d 336" and "157 Neb. 226") do not disagree, so a
+    case reported two ways still collapses to one row."""
+    if a["cites"] & b["cites"]:
+        return True
+    if a["nk"] and a["nk"] == b["nk"]:
+        if a["court"] and b["court"] and a["court"] != b["court"]:
+            return False
+        if a["series"] & b["series"]:
+            return False
+        return True
+    return False
 
 
 # How many *distinct* cases each spotlight source/court-tier may display.  A
@@ -1750,21 +1769,13 @@ _BUCKET_CAPS: dict[str, int] = {
 }
 
 
-def _dedup_accept(fps: set[str], bucket: str,
-                  seen: set[str], bucket_counts: dict[str, int]) -> bool:
-    """Decide whether to display a result with fingerprints *fps* from
-    *bucket*, given the cases already shown (*seen*) and how many each bucket
-    has shown (*bucket_counts*).  On acceptance, records the fingerprints and
-    bumps the bucket count.  Rejects a case already shown (a cross-source
-    duplicate) or one that would exceed the bucket's display cap."""
-    if fps & seen:
-        return False
-    if bucket and bucket_counts.get(bucket, 0) >= _BUCKET_CAPS.get(bucket, 99):
-        return False
-    seen.update(fps)
-    if bucket:
-        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
-    return True
+def _prefer_source(new_bucket: str, shown_bucket: str) -> bool:
+    """Whether a *new* result should take over an already-shown duplicate from
+    *shown_bucket*.  The Google Scholar opinion page is the app's first-choice
+    source, so a Scholar hit replaces a CourtListener row for the same case
+    rather than being dropped; every other collision keeps the row already
+    shown (first arrival wins)."""
+    return new_bucket == "scholar" and shown_bucket != "scholar"
 
 
 def _is_scotus_order_item(item: dict) -> bool:
@@ -3668,10 +3679,33 @@ class CourtListenerGUI:
         # Tracking state
         result_rows: list[dict] = []
         selected_idx = [-1]  # mutable via closure
-        # Cross-source de-duplication: fingerprints of the cases already shown,
-        # and how many each source/court-tier has shown.
-        seen_cases: set[str] = set()
+        # Cross-source de-duplication: a signature per case already shown (with
+        # the bucket it came from and its row, so a preferred source can take
+        # the row over), and how many each source/court-tier has shown.
+        shown: list[dict] = []
         bucket_counts: dict[str, int] = {}
+
+        def _detail_text(cite: str, year: str, source_label: str) -> str:
+            detail = f"{cite}" if cite else ""
+            if year:
+                detail = f"{detail} ({year})" if detail else f"({year})"
+            if source_label:
+                sep = "  ·  " if _CTK_AVAILABLE else "  — "
+                detail = (f"{detail}{sep}{source_label}"
+                          if detail else source_label)
+            return detail
+
+        def _replace_row(r: dict, cite: str, year: str, source_label: str,
+                         open_fn) -> None:
+            # A preferred source (Google Scholar) took over an already-shown
+            # row: swap its opener and re-label the detail line.  Badge and name
+            # stay — it is the same case, so they already match.
+            r["open_fn"] = open_fn
+            try:
+                r["detail"].configure(
+                    text=_detail_text(cite, year, source_label))
+            except tk.TclError:
+                pass
 
         def _add_result(bucket: str, court_id: str, name: str, cite: str,
                         year: str, source_label: str, open_fn) -> None:
@@ -3684,18 +3718,33 @@ class CourtListenerGUI:
             except tk.TclError:
                 return
 
-            idx = len(result_rows)
-            if idx >= max_rows:
-                return
+            # De-duplicate against the cases already on screen.  When the new
+            # result is the same case as one shown, it either takes the row over
+            # — a Google Scholar hit is the app's first-choice opener, so it
+            # replaces a CourtListener row — or is dropped; either way the two
+            # identities merge so a later hit de-duplicates against every form
+            # seen.  A reverse-caption match carries no name key, so it
+            # de-duplicates only by citation and sits beside the as-captioned
+            # case rather than being eaten by it.
+            sig = _case_signature(name, cite, year, court_id,
+                                  include_name=(bucket != "reversed"))
+            for entry in shown:
+                if _same_case(sig, entry["sig"]):
+                    if _prefer_source(bucket, entry["bucket"]):
+                        _replace_row(entry["row"], cite, year, source_label,
+                                     open_fn)
+                        entry["bucket"] = bucket
+                    entry["sig"]["cites"] |= sig["cites"]
+                    entry["sig"]["series"] |= sig["series"]
+                    entry["sig"]["court"] = entry["sig"]["court"] or sig["court"]
+                    return
 
-            # Skip a case already shown by another source (and respect the
-            # source's per-tier display cap); the source's next-best result
-            # then takes this slot instead.  A reverse-caption match is shown on
-            # purpose beside the as-captioned case, so it de-duplicates only by
-            # citation (its name key would collide with the case it sits next to).
-            fps = _case_fingerprints(name, cite, year,
-                                     include_name=(bucket != "reversed"))
-            if not _dedup_accept(fps, bucket, seen_cases, bucket_counts):
+            # A genuinely new case: honour the overall row limit and the
+            # source's per-tier display cap.
+            if len(result_rows) >= max_rows:
+                return
+            if bucket and bucket_counts.get(bucket, 0) >= _BUCKET_CAPS.get(
+                    bucket, 99):
                 return
 
             # Append a fresh row at the bottom.  Rows are added in arrival order
@@ -3710,12 +3759,7 @@ class CourtListenerGUI:
                 court_abbr = "Eng. Rep."
 
             display_name = name[:80] + ("…" if len(name) > 80 else "")
-            detail = f"{cite}" if cite else ""
-            if year:
-                detail = f"{detail} ({year})" if detail else f"({year})"
-            if source_label:
-                sep = "  ·  " if _CTK_AVAILABLE else "  — "
-                detail = f"{detail}{sep}{source_label}" if detail else source_label
+            detail = _detail_text(cite, year, source_label)
 
             r = self._spot_build_row(
                 rows_frame, court_abbr,
@@ -3724,12 +3768,15 @@ class CourtListenerGUI:
             _bind_wheel(r["row"])
             r["open_fn"] = open_fn
             result_rows.append(r)
+            shown.append({"sig": sig, "bucket": bucket, "row": r})
+            if bucket:
+                bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
             this_idx = len(result_rows) - 1
 
-            def on_click(_e=None) -> None:
+            def on_click(_e=None, _r=r) -> None:
                 popup.destroy()
                 self._quick_popup = None
-                open_fn()
+                _r["open_fn"]()
 
             _bind_recursive(r["row"], "<Button-1>", on_click)
             # Hovering a row selects it, so mouse and keyboard share one
