@@ -3549,58 +3549,121 @@ class CourtListenerGUI:
             except tk.TclError:
                 pass
 
-        # The dropdown grows to fit its results.  The court hierarchy can now
-        # return more than the old fixed six rows — up to three Supreme Court
-        # matches, two courts-of-appeals, and two state-high-court matches,
-        # plus the two Google Scholar matches and an English Reports row — so
-        # the popup starts just tall enough for the "Searching…" line and is
-        # resized as each result row streams in (up to max_rows).
+        # The dropdown grows to fit its results, then stops at the bottom of the
+        # screen and scrolls.  A common caption spans many jurisdictions and the
+        # court hierarchy can return a dozen rows, so a long list must stay
+        # reachable by wheel or arrow keys instead of spilling off-screen.
         max_rows = 10
-        if _CTK_AVAILABLE:
-            # The modern card auto-fits to its content (see _resize_to), so it
-            # only needs the width; the metrics below are the plain-Tk path's.
-            pw = 600
-            row_h = row_gap = header_h = status_h = body_pad = 0
-        else:
-            pw = 580
-            row_h = 52
-            row_gap = 2
-            header_h = 48
-            status_h = 26
-            body_pad = 6
+        pw = 600 if _CTK_AVAILABLE else 580
+        row_unit = 58 if _CTK_AVAILABLE else 54  # one row including its top gap
         sx = popup.winfo_screenwidth()
         sy = popup.winfo_screenheight()
         pos_x = (sx - pw) // 2
         pos_y = sy // 3
 
-        def _resize_to(n_rows: int) -> None:
+        # Results below the search bar.  Rows pack into `rows_frame`, which rides
+        # inside a scrolling canvas so the list can exceed the visible popup; the
+        # "Searching…" status stays pinned at the bottom of `results_frame`.
+        if _CTK_AVAILABLE:
+            results_frame = ctk.CTkFrame(border, fg_color=_UI["window"])
+            results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 8))
+            canvas_bg = _UI["window"]
+        else:
+            results_frame = tk.Frame(border, bg="#f0f0f0")
+            results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
+            canvas_bg = "#f0f0f0"
+        self._spotlight_results_frame = results_frame
+
+        scroll_area = tk.Frame(results_frame, bg=canvas_bg)
+        scroll_area.pack(side="top", fill="both", expand=True)
+        results_canvas = tk.Canvas(scroll_area, bg=canvas_bg,
+                                   highlightthickness=0, height=1)
+        results_vsb = ttk.Scrollbar(
+            scroll_area, orient="vertical", command=results_canvas.yview,
+            style="Modern.Vertical.TScrollbar" if _CTK_AVAILABLE
+            else "Vertical.TScrollbar",
+        )
+        results_canvas.configure(yscrollcommand=results_vsb.set)
+        results_canvas.pack(side="left", fill="both", expand=True)
+        if _CTK_AVAILABLE:
+            rows_frame = ctk.CTkFrame(results_canvas, fg_color=_UI["window"])
+        else:
+            rows_frame = tk.Frame(results_canvas, bg="#f0f0f0")
+        rows_window = results_canvas.create_window((0, 0), window=rows_frame,
+                                                   anchor="nw")
+        results_canvas.bind(
+            "<Configure>",
+            lambda e: results_canvas.itemconfigure(rows_window, width=e.width),
+        )
+
+        # Wheel scrolling.  The pointer usually rests on a row, not the canvas
+        # gaps, so the handlers bind to the canvas here and to every row as it
+        # streams in (see _add_result); covers Windows/macOS (<MouseWheel>) and
+        # X11 (<Button-4/5>).
+        def _wheel(direction: int) -> None:
             try:
-                if _CTK_AVAILABLE:
-                    # Let the themed card report the exact height its packed
-                    # children need — more reliable than summing widget metrics
-                    # across platforms and keeps the last row fully visible.
-                    popup.update_idletasks()
-                    h = border.winfo_reqheight()
-                    popup.geometry(f"{pw}x{h}+{pos_x}+{pos_y}")
-                    return
-                n = max(0, min(n_rows, max_rows))
-                body_h = n * (row_h + row_gap) + status_h + body_pad
-                popup.geometry(f"{pw}x{header_h + body_h}+{pos_x}+{pos_y}")
+                results_canvas.yview_scroll(direction, "units")
+            except tk.TclError:
+                pass
+
+        def _on_wheel(e) -> None:
+            _wheel(-1 if getattr(e, "delta", 0) > 0 else 1)
+
+        def _bind_wheel(widget) -> None:
+            _bind_recursive(widget, "<MouseWheel>", _on_wheel)
+            _bind_recursive(widget, "<Button-4>", lambda _e: _wheel(-1))
+            _bind_recursive(widget, "<Button-5>", lambda _e: _wheel(1))
+
+        _bind_wheel(results_canvas)
+
+        def _resize_to(n_rows: int = 0) -> None:
+            """Grow the popup to fit the rows, capped at the screen bottom; past
+            the cap the viewport holds its height and the extra rows scroll."""
+            try:
+                popup.update_idletasks()
+                content_h = rows_frame.winfo_reqheight()
+                # Measure the popup's natural (uncapped) height by letting the
+                # canvas request the whole content, then clamp to the screen.
+                results_canvas.configure(height=max(1, content_h),
+                                         scrollregion=(0, 0, pw, content_h))
+                popup.update_idletasks()
+                natural = border.winfo_reqheight()
+                max_h = sy - pos_y - 40
+                if natural <= max_h:
+                    if results_vsb.winfo_ismapped():
+                        results_vsb.pack_forget()
+                    results_canvas.yview_moveto(0.0)
+                    popup.geometry(f"{pw}x{natural}+{pos_x}+{pos_y}")
+                else:
+                    results_canvas.configure(
+                        height=max(row_unit, content_h - (natural - max_h)))
+                    if not results_vsb.winfo_ismapped():
+                        results_vsb.pack(side="right", fill="y")
+                    popup.geometry(f"{pw}x{max_h}+{pos_x}+{pos_y}")
+            except tk.TclError:
+                pass
+
+        def _scroll_into_view(idx: int) -> None:
+            """Keep the keyboard-selected row visible as Up/Down move past the
+            edge of the scrolling viewport."""
+            if not (0 <= idx < len(result_rows)):
+                return
+            try:
+                popup.update_idletasks()
+                w = result_rows[idx]["row"]
+                total = max(1, rows_frame.winfo_reqheight())
+                top = w.winfo_y()
+                bot = top + w.winfo_height()
+                vtop = results_canvas.canvasy(0)
+                vh = results_canvas.winfo_height()
+                if top < vtop:
+                    results_canvas.yview_moveto(top / total)
+                elif bot > vtop + vh:
+                    results_canvas.yview_moveto(max(0.0, bot - vh) / total)
             except tk.TclError:
                 pass
 
         _resize_to(0)
-
-        # Results frame below the search bar
-        if _CTK_AVAILABLE:
-            # padx=2 here + padx=10 on each row aligns the row cards with the
-            # search-bar card above (both sit 12px in from the card edge).
-            results_frame = ctk.CTkFrame(border, fg_color=_UI["window"])
-            results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 8))
-        else:
-            results_frame = tk.Frame(border, bg="#f0f0f0")
-            results_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
-        self._spotlight_results_frame = results_frame
 
         # Tracking state
         result_rows: list[dict] = []
@@ -3655,9 +3718,10 @@ class CourtListenerGUI:
                 detail = f"{detail}{sep}{source_label}" if detail else source_label
 
             r = self._spot_build_row(
-                results_frame, court_abbr,
+                rows_frame, court_abbr,
                 self._spot_tier_color(court_id), display_name, detail,
             )
+            _bind_wheel(r["row"])
             r["open_fn"] = open_fn
             result_rows.append(r)
             this_idx = len(result_rows) - 1
@@ -3701,10 +3765,12 @@ class CourtListenerGUI:
                 selected_idx[0] = min(selected_idx[0] + 1,
                                       len(result_rows) - 1)
                 _highlight(selected_idx[0])
+                _scroll_into_view(selected_idx[0])
             elif event.keysym == "Up":
                 nav_text[0] = entry.get().strip()
                 selected_idx[0] = max(selected_idx[0] - 1, 0)
                 _highlight(selected_idx[0])
+                _scroll_into_view(selected_idx[0])
             elif event.keysym == "Return":
                 if 0 <= selected_idx[0] < len(result_rows):
                     popup.destroy()
@@ -3752,6 +3818,9 @@ class CourtListenerGUI:
                 font=("TkDefaultFont", 8), anchor="w",
             )
             status_lbl.pack(side="bottom", fill="x", padx=8, pady=(4, 4))
+        # Re-fit now that the status line is packed, so it shows during the
+        # initial "Searching…" state (the first _resize_to ran before it).
+        _resize_to(0)
         search_done = [0]  # track how many searches completed
         total_searches = 3  # Google Scholar + CourtListener + English Reports
 
