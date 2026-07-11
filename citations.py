@@ -18,9 +18,11 @@ over the text and reconciles overlaps the same way the opinion reader does.
 
 from __future__ import annotations
 
+import json
 import re
 
 import constitution
+import court_catalog
 import ecfr
 import eng_rep
 import fed_rules
@@ -218,6 +220,111 @@ def cite_target_from_text(
 
 
 # ---------------------------------------------------------------------------
+# Unpublished opinions cited by Westlaw / LEXIS number
+# ---------------------------------------------------------------------------
+# "Care One Mgmt., LLC v. United Healthcare Workers E., No. 12-6371, 2024 WL
+# 1327972, at *7 (D.N.J. Mar. 28, 2024)" — no reporter ever prints these, but
+# the docket number and opinion date locate the document in CourtListener's
+# RECAP (PACER) archive.  The docket number usually appears only in the
+# citation's first (or table-of-authorities) occurrence, while later short
+# forms carry just the WL number — so the fields are indexed per WL number
+# across the whole document and every occurrence gets the merged spec.
+
+WL_CITE_RE = re.compile(
+    r"\b(\d{4})\s+(WL|U\.\s?S\.\s?(?:Dist\.|App\.)\s?LEXIS)\s+(\d{2,10})\b")
+
+# The docket number written immediately before the WL cite: "No. 12-6371,",
+# "Nos. 12-6371, 12-6372,", "Civ. A. No. 96-3837,", "Case No. 2:13-cv-7779,".
+_RECAP_DOCKET_RE = re.compile(
+    r"(?:Nos?\.|Civ(?:il)?\.?\s?(?:A(?:ction)?\.?)?\s?Nos?\.?|Case\s+No\.)\s*"
+    r"([A-Za-z]{0,4}\s?[\w:().-]{3,30}?)\s*,\s*$"
+)
+
+# The court/date parenthetical after the cite (an optional star pin cite in
+# between): ", at *7 (D.N.J. Mar. 28, 2024)".
+_RECAP_AFTER_RE = re.compile(
+    r"^(?:,\s*(?:at\s+)?\*?\d{1,6}(?:\s*[-–—]\s*\*?\d{1,6})?)?"
+    r"\s*\(([^()]{2,45}?)\s+"
+    r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)[a-z]*\.?)\s+"
+    r"(\d{1,2}),\s+(\d{4})\)"
+)
+
+# The case name before the docket number, for the viewer's window title.
+_RECAP_NAME_RE = re.compile(
+    r"([A-Z][\w.,'’&() -]{1,80}?\sv\.\s[\w.,'’&() -]{1,60}?|"
+    r"In\s+re\s+[\w.,'’&() -]{2,60}?),\s*"
+    r"(?:Nos?\.|Civ|Case\s+No\.)"
+)
+
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+# Bluebook court abbreviation → CourtListener court id, federal courts only
+# (RECAP is the PACER archive; state-court WL cites keep the Scholar path).
+# Keyed with spacing/periods squashed so "D.N.J.", "D. N.J." both hit.
+_FED_COURT_IDS: dict[str, str] = {}
+for _map in (court_catalog.CIRCUIT_COURTS, court_catalog.DISTRICT_COURTS,
+             court_catalog.SPECIAL_COURTS):
+    for _cid, _abbr in _map.items():
+        _FED_COURT_IDS[re.sub(r"[^a-z0-9]", "", _abbr.lower())] = _cid
+
+
+def iter_recap_cites(text: str) -> list[tuple[int, int, "str | None"]]:
+    """Every WL / LEXIS citation in *text* as ``(start, end, spec)``.
+
+    ``spec`` is a JSON string with the fields a RECAP lookup needs —
+    ``cite``, ``docket``, ``date`` and (when it resolved to a federal
+    court) ``court``, plus ``name`` for the window title — or ``None``
+    when the citation can't be a RECAP document (no docket/date anywhere
+    in the document, or a state court), in which case the caller should
+    treat it as an ordinary case citation."""
+    index: dict = {}
+    occurrences: list = []
+    for m in WL_CITE_RE.finditer(text or ""):
+        key = (m.group(1), norm_reporter(m.group(2)), m.group(3))
+        info = index.setdefault(
+            key, {"cite": re.sub(r"\s+", " ", m.group(0))})
+        before = re.sub(r"\s+", " ", text[max(0, m.start() - 90):m.start()])
+        dm = _RECAP_DOCKET_RE.search(before)
+        if dm:
+            info.setdefault("docket", dm.group(1).strip())
+            nm = _RECAP_NAME_RE.search(before)
+            if nm:
+                info.setdefault("name", nm.group(1).strip(" ,"))
+        am = _RECAP_AFTER_RE.match(
+            re.sub(r"\s+", " ", text[m.end():m.end() + 110]))
+        if am:
+            info.setdefault(
+                "court_raw", re.sub(r"\s+", " ", am.group(1)).strip())
+            mon = _MONTHS.get(am.group(2)[:3].lower())
+            if mon and "date" not in info:
+                info["date"] = (f"{am.group(4)}-{mon:02d}-"
+                                f"{int(am.group(3)):02d}")
+        occurrences.append((m.start(), m.end(), key))
+
+    out: list = []
+    for start, end, key in occurrences:
+        info = index[key]
+        spec = None
+        court_raw = info.get("court_raw", "")
+        court_id = _FED_COURT_IDS.get(
+            re.sub(r"[^a-z0-9]", "", court_raw.lower()))
+        # Only a federal docket + date is worth a RECAP lookup; a court
+        # named but not federal is a state court's unpublished opinion.
+        if ("docket" in info and "date" in info
+                and (court_id or not court_raw)):
+            fields = {"cite": info["cite"], "docket": info["docket"],
+                      "date": info["date"]}
+            if court_id:
+                fields["court"] = court_id
+            if info.get("name"):
+                fields["name"] = info["name"]
+            spec = json.dumps(fields)
+        out.append((start, end, spec))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Whole-document detection (used by the brief viewer)
 # ---------------------------------------------------------------------------
 
@@ -280,8 +387,21 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     for start, end, spec, _cases in eng_rep.iter_nominate_cites(text):
         engrep_spans.append((start, end))
         matches.append((start, end, "engrep", spec))
+    # Unpublished opinions cited by WL/LEXIS number: RECAP-resolvable ones
+    # (federal docket + date found in the document) get a "recap" action;
+    # the rest become ordinary case cites (Scholar), including the 7-digit
+    # WL numbers the broad reporter regex's page group won't match.
+    recap_spans: list[tuple[int, int]] = []
+    for start, end, spec in iter_recap_cites(text):
+        recap_spans.append((start, end))
+        if spec is not None:
+            matches.append((start, end, "recap", spec))
+        else:
+            cite = re.sub(r"\s+", " ", text[start:end]).strip()
+            matches.append((start, end, "cite", cite))
+    claimed_spans = engrep_spans + recap_spans
     for m in _iter_case_cites(text):
-        if any(m.start() < e and s < m.end() for s, e in engrep_spans):
+        if any(m.start() < e and s < m.end() for s, e in claimed_spans):
             continue
         matches.append((m.start(), m.end(), "cite", m))
     for m in us_code.USC_CITE_RE.finditer(text):
@@ -294,6 +414,10 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         matches.append((m.start(), m.end(), "const", m))
     # Short forms ("Roe, 410 U.S. at 152") resolve to the case's full citation.
     for m in _iter_short_cites(text):
+        # A WL short form ("2014 WL 1922831 at *5") overlapping a RECAP span
+        # would outrank it (same start, longer) — the RECAP action wins.
+        if any(m.start() < e and s < m.end() for s, e in recap_spans):
+            continue
         pages = index.get((m.group(1), norm_reporter(m.group(2))))
         if not pages:
             continue
@@ -327,12 +451,16 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         action: tuple[str, str] | None
         cite_base = ""
         if kind == "cite":
-            cite = _case_match_text(m)
+            # m is a regex match for reporter cites, a pre-normalized string
+            # for the WL/LEXIS cites added by the RECAP pass.
+            cite = m if isinstance(m, str) else _case_match_text(m)
             cite_base = cite
             pin_m = PINCITE_AFTER_RE.match(text, end)
             if pin_m:
                 cite += "@" + pin_m.group(1)
             action = ("cite", cite)
+        elif kind == "recap":
+            action = ("recap", m)  # m is the pre-built JSON spec
         elif kind == "usc":
             action = ("usc", us_code.cite_spec(m))
         elif kind == "cfr":
@@ -521,6 +649,45 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
     if any(a == ("cite", "9 Exch. 341") or a == ("cite", "5 East 10")
            for _, _, a in nom):
         print("nominate cite leaked into a Scholar case link:", nom)
+        sys.exit(1)
+
+    # Unpublished opinions: a federal WL cite with docket + court/date routes
+    # to RECAP — with the docket carried from the first occurrence to later
+    # short forms — while a state-court WL cite stays an ordinary case link.
+    recap = detect_links(
+        "Care One Mgmt., LLC v. United Healthcare Workers E., No. 12-6371, "
+        "2024 WL 1327972, at *7 (D.N.J. Mar. 28, 2024).  A later short form "
+        "cites 2024 WL 1327972, at *9 (D.N.J. Mar. 28, 2024).  But Foxtons, "
+        "Inc. v. Cirri Germain Realty, No. A-61210-05T3, 2008 WL 465653 "
+        "(N.J. Super. Ct. App. Div. Feb. 22, 2008) is a state case."
+    )
+    recap_actions = [a for _s, _e, a in recap if a[0] == "recap"]
+    if len(recap_actions) != 2:
+        print("expected 2 recap links:", recap)
+        sys.exit(1)
+    spec = json.loads(recap_actions[0][1])
+    if not (spec.get("docket") == "12-6371" and spec.get("court") == "njd"
+            and spec.get("date") == "2024-03-28"
+            and spec.get("cite") == "2024 WL 1327972"
+            and "Care One" in spec.get("name", "")):
+        print("bad recap spec:", spec)
+        sys.exit(1)
+    if json.loads(recap_actions[1][1]).get("docket") != "12-6371":
+        print("short-form recap did not inherit the docket:", recap_actions)
+        sys.exit(1)
+    if not any(a == ("cite", "2008 WL 465653") for _s, _e, a in recap):
+        print("state WL cite should stay a case link:", recap)
+        sys.exit(1)
+
+    # A WL cite with no docket anywhere stays a plain case link, even when
+    # its number is too long for the broad reporter regex.
+    plain = detect_links("ShotSpotter Inc. v. VICE Media, LLC, 2022 WL "
+                         "2373418, at *12 (Del. Super. Ct. June 30, 2022).")
+    if not any(a == ("cite", "2022 WL 2373418@12") for _s, _e, a in plain):
+        print("7-digit WL cite did not become a case link:", plain)
+        sys.exit(1)
+    if any(a[0] == "recap" for _s, _e, a in plain):
+        print("state WL cite must not become recap:", plain)
         sys.exit(1)
 
     print("\nOK:", len(found), "links;", sorted(kinds))

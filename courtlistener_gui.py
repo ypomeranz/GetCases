@@ -501,6 +501,7 @@ def _ensure_modern_ttk_styles(widget: tk.Misc) -> None:
 
 from bluebook_names import abbreviate_case_name
 from cl_parse import parse_cl_html as _parse_cl_html
+import courtlistener as cl_api
 from courtlistener import CourtListenerClient, CourtListenerError
 import constitution
 import ecfr
@@ -510,6 +511,7 @@ import fed_rules
 import state_statutes
 import statutes_at_large
 import us_code
+import pdfium_lock
 import us_reports_pdf
 import brief_reader
 import oyez
@@ -531,6 +533,7 @@ from court_catalog import (
     DISTRICT_COURTS as _DISTRICT_COURTS,
     STATE_COURTS as _STATE_COURTS,
     all_court_ids as _all_court_ids,
+    bluebook_court_from_name as _bluebook_court_from_name,
 )
 
 _CONFIG_PATH = Path.home() / ".config" / "courtlistener" / "config.json"
@@ -552,6 +555,98 @@ def _save_config(data: dict) -> None:
         _CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Brief cache: PDFs opened in the brief viewer are kept for 30 days from the
+# last time they were opened (each open restarts the clock) and listed in the
+# Brief ▸ Recent Briefs menu for one-click reopening.
+# ---------------------------------------------------------------------------
+
+_BRIEF_CACHE_DIR = Path.home() / ".config" / "courtlistener" / "brief_cache"
+_BRIEF_CACHE_INDEX = _BRIEF_CACHE_DIR / "briefs.json"
+_BRIEF_CACHE_DAYS = 30
+_brief_cache_lock = threading.Lock()
+
+
+def _brief_cache_load() -> list[dict]:
+    try:
+        data = json.loads(_BRIEF_CACHE_INDEX.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _brief_cache_save(entries: list[dict]) -> None:
+    try:
+        _BRIEF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _BRIEF_CACHE_INDEX.write_text(
+            json.dumps(entries, indent=1), encoding="utf-8")
+    except Exception as exc:
+        print(f"[brief-cache] save failed: {exc}")
+
+
+def _brief_cache_prune(entries: list[dict]) -> list[dict]:
+    """Drop briefs not opened in the last 30 days, deleting their files."""
+    cutoff = time.time() - _BRIEF_CACHE_DAYS * 86400
+    kept: list[dict] = []
+    for e in entries:
+        if (e.get("last_opened") or 0) >= cutoff and e.get("sha1"):
+            kept.append(e)
+        else:
+            try:
+                (_BRIEF_CACHE_DIR / f"{e.get('sha1', '')}.pdf").unlink()
+            except OSError:
+                pass
+    return kept
+
+
+def _brief_cache_record(data: bytes, name: str, mode: str) -> None:
+    """Save a PDF opened in the brief viewer into the cache (each open
+    restarts its 30-day clock and moves it to the top of Recent Briefs).
+    ``mode`` remembers which viewer to reopen it in: "linked" (the on-page
+    citation-link PDF view) or "text" (the brief text reader)."""
+    import hashlib
+
+    try:
+        sha1 = hashlib.sha1(data).hexdigest()
+        with _brief_cache_lock:
+            _BRIEF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            path = _BRIEF_CACHE_DIR / f"{sha1}.pdf"
+            if not path.is_file() or path.stat().st_size != len(data):
+                tmp = path.with_suffix(f".{os.getpid()}.tmp")
+                tmp.write_bytes(data)
+                tmp.replace(path)
+            entries = [e for e in _brief_cache_load()
+                       if e.get("sha1") != sha1]
+            entries.insert(0, {
+                "sha1": sha1,
+                "name": name,
+                "mode": mode,
+                "last_opened": time.time(),
+            })
+            _brief_cache_save(_brief_cache_prune(entries))
+    except Exception as exc:
+        print(f"[brief-cache] store failed: {exc}")
+
+
+def _brief_cache_entries() -> list[dict]:
+    """The cached briefs, newest-opened first, expired ones pruned."""
+    with _brief_cache_lock:
+        entries = _brief_cache_load()
+        kept = _brief_cache_prune(entries)
+        if len(kept) != len(entries):
+            _brief_cache_save(kept)
+    kept.sort(key=lambda e: e.get("last_opened") or 0, reverse=True)
+    return kept
+
+
+def _brief_cache_read(entry: dict) -> Optional[bytes]:
+    try:
+        data = (_BRIEF_CACHE_DIR / f"{entry.get('sha1', '')}.pdf").read_bytes()
+        return data if data.startswith(b"%PDF") else None
+    except Exception:
+        return None
 
 
 def _json_ready(value):
@@ -917,7 +1012,13 @@ def _court_for_paren(citation: str, court_id: str, fallback: str = "") -> str:
     reporter = m.group(2).strip() if m else ""
     if "scotus" in court_id or reporter in _SCOTUS_REPORTERS:
         return ""
-    abbr = _COURT_BLUEBOOK.get(court_id, "") or (fallback or "").strip()
+    abbr = _COURT_BLUEBOOK.get(court_id, "")
+    if not abbr:
+        # An id outside the catalog: bluebook the court *name* CourtListener
+        # supplied ("Court of Appeals of Ohio" → "Ohio Ct. App.") rather
+        # than printing it raw; keep the raw fallback only when the name
+        # isn't recognizable.
+        abbr = _bluebook_court_from_name(fallback) or (fallback or "").strip()
     if not abbr or not reporter:
         return abbr
     rep_tokens = [t for t in _REPORTER_SERIES_RE.sub(" ", reporter).split() if t]
@@ -2933,6 +3034,15 @@ class CourtListenerGUI:
             label="Import PDF & Link Citations (on the page)…",
             command=self._open_linked_pdf,
         )
+        # PDFs opened in the brief viewer stay cached for 30 days from their
+        # last open; this submenu reopens them (restarting the clock).
+        self._recent_briefs_menu = tk.Menu(
+            brief_menu, tearoff=0,
+            postcommand=self._fill_recent_briefs_menu,
+        )
+        brief_menu.add_cascade(
+            label="Recent Briefs", menu=self._recent_briefs_menu,
+        )
         db_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Database", menu=db_menu)
         db_menu.add_command(
@@ -4679,10 +4789,8 @@ class CourtListenerGUI:
             if not hits:
                 status_var.set(f"No opinion in the database for {q!r}.")
                 return
-            if len(hits) == 1:
-                dlg.destroy()
-                self._open_db_record(hits[0]["scholar_id"])
-                return
+            # Even a single hit goes through the picker — it carries the
+            # Open / Refresh / Delete actions for the stored opinion.
             dlg.destroy()
             _DbMatchDialog(self.root, self, hits)
 
@@ -4824,6 +4932,13 @@ class CourtListenerGUI:
                 parent=self.root,
             )
             return
+        if path.lower().endswith(".pdf"):
+            try:
+                with open(path, "rb") as fh:
+                    _brief_cache_record(fh.read(), os.path.basename(path),
+                                        "text")
+            except Exception as exc:
+                print(f"[brief-cache] could not cache {path}: {exc}")
         _BriefTextWindow(self.root, self, os.path.basename(path), text)
 
     def _open_linked_pdf(self) -> None:
@@ -4854,7 +4969,46 @@ class CourtListenerGUI:
                 parent=self.root,
             )
             return
+        _brief_cache_record(pdf_data, os.path.basename(path), "linked")
         _LinkedPdfWindow(self.root, self, pdf_data, os.path.basename(path))
+
+    def _fill_recent_briefs_menu(self) -> None:
+        """Rebuild Brief ▸ Recent Briefs from the 30-day cache."""
+        menu = self._recent_briefs_menu
+        menu.delete(0, "end")
+        entries = _brief_cache_entries()
+        if not entries:
+            menu.add_command(
+                label="(no briefs opened in the last 30 days)",
+                state="disabled",
+            )
+            return
+        for e in entries:
+            opened = time.strftime(
+                "%b %d", time.localtime(e.get("last_opened") or 0))
+            label = f"{e.get('name') or 'brief.pdf'}   ·   {opened}"
+            menu.add_command(
+                label=label[:80],
+                command=lambda e=e: self._reopen_recent_brief(e),
+            )
+
+    def _reopen_recent_brief(self, entry: dict) -> None:
+        """Open a brief from the cache, restarting its 30-day clock."""
+        data = _brief_cache_read(entry)
+        name = entry.get("name") or "brief.pdf"
+        if data is None:
+            messagebox.showwarning(
+                "Recent Briefs",
+                f"The cached copy of “{name}” is no longer available.",
+                parent=self.root,
+            )
+            _brief_cache_entries()  # prune
+            return
+        _brief_cache_record(data, name, entry.get("mode") or "linked")
+        if entry.get("mode") == "text":
+            self._open_brief_from_bytes(data, name)
+        else:
+            _LinkedPdfWindow(self.root, self, data, name)
 
     def _open_brief_from_bytes(self, data: bytes, name: str) -> None:
         """Text-reader fallback for an imported PDF when the in-app PDF viewer
@@ -6540,26 +6694,31 @@ class _CourtPickerDialog:
 
 
 class _DbMatchDialog:
-    """Pick one opinion when a database search matches several — the same name
-    or reporter page can belong to more than one case, so the user chooses."""
+    """Pick a stored opinion from a database search and act on it: Open it,
+    Refresh it (replace the stored copy with the latest Google Scholar
+    version — e.g. to pick up newly added reporter pagination), or Delete it
+    (after which the case is only ever reloaded from Google Scholar itself,
+    never from the cache)."""
 
     def __init__(self, parent: tk.Misc, app: "CourtListenerGUI", candidates: list[dict]) -> None:
         self._app = app
-        self._candidates = candidates
+        self._candidates = list(candidates)
+        self._busy = False
         win = _ui_toplevel(parent)
         self._win = win
-        win.title("Select an Opinion")
-        win.geometry("660x420")
-        win.minsize(420, 260)
+        win.title("Opinions in Database")
+        win.geometry("680x440")
+        win.minsize(440, 280)
         _ensure_modern_ttk_styles(win)
         frame = _ui_frame(win)
         frame.pack(fill="both", expand=True, padx=14, pady=12)
+        heading = ("1 opinion found" if len(candidates) == 1
+                   else f"{len(candidates)} opinions match — choose one")
         _ui_label(
-            frame, f"{len(candidates)} opinions match — choose one",
-            size=14, weight="bold", anchor="w",
+            frame, heading, size=14, weight="bold", anchor="w",
         ).pack(anchor="w", fill="x")
         card = _ui_frame(frame, card=True)
-        card.pack(fill="both", expand=True, pady=(8, 10))
+        card.pack(fill="both", expand=True, pady=(8, 6))
         pad = 8 if _CTK_AVAILABLE else 0
         cols = ("name", "cite", "court", "year")
         tree = ttk.Treeview(
@@ -6580,6 +6739,9 @@ class _DbMatchDialog:
             )
         tree.pack(fill="both", expand=True, padx=pad, pady=pad)
         self._tree = tree
+        self._status_var = tk.StringVar(value="")
+        _ui_label(frame, muted=True, anchor="w",
+                  textvariable=self._status_var).pack(fill="x", pady=(0, 6))
         btns = _ui_frame(frame)
         btns.pack(fill="x")
         _ui_button(btns, "Open", command=self._open, primary=True,
@@ -6587,18 +6749,164 @@ class _DbMatchDialog:
         _ui_button(btns, "Cancel", command=win.destroy, width=88).pack(
             side="right", padx=(0, 8)
         )
+        _ui_button(btns, "Delete", command=self._delete, width=88).pack(
+            side="left")
+        _ui_button(btns, "Refresh Opinion", command=self._refresh,
+                   width=136).pack(side="left", padx=(8, 0))
         tree.bind("<Double-1>", lambda _e: self._open())
         if candidates:
             tree.selection_set("0")
             tree.focus_set()
 
-    def _open(self) -> None:
+    def _selected(self) -> Optional[tuple[str, dict]]:
         sel = self._tree.selection()
-        if not sel:
+        if not sel or self._busy:
+            return None
+        return sel[0], self._candidates[int(sel[0])]
+
+    def _post(self, fn, *args) -> None:
+        try:
+            self._win.after(0, fn, *args)
+        except tk.TclError:
+            pass  # dialog closed while the worker ran
+
+    def _open(self) -> None:
+        picked = self._selected()
+        if picked is None:
             return
-        h = self._candidates[int(sel[0])]
+        _iid, h = picked
         self._win.destroy()
         self._app._open_db_record(h["scholar_id"])
+
+    def _delete(self) -> None:
+        """Remove the opinion from the database and scrub the query cache, so
+        reopening the case can only come fresh from Google Scholar's site."""
+        picked = self._selected()
+        if picked is None:
+            return
+        iid, h = picked
+        name = h.get("name") or h.get("cite") or "this opinion"
+        if not messagebox.askyesno(
+            "Delete Opinion",
+            f"Remove “{name}” from the local database?\n\n"
+            "It will not be served from any cache again — opening the case "
+            "later will fetch it fresh from Google Scholar.",
+            parent=self._win,
+        ):
+            return
+        self._busy = True
+        self._status_var.set("Deleting…")
+
+        def run() -> None:
+            ok, err = False, ""
+            try:
+                db = self._app._get_opinion_db()
+                rec = db.get_by_scholar_id(h["scholar_id"]) if db else None
+                ok = bool(db) and db.delete(h["scholar_id"])
+                # Scrub the fetcher's query cache too, or the next open
+                # would resurrect the deleted copy from there.
+                if rec and rec.get("url") and _SCHOLAR_AVAILABLE:
+                    fetcher = self._app._get_scholar()
+                    if fetcher is not None:
+                        n = fetcher.purge_cached_opinion(rec["url"])
+                        if n:
+                            print(f"[db] purged {n} cache entr"
+                                  f"{'y' if n == 1 else 'ies'} for {name!r}")
+            except Exception as exc:
+                err = str(exc)
+
+            def done() -> None:
+                self._busy = False
+                if not ok:
+                    self._status_var.set(
+                        f"Delete failed{': ' + err if err else '.'}")
+                    return
+                try:
+                    self._tree.delete(iid)
+                except tk.TclError:
+                    pass
+                self._status_var.set(f"Deleted {name}.")
+                if not self._tree.get_children():
+                    self._win.destroy()
+
+            self._post(done)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _refresh(self) -> None:
+        """Replace the stored copy with the latest Google Scholar version of
+        the same opinion (recent SCOTUS cases gain reporter pagination as
+        the official cite is assigned)."""
+        picked = self._selected()
+        if picked is None:
+            return
+        iid, h = picked
+        name = h.get("name") or h.get("cite") or "this opinion"
+        if not _SCHOLAR_AVAILABLE:
+            self._status_var.set(
+                "Refreshing needs beautifulsoup4 (pip install beautifulsoup4).")
+            return
+        fetcher = self._app._get_scholar()
+        db = self._app._get_opinion_db()
+        if fetcher is None or db is None:
+            return
+        rec = db.get_by_scholar_id(h["scholar_id"])
+        if not rec or not rec.get("url"):
+            self._status_var.set("No Scholar URL stored for this opinion.")
+            return
+        self._busy = True
+        self._status_var.set(
+            f"Fetching the latest Google Scholar version of {name}…")
+
+        def run() -> None:
+            msg = ""
+            new_summary: Optional[dict] = None
+            try:
+                import opinion_db as _odb
+                result = fetcher.refetch_by_url(rec["url"])
+                if not result:
+                    msg = ("Google Scholar didn't return the opinion "
+                           "(blocked or unavailable) — kept the stored copy.")
+                else:
+                    new_url, html = result
+                    new_rec = _odb.extract_record(new_url, html)
+                    if new_rec is None:
+                        msg = "The fetched page carries no Scholar id — kept the stored copy."
+                    else:
+                        # Keep enrichments the page itself can't provide.
+                        for k in ("name", "court", "year", "date_filed", "source"):
+                            if not new_rec.get(k) and rec.get(k):
+                                new_rec[k] = rec[k]
+                        db.replace(new_rec)
+                        changed = len(html) - len(rec.get("html") or "")
+                        msg = (f"Updated {name} to the latest Google Scholar "
+                               f"version ({changed:+,} characters).")
+                        new_summary = {
+                            "scholar_id": new_rec["scholar_id"],
+                            "name": new_rec.get("name", ""),
+                            "cite": (new_rec.get("cites") or [""])[0],
+                            "court": new_rec.get("court", ""),
+                            "year": new_rec.get("year", ""),
+                        }
+            except Exception as exc:
+                msg = f"Refresh failed: {exc}"
+
+            def done() -> None:
+                self._busy = False
+                self._status_var.set(msg)
+                if new_summary is not None:
+                    self._candidates[int(iid)] = new_summary
+                    try:
+                        self._tree.item(iid, values=(
+                            new_summary["name"] or "(unknown)",
+                            new_summary["cite"], new_summary["court"],
+                            new_summary["year"]))
+                    except tk.TclError:
+                        pass
+
+            self._post(done)
+
+        threading.Thread(target=run, daemon=True).start()
 
 
 _OP_ID_RE = re.compile(r"/opinions/(\d+)/?")
@@ -7011,6 +7319,20 @@ def _scholar_caption_name(blocks) -> str:
         if len(sides) != 2:
             sides = re.split(r"\s+[vV]s?\.\s+", t, maxsplit=1)
         if len(sides) == 2:
+            # A consolidated caption lists the companion cases after the
+            # first, separated by periods ("MUGLER v. KANSAS. SAME v. SAME.
+            # KANSAS v. ZIEBOLD."): only the first listed case is cited
+            # (Bluebook rule 10.2.1(b)).  Cut where a period is followed by
+            # a new case — one with its own "v.", a "SAME", or an in-re
+            # style caption — never at an entity abbreviation's period
+            # ("… v. Acme Co. of America" has no case after it).
+            cm = re.search(
+                r"\.\s+(?=[^.]*?\s+vs?\.\s+|SAME\b|IN\s+RE\b|EX\s+PARTE\b"
+                r"|(?:IN\s+THE\s+)?MATTER\s+OF\b)",
+                sides[1], re.IGNORECASE,
+            )
+            if cm:
+                sides[1] = sides[1][: cm.start() + 1]
             left, right = _caption_party(sides[0]), _caption_party(sides[1])
             if left and right:
                 return f"{left} v. {right}"
@@ -7205,12 +7527,15 @@ def _fn_bookmark(side: str, fid: str) -> str:
 def _dump_to_rtf(
     txt: tk.Text, start: str, end: str, part_colors: bool = False,
     fn_links: Optional[dict[str, tuple[str, str]]] = None,
+    omit_tags: Optional[set[str]] = None,
 ) -> str:
     """Convert a Tk Text range (with the Scholar window's tags) to an RTF
     body.  `fn_links` maps link-tag names to ("fnref"|"fndef", id);
     matching runs become RTF bookmark/hyperlink pairs so footnote markers
-    stay clickable in the exported document."""
+    stay clickable in the exported document.  Text under any tag in
+    `omit_tags` is dropped (quote-ready copies omit footnote markers)."""
     fn_links = fn_links or {}
+    omit_tags = omit_tags or set()
     out: list[str] = []
     # Seed with tags already open at *start*; dump only reports transitions.
     active: set[str] = set(txt.tag_names(start))
@@ -7255,7 +7580,7 @@ def _dump_to_rtf(
         elif key == "tagoff":
             active.discard(value)
         elif key == "text":
-            if "justify-pad" in active:
+            if "justify-pad" in active or active & omit_tags:
                 continue
             for i, seg in enumerate(value.split("\n")):
                 if i and par_open:
@@ -7279,16 +7604,23 @@ def _dump_to_rtf(
     return "".join(out)
 
 
-def _plain_without_layout_chars(txt: tk.Text, start: str, end: str) -> str:
-    """Text content without temporary on-screen justification fragments."""
+def _plain_without_layout_chars(
+    txt: tk.Text, start: str, end: str,
+    omit_tags: Optional[set[str]] = None,
+) -> str:
+    """Text content without temporary on-screen justification fragments.
+    Text under any tag in `omit_tags` is dropped too (omitted footnote
+    markers in quote-ready copies)."""
     out: list[str] = []
+    omit_tags = omit_tags or set()
     active: set[str] = set(txt.tag_names(start))
     for key, value, _index in txt.dump(start, end, text=True, tag=True):
         if key == "tagon":
             active.add(value)
         elif key == "tagoff":
             active.discard(value)
-        elif key == "text" and "justify-pad" not in active:
+        elif key == "text" and "justify-pad" not in active \
+                and not active & omit_tags:
             out.append(value)
     return "".join(out)
 
@@ -7572,6 +7904,46 @@ def _latex_run(
     return out
 
 
+# A section marker standing alone on its own (usually centered) line — the
+# way Supreme Court opinions head their parts: a bare roman numeral ("II"),
+# capital letter ("A") or number ("1"), optionally compounded ("II-B"), with
+# an optional trailing period.  Star-pagination markers may precede it.
+_BARE_HEADING_RE = re.compile(
+    r"^(?:[IVXLCDM]+|[A-Z]|\d{1,2})"
+    r"(?:\s*[-–—.]\s*(?:[IVXLCDM]+|[A-Z]|\d{1,2}))?\s*\.?$"
+)
+
+
+def _para_plain_text(p: _ExpPara) -> str:
+    """The paragraph's prose, page markers and footnote anchors dropped."""
+    return "".join(
+        r.text for r in p.runs if not (r.pagenum or r.fnref or r.fndef)
+    ).strip()
+
+
+def _heading_like(p: _ExpPara) -> bool:
+    """True when the paragraph acts as a section heading for page-break
+    purposes: an explicit heading block, or a centered section marker —
+    Supreme Court opinions head their parts with a bare "II" / "A" / "1" on
+    its own centered line, other courts with a short bold centered title."""
+    if p.kind == "heading":
+        return True
+    if p.kind != "center":
+        return False
+    text = re.sub(r"\s+", " ", _para_plain_text(p))
+    text = re.sub(r"^(?:\*\d+\s*)+", "", text).strip()  # leading page markers
+    if not text:
+        return False
+    if _BARE_HEADING_RE.match(text):
+        return True
+    # A short, all-bold centered line mid-opinion is an explanatory heading
+    # ("I. BACKGROUND").  " v. " keeps centered case-caption lines out.
+    styled = [r for r in p.runs
+              if r.text.strip() and not (r.pagenum or r.fnref or r.fndef)]
+    return (len(text) <= 80 and " v. " not in text
+            and bool(styled) and all(r.bold for r in styled))
+
+
 def _latex_paragraphs(
     paras: list[_ExpPara],
     notes: Optional[dict[str, tuple[str, str]]] = None,
@@ -7579,17 +7951,19 @@ def _latex_paragraphs(
     title_block: bool = False,
 ) -> str:
     """Paragraphs as LaTeX body text.  With `title_block`, a leading centered
-    paragraph (the case caption) is set large and bold."""
-    out: list[str] = []
-    quote_open = False
+    paragraph (the case caption) is set large and bold.
+
+    Headings — explicit heading blocks and the bare centered section markers
+    Supreme Court opinions use ("II", "A", "1") — are glued to what follows
+    with \\nopagebreak so a heading (or a run of headings) can never be left
+    at the bottom of a page while its text starts on the next: TeX then has
+    no legal break point between the heading and the second line of the
+    following paragraph (\\clubpenalty already guards the first), so the
+    whole group moves to the fresh page instead."""
+    # Pass 1: typeset each paragraph, in order (footnote placement depends on
+    # first-reference order), remembering which ones behave as headings.
+    items: list[tuple[_ExpPara, str, bool]] = []  # (para, latex, is_title)
     title_pending = title_block
-
-    def close_quote() -> None:
-        nonlocal quote_open
-        if quote_open:
-            out.append("\\end{quote}\n\n")
-            quote_open = False
-
     for p in paras:
         if p.kind == "fnhead":
             continue  # "Footnotes" label: notes are typeset at page bottoms
@@ -7604,23 +7978,45 @@ def _latex_paragraphs(
         body = "".join(pieces).strip()
         if not body:
             continue
+        items.append((p, body, title_pending and p.kind == "center"))
+        title_pending = False
+
+    # Pass 2: assemble, keeping headings attached to their following text.
+    out: list[str] = []
+    quote_open = False
+
+    def close_quote() -> None:
+        nonlocal quote_open
+        if quote_open:
+            out.append("\\end{quote}\n\n")
+            quote_open = False
+
+    for i, (p, body, is_title) in enumerate(items):
         if p.kind == "blockquote":
             if not quote_open:
                 out.append("\\begin{quote}\n")
                 quote_open = True
             out.append(body + "\n\n")
-            title_pending = False
             continue
         close_quote()
+        # \nopagebreak only helps when something follows in this section.
+        heading = not is_title and _heading_like(p)
+        glue = "\\nopagebreak" if heading and i + 1 < len(items) else ""
         if p.kind == "center":
-            if title_pending:
+            if is_title:
                 body = "{\\large\\bfseries " + body + "}"
-            out.append("\\begin{center}\n" + body + "\n\\end{center}\n\n")
+            if heading:
+                # Not a center environment: its surrounding list glue would
+                # reopen a legal page-break point after the \nopagebreak.
+                out.append("\\medskip{\\centering " + body + "\\par}"
+                           + glue + "\\medskip\n\n")
+            else:
+                out.append("\\begin{center}\n" + body + "\n\\end{center}\n\n")
         elif p.kind == "heading":
-            out.append("\\medskip\\noindent\\textbf{" + body + "}\n\n")
+            out.append("\\medskip\\noindent\\textbf{" + body + "}\\par"
+                       + glue + "\n\n")
         else:
             out.append(body + "\n\n")
-        title_pending = False
     close_quote()
     return "".join(out)
 
@@ -8383,10 +8779,11 @@ class _TextFinder:
 # even on *different* documents, can crash the interpreter.  The PDF pane renders
 # on the main thread while the citation-linking worker (_detect_pdf_citation_links)
 # reads text/char-boxes on a background thread, so every stretch of PDFium work is
-# serialized through this one re-entrant lock.  This is the fix for the old
-# "import a PDF and link its citations" feature, which crashed because the page
-# render and the text scan ran in parallel.
-_PDFIUM_LOCK = threading.RLock()
+# serialized through the one process-wide lock in ``pdfium_lock`` — shared with
+# ``us_reports_pdf`` (opinion carving) and ``brief_reader`` (brief text), whose
+# worker-thread PDFium calls used to run unserialized against the pane's render
+# and crash the app when a case link was clicked from the PDF brief viewer.
+_PDFIUM_LOCK = pdfium_lock.PDFIUM_LOCK
 _PDF_HEADER_RE = re.compile(br"%PDF-\d")
 _PDF_LINK_ATTR_RE = re.compile(
     r"""(?is)\b(?:href|src|data|data-url)=["']([^"']+)["']"""
@@ -9911,6 +10308,7 @@ class _ScholarTextWindow:
         self._cl_text: Optional[str] = cl_text
         self._mode = "courtlistener" if self._cl_primary else "scholar"
         self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
+        self._pdf_holder: Optional[ttk.Frame] = None  # pane + parts strip
         self._pdf_url: Optional[str] = None
         self._pdf_bytes: Optional[bytes] = None
         # Background-prefetched PDF (data, url) so "View PDF" is instant; set by
@@ -10143,6 +10541,7 @@ class _ScholarTextWindow:
         self._text_frame, self._vsb = text_frame, vsb
         self._details_frame: Optional[ttk.Frame] = None
         self._details_loaded = False
+        self._details_case: Optional[tuple] = None  # cached (title, lines)
 
         txt.tag_configure("center", justify="center")
         txt.tag_configure("blockquote", lmargin1=36, lmargin2=36, rmargin=36)
@@ -11074,6 +11473,7 @@ class _ScholarTextWindow:
         self._finder.refresh()
         self._refresh_pdf_button()
         self._locate_pdf()
+        self._refresh_outline_panel()
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
@@ -11699,6 +12099,7 @@ class _ScholarTextWindow:
         self._hide_cl_button()  # CL view uses the toggle for "Google Scholar Text"
         self._show_pdf_button()
         self._finder.refresh()
+        self._refresh_outline_panel()
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
@@ -11731,6 +12132,7 @@ class _ScholarTextWindow:
         )
         self._show_pdf_button()
         self._finder.refresh()
+        self._refresh_outline_panel()
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
@@ -11918,6 +12320,30 @@ class _ScholarTextWindow:
                     surname = _fix_name_case(jm.group(2).replace("’", "'"))
                     form = "statement of" if jm.group(1) else "opinion of"
                     return f"{form} {surname}, J."
+                # Headers that never name the role — the role was read from
+                # the opinion's opening lines when the part was segmented, so
+                # part.kind is trustworthy here.  A bare state-court byline
+                # ("TRAYNOR, J.") or an explicit hand-off ("MR. JUSTICE FIELD
+                # delivered the following separate opinion.").
+                role = "dissenting" if part.kind == "dissent" else "concurring"
+                bm = re.match(
+                    r"([A-Z][\w.'’-]+),\s*(C\.\s*)?J\.\s*[.:]?\s*$",
+                    (part.label or "").strip(),
+                )
+                if bm:
+                    title = "C.J." if bm.group(2) else "J."
+                    surname = _fix_name_case(bm.group(1).replace("’", "'"))
+                    return f"{surname}, {title}, {role}"
+                dm = re.match(
+                    r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(CHIEF\s+)?JUSTICE\s+"
+                    r"([A-Z][\w.'’-]+)\s+delivered\s+(?:the\s+following|a)\s+"
+                    r"(?:separate|concurring|dissenting)\s+opinion",
+                    (part.label or "").strip(), re.IGNORECASE,
+                )
+                if dm:
+                    title = "C.J." if dm.group(1) else "J."
+                    surname = _fix_name_case(dm.group(2).replace("’", "'"))
+                    return f"{surname}, {title}, {role}"
                 return ""
             phrase = {
                 "concurrence": "concurring",
@@ -12152,9 +12578,12 @@ class _ScholarTextWindow:
             pass
 
     def _bluebook_citation(
-        self, pin: Optional[str], writer: str = ""
+        self, pin: Optional[str], writer: str = "",
+        extra_parens: tuple[str, ...] = (),
     ) -> tuple[str, str]:
-        """Return (plain, rtf-fragment) forms of the Bluebook citation."""
+        """Return (plain, rtf-fragment) forms of the Bluebook citation.
+        `extra_parens` follow the writer parenthetical — e.g. "footnote
+        omitted" (Bluebook rule 5.2(d))."""
         bb = self._bb
         name, cite, court, year = bb["name"], bb["cite"], bb["court"], bb["year"]
         rest = ""
@@ -12169,6 +12598,9 @@ class _ScholarTextWindow:
             rest += f" ({paren_inner})"
         if writer:
             rest += f" ({writer})"
+        for extra in extra_parens:
+            if extra:
+                rest += f" ({extra})"
         rest += "."
         # Bluebook abbreviations ("Ass'n", "Int'l", "Dep't", "F. App'x"),
         # possessives, and names like O'Connor take a typographic apostrophe
@@ -12315,6 +12747,14 @@ class _ScholarTextWindow:
         # its own (still richly, just without the citation).
         with_cite = self._copy_with_cite.get()
         plain_cite, rtf_cite = "", ""
+        omit_tags: set[str] = set()
+        n_omitted = 0
+        if with_cite and selected:
+            # Footnote references inside the copied body text: a quote-ready
+            # copy drops the marker and says so in the citation ("(footnote
+            # omitted)") — unless the note's own text is inside the selection
+            # (then it is being copied, not omitted).
+            omit_tags, n_omitted = self._omitted_footnote_tags(start, end)
         if with_cite:
             # Pin cites and the writer parenthetical apply whenever the opinion
             # on screen actually carries reporter page markers — the Google
@@ -12344,10 +12784,16 @@ class _ScholarTextWindow:
                             break
                 if pi is not None and pi < len(parts):
                     writer = self._writer_parenthetical(parts[pi])
-            plain_cite, rtf_cite = self._bluebook_citation(pin, writer)
-        body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map())
+            extras: tuple[str, ...] = ()
+            if n_omitted:
+                extras = ("footnote omitted" if n_omitted == 1
+                          else "footnotes omitted",)
+            plain_cite, rtf_cite = self._bluebook_citation(pin, writer, extras)
+        body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map(),
+                            omit_tags=omit_tags)
         rtf = _rtf_document(body + rtf_cite)
-        plain = _plain_without_layout_chars(txt, start, end).rstrip()
+        plain = _plain_without_layout_chars(txt, start, end,
+                                            omit_tags=omit_tags).rstrip()
         if plain_cite:
             plain += "\n\n" + plain_cite + "\n"
         how = _copy_rich_clipboard(self._win, rtf, plain)
@@ -12361,6 +12807,37 @@ class _ScholarTextWindow:
         """Link tags that anchor footnote jumps, for RTF bookmarks."""
         return {t: a for t, a in self._link_actions.items()
                 if a[0] in ("fnref", "fndef")}
+
+    def _omitted_footnote_tags(self, start: str, end: str) -> tuple[set[str], int]:
+        """Footnote-reference marker tags inside [start, end) whose notes a
+        quote-ready copy omits, with the count of distinct omitted notes.
+        A reference is omitted unless its note's body is also selected (the
+        note is then being copied along, not dropped); markers inside a
+        footnote body (a note citing another note) are left alone."""
+        txt = self._text
+        fn_regions = getattr(self, "_fn_regions", []) or []
+        def_pos = getattr(self, "_fn_def_pos", {}) or {}
+        omit: set[str] = set()
+        fids: set[str] = set()
+        for tag, (side, fid) in self._fn_link_map().items():
+            if side != "fnref":
+                continue
+            ranges = txt.tag_ranges(tag)
+            for i in range(0, len(ranges), 2):
+                rs, rend = str(ranges[i]), str(ranges[i + 1])
+                if not (txt.compare(rs, "<", end)
+                        and txt.compare(rend, ">", start)):
+                    continue
+                if any(txt.compare(rs, ">=", fr[0])
+                       and txt.compare(rs, "<", fr[1]) for fr in fn_regions):
+                    continue  # marker sits inside a note body
+                body_pos = def_pos.get(fid)
+                if body_pos and txt.compare(body_pos, ">=", start) \
+                        and txt.compare(body_pos, "<", end):
+                    continue  # the note itself is selected too
+                omit.add(tag)
+                fids.add(fid)
+        return omit, len(fids)
 
     def _filename_item(self) -> dict:
         if self._item:
@@ -12828,6 +13305,25 @@ class _ScholarTextWindow:
             _ui_button(header, "A−", command=lambda: self._zoom_details(-1),
                        width=40).pack(side="right", padx=(0, 4))
 
+            # What the panel shows: the case details (Oyez line-up/summary,
+            # falling back to the Court's recent decisions, then to whatever
+            # the open text reveals) or the opinion's detected outline.
+            mode_row = ttk.Frame(f)
+            mode_row.pack(fill="x", padx=6, pady=(0, 2))
+            ttk.Label(mode_row, text="Show",
+                      style="ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel",
+                      ).pack(side="left")
+            self._details_mode_combo = ttk.Combobox(
+                mode_row, state="readonly", width=14,
+                values=("Case details", "Outline"),
+                style="Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox",
+            )
+            self._details_mode_combo.current(0)
+            self._details_mode_combo.pack(side="left", padx=(6, 0))
+            self._details_mode_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _e: self._refresh_details_view())
+
             body = tk.Text(
                 f, width=38, wrap="word",
                 font=self._details_fonts["body"],
@@ -12849,6 +13345,17 @@ class _ScholarTextWindow:
                           lambda _e: body.config(cursor="hand2"))
             body.tag_bind("olink", "<Leave>",
                           lambda _e: body.config(cursor=""))
+            # Outline entries for the opinion's parts, in the same colors the
+            # text view's part map uses (configured after "olink" so the part
+            # color outranks the link blue).
+            body.tag_configure("olpart", font=self._details_fonts["h"],
+                               foreground="#333333", spacing1=8)
+            body.tag_configure("olmaj", font=self._details_fonts["h"],
+                               foreground=self._MAJORITY_COLOR, spacing1=8)
+            body.tag_configure("olconc", font=self._details_fonts["h"],
+                               foreground=self._CONCUR_COLOR, spacing1=8)
+            body.tag_configure("oldiss", font=self._details_fonts["h"],
+                               foreground=self._DISSENT_COLOR, spacing1=8)
             self._details_text = body
             self._details_frame = f
             self._apply_details_fonts()   # honor the persisted zoom choice
@@ -12881,10 +13388,46 @@ class _ScholarTextWindow:
         if self._details_var.get():
             self._details_panel().pack(side="right", fill="y",
                                        before=self._vsb)
-            if not self._details_loaded:
-                self._load_details()
+            self._refresh_details_view()
         elif self._details_frame is not None:
             self._details_frame.pack_forget()
+
+    def _details_mode(self) -> str:
+        """The side panel's selected view: "case" or "outline"."""
+        combo = getattr(self, "_details_mode_combo", None)
+        try:
+            if combo is not None and combo.get() == "Outline":
+                return "outline"
+        except tk.TclError:
+            pass
+        return "case"
+
+    def _refresh_details_view(self) -> None:
+        """Fill the side panel for its selected mode."""
+        if self._details_frame is None:
+            return
+        if self._details_mode() == "outline":
+            self._show_outline()
+        else:
+            self._show_case_details()
+
+    def _show_case_details(self) -> None:
+        """The case-details view: cached lines when the lookup already ran,
+        else kick off the background load."""
+        cached = getattr(self, "_details_case", None)
+        if cached is not None:
+            self._apply_details(*cached)
+        elif not self._details_loaded:
+            self._load_details()
+        else:  # lookup still in flight
+            self._set_details([("lbl", "Loading case details…")])
+
+    def _apply_case_details(self, title: str, lines: list[tuple]) -> None:
+        """Store the fetched case details and show them — unless the user
+        has switched the panel to the outline meanwhile."""
+        self._details_case = (title, lines)
+        if self._details_mode() != "outline":
+            self._apply_details(title, lines)
 
     def _set_details(self, lines: list[tuple]) -> None:
         """Render the details pane.  Each line is ``(style, text)`` or, for a
@@ -12970,7 +13513,7 @@ class _ScholarTextWindow:
             if not lines:
                 lines = [("lbl", "No authorship details available "
                                  "for this case.")]
-            self._post(self._apply_details, title, lines)
+            self._post(self._apply_case_details, title, lines)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -13119,6 +13662,104 @@ class _ScholarTextWindow:
             lines.append(("", ""))
             lines.append(("", "View full details on Oyez →", case.web_url))
         return lines
+
+    # ------------------------------------------------------------------
+    # Side panel: detected outline
+    # ------------------------------------------------------------------
+
+    _OUTLINE_PART_STYLES = {"majority": "olmaj", "concurrence": "olconc",
+                            "dissent": "oldiss"}
+
+    def _show_outline(self) -> None:
+        """The outline view: each opinion part (colored like the part map)
+        and the section headings inside it — SCOTUS's bare "II"/"A"/"1"
+        markers and other courts' explanatory headings — as links that jump
+        the reader to that spot."""
+        entries = self._collect_outline()
+        lines: list[tuple] = []
+        if not entries:
+            lines.append(("lbl", "No outline detected in this opinion."))
+        else:
+            lines.append(("lbl", "Detected outline — click to jump."))
+            for level, style, text, pos in entries:
+                lines.append((style, "   " * level + text,
+                              lambda p=pos: self._outline_jump(p)))
+        self._apply_details("Outline", lines)
+
+    def _outline_jump(self, pos: str) -> None:
+        """Scroll the reader so *pos* tops the view, and flash its line."""
+        try:
+            self._text.yview(pos)
+        except tk.TclError:
+            return
+        self._jump_to(pos)
+
+    def _refresh_outline_panel(self) -> None:
+        """Rebuild the outline after a re-render — its stored text indices
+        go stale whenever the text is rebuilt (part switch, source toggle)."""
+        if (self._details_frame is not None and self._details_var.get()
+                and self._details_mode() == "outline"):
+            self._show_outline()
+
+    def _collect_outline(self) -> list[tuple[int, str, str, str]]:
+        """Outline entries of the rendered text, in document order:
+        (indent level, panel style tag, display text, text index).  Level 0
+        is an opinion part; headings nest roman → letter → number the way
+        Supreme Court opinions subdivide (II → A → 1)."""
+        txt = getattr(self, "_text", None)
+        if txt is None:
+            return []
+        entries: list[tuple[tuple[int, int], int, str, str, str]] = []
+        parts = getattr(self, "_rendered_parts", None) or []
+        for rs, _rend, pi in self._part_region_indices():
+            if pi >= len(parts):
+                continue
+            part = parts[pi]
+            label = re.sub(r"\s+", " ", part.label or "").strip() or "Part"
+            if len(label) > 110:
+                label = label[:107] + "…"
+            style = self._OUTLINE_PART_STYLES.get(part.kind, "olpart")
+            entries.append((_tk_ix(rs), 0, style, label, rs))
+        for tag in ("heading", "center"):
+            ranges = txt.tag_ranges(tag)
+            for i in range(0, len(ranges), 2):
+                start = str(ranges[i])
+                text = txt.get(start, str(ranges[i + 1]))
+                off = 0  # adjacent blocks share one tag range; walk its lines
+                for line in text.split("\n"):
+                    t = re.sub(r"^(?:\*\d+\s*)+", "", line).strip()
+                    level = self._outline_level(t, tag)
+                    if level is not None:
+                        pos = txt.index(f"{start}+{off}c")
+                        entries.append((_tk_ix(pos), level, "", t, pos))
+                    off += len(line) + 1
+        entries.sort(key=lambda e: e[0])
+        return [(level, style, text, pos)
+                for _ix, level, style, text, pos in entries]
+
+    @staticmethod
+    def _outline_level(t: str, tag: str) -> Optional[int]:
+        """The outline depth of one heading/centered line, or None when the
+        line isn't a heading (a caption line, a "* * *" divider…)."""
+        def depth(marker: str) -> int:
+            if marker.isdigit():
+                return 3
+            if len(marker) == 1 and marker not in "IVX":
+                return 2  # a lettered subsection ("A"), not a roman numeral
+            return 1
+        if not t:
+            return None
+        if tag == "heading":
+            if len(t) > 80:
+                return None  # a paragraph that merely carries the tag
+            m = re.match(r"([IVXLCDM]+|[A-Z]|\d{1,2})[.)]\s+\S", t)
+            return depth(m.group(1)) if m else 1
+        # Centered lines: only the bare section markers count ("II", "A.").
+        m = _BARE_HEADING_RE.match(t)
+        if not m:
+            return None
+        lead = re.match(r"[IVXLCDM]+|[A-Z]|\d{1,2}", t)
+        return depth(lead.group(0)) if lead else 1
 
     # ------------------------------------------------------------------
     # Citation links
@@ -13997,18 +14638,28 @@ class _ScholarTextWindow:
         width = max(self._text.winfo_width() - 24, 520)
         # US Reports scans get a roughly 3× margin (see _is_us_reports_pdf).
         margin = _PdfPane._MARGIN * 3 if _is_us_reports_pdf(url) else None
+        # The pane lives in a holder frame so a parts strip (built once the
+        # text layer reveals the separate opinions) can sit to its right.
+        if getattr(self, "_pdf_holder", None) is not None:
+            self._pdf_holder.destroy()  # a previous PDF view left behind
+            self._pdf_holder = None
+            self._pdf_pane = None
+        holder = ttk.Frame(self._win)
         try:
             pane = _PdfPane(
-                self._win, data, width=width, margin=margin,
+                holder, data, width=width, margin=margin,
                 link_style="recolor", uniform_crop=True,
             )
         except Exception as exc:  # pragma: no cover - render/lib failure
+            holder.destroy()
             self._on_pdf_error(str(exc))
             return
         # Swap the text view for the PDF pane (kept above the button row).
         self._text_frame.pack_forget()
-        pane.pack(fill="both", expand=True, padx=8, pady=4,
-                  before=self._btn_frame)
+        holder.pack(fill="both", expand=True, padx=8, pady=4,
+                    before=self._btn_frame)
+        pane.pack(side="left", fill="both", expand=True)
+        self._pdf_holder = holder
         self._pdf_pane = pane
         self._pdf_url = url
         self._pdf_bytes = data
@@ -14031,6 +14682,14 @@ class _ScholarTextWindow:
                 links = _citation_links_from_visible_pdf_text(d, pages)
             except Exception as exc:
                 print(f"[pdf-links] citation scan failed: {exc}")
+            # The separate opinions (Syllabus, Opinion of the Court, each
+            # concurrence/dissent), read from the running heads — slip
+            # opinions and US Reports pages share that layout.
+            sections: list = []
+            try:
+                sections = slip_opinion.detect_sections(pages)
+            except Exception as exc:
+                print(f"[pdf-parts] section detection failed: {exc}")
 
             def apply() -> None:
                 try:
@@ -14042,6 +14701,10 @@ class _ScholarTextWindow:
                                 self._open_pdf_cite_browser,
                             )
                         p.enable_find(pages, bind_keys=False)
+                        if len(sections) > 1:
+                            nav = _build_pdf_parts_nav(
+                                self._pdf_holder, sections, p.scroll_to_page)
+                            nav.pack(side="right", fill="y", padx=(4, 0))
                         bits = []
                         n = sum(len(v) for v in links.values())
                         if n:
@@ -14049,6 +14712,9 @@ class _ScholarTextWindow:
                                 f"{n} citation link{'s' if n != 1 else ''} "
                                 "shown in blue"
                             )
+                        if len(sections) > 1:
+                            bits.append(f"{len(sections)} opinion parts "
+                                        "listed on the right")
                         bits.append("drag to select text; Ctrl+C copies")
                         self._status_var.set("; ".join(bits) + ".")
                 except tk.TclError:
@@ -14142,9 +14808,13 @@ class _ScholarTextWindow:
     def _back_from_pdf(self) -> None:
         """Return from the PDF to the text view it was opened from — the Google
         Scholar text, or the CourtListener text for a CL-primary window."""
-        if self._pdf_pane is not None:
+        holder = getattr(self, "_pdf_holder", None)
+        if holder is not None:
+            holder.destroy()  # takes the pane and its parts strip with it
+            self._pdf_holder = None
+        elif self._pdf_pane is not None:
             self._pdf_pane.destroy()
-            self._pdf_pane = None
+        self._pdf_pane = None
         self._text_frame.pack(fill="both", expand=True, padx=8, pady=4,
                               before=self._btn_frame)
         if self._pre_pdf_mode == "courtlistener":
@@ -14891,6 +15561,41 @@ class _SlipTextWindow:
             pass
 
 
+# Colors for a PDF's detected opinion parts — the same palette the text
+# view's part map uses (_ScholarTextWindow._PARTMAP_COLORS), so the strip
+# reads identically beside a PDF and beside the CourtListener/Scholar text.
+_PDF_PART_COLORS = {
+    "syllabus": "#555555",
+    "majority": _ScholarTextWindow._MAJORITY_COLOR,
+    "concurrence": _ScholarTextWindow._CONCUR_COLOR,
+    "dissent": _ScholarTextWindow._DISSENT_COLOR,
+    "separate": "#6a4d9f",
+}
+
+
+def _build_pdf_parts_nav(parent, sections: list, goto) -> ttk.Frame:
+    """A slim strip listing a PDF's detected opinion parts (from
+    slip_opinion.detect_sections), each colored by kind; clicking a label
+    calls ``goto(start_page)``.  The caller packs the returned frame."""
+    nav = ttk.Frame(parent, padding=(6, 4))
+    ttk.Label(nav, text="Parts", font=("TkDefaultFont", 9, "bold"),
+              anchor="w").pack(fill="x", pady=(2, 4))
+    for sec in sections:
+        lbl = tk.Label(
+            nav, text=sec.label, anchor="w", justify="left",
+            wraplength=150, cursor="hand2",
+            foreground=_PDF_PART_COLORS.get(sec.kind, "#333333"),
+            font=("TkDefaultFont", 9, "underline"),
+        )
+        lbl.pack(fill="x", pady=2)
+        lbl.bind("<Button-1>", lambda _e, p=sec.start_page: goto(p))
+        page_no = tk.Label(nav, text=f"p. {sec.start_page + 1}",
+                           anchor="w", foreground="#999999",
+                           font=("TkDefaultFont", 8))
+        page_no.pack(fill="x", padx=(8, 0))
+    return nav
+
+
 class _SlipOpinionWindow:
     """Viewer for a Supreme Court slip opinion straight from supremecourt.gov.
 
@@ -15127,26 +15832,7 @@ class _SlipOpinionWindow:
         scrolls the PDF to that part's first page."""
         if len(sections) < 2 or self._pane is None:
             return
-        nav = ttk.Frame(self._body, padding=(6, 4))
-        ttk.Label(nav, text="Parts", font=("TkDefaultFont", 9, "bold"),
-                  anchor="w").pack(fill="x", pady=(2, 4))
-        colors = {"syllabus": "#555555", "majority": "#1a3e72",
-                  "concurrence": "#1a7a3c", "dissent": "#a31515",
-                  "separate": "#6a4d9f"}
-        for sec in sections:
-            lbl = tk.Label(
-                nav, text=sec.label, anchor="w", justify="left",
-                wraplength=150, cursor="hand2",
-                foreground=colors.get(sec.kind, "#333333"),
-                font=("TkDefaultFont", 9, "underline"),
-            )
-            lbl.pack(fill="x", pady=2)
-            lbl.bind("<Button-1>",
-                     lambda _e, p=sec.start_page: self._goto_page(p))
-            page_no = tk.Label(nav, text=f"p. {sec.start_page + 1}",
-                               anchor="w", foreground="#999999",
-                               font=("TkDefaultFont", 8))
-            page_no.pack(fill="x", padx=(8, 0))
+        nav = _build_pdf_parts_nav(self._body, sections, self._goto_page)
         nav.pack(side="right", fill="y", padx=(0, 8), pady=4)
         self._nav = nav
 
@@ -15242,8 +15928,8 @@ def _open_eng_rep_case(parent: tk.Misc, case: "eng_rep.ERCase",
 
 #: Categories used to colour-code highlights by what the citation points at.
 def _brief_action_category(kind: str) -> str:
-    if kind in ("cite", "url", "engrep"):
-        return "case"  # English Reports cites are cases too
+    if kind in ("cite", "url", "engrep", "recap"):
+        return "case"  # English Reports and RECAP documents are cases too
     if kind == "const":
         return "const"
     return "statute"
@@ -15257,6 +15943,21 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
     kind, value = action
     if kind in ("browse", "statpdf"):
         url = value
+    elif kind == "recap":
+        # The RECAP search on CourtListener, pre-filtered to the docket,
+        # court and opinion date the citation names.
+        try:
+            spec = json.loads(value)
+        except Exception:
+            spec = {}
+        params = {"type": "rd", "q": "",
+                  "docket_number": spec.get("docket", ""),
+                  "entry_date_filed_after": spec.get("date", ""),
+                  "entry_date_filed_before": spec.get("date", "")}
+        if spec.get("court"):
+            params["court"] = spec["court"]
+        url = ("https://www.courtlistener.com/?"
+               + urllib.parse.urlencode(params))
     elif kind == "cite":
         cite = value.split("@")[0]
         url = ("https://scholar.google.com/scholar?q="
@@ -15281,9 +15982,77 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
         pass
 
 
+def _open_recap_citation(app: "CourtListenerGUI", parent: tk.Misc,
+                         spec_json: str, status=lambda _s: None) -> None:
+    """Open an unpublished opinion cited by WL/LEXIS number — "No. 12-6371,
+    2024 WL 1327972 (D.N.J. Mar. 28, 2024)" — from CourtListener's RECAP
+    (PACER) archive, located by its docket number and opinion date.  When
+    RECAP hasn't the document (or its PDF), falls back to the ordinary
+    citation path (Google Scholar, then the CourtListener opinion text)."""
+    try:
+        spec = json.loads(spec_json)
+    except Exception:
+        status("Couldn't read that citation.")
+        return
+    cite = spec.get("cite") or "unpublished opinion"
+    title = f"{spec['name']} — {cite}" if spec.get("name") else cite
+
+    def safe_status(s: str) -> None:
+        try:
+            status(s)
+        except tk.TclError:
+            pass
+
+    safe_status(f"Looking up {cite} on RECAP…")
+    # Resolve these on the calling (main) thread — they touch tk variables.
+    client = app._get_client() if app._token_var.get().strip() else None
+    fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
+
+    def run() -> None:
+        info = None
+        try:
+            info = cl_api.find_recap_document(
+                spec.get("docket", ""), spec.get("court"),
+                spec.get("date", ""),
+                session=(client._session if client is not None else None),
+            )
+        except Exception as exc:
+            print(f"[recap] lookup failed for {cite!r}: {exc}")
+        if info and info.get("pdf_url"):
+            def open_pdf(url=info["pdf_url"], t=title):
+                _PdfWindow(app.root, url, t, safe_status, app=app,
+                           is_case=True)
+            app._post_root(open_pdf)
+            app._post_root(lambda: safe_status(
+                f"Opened {cite} from RECAP ({info.get('description') or 'document'})."))
+            return
+        # RECAP doesn't have the PDF — fall back to the regular citation
+        # path; failing that, at least point the browser at the docket.
+        safe_status(f"RECAP hasn't {cite} — trying Google Scholar…")
+        ok = False
+        if fetcher is not None or client is not None:
+            try:
+                ok = app._try_open_citation("", cite, "", fetcher, client,
+                                            prefetch_pdf=False)
+            except Exception as exc:
+                print(f"[recap] scholar fallback failed for {cite!r}: {exc}")
+        if ok:
+            app._post_root(lambda: safe_status(f"Opened {cite}."))
+        elif info and info.get("web_url"):
+            webbrowser.open(info["web_url"])
+            app._post_root(lambda: safe_status(
+                f"{cite}: PDF not in RECAP — opened the docket in your "
+                "browser."))
+        else:
+            app._post_root(lambda: safe_status(f"Not found: {cite}"))
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
                          action: tuple[str, str],
-                         status=lambda _s: None) -> None:
+                         status=lambda _s: None,
+                         prefetch_pdf: bool = True) -> None:
     """Open whatever a highlighted brief citation points at, reusing the exact
     paths the rest of the app uses — so briefs behave like the opinion reader
     and the Quick Look Up dialog rather than a parallel implementation:
@@ -15300,6 +16069,9 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
         return
     if kind == "engrep":
         _open_eng_rep(parent, value, status, app=app)
+        return
+    if kind == "recap":
+        _open_recap_citation(app, parent, value, status)
         return
     if kind != "cite":
         status("Don't know how to open that citation.")
@@ -15321,7 +16093,8 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
     safe_status(f"Opening {cite}…")
 
     def run() -> None:
-        ok = app._try_open_citation("", cite, pin, fetcher, client)
+        ok = app._try_open_citation("", cite, pin, fetcher, client,
+                                    prefetch_pdf=prefetch_pdf)
         try:
             parent.after(0, lambda: safe_status(
                 f"Opened {cite}." if ok else f"Not found: {cite}"))
@@ -15572,7 +16345,10 @@ class _LinkedPdfWindow:
         self._status_var.set(msg)
 
     def _open_cite(self, action: tuple, snippet: str) -> None:
-        _follow_brief_action(self._app, self._win, action, self._safe_status)
+        # prefetch_pdf=False: warming a second big PDF while this viewer's
+        # pane is live renders/extracts in parallel and can hang the app.
+        _follow_brief_action(self._app, self._win, action, self._safe_status,
+                             prefetch_pdf=False)
 
     def _open_cite_browser(self, action: tuple, snippet: str) -> None:
         _open_citation_in_browser(action, snippet)

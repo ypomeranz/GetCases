@@ -79,23 +79,31 @@ def _pdf_text(path: str) -> str:
             "Install it with:  pip install pypdfium2"
         ) from exc
 
-    doc = pdfium.PdfDocument(path)
+    from pdfium_lock import PDFIUM_LOCK
+
+    # Per-page locking (PDFium is not thread-safe): this may run on a worker
+    # thread while the GUI's PDF pane renders pages on the main thread.
+    with PDFIUM_LOCK:
+        doc = pdfium.PdfDocument(path)
+        n_pages = len(doc)
     pages: list[str] = []
     try:
-        for i in range(len(doc)):
-            page = doc[i]
-            try:
-                tp = page.get_textpage()
+        for i in range(n_pages):
+            with PDFIUM_LOCK:
+                page = doc[i]
                 try:
-                    pages.append(tp.get_text_range())
+                    tp = page.get_textpage()
+                    try:
+                        pages.append(tp.get_text_range())
+                    finally:
+                        tp.close()
+                except Exception:
+                    pages.append("")
                 finally:
-                    tp.close()
-            except Exception:
-                pages.append("")
-            finally:
-                page.close()
+                    page.close()
     finally:
-        doc.close()
+        with PDFIUM_LOCK:
+            doc.close()
     return _clean_pdf_text("\n\n".join(pages))
 
 

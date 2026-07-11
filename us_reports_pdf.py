@@ -51,6 +51,8 @@ from typing import Optional
 
 import requests
 
+from pdfium_lock import PDFIUM_LOCK
+
 # The volume PDFs live next to the app; downloads land here too, so a volume
 # is fetched from supremecourt.gov at most once.
 US_REPORTS_DIR = Path(__file__).resolve().parent / "US Reports"
@@ -238,8 +240,11 @@ def _arabic_labels(path: Path, pdf) -> list[tuple[int, int]]:
     import pypdfium2.raw as C
 
     pairs: list[tuple[int, int]] = []
-    for i in range(len(pdf)):
-        lab = _page_label(pdf, C, i)
+    with PDFIUM_LOCK:
+        n_pages = len(pdf)
+    for i in range(n_pages):
+        with PDFIUM_LOCK:
+            lab = _page_label(pdf, C, i)
         if lab and lab.isdigit():
             pairs.append((i, int(lab)))
     with _lock:
@@ -264,8 +269,9 @@ def _head_lines(pdf, index: int, n: int = 2) -> list[str]:
     """The first *n* real text lines of a page — the running head region —
     with the preliminary-print watermark and blank lines dropped."""
     try:
-        page = pdf[index]
-        text = page.get_textpage().get_text_bounded()
+        with PDFIUM_LOCK:
+            page = pdf[index]
+            text = page.get_textpage().get_text_bounded()
     except Exception:
         return []
     lines = []
@@ -281,7 +287,8 @@ def _head_lines(pdf, index: int, n: int = 2) -> list[str]:
 
 def _page_is_blank(pdf, index: int) -> bool:
     try:
-        return not pdf[index].get_textpage().get_text_bounded().strip()
+        with PDFIUM_LOCK:
+            return not pdf[index].get_textpage().get_text_bounded().strip()
     except Exception:
         return False
 
@@ -316,17 +323,20 @@ def _locate(vol: int, page: int) -> Optional[tuple[Path, "object", int, int]]:
     import pypdfium2 as pdfium
 
     for path in volume_files(vol):
-        pdf = pdfium.PdfDocument(path)
+        with PDFIUM_LOCK:
+            pdf = pdfium.PdfDocument(path)
         try:
             pairs = _arabic_labels(path, pdf)
         except Exception:
-            pdf.close()
+            with PDFIUM_LOCK:
+                pdf.close()
             raise
         # Prefer the longest run holding the page — 587BV has a stray "1"
         # label on its cover that would otherwise shadow the real page 1.
         holding = [r for r in _runs(pairs) if r[1] <= page <= r[3]]
         if not holding:
-            pdf.close()
+            with PDFIUM_LOCK:
+                pdf.close()
             continue
         run = max(holding, key=lambda r: r[3] - r[1])
         start = run[0] + (page - run[1])
@@ -370,17 +380,19 @@ def extract(vol: int, page: int) -> Optional[Path]:
     path, pdf, start, end = located
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        dst = pdfium.PdfDocument.new()
-        dst.import_pages(pdf, pages=list(range(start, end + 1)))
         tmp = out.with_suffix(".tmp")
-        dst.save(tmp)
-        dst.close()
+        with PDFIUM_LOCK:
+            dst = pdfium.PdfDocument.new()
+            dst.import_pages(pdf, pages=list(range(start, end + 1)))
+            dst.save(tmp)
+            dst.close()
         tmp.replace(out)
         print(f"[usrep] extracted {vol} U.S. {page} from {path.name} "
               f"(pdf pages {start + 1}-{end + 1})")
         return out
     finally:
-        pdf.close()
+        with PDFIUM_LOCK:
+            pdf.close()
 
 
 def extract_citation(cite: str) -> Optional[Path]:

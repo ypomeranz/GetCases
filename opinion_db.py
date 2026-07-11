@@ -580,6 +580,61 @@ class OpinionDB:
             return False
         return self.add(rec)
 
+    def _rewrite_jsonl(self, sid: str, new_record: Optional[dict]) -> bool:
+        """Rewrite ``opinions.jsonl`` with the record for *sid* removed
+        (``new_record=None``) or replaced in place (diff-friendly for the
+        Git-synced file).  A replacement whose id isn't present yet is
+        appended.  Atomic (temp file + rename); the index is rebuilt from
+        the rewritten file.  Returns whether anything changed."""
+        with self._lock:
+            lines: list[str] = []
+            found = False
+            if self.jsonl_path.exists():
+                with open(self.jsonl_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        try:
+                            rec_sid = json.loads(stripped).get("scholar_id")
+                        except Exception:
+                            lines.append(stripped)  # keep unreadable lines as-is
+                            continue
+                        if rec_sid == sid:
+                            found = True
+                            if new_record is not None:
+                                lines.append(
+                                    json.dumps(new_record, ensure_ascii=False))
+                            continue  # removed (or just replaced)
+                        lines.append(stripped)
+            if not found:
+                if new_record is None:
+                    return False
+                lines.append(json.dumps(new_record, ensure_ascii=False))
+            tmp = self.jsonl_path.with_suffix(f".{os.getpid()}.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                for line in lines:
+                    f.write(line + "\n")
+            tmp.replace(self.jsonl_path)
+            self.rebuild_index()
+            return True
+
+    def delete(self, sid: str) -> bool:
+        """Remove the opinion with Scholar id *sid* from the JSONL store and
+        the index.  Returns whether a record was removed."""
+        if not sid:
+            return False
+        return self._rewrite_jsonl(str(sid).strip(), None)
+
+    def replace(self, record: dict) -> bool:
+        """Store *record* in place of the existing record sharing its Scholar
+        id (appending when absent) — used to refresh an opinion with a newer
+        Google Scholar version."""
+        sid = record.get("scholar_id")
+        if not sid:
+            return False
+        return self._rewrite_jsonl(str(sid).strip(), record)
+
     def merge_from(self, other_jsonl: os.PathLike | str) -> dict:
         """Merge another ``opinions.jsonl`` into this store.  Opinions whose
         Scholar id is already present are skipped (existing copy kept).  Returns
