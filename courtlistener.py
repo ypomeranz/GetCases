@@ -742,3 +742,110 @@ class CourtListenerClient:
         params = self._clean_params({**filters, "count": "on"})
         data = self._get(endpoint, params)
         return data.get("count", 0)
+
+
+# ---------------------------------------------------------------------------
+# RECAP lookup for unpublished opinions
+# ---------------------------------------------------------------------------
+
+# Ranking for same-day docket entries: the cited document is the opinion
+# itself, but courts often docket a separate order the same day.
+_RECAP_DESC_RANK = (
+    ("opinion", 4),
+    ("memorandum", 3),
+    ("report and recommendation", 2),
+    ("findings", 2),
+    ("order", 1),
+)
+
+
+def _recap_doc_score(doc: dict) -> tuple:
+    text = " ".join(
+        str(doc.get(k) or "") for k in ("short_description", "description")
+    ).lower()
+    rank = 0
+    for phrase, score in _RECAP_DESC_RANK:
+        if phrase in text:
+            rank = max(rank, score)
+    available = bool(doc.get("is_available") and doc.get("filepath_local"))
+    return (available, rank)
+
+
+def find_recap_document(
+    docket_number: str,
+    court: str | None,
+    date_filed: str,
+    session: "Session | None" = None,
+    timeout: int = 30,
+) -> dict | None:
+    """Locate the RECAP (PACER) document behind an unpublished-opinion
+    citation — "2024 WL 1327972 (D.N.J. Mar. 28, 2024)" cited with
+    "No. 12-6371" — by searching the RECAP archive for documents filed in
+    that docket on that day.
+
+    Parameters
+    ----------
+    docket_number:
+        As printed in the citation ("12-6371", "2:13-cv-7779"); judge-
+        initial suffixes are retried stripped when the full form finds
+        nothing.
+    court:
+        CourtListener court id ("njd"), or ``None`` to search all courts.
+    date_filed:
+        The opinion's date, ISO format ("2024-03-28").
+    session:
+        Optional authenticated ``requests`` session; anonymous works too
+        (the search API allows it, rate-limited).
+
+    Returns
+    -------
+    dict | None
+        ``{"pdf_url", "web_url", "description", "docket_id"}`` for the
+        best match — ``pdf_url`` is ``None`` when the document exists but
+        its PDF isn't in the archive — or ``None`` when nothing matched.
+    """
+    import re as _re
+
+    s = session or requests.Session()
+    url = urljoin(BASE_URL, "search/")
+    variants = [docket_number]
+    core = _re.sub(r"(?<=\d)-[A-Za-z]{1,4}(?:-[A-Za-z]{1,4})*$", "",
+                   docket_number)
+    if core != docket_number:
+        variants.append(core)
+
+    for docket in variants:
+        params = {
+            "type": "rd",
+            "q": "",
+            "docket_number": docket,
+            "entry_date_filed_after": date_filed,
+            "entry_date_filed_before": date_filed,
+        }
+        if court:
+            params["court"] = court
+        try:
+            resp = s.get(url, params=params, timeout=timeout)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+        except Exception:
+            continue
+        results = data.get("results") or []
+        # A loose docket number can match hundreds of entries across
+        # courts; that's noise, not the cited opinion.
+        if not results or (data.get("count") or 0) > 40:
+            continue
+        best = max(results, key=_recap_doc_score)
+        path = best.get("filepath_local") or ""
+        pdf_url = ("https://storage.courtlistener.com/" + path.lstrip("/")
+                   if best.get("is_available") and path else None)
+        web = best.get("absolute_url") or ""
+        return {
+            "pdf_url": pdf_url,
+            "web_url": ("https://www.courtlistener.com" + web) if web else "",
+            "description": (best.get("short_description")
+                            or best.get("description") or ""),
+            "docket_id": best.get("docket_id"),
+        }
+    return None

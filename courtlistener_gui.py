@@ -501,6 +501,7 @@ def _ensure_modern_ttk_styles(widget: tk.Misc) -> None:
 
 from bluebook_names import abbreviate_case_name
 from cl_parse import parse_cl_html as _parse_cl_html
+import courtlistener as cl_api
 from courtlistener import CourtListenerClient, CourtListenerError
 import constitution
 import ecfr
@@ -510,6 +511,7 @@ import fed_rules
 import state_statutes
 import statutes_at_large
 import us_code
+import pdfium_lock
 import us_reports_pdf
 import brief_reader
 import oyez
@@ -8777,10 +8779,11 @@ class _TextFinder:
 # even on *different* documents, can crash the interpreter.  The PDF pane renders
 # on the main thread while the citation-linking worker (_detect_pdf_citation_links)
 # reads text/char-boxes on a background thread, so every stretch of PDFium work is
-# serialized through this one re-entrant lock.  This is the fix for the old
-# "import a PDF and link its citations" feature, which crashed because the page
-# render and the text scan ran in parallel.
-_PDFIUM_LOCK = threading.RLock()
+# serialized through the one process-wide lock in ``pdfium_lock`` — shared with
+# ``us_reports_pdf`` (opinion carving) and ``brief_reader`` (brief text), whose
+# worker-thread PDFium calls used to run unserialized against the pane's render
+# and crash the app when a case link was clicked from the PDF brief viewer.
+_PDFIUM_LOCK = pdfium_lock.PDFIUM_LOCK
 _PDF_HEADER_RE = re.compile(br"%PDF-\d")
 _PDF_LINK_ATTR_RE = re.compile(
     r"""(?is)\b(?:href|src|data|data-url)=["']([^"']+)["']"""
@@ -15925,8 +15928,8 @@ def _open_eng_rep_case(parent: tk.Misc, case: "eng_rep.ERCase",
 
 #: Categories used to colour-code highlights by what the citation points at.
 def _brief_action_category(kind: str) -> str:
-    if kind in ("cite", "url", "engrep"):
-        return "case"  # English Reports cites are cases too
+    if kind in ("cite", "url", "engrep", "recap"):
+        return "case"  # English Reports and RECAP documents are cases too
     if kind == "const":
         return "const"
     return "statute"
@@ -15940,6 +15943,21 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
     kind, value = action
     if kind in ("browse", "statpdf"):
         url = value
+    elif kind == "recap":
+        # The RECAP search on CourtListener, pre-filtered to the docket,
+        # court and opinion date the citation names.
+        try:
+            spec = json.loads(value)
+        except Exception:
+            spec = {}
+        params = {"type": "rd", "q": "",
+                  "docket_number": spec.get("docket", ""),
+                  "entry_date_filed_after": spec.get("date", ""),
+                  "entry_date_filed_before": spec.get("date", "")}
+        if spec.get("court"):
+            params["court"] = spec["court"]
+        url = ("https://www.courtlistener.com/?"
+               + urllib.parse.urlencode(params))
     elif kind == "cite":
         cite = value.split("@")[0]
         url = ("https://scholar.google.com/scholar?q="
@@ -15964,9 +15982,77 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
         pass
 
 
+def _open_recap_citation(app: "CourtListenerGUI", parent: tk.Misc,
+                         spec_json: str, status=lambda _s: None) -> None:
+    """Open an unpublished opinion cited by WL/LEXIS number — "No. 12-6371,
+    2024 WL 1327972 (D.N.J. Mar. 28, 2024)" — from CourtListener's RECAP
+    (PACER) archive, located by its docket number and opinion date.  When
+    RECAP hasn't the document (or its PDF), falls back to the ordinary
+    citation path (Google Scholar, then the CourtListener opinion text)."""
+    try:
+        spec = json.loads(spec_json)
+    except Exception:
+        status("Couldn't read that citation.")
+        return
+    cite = spec.get("cite") or "unpublished opinion"
+    title = f"{spec['name']} — {cite}" if spec.get("name") else cite
+
+    def safe_status(s: str) -> None:
+        try:
+            status(s)
+        except tk.TclError:
+            pass
+
+    safe_status(f"Looking up {cite} on RECAP…")
+    # Resolve these on the calling (main) thread — they touch tk variables.
+    client = app._get_client() if app._token_var.get().strip() else None
+    fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
+
+    def run() -> None:
+        info = None
+        try:
+            info = cl_api.find_recap_document(
+                spec.get("docket", ""), spec.get("court"),
+                spec.get("date", ""),
+                session=(client._session if client is not None else None),
+            )
+        except Exception as exc:
+            print(f"[recap] lookup failed for {cite!r}: {exc}")
+        if info and info.get("pdf_url"):
+            def open_pdf(url=info["pdf_url"], t=title):
+                _PdfWindow(app.root, url, t, safe_status, app=app,
+                           is_case=True)
+            app._post_root(open_pdf)
+            app._post_root(lambda: safe_status(
+                f"Opened {cite} from RECAP ({info.get('description') or 'document'})."))
+            return
+        # RECAP doesn't have the PDF — fall back to the regular citation
+        # path; failing that, at least point the browser at the docket.
+        safe_status(f"RECAP hasn't {cite} — trying Google Scholar…")
+        ok = False
+        if fetcher is not None or client is not None:
+            try:
+                ok = app._try_open_citation("", cite, "", fetcher, client,
+                                            prefetch_pdf=False)
+            except Exception as exc:
+                print(f"[recap] scholar fallback failed for {cite!r}: {exc}")
+        if ok:
+            app._post_root(lambda: safe_status(f"Opened {cite}."))
+        elif info and info.get("web_url"):
+            webbrowser.open(info["web_url"])
+            app._post_root(lambda: safe_status(
+                f"{cite}: PDF not in RECAP — opened the docket in your "
+                "browser."))
+        else:
+            app._post_root(lambda: safe_status(f"Not found: {cite}"))
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
                          action: tuple[str, str],
-                         status=lambda _s: None) -> None:
+                         status=lambda _s: None,
+                         prefetch_pdf: bool = True) -> None:
     """Open whatever a highlighted brief citation points at, reusing the exact
     paths the rest of the app uses — so briefs behave like the opinion reader
     and the Quick Look Up dialog rather than a parallel implementation:
@@ -15983,6 +16069,9 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
         return
     if kind == "engrep":
         _open_eng_rep(parent, value, status, app=app)
+        return
+    if kind == "recap":
+        _open_recap_citation(app, parent, value, status)
         return
     if kind != "cite":
         status("Don't know how to open that citation.")
@@ -16004,7 +16093,8 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
     safe_status(f"Opening {cite}…")
 
     def run() -> None:
-        ok = app._try_open_citation("", cite, pin, fetcher, client)
+        ok = app._try_open_citation("", cite, pin, fetcher, client,
+                                    prefetch_pdf=prefetch_pdf)
         try:
             parent.after(0, lambda: safe_status(
                 f"Opened {cite}." if ok else f"Not found: {cite}"))
@@ -16255,7 +16345,10 @@ class _LinkedPdfWindow:
         self._status_var.set(msg)
 
     def _open_cite(self, action: tuple, snippet: str) -> None:
-        _follow_brief_action(self._app, self._win, action, self._safe_status)
+        # prefetch_pdf=False: warming a second big PDF while this viewer's
+        # pane is live renders/extracts in parallel and can hang the app.
+        _follow_brief_action(self._app, self._win, action, self._safe_status,
+                             prefetch_pdf=False)
 
     def _open_cite_browser(self, action: tuple, snippet: str) -> None:
         _open_citation_in_browser(action, snippet)
