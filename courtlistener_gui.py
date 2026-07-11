@@ -637,15 +637,22 @@ _anon_session.headers.update({
     "Sec-Fetch-User": "?1",
 })
 
-# URL routing for official US Reports PDFs (GPO's GovInfo edition preferred):
-#   vols 2-583  → GovInfo (link service, then direct per-opinion PDF)
-#   vols 1-542  → LOC CDN per-opinion PDFs when GovInfo fails (volume and page
-#                 both 3-digit zero-padded); also covers vol 1, which GovInfo lacks
+# URL routing for official US Reports PDFs:
+#   vols 1-501  → LOC CDN per-opinion PDFs preferred; GovInfo only as backup
+#                 when LOC lacks the volume/page (vol 1 has no GovInfo copy)
+#   vols 502-583 → GovInfo (link service, then direct per-opinion PDF)
+#                 preferred, with the LOC CDN as backup through vol 542
+#   vols 1-542  → LOC CDN per-opinion PDFs (volume and page both 3-digit
+#                 zero-padded) — the preferred source at/below _LOC_PREFERRED_MAX
+#                 and the GovInfo backup above it
 #   vols 584+   → us_reports_pdf carves the opinion out of the Court's own
 #                 bound-volume / preliminary-print PDF, downloaded from
 #                 supremecourt.gov into the "US Reports" folder on first use
 #                 and reused from there after
 _LOC_CUTOFF = 542
+# At/below this volume the LOC (Library of Congress) scan is preferred over
+# GPO's GovInfo edition; GovInfo is used only when LOC hasn't the volume/page.
+_LOC_PREFERRED_MAX = 501
 _GOVINFO_MAX = 583
 _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 
@@ -5486,11 +5493,12 @@ class CourtListenerGUI:
         Attempt to find a PDF URL for the selected search result.
 
         Strategy (local_path always preferred over download_url):
-        0. US Reports citation → GovInfo (vols 2-583), then LOC CDN
-           (vols 1-542), then an opinion carved from the Court's own volume
-           PDF (vols 584+; fetched from supremecourt.gov once and kept in
-           the "US Reports" folder).  Volumes on none of those fall through
-           to local_path.
+        0. US Reports citation → LOC CDN preferred for vols 1-501 (GovInfo
+           backup), GovInfo preferred for vols 502-583 (LOC CDN backup through
+           vol 542), then an opinion carved from the Court's own volume PDF
+           (vols 584+; fetched from supremecourt.gov once and kept in the
+           "US Reports" folder).  Volumes on none of those fall through to
+           local_path.
         0.5. Non-SCOTUS cases: try static.case.law (Harvard CAP) first.
              Only falls through if the URL returns a non-200 response.
         1. local_path from the search result (if already present).
@@ -5543,25 +5551,43 @@ class CourtListenerGUI:
             all_cites.append(us_from_sct)
 
         # 0. Official US Reports PDF — try every U.S.-Reports cite among them.
-        #    GPO's GovInfo first (vols 2-583), then the LOC CDN (vols 1-542),
-        #    then an opinion carved out of the Court's bound-volume/
-        #    preliminary-print PDF (vols 584+; downloaded from
-        #    supremecourt.gov on first use, reused from the "US Reports"
-        #    folder after).
-        for cite in all_cites:
+        #    For vols 1-501 the LOC (Library of Congress) CDN scan is preferred,
+        #    with GPO's GovInfo edition only as a backup; for vols 502-583
+        #    GovInfo is preferred, with the LOC CDN as backup through vol 542.
+        #    Beyond that an opinion is carved out of the Court's bound-volume/
+        #    preliminary-print PDF (vols 584+; downloaded from supremecourt.gov
+        #    on first use, reused from the "US Reports" folder after).
+        def _try_govinfo(cite: str) -> Optional[str]:
             gov = _us_reports_govinfo_url(cite)
+            if not gov:
+                return None
+            link_url, direct_url = gov
+            if _head_ok(link_url, "GovInfo link"):
+                print(f"[resolve] using GovInfo link URL: {link_url}")
+                return link_url
+            if _head_ok(direct_url, "GovInfo direct PDF"):
+                print(f"[resolve] using GovInfo direct PDF URL: {direct_url}")
+                return direct_url
+            return None
+
+        def _try_loc(cite: str) -> Optional[str]:
             loc_url = _us_reports_loc_url(cite)
-            if gov:
-                link_url, direct_url = gov
-                if _head_ok(link_url, "GovInfo link"):
-                    print(f"[resolve] using GovInfo link URL: {link_url}")
-                    return link_url
-                if _head_ok(direct_url, "GovInfo direct PDF"):
-                    print(f"[resolve] using GovInfo direct PDF URL: {direct_url}")
-                    return direct_url
             if loc_url and _head_ok(loc_url, "LOC US Reports"):
                 print(f"[resolve] using LOC US Reports PDF: {loc_url}")
                 return loc_url
+            return None
+
+        for cite in all_cites:
+            m = _US_CITE_RE.search(cite)
+            loc_preferred = bool(m) and int(m.group(1)) <= _LOC_PREFERRED_MAX
+            sources = (
+                (_try_loc, _try_govinfo) if loc_preferred
+                else (_try_govinfo, _try_loc)
+            )
+            for source in sources:
+                url = source(cite)
+                if url is not None:
+                    return url
             local_pdf = us_reports_pdf.extract_citation(cite)
             if local_pdf is not None:
                 url = local_pdf.as_uri()
