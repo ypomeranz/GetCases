@@ -650,7 +650,12 @@ _SEP_HEADER_RE = re.compile(
     r"[A-Z][\w.'’-]*(?:\s+[A-Z][\w.'’-]*){0,3}\s*,\s*"
     r"(?:C\.\s*J\.|JJ?\.|(?:Chief\s+|Senior\s+|Presiding\s+)?"
     r"(?:Circuit\s+|District\s+|Bankruptcy\s+)?Judge))"
-    r".{0,200}?\b(?:concurring|dissenting)",
+    r".{0,200}?\b(?:concurring|dissenting)"
+    # A real header ends right after the role phrase (allowing "in part…"
+    # tails and trailing footnote markers).  Prose that merely *mentions*
+    # someone concurring ("Justice Frankfurter prefaced his concurring
+    # opinion in Youngstown…") runs on past it and must not match.
+    r"[^.:]{0,80}[.:]?\s*(?:(?:\[[^\]\s]{1,6}\]|[*†‡]|\d{1,2})\s*)*$",
     re.IGNORECASE | re.DOTALL,
 )
 # Syllabus disposition lines ("BLACKMUN, J., delivered the opinion…;
@@ -660,16 +665,46 @@ _NOT_SEP_RE = re.compile(r"\b(?:filed|delivered|announced)\b", re.IGNORECASE)
 
 # A separate opinion introduced *without* "concurring"/"dissenting": the bare
 # old-style attribution ("MR. JUSTICE HOLMES:" opening his separate opinion in
-# INS v. AP) or an end-of-report statement ("Statement of JUSTICE SOUTER." in
-# Lucas).  Exactly one justice name followed by the closing punctuation —
-# anything longer is prose.  Only honored once the majority opinion has begun:
-# before it, the same bare line would be the majority's own byline.
+# INS v. AP), an end-of-report statement ("Statement of JUSTICE SOUTER." in
+# Lucas), or the state-court style bare byline ("TRAYNOR, J." opening his
+# Escola concurrence).  Exactly one justice name followed by the closing
+# punctuation — anything longer is prose.  Only honored once the majority
+# opinion has begun: before it, the same bare line would be the majority's
+# own byline.
 _BARE_SEP_HEADER_RE = re.compile(
     r"^(?:Statement\s+of\s+)?"
-    r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(?:CHIEF\s+)?JUSTICE\s+"
-    r"[A-Z][\w.'’-]+\s*[.:]$",
+    r"(?:(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(?:CHIEF\s+)?JUSTICE\s+"
+    r"[A-Z][\w.'’-]+\s*[.:]"
+    r"|[A-Z][\w.'’-]+,\s*(?:C\.\s*)?J\.)$",
     re.IGNORECASE,
 )
+
+# An explicit hand-off to a separate opinion that never says which way it
+# goes: "MR. JUSTICE FIELD delivered the following separate opinion."
+# (Mugler v. Kansas).  The role is read from the opinion's opening lines
+# ("I dissent from the judgment…") by _peek_sep_kind.
+_SEP_DELIVERED_RE = re.compile(
+    r"^\s*(?:MR\.\s+|MRS\.\s+|MS\.\s+)?"
+    r"(?:(?:CHIEF\s+)?JUSTICE\s+[A-Z][\w.'’-]+|[A-Z][\w.'’-]+,\s*(?:C\.\s*)?J\.)"
+    r"\s+delivered\s+(?:the\s+following|a)\s+"
+    r"(?:separate|concurring|dissenting)\s+opinion",
+    re.IGNORECASE,
+)
+
+
+def _peek_sep_kind(blocks: list, i: int, default: str = "concurrence") -> str:
+    """The role of a separate opinion whose header names none (a bare
+    "TRAYNOR, J.", "…delivered the following separate opinion."): read the
+    opening sentences — "I dissent…" / "I concur…" say which way it went."""
+    for b in blocks[i + 1: i + 4]:
+        t = _content_text(b)
+        if not t:
+            continue
+        m = re.search(r"\b(dissent|concur)", t[:300], re.IGNORECASE)
+        if m:
+            return ("dissent" if m.group(1).lower() == "dissent"
+                    else "concurrence")
+    return default
 
 # The byline shared with the body of _SEP_HEADER_RE — a justice/judge name
 # followed (within a clause) by "concurring"/"dissenting".
@@ -904,8 +939,21 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
             label = t if len(t) <= 90 else t[:87] + "…"
             boundaries.append((i, kind, label))
             continue
+        if len(t) <= 200 and _SEP_DELIVERED_RE.match(t):
+            m = re.search(r"\b(dissenting|concurring)\b", t, re.IGNORECASE)
+            kind = ("dissent" if m and m.group(1).lower() == "dissenting"
+                    else "concurrence" if m else _peek_sep_kind(blocks, i))
+            boundaries.append((i, kind, t if len(t) <= 90 else t[:87] + "…"))
+            continue
         if len(t) <= 60 and _BARE_SEP_HEADER_RE.match(t):
-            bare_headers.append((i, "concurrence", t))
+            if (maj_author_idx is None and not boundaries and not bare_headers
+                    and _AUTHOR_LINE_RE.match(t)):
+                # The first bare state-court byline before any separate
+                # opinion opens the majority ("GIBSON, C.J." in Escola),
+                # not a separate opinion.
+                maj_author_idx = i
+            else:
+                bare_headers.append((i, _peek_sep_kind(blocks, i), t))
             continue
         if _MAJ_PHRASE_RE.search(t[:160]) and _MAJ_ATTRIB_RE.match(t):
             # Candidates are collected over the whole document: an attribution

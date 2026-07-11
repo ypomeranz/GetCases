@@ -531,6 +531,7 @@ from court_catalog import (
     DISTRICT_COURTS as _DISTRICT_COURTS,
     STATE_COURTS as _STATE_COURTS,
     all_court_ids as _all_court_ids,
+    bluebook_court_from_name as _bluebook_court_from_name,
 )
 
 _CONFIG_PATH = Path.home() / ".config" / "courtlistener" / "config.json"
@@ -917,7 +918,13 @@ def _court_for_paren(citation: str, court_id: str, fallback: str = "") -> str:
     reporter = m.group(2).strip() if m else ""
     if "scotus" in court_id or reporter in _SCOTUS_REPORTERS:
         return ""
-    abbr = _COURT_BLUEBOOK.get(court_id, "") or (fallback or "").strip()
+    abbr = _COURT_BLUEBOOK.get(court_id, "")
+    if not abbr:
+        # An id outside the catalog: bluebook the court *name* CourtListener
+        # supplied ("Court of Appeals of Ohio" → "Ohio Ct. App.") rather
+        # than printing it raw; keep the raw fallback only when the name
+        # isn't recognizable.
+        abbr = _bluebook_court_from_name(fallback) or (fallback or "").strip()
     if not abbr or not reporter:
         return abbr
     rep_tokens = [t for t in _REPORTER_SERIES_RE.sub(" ", reporter).split() if t]
@@ -7011,6 +7018,20 @@ def _scholar_caption_name(blocks) -> str:
         if len(sides) != 2:
             sides = re.split(r"\s+[vV]s?\.\s+", t, maxsplit=1)
         if len(sides) == 2:
+            # A consolidated caption lists the companion cases after the
+            # first, separated by periods ("MUGLER v. KANSAS. SAME v. SAME.
+            # KANSAS v. ZIEBOLD."): only the first listed case is cited
+            # (Bluebook rule 10.2.1(b)).  Cut where a period is followed by
+            # a new case — one with its own "v.", a "SAME", or an in-re
+            # style caption — never at an entity abbreviation's period
+            # ("… v. Acme Co. of America" has no case after it).
+            cm = re.search(
+                r"\.\s+(?=[^.]*?\s+vs?\.\s+|SAME\b|IN\s+RE\b|EX\s+PARTE\b"
+                r"|(?:IN\s+THE\s+)?MATTER\s+OF\b)",
+                sides[1], re.IGNORECASE,
+            )
+            if cm:
+                sides[1] = sides[1][: cm.start() + 1]
             left, right = _caption_party(sides[0]), _caption_party(sides[1])
             if left and right:
                 return f"{left} v. {right}"
@@ -11997,6 +12018,30 @@ class _ScholarTextWindow:
                     surname = _fix_name_case(jm.group(2).replace("’", "'"))
                     form = "statement of" if jm.group(1) else "opinion of"
                     return f"{form} {surname}, J."
+                # Headers that never name the role — the role was read from
+                # the opinion's opening lines when the part was segmented, so
+                # part.kind is trustworthy here.  A bare state-court byline
+                # ("TRAYNOR, J.") or an explicit hand-off ("MR. JUSTICE FIELD
+                # delivered the following separate opinion.").
+                role = "dissenting" if part.kind == "dissent" else "concurring"
+                bm = re.match(
+                    r"([A-Z][\w.'’-]+),\s*(C\.\s*)?J\.\s*[.:]?\s*$",
+                    (part.label or "").strip(),
+                )
+                if bm:
+                    title = "C.J." if bm.group(2) else "J."
+                    surname = _fix_name_case(bm.group(1).replace("’", "'"))
+                    return f"{surname}, {title}, {role}"
+                dm = re.match(
+                    r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(CHIEF\s+)?JUSTICE\s+"
+                    r"([A-Z][\w.'’-]+)\s+delivered\s+(?:the\s+following|a)\s+"
+                    r"(?:separate|concurring|dissenting)\s+opinion",
+                    (part.label or "").strip(), re.IGNORECASE,
+                )
+                if dm:
+                    title = "C.J." if dm.group(1) else "J."
+                    surname = _fix_name_case(dm.group(2).replace("’", "'"))
+                    return f"{surname}, {title}, {role}"
                 return ""
             phrase = {
                 "concurrence": "concurring",

@@ -144,10 +144,13 @@ _SPECIAL_LABELS: list[tuple[str, str]] = [
 STATE_COURTS: list[tuple[str, list[tuple[str, str, str]]]] = [
     ("Alabama", [
         ("ala", "Ala.", "Supreme Court"),
-        ("alactapp", "Ala. Crim. App.", "Court of Criminal Appeals"),
+        ("alacrimapp", "Ala. Crim. App.", "Court of Criminal Appeals"),
         ("alacivapp", "Ala. Civ. App.", "Court of Civil Appeals"),
     ]),
-    ("Alaska", [("alaska", "Alaska", "Supreme Court")]),
+    ("Alaska", [
+        ("alaska", "Alaska", "Supreme Court"),
+        ("alaskactapp", "Alaska Ct. App.", "Court of Appeals"),
+    ]),
     ("Arizona", [
         ("ariz", "Ariz.", "Supreme Court"),
         ("arizctapp", "Ariz. Ct. App.", "Court of Appeals"),
@@ -170,6 +173,7 @@ STATE_COURTS: list[tuple[str, list[tuple[str, str, str]]]] = [
     ]),
     ("Delaware", [
         ("del", "Del.", "Supreme Court"),
+        ("delch", "Del. Ch.", "Court of Chancery"),
         ("delsuperct", "Del. Super. Ct.", "Superior Court"),
     ]),
     ("District of Columbia", [("dc", "D.C.", "Court of Appeals")]),
@@ -243,7 +247,10 @@ STATE_COURTS: list[tuple[str, list[tuple[str, str, str]]]] = [
         ("neb", "Neb.", "Supreme Court"),
         ("nebctapp", "Neb. Ct. App.", "Court of Appeals"),
     ]),
-    ("Nevada", [("nev", "Nev.", "Supreme Court")]),
+    ("Nevada", [
+        ("nev", "Nev.", "Supreme Court"),
+        ("nevapp", "Nev. Ct. App.", "Court of Appeals"),
+    ]),
     ("New Hampshire", [("nh", "N.H.", "Supreme Court")]),
     ("New Jersey", [
         ("nj", "N.J.", "Supreme Court"),
@@ -294,6 +301,7 @@ STATE_COURTS: list[tuple[str, list[tuple[str, str, str]]]] = [
     ]),
     ("Texas", [
         ("tex", "Tex.", "Supreme Court"),
+        ("texcrimapp", "Tex. Crim. App.", "Court of Criminal Appeals"),
         ("texapp", "Tex. App.", "Courts of Appeals"),
     ]),
     ("Utah", [
@@ -317,12 +325,39 @@ STATE_COURTS: list[tuple[str, list[tuple[str, str, str]]]] = [
     ("Wyoming", [("wyo", "Wyo.", "Supreme Court")]),
 ]
 
+# Court IDs CourtListener uses that don't belong in the picker tree —
+# historical courts and the busier state trial courts — but that should
+# still produce a proper Bluebook abbreviation in citations.
+EXTRA_BLUEBOOK: dict[str, str] = {
+    "alactapp": "Ala. Ct. App.",       # Court of Appeals (1911-1969)
+    "calappdeptsuper": "Cal. App. Dep't Super. Ct.",
+    "connsuperct": "Conn. Super. Ct.",
+    "gasuperct": "Ga. Super. Ct.",
+    "masssuperct": "Mass. Super. Ct.",
+    "massdistct": "Mass. Dist. Ct.",
+    "mesuperct": "Me. Super. Ct.",
+    "njch": "N.J. Ch.",                # Court of Chancery (pre-1948)
+    "njeanda": "N.J.",                 # Court of Errors and Appeals (highest, pre-1948)
+    "njsuperctchdiv": "N.J. Super. Ct. Ch. Div.",
+    "njsuperctlawdiv": "N.J. Super. Ct. Law Div.",
+    "nysupct": "N.Y. Sup. Ct.",        # the trial court, despite the name
+    "nyappterm": "N.Y. App. Term",
+    "nysurct": "N.Y. Sur. Ct.",
+    "nyfamct": "N.Y. Fam. Ct.",
+    "nycivct": "N.Y. Civ. Ct.",
+    "nycrimct": "N.Y. Crim. Ct.",
+    "ohioctcl": "Ohio Ct. Cl.",
+    "risuperct": "R.I. Super. Ct.",
+    "tennsuperct": "Tenn. Super. Ct.",
+}
+
 # --- Merged Bluebook map (same content the GUI used previously) ---------------
 
 COURT_BLUEBOOK: dict[str, str] = {}
 COURT_BLUEBOOK.update(CIRCUIT_COURTS)
 COURT_BLUEBOOK.update(DISTRICT_COURTS)
 COURT_BLUEBOOK.update(SPECIAL_COURTS)
+COURT_BLUEBOOK.update(EXTRA_BLUEBOOK)
 for _state, _courts in STATE_COURTS:
     for _cid, _abbr, _label in _courts:
         COURT_BLUEBOOK[_cid] = _abbr
@@ -366,3 +401,119 @@ def all_court_ids() -> set[str]:
 
     walk(CATALOG)
     return ids
+
+
+# --- Bluebook abbreviation from a court's full name ---------------------------
+# CourtListener knows thousands of courts; COURT_BLUEBOOK maps only the ids
+# the picker offers (plus EXTRA_BLUEBOOK).  For everything else the GUI falls
+# back to the court *name* CourtListener supplies ("Court of Appeals of Ohio,
+# Twelfth Appellate District") — bluebook_court_from_name turns that into the
+# proper T1/T10 form ("Ohio Ct. App.") instead of printing the name raw.
+
+STATE_BLUEBOOK: dict[str, str] = {
+    "alabama": "Ala.", "alaska": "Alaska", "arizona": "Ariz.",
+    "arkansas": "Ark.", "california": "Cal.", "colorado": "Colo.",
+    "connecticut": "Conn.", "delaware": "Del.",
+    "district of columbia": "D.C.", "florida": "Fla.", "georgia": "Ga.",
+    "hawai'i": "Haw.", "hawaii": "Haw.", "idaho": "Idaho",
+    "illinois": "Ill.", "indiana": "Ind.", "iowa": "Iowa",
+    "kansas": "Kan.", "kentucky": "Ky.", "louisiana": "La.",
+    "maine": "Me.", "maryland": "Md.", "massachusetts": "Mass.",
+    "michigan": "Mich.", "minnesota": "Minn.", "mississippi": "Miss.",
+    "missouri": "Mo.", "montana": "Mont.", "nebraska": "Neb.",
+    "nevada": "Nev.", "new hampshire": "N.H.", "new jersey": "N.J.",
+    "new mexico": "N.M.", "new york": "N.Y.", "north carolina": "N.C.",
+    "north dakota": "N.D.", "ohio": "Ohio", "oklahoma": "Okla.",
+    "oregon": "Or.", "pennsylvania": "Pa.", "rhode island": "R.I.",
+    "south carolina": "S.C.", "south dakota": "S.D.",
+    "tennessee": "Tenn.", "texas": "Tex.", "utah": "Utah",
+    "vermont": "Vt.", "virginia": "Va.", "washington": "Wash.",
+    "west virginia": "W. Va.", "wisconsin": "Wis.", "wyoming": "Wyo.",
+    "puerto rico": "P.R.", "guam": "Guam", "virgin islands": "V.I.",
+    "northern mariana islands": "N. Mar. I.", "american samoa": "Am. Samoa",
+}
+
+# Court-type phrase → Bluebook abbreviation, first match wins (specific
+# phrases before the generic ones they contain).  An empty abbreviation
+# means the state abbreviation alone names the court (its court of last
+# resort — "Supreme Court of Ohio" cites as just "Ohio").
+_COURT_TYPE_BLUEBOOK: list[tuple[str, str]] = [
+    # Courts of last resort first — several contain "court of appeals"
+    # ("Supreme Court of Appeals of West Virginia"), which must not fall
+    # through to the intermediate-court mapping below.
+    ("supreme judicial court", ""),
+    ("supreme court of appeals", ""),
+    ("supreme court of errors", ""),
+    ("court of errors and appeals", ""),
+    ("supreme court", ""),
+    ("court of criminal appeals", "Crim. App."),
+    ("court of civil appeals", "Civ. App."),
+    ("court of special appeals", "Ct. Spec. App."),
+    ("district court of appeals", "Dist. Ct. App."),
+    ("district court of appeal", "Dist. Ct. App."),
+    ("intermediate court of appeals", "Ct. App."),
+    ("courts of appeals", "Ct. App."),
+    ("court of appeals", "Ct. App."),
+    ("court of appeal", "Ct. App."),
+    ("appellate division", "App. Div."),
+    ("appellate term", "App. Term"),
+    ("appellate court", "App. Ct."),
+    ("appeals court", "App. Ct."),
+    ("superior court", "Super. Ct."),
+    ("court of chancery", "Ch."),
+    ("chancery court", "Ch."),
+    ("commonwealth court", "Commw. Ct."),
+    ("court of claims", "Ct. Cl."),
+    ("court of common pleas", "Ct. Com. Pl."),
+    ("surrogate's court", "Sur. Ct."),
+    ("surrogate’s court", "Sur. Ct."),
+    ("family court", "Fam. Ct."),
+    ("orphans' court", "Orphans' Ct."),
+    ("tax court", "T.C."),
+    ("land court", "Land Ct."),
+    ("probate court", "Prob. Ct."),
+    ("circuit court", "Cir. Ct."),
+    ("district court", "Dist. Ct."),
+    ("county court", "Cnty. Ct."),
+    ("municipal court", "Mun. Ct."),
+    ("city court", "City Ct."),
+    ("justice court", "Just. Ct."),
+]
+
+
+def bluebook_court_from_name(name: str) -> str:
+    """Bluebook abbreviation for a state court from its full name
+    ("Court of Appeals of Ohio" → "Ohio Ct. App.", "Supreme Court of
+    California" → "Cal."), or "" when the name isn't recognized (the caller
+    then keeps whatever it had).  Handles the high-court quirks: New York's
+    and (historically) Maryland's and D.C.'s "Court of Appeals" are courts
+    of last resort, and New York's "Supreme Court" is its trial court."""
+    import re
+
+    t = re.sub(r"\s+", " ", (name or "")).strip()
+    if not t:
+        return ""
+    low = t.lower()
+    state = ""
+    # Longest name first with word boundaries, so "West Virginia" isn't
+    # taken for "Virginia" (nor "Arkansas" for "Kansas").
+    for sname in sorted(STATE_BLUEBOOK, key=len, reverse=True):
+        if re.search(r"\b" + re.escape(sname) + r"\b", low):
+            state = STATE_BLUEBOOK[sname]
+            break
+    if not state:
+        return ""
+    if state in ("N.Y.", "Md.", "D.C.") and "court of appeals" in low:
+        return state  # the court of last resort, not an intermediate court
+    if state == "N.Y." and "supreme court" in low:
+        if "appellate division" in low:
+            return "N.Y. App. Div."
+        if "appellate term" in low:
+            return "N.Y. App. Term"
+        return "N.Y. Sup. Ct."  # New York's trial court
+    if "superior court" in low and "appellate division" in low:
+        return f"{state} Super. Ct. App. Div."
+    for phrase, abbr in _COURT_TYPE_BLUEBOOK:
+        if phrase in low:
+            return f"{state} {abbr}".strip()
+    return ""
