@@ -1927,6 +1927,47 @@ class GoogleScholarFetcher:
     # Cache
     # ------------------------------------------------------------------
 
+    def _cached_keys_for_opinion(self, url: str) -> list[str]:
+        """Every query-cache key whose stored opinion is the scholar_case at
+        *url* (matched on the ``case=`` id)."""
+        from opinion_db import scholar_id_from_url
+        sid = scholar_id_from_url(url or "")
+        if not sid:
+            return []
+        rows = self._db.execute(
+            "SELECT cache_key, case_url FROM opinions"
+        ).fetchall()
+        return [k for k, u in rows
+                if u and scholar_id_from_url(u) == sid]
+
+    def purge_cached_opinion(self, url: str) -> int:
+        """Drop every query-cache row holding this opinion, so a deleted
+        opinion can't be resurrected from the cache — after this, only a
+        fresh Google Scholar fetch brings it back.  Returns rows removed."""
+        keys = self._cached_keys_for_opinion(url)
+        if keys:
+            self._db.executemany(
+                "DELETE FROM opinions WHERE cache_key=?",
+                [(k,) for k in keys],
+            )
+            self._db.commit()
+        return len(keys)
+
+    def refetch_by_url(self, url: str) -> Optional[tuple[str, str]]:
+        """Fetch a scholar_case page straight from Google Scholar, bypassing
+        the opinion database and the query cache — Refresh uses this to pick
+        up a newer version of an opinion (say, reporter pagination added to
+        a recent case).  On success every query-cache row holding the old
+        copy is updated to the fresh one.  The opinion database is NOT
+        updated here (add_opinion de-dupes); the caller replaces its record.
+        """
+        result = self._fetch_case_page(url)
+        if result:
+            new_url, html = result
+            for key in self._cached_keys_for_opinion(url):
+                self._cache_put(key, new_url, html)
+        return result
+
     def _cache_get(self, key: str) -> Optional[tuple[str, str]]:
         row = self._db.execute(
             "SELECT case_url, html FROM opinions "
