@@ -1191,6 +1191,43 @@ def _static_case_law_url(citation: str) -> Optional[str]:
     return f"https://static.case.law/{slug}/{vol}/case-pdfs/{int(page):04d}-01.pdf"
 
 
+@dataclass(frozen=True)
+class _CaseLawPdfChoice:
+    cite: str
+    url: str
+
+
+def _case_law_pdf_choices_for_cites(cites: list[str]) -> list[_CaseLawPdfChoice]:
+    """Every static.case.law PDF that exists for the supplied parallel cites.
+
+    State opinions are often printed in both an official state reporter and a
+    regional reporter.  CAP stores those scans under each reporter, so keep
+    probing after the first hit and let the reader choose among them.
+    """
+    choices: list[_CaseLawPdfChoice] = []
+    seen_urls: set[str] = set()
+    for raw in cites:
+        cite = re.sub(r"<[^>]+>", "", str(raw or "")).strip()
+        if (not cite or _NOISE_CITE_RE.search(cite)
+                or _NONSTANDARD_CITE_RE.search(cite)):
+            continue
+        url = _static_case_law_url(cite)
+        if not url or url in seen_urls:
+            continue
+        print(f"[case.law] checking static.case.law: {url}")
+        try:
+            head = _anon_session.head(url, timeout=10, allow_redirects=True)
+        except Exception as exc:
+            print(f"[case.law] HEAD check failed for {url}: {exc}")
+            continue
+        if head.status_code == 200:
+            seen_urls.add(url)
+            choices.append(_CaseLawPdfChoice(cite=cite, url=url))
+        else:
+            print(f"[case.law] static.case.law {head.status_code} for {cite!r}")
+    return choices
+
+
 # --- Early-SCOTUS "nominative" reporters -------------------------------------
 # Before 1875 the U.S. Reports were cited by the Reporter of Decisions' name
 # ("3 Dall. 386", "1 Cranch 137").  Google Scholar prints these old SCOTUS cites
@@ -1254,20 +1291,8 @@ def _case_law_pdf_for_cite(cite: str) -> Optional[str]:
     """A static.case.law PDF URL that actually exists (HEAD 200) for *cite* —
     trying the citation as printed and then its modern U.S.-Reports form for an
     old nominative SCOTUS cite — or None when case.law has neither."""
-    seen: set[str] = set()
-    for c in (cite, _us_reports_cite(cite)):
-        url = _static_case_law_url(c) if c else None
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        try:
-            if _anon_session.head(
-                url, timeout=10, allow_redirects=True
-            ).status_code == 200:
-                return url
-        except Exception as exc:
-            print(f"[case.law] HEAD check failed for {url}: {exc}")
-    return None
+    choices = _case_law_pdf_choices_for_cites([cite, _us_reports_cite(cite)])
+    return choices[0].url if choices else None
 
 
 def _link_name(text: str) -> str:
@@ -5662,6 +5687,7 @@ class CourtListenerGUI:
         5. Walk the cluster's sub_opinions checking local_path then download_url.
         """
         storage_base = "https://storage.courtlistener.com/"
+        item.pop("_case_law_pdf_choices", None)
 
         # Determine whether this is a SCOTUS case.
         court_val = str(item.get("court_id") or "")
@@ -5749,24 +5775,14 @@ class CourtListenerGUI:
                 return url
 
         # 0.5. Non-SCOTUS: the Harvard CAP static.case.law copy.  Try every
-        #      parallel cite before giving up.
+        #      parallel cite before giving up; when more than one reporter scan
+        #      exists, keep all of them for the case window's View PDF menu.
         if not is_scotus:
-            for cite in all_cites:
-                if "lexis" in cite.lower():
-                    continue
-                scl_url = _static_case_law_url(cite)
-                if not scl_url:
-                    continue
-                print(f"[resolve] checking static.case.law: {scl_url}")
-                try:
-                    head = _anon_session.head(scl_url, timeout=10,
-                                              allow_redirects=True)
-                    if head.status_code == 200:
-                        print(f"[resolve] using static.case.law PDF: {scl_url}")
-                        return scl_url
-                    print(f"[resolve] static.case.law {head.status_code} for {cite!r}")
-                except Exception as exc:
-                    print(f"[resolve] static.case.law check failed: {exc}")
+            choices = _case_law_pdf_choices_for_cites(all_cites)
+            if choices:
+                item["_case_law_pdf_choices"] = choices
+                print(f"[resolve] using static.case.law PDF: {choices[0].url}")
+                return choices[0].url
 
         # 1. local_path already present on the search result
         local = item.get("local_path") or item.get("localPath") or ""
@@ -10314,6 +10330,7 @@ class _ScholarTextWindow:
         # Background-prefetched PDF (data, url) so "View PDF" is instant; set by
         # _prefetch_pdf, consumed by _view_pdf.
         self._pdf_prefetch: Optional[tuple[bytes, str]] = None
+        self._case_law_pdf_choices: list[_CaseLawPdfChoice] = []
         self._pdf_prefetch_started = False
         # CourtListener text view: whether a PDF was located anywhere (None =
         # still looking, True/False = found/not), gating its "View PDF" button.
@@ -10695,7 +10712,9 @@ class _ScholarTextWindow:
 
     def _source_or_pdf_widths(self, button) -> tuple[int, int]:
         text = self._button_text(button)
-        if text in ("View PDF", "No PDF"):
+        if text.startswith("View PDF"):
+            return (96, 84) if "▾" in text else (84, 70)
+        if text == "No PDF":
             return 84, 70
         if text.startswith("Finding PDF"):
             return 104, 90
@@ -14400,8 +14419,81 @@ class _ScholarTextWindow:
     # CourtListener-view "View PDF" button
     # ------------------------------------------------------------------
 
+    def _remember_case_law_pdf_choices(self, item: dict) -> None:
+        choices = item.get("_case_law_pdf_choices") or []
+        self._case_law_pdf_choices = list(choices)
+        self._post(self._refresh_pdf_button)
+
+    def _post_pdf_menu(self) -> None:
+        choices = list(getattr(self, "_case_law_pdf_choices", []) or [])
+        if len(choices) <= 1:
+            self._view_pdf()
+            return
+        btn = self._active_pdf_button()
+        if btn is None:
+            return
+        menu = tk.Menu(self._win, tearoff=0)
+        for choice in choices:
+            menu.add_command(
+                label=choice.cite,
+                command=lambda c=choice: self._view_pdf_choice(c),
+            )
+        try:
+            menu.tk_popup(btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _view_pdf_choice(self, choice: _CaseLawPdfChoice) -> None:
+        """Open a specific reporter scan chosen from the View PDF menu."""
+        try:
+            import pypdfium2  # noqa: F401
+            from PIL import ImageTk  # noqa: F401
+        except ImportError:
+            self._pdf_url = choice.url
+            if messagebox.askyesno(
+                "PDF viewer not installed",
+                "Viewing PDFs inside the app needs two Python packages:\n\n"
+                "    pip install pypdfium2 Pillow\n\n"
+                "Open the PDF in your web browser instead?",
+                parent=self._win,
+            ):
+                webbrowser.open(choice.url)
+            return
+        if self._mode in ("scholar", "courtlistener"):
+            self._pre_pdf_mode = self._mode
+        if self._pdf_prefetch is not None and self._pdf_prefetch[1] == choice.url:
+            data, url = self._pdf_prefetch
+            self._show_pdf(data, url)
+            return
+        busy = self._active_pdf_button()
+        try:
+            if busy is not None:
+                busy.configure(state="disabled")
+        except tk.TclError:
+            pass
+        self._pdf_url = choice.url
+        self._status_var.set(f"Opening PDF for {choice.cite}...")
+        client = self._app._get_client()
+
+        def run() -> None:
+            try:
+                fetched = _fetch_pdf_bytes(choice.url, client=client, timeout=30)
+                if fetched is None:
+                    self._post(
+                        self._on_pdf_error,
+                        "The source returned something that isn't a PDF.",
+                    )
+                    return
+                data, final_url = fetched
+                self._pdf_url = final_url
+                self._post(self._show_pdf, data, final_url)
+            except Exception as exc:
+                self._post(self._on_pdf_error, str(exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _pack_courtlistener_action_buttons(self) -> None:
-        """Pack Scholar then PDF actions so PDF sits to the right of Scholar."""
+        """Pack right-side actions so View PDF stays second from the right."""
         scholar = getattr(self, "_toggle_btn", None)
         pdf = getattr(self, "_pdf_btn", None)
         if scholar is None or pdf is None:
@@ -14469,8 +14561,11 @@ class _ScholarTextWindow:
             return
         try:
             if self._pdf_located is True or self._pdf_prefetch is not None:
+                choices = getattr(self, "_case_law_pdf_choices", []) or []
+                label = "View PDF ▾" if len(choices) > 1 else "View PDF"
+                command = self._post_pdf_menu if len(choices) > 1 else self._view_pdf
                 _style_ui_button(btn, primary=True)
-                btn.configure(state="normal", text="View PDF")
+                btn.configure(state="normal", text=label, command=command)
             elif self._pdf_located is False:
                 _style_ui_button(btn, primary=False)
                 btn.configure(state="disabled", text="No PDF")
@@ -14502,6 +14597,7 @@ class _ScholarTextWindow:
             url = None
             try:
                 url = self._app._resolve_pdf_url(client, item)
+                self._remember_case_law_pdf_choices(item)
             except Exception as exc:
                 print(f"[pdf] resolve failed: {exc}")
             if not url:
@@ -14559,6 +14655,7 @@ class _ScholarTextWindow:
         def run() -> None:
             try:
                 url = self._app._resolve_pdf_url(client, item)
+                self._remember_case_law_pdf_choices(item)
                 if not url:
                     return
                 fetched = _fetch_pdf_bytes(url, client=client, timeout=30)
@@ -14613,6 +14710,7 @@ class _ScholarTextWindow:
             try:
                 url = (self._app._resolve_pdf_url(client, item)
                        if client is not None else None)
+                self._remember_case_law_pdf_choices(item)
                 if not url:
                     self._post(self._on_pdf_error,
                                "No PDF is available for this opinion.")
@@ -14851,6 +14949,7 @@ class _ScholarTextWindow:
         def run() -> None:
             try:
                 url = self._app._resolve_pdf_url(client, item)
+                self._remember_case_law_pdf_choices(item)
             except Exception:
                 url = None
             self._post(self._after_resolve_for_browser, url)
