@@ -38,6 +38,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
@@ -451,6 +452,18 @@ class OpinionDB:
                     pass  # fall back to a full rebuild
             self.rebuild_index()
 
+    def _warn_skipped(self, skipped: int) -> None:
+        """Surface unparseable JSONL lines (e.g. leftover git conflict markers)
+        instead of dropping them silently — the file is hand-merged via Git, so
+        garbage lines are worth a human's attention even though the index can
+        simply skip them."""
+        if skipped:
+            print(
+                f"opinion_db: skipped {skipped} unparseable line(s) in "
+                f"{self.jsonl_path} (leftover merge-conflict markers?)",
+                file=sys.stderr,
+            )
+
     def _appended_cleanly(self, offset: int) -> bool:
         """True when byte ``offset`` sits just after a newline, so reading from
         there yields whole JSON lines (the only way ``add`` ever grows the
@@ -465,7 +478,7 @@ class OpinionDB:
             return False
 
     def _ingest_tail(self, offset: int) -> None:
-        added = 0
+        added = skipped = 0
         with open(self.jsonl_path, "r", encoding="utf-8") as f:
             f.seek(offset)
             for line in f:
@@ -476,7 +489,9 @@ class OpinionDB:
                     self._index_record(json.loads(line))
                     added += 1
                 except Exception:
+                    skipped += 1
                     continue
+        self._warn_skipped(skipped)
         prev = int(self._get_meta("jsonl_lines") or "0")
         self._set_meta("jsonl_lines", str(prev + added))
         self._set_meta("jsonl_size", str(self.jsonl_path.stat().st_size))
@@ -488,7 +503,7 @@ class OpinionDB:
             self._db.executescript(
                 "DELETE FROM opinions; DELETE FROM citations; DELETE FROM parties;"
             )
-            lines = 0
+            lines = skipped = 0
             if self.jsonl_path.exists():
                 with open(self.jsonl_path, "r", encoding="utf-8") as f:
                     for line in f:
@@ -499,7 +514,9 @@ class OpinionDB:
                             self._index_record(json.loads(line))
                             lines += 1
                         except Exception:
+                            skipped += 1
                             continue
+            self._warn_skipped(skipped)
             size = self.jsonl_path.stat().st_size if self.jsonl_path.exists() else 0
             self._set_meta("schema_version", str(_SCHEMA_VERSION))
             self._set_meta("jsonl_lines", str(lines))
