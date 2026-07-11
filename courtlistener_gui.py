@@ -7205,12 +7205,15 @@ def _fn_bookmark(side: str, fid: str) -> str:
 def _dump_to_rtf(
     txt: tk.Text, start: str, end: str, part_colors: bool = False,
     fn_links: Optional[dict[str, tuple[str, str]]] = None,
+    omit_tags: Optional[set[str]] = None,
 ) -> str:
     """Convert a Tk Text range (with the Scholar window's tags) to an RTF
     body.  `fn_links` maps link-tag names to ("fnref"|"fndef", id);
     matching runs become RTF bookmark/hyperlink pairs so footnote markers
-    stay clickable in the exported document."""
+    stay clickable in the exported document.  Text under any tag in
+    `omit_tags` is dropped (quote-ready copies omit footnote markers)."""
     fn_links = fn_links or {}
+    omit_tags = omit_tags or set()
     out: list[str] = []
     # Seed with tags already open at *start*; dump only reports transitions.
     active: set[str] = set(txt.tag_names(start))
@@ -7255,7 +7258,7 @@ def _dump_to_rtf(
         elif key == "tagoff":
             active.discard(value)
         elif key == "text":
-            if "justify-pad" in active:
+            if "justify-pad" in active or active & omit_tags:
                 continue
             for i, seg in enumerate(value.split("\n")):
                 if i and par_open:
@@ -7279,16 +7282,23 @@ def _dump_to_rtf(
     return "".join(out)
 
 
-def _plain_without_layout_chars(txt: tk.Text, start: str, end: str) -> str:
-    """Text content without temporary on-screen justification fragments."""
+def _plain_without_layout_chars(
+    txt: tk.Text, start: str, end: str,
+    omit_tags: Optional[set[str]] = None,
+) -> str:
+    """Text content without temporary on-screen justification fragments.
+    Text under any tag in `omit_tags` is dropped too (omitted footnote
+    markers in quote-ready copies)."""
     out: list[str] = []
+    omit_tags = omit_tags or set()
     active: set[str] = set(txt.tag_names(start))
     for key, value, _index in txt.dump(start, end, text=True, tag=True):
         if key == "tagon":
             active.add(value)
         elif key == "tagoff":
             active.discard(value)
-        elif key == "text" and "justify-pad" not in active:
+        elif key == "text" and "justify-pad" not in active \
+                and not active & omit_tags:
             out.append(value)
     return "".join(out)
 
@@ -7572,6 +7582,46 @@ def _latex_run(
     return out
 
 
+# A section marker standing alone on its own (usually centered) line — the
+# way Supreme Court opinions head their parts: a bare roman numeral ("II"),
+# capital letter ("A") or number ("1"), optionally compounded ("II-B"), with
+# an optional trailing period.  Star-pagination markers may precede it.
+_BARE_HEADING_RE = re.compile(
+    r"^(?:[IVXLCDM]+|[A-Z]|\d{1,2})"
+    r"(?:\s*[-–—.]\s*(?:[IVXLCDM]+|[A-Z]|\d{1,2}))?\s*\.?$"
+)
+
+
+def _para_plain_text(p: _ExpPara) -> str:
+    """The paragraph's prose, page markers and footnote anchors dropped."""
+    return "".join(
+        r.text for r in p.runs if not (r.pagenum or r.fnref or r.fndef)
+    ).strip()
+
+
+def _heading_like(p: _ExpPara) -> bool:
+    """True when the paragraph acts as a section heading for page-break
+    purposes: an explicit heading block, or a centered section marker —
+    Supreme Court opinions head their parts with a bare "II" / "A" / "1" on
+    its own centered line, other courts with a short bold centered title."""
+    if p.kind == "heading":
+        return True
+    if p.kind != "center":
+        return False
+    text = re.sub(r"\s+", " ", _para_plain_text(p))
+    text = re.sub(r"^(?:\*\d+\s*)+", "", text).strip()  # leading page markers
+    if not text:
+        return False
+    if _BARE_HEADING_RE.match(text):
+        return True
+    # A short, all-bold centered line mid-opinion is an explanatory heading
+    # ("I. BACKGROUND").  " v. " keeps centered case-caption lines out.
+    styled = [r for r in p.runs
+              if r.text.strip() and not (r.pagenum or r.fnref or r.fndef)]
+    return (len(text) <= 80 and " v. " not in text
+            and bool(styled) and all(r.bold for r in styled))
+
+
 def _latex_paragraphs(
     paras: list[_ExpPara],
     notes: Optional[dict[str, tuple[str, str]]] = None,
@@ -7579,17 +7629,19 @@ def _latex_paragraphs(
     title_block: bool = False,
 ) -> str:
     """Paragraphs as LaTeX body text.  With `title_block`, a leading centered
-    paragraph (the case caption) is set large and bold."""
-    out: list[str] = []
-    quote_open = False
+    paragraph (the case caption) is set large and bold.
+
+    Headings — explicit heading blocks and the bare centered section markers
+    Supreme Court opinions use ("II", "A", "1") — are glued to what follows
+    with \\nopagebreak so a heading (or a run of headings) can never be left
+    at the bottom of a page while its text starts on the next: TeX then has
+    no legal break point between the heading and the second line of the
+    following paragraph (\\clubpenalty already guards the first), so the
+    whole group moves to the fresh page instead."""
+    # Pass 1: typeset each paragraph, in order (footnote placement depends on
+    # first-reference order), remembering which ones behave as headings.
+    items: list[tuple[_ExpPara, str, bool]] = []  # (para, latex, is_title)
     title_pending = title_block
-
-    def close_quote() -> None:
-        nonlocal quote_open
-        if quote_open:
-            out.append("\\end{quote}\n\n")
-            quote_open = False
-
     for p in paras:
         if p.kind == "fnhead":
             continue  # "Footnotes" label: notes are typeset at page bottoms
@@ -7604,23 +7656,45 @@ def _latex_paragraphs(
         body = "".join(pieces).strip()
         if not body:
             continue
+        items.append((p, body, title_pending and p.kind == "center"))
+        title_pending = False
+
+    # Pass 2: assemble, keeping headings attached to their following text.
+    out: list[str] = []
+    quote_open = False
+
+    def close_quote() -> None:
+        nonlocal quote_open
+        if quote_open:
+            out.append("\\end{quote}\n\n")
+            quote_open = False
+
+    for i, (p, body, is_title) in enumerate(items):
         if p.kind == "blockquote":
             if not quote_open:
                 out.append("\\begin{quote}\n")
                 quote_open = True
             out.append(body + "\n\n")
-            title_pending = False
             continue
         close_quote()
+        # \nopagebreak only helps when something follows in this section.
+        heading = not is_title and _heading_like(p)
+        glue = "\\nopagebreak" if heading and i + 1 < len(items) else ""
         if p.kind == "center":
-            if title_pending:
+            if is_title:
                 body = "{\\large\\bfseries " + body + "}"
-            out.append("\\begin{center}\n" + body + "\n\\end{center}\n\n")
+            if heading:
+                # Not a center environment: its surrounding list glue would
+                # reopen a legal page-break point after the \nopagebreak.
+                out.append("\\medskip{\\centering " + body + "\\par}"
+                           + glue + "\\medskip\n\n")
+            else:
+                out.append("\\begin{center}\n" + body + "\n\\end{center}\n\n")
         elif p.kind == "heading":
-            out.append("\\medskip\\noindent\\textbf{" + body + "}\n\n")
+            out.append("\\medskip\\noindent\\textbf{" + body + "}\\par"
+                       + glue + "\n\n")
         else:
             out.append(body + "\n\n")
-        title_pending = False
     close_quote()
     return "".join(out)
 
@@ -9911,6 +9985,7 @@ class _ScholarTextWindow:
         self._cl_text: Optional[str] = cl_text
         self._mode = "courtlistener" if self._cl_primary else "scholar"
         self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
+        self._pdf_holder: Optional[ttk.Frame] = None  # pane + parts strip
         self._pdf_url: Optional[str] = None
         self._pdf_bytes: Optional[bytes] = None
         # Background-prefetched PDF (data, url) so "View PDF" is instant; set by
@@ -10143,6 +10218,7 @@ class _ScholarTextWindow:
         self._text_frame, self._vsb = text_frame, vsb
         self._details_frame: Optional[ttk.Frame] = None
         self._details_loaded = False
+        self._details_case: Optional[tuple] = None  # cached (title, lines)
 
         txt.tag_configure("center", justify="center")
         txt.tag_configure("blockquote", lmargin1=36, lmargin2=36, rmargin=36)
@@ -11074,6 +11150,7 @@ class _ScholarTextWindow:
         self._finder.refresh()
         self._refresh_pdf_button()
         self._locate_pdf()
+        self._refresh_outline_panel()
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
@@ -11699,6 +11776,7 @@ class _ScholarTextWindow:
         self._hide_cl_button()  # CL view uses the toggle for "Google Scholar Text"
         self._show_pdf_button()
         self._finder.refresh()
+        self._refresh_outline_panel()
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
@@ -11731,6 +11809,7 @@ class _ScholarTextWindow:
         )
         self._show_pdf_button()
         self._finder.refresh()
+        self._refresh_outline_panel()
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
@@ -12152,9 +12231,12 @@ class _ScholarTextWindow:
             pass
 
     def _bluebook_citation(
-        self, pin: Optional[str], writer: str = ""
+        self, pin: Optional[str], writer: str = "",
+        extra_parens: tuple[str, ...] = (),
     ) -> tuple[str, str]:
-        """Return (plain, rtf-fragment) forms of the Bluebook citation."""
+        """Return (plain, rtf-fragment) forms of the Bluebook citation.
+        `extra_parens` follow the writer parenthetical — e.g. "footnote
+        omitted" (Bluebook rule 5.2(d))."""
         bb = self._bb
         name, cite, court, year = bb["name"], bb["cite"], bb["court"], bb["year"]
         rest = ""
@@ -12169,6 +12251,9 @@ class _ScholarTextWindow:
             rest += f" ({paren_inner})"
         if writer:
             rest += f" ({writer})"
+        for extra in extra_parens:
+            if extra:
+                rest += f" ({extra})"
         rest += "."
         # Bluebook abbreviations ("Ass'n", "Int'l", "Dep't", "F. App'x"),
         # possessives, and names like O'Connor take a typographic apostrophe
@@ -12315,6 +12400,14 @@ class _ScholarTextWindow:
         # its own (still richly, just without the citation).
         with_cite = self._copy_with_cite.get()
         plain_cite, rtf_cite = "", ""
+        omit_tags: set[str] = set()
+        n_omitted = 0
+        if with_cite and selected:
+            # Footnote references inside the copied body text: a quote-ready
+            # copy drops the marker and says so in the citation ("(footnote
+            # omitted)") — unless the note's own text is inside the selection
+            # (then it is being copied, not omitted).
+            omit_tags, n_omitted = self._omitted_footnote_tags(start, end)
         if with_cite:
             # Pin cites and the writer parenthetical apply whenever the opinion
             # on screen actually carries reporter page markers — the Google
@@ -12344,10 +12437,16 @@ class _ScholarTextWindow:
                             break
                 if pi is not None and pi < len(parts):
                     writer = self._writer_parenthetical(parts[pi])
-            plain_cite, rtf_cite = self._bluebook_citation(pin, writer)
-        body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map())
+            extras: tuple[str, ...] = ()
+            if n_omitted:
+                extras = ("footnote omitted" if n_omitted == 1
+                          else "footnotes omitted",)
+            plain_cite, rtf_cite = self._bluebook_citation(pin, writer, extras)
+        body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map(),
+                            omit_tags=omit_tags)
         rtf = _rtf_document(body + rtf_cite)
-        plain = _plain_without_layout_chars(txt, start, end).rstrip()
+        plain = _plain_without_layout_chars(txt, start, end,
+                                            omit_tags=omit_tags).rstrip()
         if plain_cite:
             plain += "\n\n" + plain_cite + "\n"
         how = _copy_rich_clipboard(self._win, rtf, plain)
@@ -12361,6 +12460,37 @@ class _ScholarTextWindow:
         """Link tags that anchor footnote jumps, for RTF bookmarks."""
         return {t: a for t, a in self._link_actions.items()
                 if a[0] in ("fnref", "fndef")}
+
+    def _omitted_footnote_tags(self, start: str, end: str) -> tuple[set[str], int]:
+        """Footnote-reference marker tags inside [start, end) whose notes a
+        quote-ready copy omits, with the count of distinct omitted notes.
+        A reference is omitted unless its note's body is also selected (the
+        note is then being copied along, not dropped); markers inside a
+        footnote body (a note citing another note) are left alone."""
+        txt = self._text
+        fn_regions = getattr(self, "_fn_regions", []) or []
+        def_pos = getattr(self, "_fn_def_pos", {}) or {}
+        omit: set[str] = set()
+        fids: set[str] = set()
+        for tag, (side, fid) in self._fn_link_map().items():
+            if side != "fnref":
+                continue
+            ranges = txt.tag_ranges(tag)
+            for i in range(0, len(ranges), 2):
+                rs, rend = str(ranges[i]), str(ranges[i + 1])
+                if not (txt.compare(rs, "<", end)
+                        and txt.compare(rend, ">", start)):
+                    continue
+                if any(txt.compare(rs, ">=", fr[0])
+                       and txt.compare(rs, "<", fr[1]) for fr in fn_regions):
+                    continue  # marker sits inside a note body
+                body_pos = def_pos.get(fid)
+                if body_pos and txt.compare(body_pos, ">=", start) \
+                        and txt.compare(body_pos, "<", end):
+                    continue  # the note itself is selected too
+                omit.add(tag)
+                fids.add(fid)
+        return omit, len(fids)
 
     def _filename_item(self) -> dict:
         if self._item:
@@ -12828,6 +12958,25 @@ class _ScholarTextWindow:
             _ui_button(header, "A−", command=lambda: self._zoom_details(-1),
                        width=40).pack(side="right", padx=(0, 4))
 
+            # What the panel shows: the case details (Oyez line-up/summary,
+            # falling back to the Court's recent decisions, then to whatever
+            # the open text reveals) or the opinion's detected outline.
+            mode_row = ttk.Frame(f)
+            mode_row.pack(fill="x", padx=6, pady=(0, 2))
+            ttk.Label(mode_row, text="Show",
+                      style="ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel",
+                      ).pack(side="left")
+            self._details_mode_combo = ttk.Combobox(
+                mode_row, state="readonly", width=14,
+                values=("Case details", "Outline"),
+                style="Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox",
+            )
+            self._details_mode_combo.current(0)
+            self._details_mode_combo.pack(side="left", padx=(6, 0))
+            self._details_mode_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _e: self._refresh_details_view())
+
             body = tk.Text(
                 f, width=38, wrap="word",
                 font=self._details_fonts["body"],
@@ -12849,6 +12998,17 @@ class _ScholarTextWindow:
                           lambda _e: body.config(cursor="hand2"))
             body.tag_bind("olink", "<Leave>",
                           lambda _e: body.config(cursor=""))
+            # Outline entries for the opinion's parts, in the same colors the
+            # text view's part map uses (configured after "olink" so the part
+            # color outranks the link blue).
+            body.tag_configure("olpart", font=self._details_fonts["h"],
+                               foreground="#333333", spacing1=8)
+            body.tag_configure("olmaj", font=self._details_fonts["h"],
+                               foreground=self._MAJORITY_COLOR, spacing1=8)
+            body.tag_configure("olconc", font=self._details_fonts["h"],
+                               foreground=self._CONCUR_COLOR, spacing1=8)
+            body.tag_configure("oldiss", font=self._details_fonts["h"],
+                               foreground=self._DISSENT_COLOR, spacing1=8)
             self._details_text = body
             self._details_frame = f
             self._apply_details_fonts()   # honor the persisted zoom choice
@@ -12881,10 +13041,46 @@ class _ScholarTextWindow:
         if self._details_var.get():
             self._details_panel().pack(side="right", fill="y",
                                        before=self._vsb)
-            if not self._details_loaded:
-                self._load_details()
+            self._refresh_details_view()
         elif self._details_frame is not None:
             self._details_frame.pack_forget()
+
+    def _details_mode(self) -> str:
+        """The side panel's selected view: "case" or "outline"."""
+        combo = getattr(self, "_details_mode_combo", None)
+        try:
+            if combo is not None and combo.get() == "Outline":
+                return "outline"
+        except tk.TclError:
+            pass
+        return "case"
+
+    def _refresh_details_view(self) -> None:
+        """Fill the side panel for its selected mode."""
+        if self._details_frame is None:
+            return
+        if self._details_mode() == "outline":
+            self._show_outline()
+        else:
+            self._show_case_details()
+
+    def _show_case_details(self) -> None:
+        """The case-details view: cached lines when the lookup already ran,
+        else kick off the background load."""
+        cached = getattr(self, "_details_case", None)
+        if cached is not None:
+            self._apply_details(*cached)
+        elif not self._details_loaded:
+            self._load_details()
+        else:  # lookup still in flight
+            self._set_details([("lbl", "Loading case details…")])
+
+    def _apply_case_details(self, title: str, lines: list[tuple]) -> None:
+        """Store the fetched case details and show them — unless the user
+        has switched the panel to the outline meanwhile."""
+        self._details_case = (title, lines)
+        if self._details_mode() != "outline":
+            self._apply_details(title, lines)
 
     def _set_details(self, lines: list[tuple]) -> None:
         """Render the details pane.  Each line is ``(style, text)`` or, for a
@@ -12970,7 +13166,7 @@ class _ScholarTextWindow:
             if not lines:
                 lines = [("lbl", "No authorship details available "
                                  "for this case.")]
-            self._post(self._apply_details, title, lines)
+            self._post(self._apply_case_details, title, lines)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -13119,6 +13315,104 @@ class _ScholarTextWindow:
             lines.append(("", ""))
             lines.append(("", "View full details on Oyez →", case.web_url))
         return lines
+
+    # ------------------------------------------------------------------
+    # Side panel: detected outline
+    # ------------------------------------------------------------------
+
+    _OUTLINE_PART_STYLES = {"majority": "olmaj", "concurrence": "olconc",
+                            "dissent": "oldiss"}
+
+    def _show_outline(self) -> None:
+        """The outline view: each opinion part (colored like the part map)
+        and the section headings inside it — SCOTUS's bare "II"/"A"/"1"
+        markers and other courts' explanatory headings — as links that jump
+        the reader to that spot."""
+        entries = self._collect_outline()
+        lines: list[tuple] = []
+        if not entries:
+            lines.append(("lbl", "No outline detected in this opinion."))
+        else:
+            lines.append(("lbl", "Detected outline — click to jump."))
+            for level, style, text, pos in entries:
+                lines.append((style, "   " * level + text,
+                              lambda p=pos: self._outline_jump(p)))
+        self._apply_details("Outline", lines)
+
+    def _outline_jump(self, pos: str) -> None:
+        """Scroll the reader so *pos* tops the view, and flash its line."""
+        try:
+            self._text.yview(pos)
+        except tk.TclError:
+            return
+        self._jump_to(pos)
+
+    def _refresh_outline_panel(self) -> None:
+        """Rebuild the outline after a re-render — its stored text indices
+        go stale whenever the text is rebuilt (part switch, source toggle)."""
+        if (self._details_frame is not None and self._details_var.get()
+                and self._details_mode() == "outline"):
+            self._show_outline()
+
+    def _collect_outline(self) -> list[tuple[int, str, str, str]]:
+        """Outline entries of the rendered text, in document order:
+        (indent level, panel style tag, display text, text index).  Level 0
+        is an opinion part; headings nest roman → letter → number the way
+        Supreme Court opinions subdivide (II → A → 1)."""
+        txt = getattr(self, "_text", None)
+        if txt is None:
+            return []
+        entries: list[tuple[tuple[int, int], int, str, str, str]] = []
+        parts = getattr(self, "_rendered_parts", None) or []
+        for rs, _rend, pi in self._part_region_indices():
+            if pi >= len(parts):
+                continue
+            part = parts[pi]
+            label = re.sub(r"\s+", " ", part.label or "").strip() or "Part"
+            if len(label) > 110:
+                label = label[:107] + "…"
+            style = self._OUTLINE_PART_STYLES.get(part.kind, "olpart")
+            entries.append((_tk_ix(rs), 0, style, label, rs))
+        for tag in ("heading", "center"):
+            ranges = txt.tag_ranges(tag)
+            for i in range(0, len(ranges), 2):
+                start = str(ranges[i])
+                text = txt.get(start, str(ranges[i + 1]))
+                off = 0  # adjacent blocks share one tag range; walk its lines
+                for line in text.split("\n"):
+                    t = re.sub(r"^(?:\*\d+\s*)+", "", line).strip()
+                    level = self._outline_level(t, tag)
+                    if level is not None:
+                        pos = txt.index(f"{start}+{off}c")
+                        entries.append((_tk_ix(pos), level, "", t, pos))
+                    off += len(line) + 1
+        entries.sort(key=lambda e: e[0])
+        return [(level, style, text, pos)
+                for _ix, level, style, text, pos in entries]
+
+    @staticmethod
+    def _outline_level(t: str, tag: str) -> Optional[int]:
+        """The outline depth of one heading/centered line, or None when the
+        line isn't a heading (a caption line, a "* * *" divider…)."""
+        def depth(marker: str) -> int:
+            if marker.isdigit():
+                return 3
+            if len(marker) == 1 and marker not in "IVX":
+                return 2  # a lettered subsection ("A"), not a roman numeral
+            return 1
+        if not t:
+            return None
+        if tag == "heading":
+            if len(t) > 80:
+                return None  # a paragraph that merely carries the tag
+            m = re.match(r"([IVXLCDM]+|[A-Z]|\d{1,2})[.)]\s+\S", t)
+            return depth(m.group(1)) if m else 1
+        # Centered lines: only the bare section markers count ("II", "A.").
+        m = _BARE_HEADING_RE.match(t)
+        if not m:
+            return None
+        lead = re.match(r"[IVXLCDM]+|[A-Z]|\d{1,2}", t)
+        return depth(lead.group(0)) if lead else 1
 
     # ------------------------------------------------------------------
     # Citation links
@@ -13997,18 +14291,28 @@ class _ScholarTextWindow:
         width = max(self._text.winfo_width() - 24, 520)
         # US Reports scans get a roughly 3× margin (see _is_us_reports_pdf).
         margin = _PdfPane._MARGIN * 3 if _is_us_reports_pdf(url) else None
+        # The pane lives in a holder frame so a parts strip (built once the
+        # text layer reveals the separate opinions) can sit to its right.
+        if getattr(self, "_pdf_holder", None) is not None:
+            self._pdf_holder.destroy()  # a previous PDF view left behind
+            self._pdf_holder = None
+            self._pdf_pane = None
+        holder = ttk.Frame(self._win)
         try:
             pane = _PdfPane(
-                self._win, data, width=width, margin=margin,
+                holder, data, width=width, margin=margin,
                 link_style="recolor", uniform_crop=True,
             )
         except Exception as exc:  # pragma: no cover - render/lib failure
+            holder.destroy()
             self._on_pdf_error(str(exc))
             return
         # Swap the text view for the PDF pane (kept above the button row).
         self._text_frame.pack_forget()
-        pane.pack(fill="both", expand=True, padx=8, pady=4,
-                  before=self._btn_frame)
+        holder.pack(fill="both", expand=True, padx=8, pady=4,
+                    before=self._btn_frame)
+        pane.pack(side="left", fill="both", expand=True)
+        self._pdf_holder = holder
         self._pdf_pane = pane
         self._pdf_url = url
         self._pdf_bytes = data
@@ -14031,6 +14335,14 @@ class _ScholarTextWindow:
                 links = _citation_links_from_visible_pdf_text(d, pages)
             except Exception as exc:
                 print(f"[pdf-links] citation scan failed: {exc}")
+            # The separate opinions (Syllabus, Opinion of the Court, each
+            # concurrence/dissent), read from the running heads — slip
+            # opinions and US Reports pages share that layout.
+            sections: list = []
+            try:
+                sections = slip_opinion.detect_sections(pages)
+            except Exception as exc:
+                print(f"[pdf-parts] section detection failed: {exc}")
 
             def apply() -> None:
                 try:
@@ -14042,6 +14354,10 @@ class _ScholarTextWindow:
                                 self._open_pdf_cite_browser,
                             )
                         p.enable_find(pages, bind_keys=False)
+                        if len(sections) > 1:
+                            nav = _build_pdf_parts_nav(
+                                self._pdf_holder, sections, p.scroll_to_page)
+                            nav.pack(side="right", fill="y", padx=(4, 0))
                         bits = []
                         n = sum(len(v) for v in links.values())
                         if n:
@@ -14049,6 +14365,9 @@ class _ScholarTextWindow:
                                 f"{n} citation link{'s' if n != 1 else ''} "
                                 "shown in blue"
                             )
+                        if len(sections) > 1:
+                            bits.append(f"{len(sections)} opinion parts "
+                                        "listed on the right")
                         bits.append("drag to select text; Ctrl+C copies")
                         self._status_var.set("; ".join(bits) + ".")
                 except tk.TclError:
@@ -14142,9 +14461,13 @@ class _ScholarTextWindow:
     def _back_from_pdf(self) -> None:
         """Return from the PDF to the text view it was opened from — the Google
         Scholar text, or the CourtListener text for a CL-primary window."""
-        if self._pdf_pane is not None:
+        holder = getattr(self, "_pdf_holder", None)
+        if holder is not None:
+            holder.destroy()  # takes the pane and its parts strip with it
+            self._pdf_holder = None
+        elif self._pdf_pane is not None:
             self._pdf_pane.destroy()
-            self._pdf_pane = None
+        self._pdf_pane = None
         self._text_frame.pack(fill="both", expand=True, padx=8, pady=4,
                               before=self._btn_frame)
         if self._pre_pdf_mode == "courtlistener":
@@ -14891,6 +15214,41 @@ class _SlipTextWindow:
             pass
 
 
+# Colors for a PDF's detected opinion parts — the same palette the text
+# view's part map uses (_ScholarTextWindow._PARTMAP_COLORS), so the strip
+# reads identically beside a PDF and beside the CourtListener/Scholar text.
+_PDF_PART_COLORS = {
+    "syllabus": "#555555",
+    "majority": _ScholarTextWindow._MAJORITY_COLOR,
+    "concurrence": _ScholarTextWindow._CONCUR_COLOR,
+    "dissent": _ScholarTextWindow._DISSENT_COLOR,
+    "separate": "#6a4d9f",
+}
+
+
+def _build_pdf_parts_nav(parent, sections: list, goto) -> ttk.Frame:
+    """A slim strip listing a PDF's detected opinion parts (from
+    slip_opinion.detect_sections), each colored by kind; clicking a label
+    calls ``goto(start_page)``.  The caller packs the returned frame."""
+    nav = ttk.Frame(parent, padding=(6, 4))
+    ttk.Label(nav, text="Parts", font=("TkDefaultFont", 9, "bold"),
+              anchor="w").pack(fill="x", pady=(2, 4))
+    for sec in sections:
+        lbl = tk.Label(
+            nav, text=sec.label, anchor="w", justify="left",
+            wraplength=150, cursor="hand2",
+            foreground=_PDF_PART_COLORS.get(sec.kind, "#333333"),
+            font=("TkDefaultFont", 9, "underline"),
+        )
+        lbl.pack(fill="x", pady=2)
+        lbl.bind("<Button-1>", lambda _e, p=sec.start_page: goto(p))
+        page_no = tk.Label(nav, text=f"p. {sec.start_page + 1}",
+                           anchor="w", foreground="#999999",
+                           font=("TkDefaultFont", 8))
+        page_no.pack(fill="x", padx=(8, 0))
+    return nav
+
+
 class _SlipOpinionWindow:
     """Viewer for a Supreme Court slip opinion straight from supremecourt.gov.
 
@@ -15127,26 +15485,7 @@ class _SlipOpinionWindow:
         scrolls the PDF to that part's first page."""
         if len(sections) < 2 or self._pane is None:
             return
-        nav = ttk.Frame(self._body, padding=(6, 4))
-        ttk.Label(nav, text="Parts", font=("TkDefaultFont", 9, "bold"),
-                  anchor="w").pack(fill="x", pady=(2, 4))
-        colors = {"syllabus": "#555555", "majority": "#1a3e72",
-                  "concurrence": "#1a7a3c", "dissent": "#a31515",
-                  "separate": "#6a4d9f"}
-        for sec in sections:
-            lbl = tk.Label(
-                nav, text=sec.label, anchor="w", justify="left",
-                wraplength=150, cursor="hand2",
-                foreground=colors.get(sec.kind, "#333333"),
-                font=("TkDefaultFont", 9, "underline"),
-            )
-            lbl.pack(fill="x", pady=2)
-            lbl.bind("<Button-1>",
-                     lambda _e, p=sec.start_page: self._goto_page(p))
-            page_no = tk.Label(nav, text=f"p. {sec.start_page + 1}",
-                               anchor="w", foreground="#999999",
-                               font=("TkDefaultFont", 8))
-            page_no.pack(fill="x", padx=(8, 0))
+        nav = _build_pdf_parts_nav(self._body, sections, self._goto_page)
         nav.pack(side="right", fill="y", padx=(0, 8), pady=4)
         self._nav = nav
 
