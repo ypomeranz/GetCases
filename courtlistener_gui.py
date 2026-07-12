@@ -2785,6 +2785,9 @@ class CourtListenerGUI:
         self._scholar: Optional["GoogleScholarFetcher"] = None
         self._opinion_db = None          # opinion_db.OpinionDB (lazy)
         self._opinion_db_failed = False  # don't retry a broken DB every call
+        self._opinion_db_loading = False
+        self._opinion_db_thread: Optional[threading.Thread] = None
+        self._opinion_db_lock = threading.RLock()
 
         self._preview_cache: dict[int, str] = {}  # result index → snippet text
         self._sort_state: dict[int, tuple[str, bool]] = {}  # tree id → (col, reverse)
@@ -5866,34 +5869,113 @@ class CourtListenerGUI:
                 "Install it with:\n    pip install beautifulsoup4",
             )
             return None
+        db = self._get_opinion_db(wait=False)
         if self._scholar is None:
             # Hand the fetcher the same name matcher used to rank
             # CourtListener/Scholar results, so a blocked search ranks local
             # database candidates the same way (see search_cases' fallback).
             self._scholar = GoogleScholarFetcher(
-                db=self._get_opinion_db(),
+                db=db,
                 name_scorer=_name_match_score,
                 name_min=_NAME_MATCH_MIN,
             )
+        elif db is not None and hasattr(self._scholar, "set_opinion_db"):
+            self._scholar.set_opinion_db(db)
         return self._scholar
 
-    def _get_opinion_db(self):
-        """The searchable opinion database (lazily opened).  Returns the
-        ``OpinionDB`` or ``None`` if it can't be opened — the app still runs,
-        just without the database (opinions then come straight from Scholar)."""
-        if self._opinion_db is None and not self._opinion_db_failed:
+    def _attach_opinion_db_to_scholar(self, db) -> None:
+        fetcher = self._scholar
+        if fetcher is not None and hasattr(fetcher, "set_opinion_db"):
             try:
-                import opinion_db
-                self._opinion_db = opinion_db.OpinionDB()
-                print(
-                    f"[db] opinion database ready "
-                    f"({self._opinion_db.count()} opinions) "
-                    f"at {self._opinion_db.jsonl_path}"
-                )
+                fetcher.set_opinion_db(db)
+            except Exception as exc:
+                print(f"[db] attaching opinion database to Scholar failed: {exc}")
+
+    def _open_opinion_db_sync(self):
+        import opinion_db
+        db = opinion_db.OpinionDB()
+        print(
+            f"[db] opinion database ready "
+            f"({db.count()} opinions) "
+            f"at {db.jsonl_path}"
+        )
+        return db
+
+    def _start_opinion_db_load(self) -> None:
+        """Start opening the opinion DB on a background thread.
+
+        Google Scholar searches can run without the local DB; this keeps the
+        first user lookup from waiting on JSONL/index sync. Once the DB is
+        ready, the existing Scholar fetcher is updated in-place.
+        """
+        def run() -> None:
+            db = None
+            failed = False
+            try:
+                db = self._open_opinion_db_sync()
             except Exception as exc:
                 print(f"[db] opinion database unavailable: {exc}")
-                self._opinion_db_failed = True
-        return self._opinion_db
+                failed = True
+            with self._opinion_db_lock:
+                self._opinion_db = db
+                self._opinion_db_failed = failed
+                self._opinion_db_loading = False
+                self._opinion_db_thread = None
+            if db is not None:
+                self._attach_opinion_db_to_scholar(db)
+
+        t = threading.Thread(target=run, daemon=True)
+        with self._opinion_db_lock:
+            if (self._opinion_db is not None or self._opinion_db_failed
+                    or self._opinion_db_loading):
+                return
+            self._opinion_db_loading = True
+            self._opinion_db_thread = t
+        t.start()
+
+    def _get_opinion_db(self, wait: bool = True):
+        """The searchable opinion database (lazily opened). Returns the
+        ``OpinionDB`` or ``None`` if it can't be opened; the app still runs,
+        just without the database (opinions then come straight from Scholar).
+
+        ``wait=False`` is for normal Scholar lookups: kick off a background
+        open/sync and return immediately so the search can continue against the
+        online sources. Explicit database actions keep the default blocking
+        behavior because the user asked for the local database itself.
+        """
+        with self._opinion_db_lock:
+            db = self._opinion_db
+            failed = self._opinion_db_failed
+            loading = self._opinion_db_loading
+            thread = self._opinion_db_thread
+        if db is not None or failed:
+            return db
+        if not wait:
+            self._start_opinion_db_load()
+            return None
+        if loading and thread is not None:
+            thread.join()
+            with self._opinion_db_lock:
+                return self._opinion_db
+        with self._opinion_db_lock:
+            if self._opinion_db is not None or self._opinion_db_failed:
+                return self._opinion_db
+            self._opinion_db_loading = True
+        db = None
+        failed = False
+        try:
+            db = self._open_opinion_db_sync()
+        except Exception as exc:
+            print(f"[db] opinion database unavailable: {exc}")
+            failed = True
+        with self._opinion_db_lock:
+            self._opinion_db = db
+            self._opinion_db_failed = failed
+            self._opinion_db_loading = False
+            self._opinion_db_thread = None
+        if db is not None:
+            self._attach_opinion_db_to_scholar(db)
+        return db
 
     # ------------------------------------------------------------------
     # Software update  (Settings ▸ Check for Updates…)
@@ -9743,10 +9825,20 @@ class _PdfPane(ttk.Frame):
         # Ignore implausible crops (blank page, or so tight it's likely noise).
         if (fr - fl) < 0.15 or (fb - ft) < 0.15:
             return full
+        # Redacted case.law scans can contain full-height/full-width black bars
+        # plus sparse text at the opposite edge.  Projection cropping may then
+        # look confident while cutting off edge characters. Treat those one-side
+        # crops as uncertain and leave the page whole.
+        if (ft <= self._PAD_FRAC and fb >= 1.0 - self._PAD_FRAC
+                and (fl > 0.03 or fr < 0.97)):
+            return full
+        if (fl <= self._PAD_FRAC and fr >= 1.0 - self._PAD_FRAC
+                and (ft > 0.03 or fb < 0.97)):
+            return full
         return (fl, ft, fr, fb)
 
     def _apply_uniform_crop(self) -> None:
-        """Use one shared crop box for same-template opinion PDFs."""
+        """Use one shared crop box for confident same-template opinion pages."""
         if len(self._meta) < 2:
             return
         widths = [m[0] for m in self._meta]
@@ -9768,7 +9860,13 @@ class _PdfPane(ttk.Frame):
         if (fr - fl) < 0.15 or (fb - ft) < 0.15:
             return
         common = (fl, ft, fr, fb)
-        self._meta = [(w_pt, h_pt, common) for w_pt, h_pt, _ in self._meta]
+        # A full-page box means detection was not confident for that page
+        # (blank, noisy, or real content spanning the page). Do not force the
+        # shared crop onto those pages; that can cut off text on case.law scans.
+        self._meta = [
+            (w_pt, h_pt, common if frac != full else full)
+            for w_pt, h_pt, frac in self._meta
+        ]
 
     def _on_yview(self, first: str, last: str) -> None:
         self._vsb.set(first, last)
@@ -10425,22 +10523,25 @@ class _PdfPane(ttk.Frame):
         """True when the PDF carries a real selectable text layer (born-digital,
         not a bare scan) — the case where a lossless, text-preserving crop is
         worth doing instead of the raster export."""
+        any_text = False
         try:
             with _PDFIUM_LOCK:
                 for i in range(len(self._doc)):
                     page = self._doc[i]
                     try:
+                        if _page_has_scan_background(page):
+                            return False
                         tp = page.get_textpage()
                         try:
                             if tp.count_chars() > 0:
-                                return True
+                                any_text = True
                         finally:
                             tp.close()
                     finally:
                         page.close()
         except Exception:
             return False
-        return False
+        return any_text
 
     def export_cropped_pdf(self, path: str) -> None:
         """Write a PDF cropped to each page's content with the selectable text
