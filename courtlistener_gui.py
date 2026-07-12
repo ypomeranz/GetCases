@@ -18,6 +18,7 @@ Token lookup order:
 from __future__ import annotations
 
 import difflib
+import gc
 import html as _html
 import importlib.util
 import json
@@ -1191,6 +1192,43 @@ def _static_case_law_url(citation: str) -> Optional[str]:
     return f"https://static.case.law/{slug}/{vol}/case-pdfs/{int(page):04d}-01.pdf"
 
 
+@dataclass(frozen=True)
+class _CaseLawPdfChoice:
+    cite: str
+    url: str
+
+
+def _case_law_pdf_choices_for_cites(cites: list[str]) -> list[_CaseLawPdfChoice]:
+    """Every static.case.law PDF that exists for the supplied parallel cites.
+
+    State opinions are often printed in both an official state reporter and a
+    regional reporter.  CAP stores those scans under each reporter, so keep
+    probing after the first hit and let the reader choose among them.
+    """
+    choices: list[_CaseLawPdfChoice] = []
+    seen_urls: set[str] = set()
+    for raw in cites:
+        cite = re.sub(r"<[^>]+>", "", str(raw or "")).strip()
+        if (not cite or _NOISE_CITE_RE.search(cite)
+                or _NONSTANDARD_CITE_RE.search(cite)):
+            continue
+        url = _static_case_law_url(cite)
+        if not url or url in seen_urls:
+            continue
+        print(f"[case.law] checking static.case.law: {url}")
+        try:
+            head = _anon_session.head(url, timeout=10, allow_redirects=True)
+        except Exception as exc:
+            print(f"[case.law] HEAD check failed for {url}: {exc}")
+            continue
+        if head.status_code == 200:
+            seen_urls.add(url)
+            choices.append(_CaseLawPdfChoice(cite=cite, url=url))
+        else:
+            print(f"[case.law] static.case.law {head.status_code} for {cite!r}")
+    return choices
+
+
 # --- Early-SCOTUS "nominative" reporters -------------------------------------
 # Before 1875 the U.S. Reports were cited by the Reporter of Decisions' name
 # ("3 Dall. 386", "1 Cranch 137").  Google Scholar prints these old SCOTUS cites
@@ -1254,20 +1292,8 @@ def _case_law_pdf_for_cite(cite: str) -> Optional[str]:
     """A static.case.law PDF URL that actually exists (HEAD 200) for *cite* —
     trying the citation as printed and then its modern U.S.-Reports form for an
     old nominative SCOTUS cite — or None when case.law has neither."""
-    seen: set[str] = set()
-    for c in (cite, _us_reports_cite(cite)):
-        url = _static_case_law_url(c) if c else None
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        try:
-            if _anon_session.head(
-                url, timeout=10, allow_redirects=True
-            ).status_code == 200:
-                return url
-        except Exception as exc:
-            print(f"[case.law] HEAD check failed for {url}: {exc}")
-    return None
+    choices = _case_law_pdf_choices_for_cites([cite, _us_reports_cite(cite)])
+    return choices[0].url if choices else None
 
 
 def _link_name(text: str) -> str:
@@ -5662,6 +5688,7 @@ class CourtListenerGUI:
         5. Walk the cluster's sub_opinions checking local_path then download_url.
         """
         storage_base = "https://storage.courtlistener.com/"
+        item.pop("_case_law_pdf_choices", None)
 
         # Determine whether this is a SCOTUS case.
         court_val = str(item.get("court_id") or "")
@@ -5749,24 +5776,14 @@ class CourtListenerGUI:
                 return url
 
         # 0.5. Non-SCOTUS: the Harvard CAP static.case.law copy.  Try every
-        #      parallel cite before giving up.
+        #      parallel cite before giving up; when more than one reporter scan
+        #      exists, keep all of them for the case window's View PDF menu.
         if not is_scotus:
-            for cite in all_cites:
-                if "lexis" in cite.lower():
-                    continue
-                scl_url = _static_case_law_url(cite)
-                if not scl_url:
-                    continue
-                print(f"[resolve] checking static.case.law: {scl_url}")
-                try:
-                    head = _anon_session.head(scl_url, timeout=10,
-                                              allow_redirects=True)
-                    if head.status_code == 200:
-                        print(f"[resolve] using static.case.law PDF: {scl_url}")
-                        return scl_url
-                    print(f"[resolve] static.case.law {head.status_code} for {cite!r}")
-                except Exception as exc:
-                    print(f"[resolve] static.case.law check failed: {exc}")
+            choices = _case_law_pdf_choices_for_cites(all_cites)
+            if choices:
+                item["_case_law_pdf_choices"] = choices
+                print(f"[resolve] using static.case.law PDF: {choices[0].url}")
+                return choices[0].url
 
         # 1. local_path already present on the search result
         local = item.get("local_path") or item.get("localPath") or ""
@@ -9265,6 +9282,103 @@ def _citation_links_from_visible_pdf_text(pdf_bytes: bytes, pages: list) -> dict
     return _citation_links_from_pages(pages, link_pages=link_pages)
 
 
+# ---------------------------------------------------------------------------
+# Main-thread-only Tk image lifecycle.
+#
+# Tcl/Tk may only be touched from the thread running the Tcl interpreter —
+# the main thread.  The panes below honor that (workers hand results to the
+# main thread via ``after``), but Python's *cyclic* garbage collector runs
+# finalizers on whichever thread happens to trigger a collection, and
+# ``ImageTk.PhotoImage.__del__`` calls Tcl's ``image delete``.  So a page
+# image that dies inside a reference cycle (a closed viewer window, say) can
+# fire a Tcl call from a PDF-scanning worker thread.  That call blocks the
+# worker — while it holds ``_PDFIUM_LOCK`` — until the main loop services it;
+# if the main thread is itself waiting on ``_PDFIUM_LOCK`` to render a page,
+# the app deadlocks, and the tangle ends in
+# ``Fatal Python error: PyEval_RestoreThread``.
+#
+# Two rules keep it safe:
+#   • page images are :func:`_make_safe_photo` instances, whose finalizer
+#     never calls Tcl off the main thread — it just parks the Tcl image name
+#     in :data:`_TK_IMAGE_GRAVEYARD` (a plain list append) for the main
+#     thread to delete later;
+#   • the pane frees images deterministically on the main thread (page
+#     scrolled away, re-render, pane destroyed) via :func:`_dispose_photo`,
+#     so images normally never reach the garbage collector at all.
+# ``main()`` additionally disables automatic GC and collects on a main-thread
+# timer, which protects every other Tcl-calling finalizer (``Variable``,
+# ``font.Font``, …) the same way.
+# ---------------------------------------------------------------------------
+
+_TK_IMAGE_GRAVEYARD: list = []   # [(tkapp, image_name), …] pending `image delete`
+_SAFE_PHOTO_CLS = None           # built lazily — PIL may not be installed
+
+
+def _flush_tk_image_graveyard() -> None:
+    """Delete the Tcl images parked by finalizers that ran off the main
+    thread.  Main thread only; cheap when nothing is parked."""
+    while _TK_IMAGE_GRAVEYARD:
+        try:
+            tkapp, name = _TK_IMAGE_GRAVEYARD.pop()
+        except IndexError:
+            break
+        try:
+            tkapp.call("image", "delete", name)
+        except Exception:
+            pass
+
+
+def _make_safe_photo(img):
+    """An ``ImageTk.PhotoImage`` of ``img`` whose finalizer is safe on any
+    thread (see the lifecycle note above)."""
+    global _SAFE_PHOTO_CLS
+    if _SAFE_PHOTO_CLS is None:
+        from PIL import ImageTk
+
+        class _SafePhotoImage(ImageTk.PhotoImage):
+            def __del__(self) -> None:
+                if threading.current_thread() is threading.main_thread():
+                    super().__del__()
+                    return
+                # Off the main thread (cyclic GC): no Tcl calls allowed.
+                # Park the name for the main thread and disarm the inner
+                # tkinter.PhotoImage's own Tcl-calling __del__.
+                inner = getattr(self, "_PhotoImage__photo", None)
+                name = getattr(inner, "name", None)
+                tkapp = getattr(inner, "tk", None)
+                if inner is not None:
+                    inner.name = None
+                if name and tkapp is not None:
+                    _TK_IMAGE_GRAVEYARD.append((tkapp, name))
+
+        _SAFE_PHOTO_CLS = _SafePhotoImage
+    return _SAFE_PHOTO_CLS(img)
+
+
+def _dispose_photo(photo) -> None:
+    """Free a page PhotoImage now — main thread only — and disarm its
+    finalizers, so whenever (and on whatever thread) the garbage collector
+    eventually finds the husk there is nothing left to do."""
+    if photo is None:
+        return
+    inner = getattr(photo, "_PhotoImage__photo", None)
+    try:
+        # PIL's PhotoImage.__del__ starts with `self.__photo.name`; with the
+        # attribute gone it returns immediately, calling no Tcl.
+        del photo._PhotoImage__photo
+    except AttributeError:
+        pass
+    if inner is None:
+        return
+    name = getattr(inner, "name", None)
+    inner.name = None               # tkinter.Image.__del__ → no-op
+    if name:
+        try:
+            inner.tk.call("image", "delete", name)
+        except Exception:
+            pass
+
+
 class _PdfPane(ttk.Frame):
     """A scrollable, lazily-rendered view of a PDF, embedded in the opinion
     window (pypdfium2 + Pillow).
@@ -9295,8 +9409,10 @@ class _PdfPane(ttk.Frame):
                  link_style: str = "tint",
                  uniform_crop: bool = False) -> None:
         super().__init__(parent)
+        self._disposed = False
         import pypdfium2 as pdfium
         from PIL import ImageTk  # noqa: F401  (availability check at construct)
+        _flush_tk_image_graveyard()
 
         self._pdf_bytes = pdf_bytes   # kept for the lossless text-preserving export
         # How citation links are shown: "tint" draws translucent highlight
@@ -9385,6 +9501,10 @@ class _PdfPane(ttk.Frame):
         # PDF.  Focusing on hover can make some platforms raise this window just
         # because the pointer crossed it.
         canvas.bind("<Button-1>", lambda _e: canvas.focus_set(), add="+")
+        # Release the page images/document even when the toplevel dies at the
+        # Tcl level (window-manager close), where Python-side destroy() never
+        # cascades down to this frame.
+        self.bind("<Destroy>", lambda _e: self._dispose(), add="+")
         self.after(60, self._render_visible)
 
     # ------------------------------------------------------------------
@@ -9447,6 +9567,8 @@ class _PdfPane(ttk.Frame):
         c.delete("all")
         self._rect_ids = []
         self._slots = []
+        for photo in self._photos.values():
+            _dispose_photo(photo)
         self._photos.clear()
         self._img_ids.clear()
         self._overlay_ids.clear()
@@ -9558,6 +9680,7 @@ class _PdfPane(ttk.Frame):
         self._canvas.yview_scroll(direction * self._SCROLL_PX, "units")
 
     def _render_visible(self) -> None:
+        _flush_tk_image_graveyard()
         c = self._canvas
         try:
             top = c.canvasy(0)
@@ -9571,7 +9694,7 @@ class _PdfPane(ttk.Frame):
                 self._render_page(i)
             elif not near and i in self._img_ids:
                 c.delete(self._img_ids.pop(i))
-                self._photos.pop(i, None)
+                _dispose_photo(self._photos.pop(i, None))
                 for oid in self._overlay_ids.pop(i, []):
                     c.delete(oid)
                 for oid in self._search_ids.pop(i, []):
@@ -9580,7 +9703,7 @@ class _PdfPane(ttk.Frame):
                     c.delete(oid)
 
     def _render_page(self, i: int) -> None:
-        from PIL import Image, ImageTk
+        from PIL import Image
         y, slot_h, frac, scale = self._slots[i]
         with _PDFIUM_LOCK:
             page = self._doc[i]
@@ -9602,7 +9725,7 @@ class _PdfPane(ttk.Frame):
             content = content.resize((self._inner_w, inner_h), Image.LANCZOS)
         canvas_img = Image.new("RGB", (self._target_w, slot_h), "white")
         canvas_img.paste(content, (self._margin, self._margin))
-        photo = ImageTk.PhotoImage(canvas_img)
+        photo = _make_safe_photo(canvas_img)
         self._photos[i] = photo
         self._img_ids[i] = self._canvas.create_image(
             self._page_x, y, anchor="nw", image=photo)
@@ -9634,7 +9757,7 @@ class _PdfPane(ttk.Frame):
             c = self._canvas
             for i in list(self._img_ids):   # drop stale renders; re-render blue
                 c.delete(self._img_ids.pop(i))
-                self._photos.pop(i, None)
+                _dispose_photo(self._photos.pop(i, None))
             self._render_visible()
             return
         for i in list(self._img_ids):
@@ -10184,15 +10307,34 @@ class _PdfPane(ttk.Frame):
                 print(f"[pdf] lossless crop failed ({exc}); using raster export")
         self.export_pdf(path)
 
-    def destroy(self) -> None:
+    def _dispose(self) -> None:
+        """Free the page images and the PDFium document.  Idempotent; main
+        thread only.  Runs from destroy() and from the <Destroy> binding, so
+        the images are released deterministically instead of waiting — full
+        of live Tcl handles — for the garbage collector (see the Tk-image
+        lifecycle note above)."""
+        if getattr(self, "_disposed", True):
+            return
+        self._disposed = True
+        photos = getattr(self, "_photos", None)  # absent if __init__ raised
+        if photos:
+            for photo in photos.values():
+                _dispose_photo(photo)
+            photos.clear()
+        _flush_tk_image_graveyard()
         # Under the PDFium lock: closing the document is a PDFium call and may
         # overlap the citation-scan worker (which holds its own document) if the
         # window is closed mid-scan.
-        try:
-            with _PDFIUM_LOCK:
-                self._doc.close()
-        except Exception:
-            pass
+        doc = getattr(self, "_doc", None)
+        if doc is not None:
+            try:
+                with _PDFIUM_LOCK:
+                    doc.close()
+            except Exception:
+                pass
+
+    def destroy(self) -> None:
+        self._dispose()
         super().destroy()
 
 
@@ -10314,6 +10456,7 @@ class _ScholarTextWindow:
         # Background-prefetched PDF (data, url) so "View PDF" is instant; set by
         # _prefetch_pdf, consumed by _view_pdf.
         self._pdf_prefetch: Optional[tuple[bytes, str]] = None
+        self._case_law_pdf_choices: list[_CaseLawPdfChoice] = []
         self._pdf_prefetch_started = False
         # CourtListener text view: whether a PDF was located anywhere (None =
         # still looking, True/False = found/not), gating its "View PDF" button.
@@ -10695,7 +10838,9 @@ class _ScholarTextWindow:
 
     def _source_or_pdf_widths(self, button) -> tuple[int, int]:
         text = self._button_text(button)
-        if text in ("View PDF", "No PDF"):
+        if text.startswith("View PDF"):
+            return (96, 84) if "▾" in text else (84, 70)
+        if text == "No PDF":
             return 84, 70
         if text.startswith("Finding PDF"):
             return 104, 90
@@ -14400,8 +14545,81 @@ class _ScholarTextWindow:
     # CourtListener-view "View PDF" button
     # ------------------------------------------------------------------
 
+    def _remember_case_law_pdf_choices(self, item: dict) -> None:
+        choices = item.get("_case_law_pdf_choices") or []
+        self._case_law_pdf_choices = list(choices)
+        self._post(self._refresh_pdf_button)
+
+    def _post_pdf_menu(self) -> None:
+        choices = list(getattr(self, "_case_law_pdf_choices", []) or [])
+        if len(choices) <= 1:
+            self._view_pdf()
+            return
+        btn = self._active_pdf_button()
+        if btn is None:
+            return
+        menu = tk.Menu(self._win, tearoff=0)
+        for choice in choices:
+            menu.add_command(
+                label=choice.cite,
+                command=lambda c=choice: self._view_pdf_choice(c),
+            )
+        try:
+            menu.tk_popup(btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _view_pdf_choice(self, choice: _CaseLawPdfChoice) -> None:
+        """Open a specific reporter scan chosen from the View PDF menu."""
+        try:
+            import pypdfium2  # noqa: F401
+            from PIL import ImageTk  # noqa: F401
+        except ImportError:
+            self._pdf_url = choice.url
+            if messagebox.askyesno(
+                "PDF viewer not installed",
+                "Viewing PDFs inside the app needs two Python packages:\n\n"
+                "    pip install pypdfium2 Pillow\n\n"
+                "Open the PDF in your web browser instead?",
+                parent=self._win,
+            ):
+                webbrowser.open(choice.url)
+            return
+        if self._mode in ("scholar", "courtlistener"):
+            self._pre_pdf_mode = self._mode
+        if self._pdf_prefetch is not None and self._pdf_prefetch[1] == choice.url:
+            data, url = self._pdf_prefetch
+            self._show_pdf(data, url)
+            return
+        busy = self._active_pdf_button()
+        try:
+            if busy is not None:
+                busy.configure(state="disabled")
+        except tk.TclError:
+            pass
+        self._pdf_url = choice.url
+        self._status_var.set(f"Opening PDF for {choice.cite}...")
+        client = self._app._get_client()
+
+        def run() -> None:
+            try:
+                fetched = _fetch_pdf_bytes(choice.url, client=client, timeout=30)
+                if fetched is None:
+                    self._post(
+                        self._on_pdf_error,
+                        "The source returned something that isn't a PDF.",
+                    )
+                    return
+                data, final_url = fetched
+                self._pdf_url = final_url
+                self._post(self._show_pdf, data, final_url)
+            except Exception as exc:
+                self._post(self._on_pdf_error, str(exc))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _pack_courtlistener_action_buttons(self) -> None:
-        """Pack Scholar then PDF actions so PDF sits to the right of Scholar."""
+        """Pack right-side actions so View PDF stays second from the right."""
         scholar = getattr(self, "_toggle_btn", None)
         pdf = getattr(self, "_pdf_btn", None)
         if scholar is None or pdf is None:
@@ -14469,8 +14687,11 @@ class _ScholarTextWindow:
             return
         try:
             if self._pdf_located is True or self._pdf_prefetch is not None:
+                choices = getattr(self, "_case_law_pdf_choices", []) or []
+                label = "View PDF ▾" if len(choices) > 1 else "View PDF"
+                command = self._post_pdf_menu if len(choices) > 1 else self._view_pdf
                 _style_ui_button(btn, primary=True)
-                btn.configure(state="normal", text="View PDF")
+                btn.configure(state="normal", text=label, command=command)
             elif self._pdf_located is False:
                 _style_ui_button(btn, primary=False)
                 btn.configure(state="disabled", text="No PDF")
@@ -14502,6 +14723,7 @@ class _ScholarTextWindow:
             url = None
             try:
                 url = self._app._resolve_pdf_url(client, item)
+                self._remember_case_law_pdf_choices(item)
             except Exception as exc:
                 print(f"[pdf] resolve failed: {exc}")
             if not url:
@@ -14559,6 +14781,7 @@ class _ScholarTextWindow:
         def run() -> None:
             try:
                 url = self._app._resolve_pdf_url(client, item)
+                self._remember_case_law_pdf_choices(item)
                 if not url:
                     return
                 fetched = _fetch_pdf_bytes(url, client=client, timeout=30)
@@ -14613,6 +14836,7 @@ class _ScholarTextWindow:
             try:
                 url = (self._app._resolve_pdf_url(client, item)
                        if client is not None else None)
+                self._remember_case_law_pdf_choices(item)
                 if not url:
                     self._post(self._on_pdf_error,
                                "No PDF is available for this opinion.")
@@ -14851,6 +15075,7 @@ class _ScholarTextWindow:
         def run() -> None:
             try:
                 url = self._app._resolve_pdf_url(client, item)
+                self._remember_case_law_pdf_choices(item)
             except Exception:
                 url = None
             self._post(self._after_resolve_for_browser, url)
@@ -17461,6 +17686,23 @@ class _CitingOpinionsWindow:
 
 def main() -> None:
     root = tk.Tk()
+
+    # Run every cyclic-GC collection on the main thread.  Automatic GC fires
+    # on whichever thread crosses the allocation threshold, and tkinter
+    # finalizers (PhotoImage, Variable, Font, …) call into Tcl — which is only
+    # safe on the main thread; a worker-thread collection can therefore
+    # deadlock or abort the process (see the Tk-image lifecycle note above
+    # _PdfPane).  Reference counting still frees non-cyclic objects instantly;
+    # only cycle collection is deferred to this timer.
+    gc.disable()
+
+    def _gc_tick() -> None:
+        gc.collect()
+        _flush_tk_image_graveyard()
+        root.after(5000, _gc_tick)
+
+    root.after(5000, _gc_tick)
+
     app = CourtListenerGUI(root)
     eng_rep.warm()  # load the English Reports index in the background
 
