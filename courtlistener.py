@@ -771,24 +771,55 @@ def _recap_doc_score(doc: dict) -> tuple:
     return (available, rank)
 
 
+def _case_name_queries(case_name: str | None) -> list[str]:
+    """Case-name query variants for the RECAP search, tightest first: the
+    name as printed, then only its unabbreviated words.  Bluebook clips
+    parties to a period ("Am. Int'l Indus.") or an apostrophe contraction
+    ("Nat'l", "Ass'n") that the full case names on PACER dockets won't
+    match, while the words left whole ("Peninsula Pathology") match fine."""
+    import re as _re
+
+    name = (case_name or "").strip(" ,;")
+    if not name:
+        return []
+    queries = [name]
+    words: list[str] = []
+    for w in _re.findall(r"[A-Za-z][A-Za-z'’-]*\.?", name):
+        wl = w.lower().replace("’", "'")
+        if (w.endswith(".") or len(w) < 3 or w in words
+                or wl in ("the", "and", "for", "llc", "inc", "corp", "co",
+                          "ltd", "llp", "plc")
+                or _re.search(r"'[a-z]{1,2}$", wl)):
+            continue
+        words.append(w)
+    tokens = " ".join(words[:4])
+    if tokens and tokens.lower() != name.lower():
+        queries.append(tokens)
+    return queries
+
+
 def find_recap_document(
     docket_number: str,
     court: str | None,
     date_filed: str,
     session: "Session | None" = None,
     timeout: int = 30,
+    case_name: str | None = None,
 ) -> dict | None:
     """Locate the RECAP (PACER) document behind an unpublished-opinion
-    citation — "2024 WL 1327972 (D.N.J. Mar. 28, 2024)" cited with
-    "No. 12-6371" — by searching the RECAP archive for documents filed in
-    that docket on that day.
+    citation by searching the archive for documents filed in that case on
+    that day — keyed by docket number when the citation prints one ("No.
+    12-6371, 2024 WL 1327972 (D.N.J. Mar. 28, 2024)"), by case name when
+    it doesn't ("Pecos River Talc LLC v. Emory, 2025 WL 1249947 (E.D. Va.
+    Apr. 30, 2025)" — the party names, court and date pin the entry down
+    just as well).
 
     Parameters
     ----------
     docket_number:
-        As printed in the citation ("12-6371", "2:13-cv-7779"); judge-
-        initial suffixes are retried stripped when the full form finds
-        nothing.
+        As printed in the citation ("12-6371", "2:13-cv-7779"), or ""
+        when it prints none; judge-initial suffixes are retried stripped
+        when the full form finds nothing.
     court:
         CourtListener court id ("njd"), or ``None`` to search all courts.
     date_filed:
@@ -796,6 +827,10 @@ def find_recap_document(
     session:
         Optional authenticated ``requests`` session; anonymous works too
         (the search API allows it, rate-limited).
+    case_name:
+        The case name as printed in the citation, if known.  Tried after
+        the docket-number searches (see :func:`_case_name_queries`), so it
+        also rescues a docket number PACER styles differently.
 
     Returns
     -------
@@ -808,19 +843,23 @@ def find_recap_document(
 
     s = session or requests.Session()
     url = urljoin(BASE_URL, "search/")
-    variants = [docket_number]
-    core = _re.sub(r"(?<=\d)-[A-Za-z]{1,4}(?:-[A-Za-z]{1,4})*$", "",
-                   docket_number)
-    if core != docket_number:
-        variants.append(core)
+    attempts: list[dict] = []
+    if docket_number:
+        variants = [docket_number]
+        core = _re.sub(r"(?<=\d)-[A-Za-z]{1,4}(?:-[A-Za-z]{1,4})*$", "",
+                       docket_number)
+        if core != docket_number:
+            variants.append(core)
+        attempts += [{"docket_number": v} for v in variants]
+    attempts += [{"case_name": q} for q in _case_name_queries(case_name)]
 
-    for docket in variants:
+    for extra in attempts:
         params = {
             "type": "rd",
             "q": "",
-            "docket_number": docket,
             "entry_date_filed_after": date_filed,
             "entry_date_filed_before": date_filed,
+            **extra,
         }
         if court:
             params["court"] = court
