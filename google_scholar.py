@@ -1124,6 +1124,7 @@ class GoogleScholarFetcher:
         self._opinion_db = db
         self._name_scorer = name_scorer
         self._name_min = name_min
+        self._opinion_db_backfill_started = False
 
         # Browser personas (TLS fingerprint + matching UA), pinned per session
         # and rotated on a challenge.  The persona that worked last run is
@@ -1211,6 +1212,18 @@ class GoogleScholarFetcher:
         # before storage).  Runs once in the background; add_opinion de-dupes.
         self._backfill_opinion_db()
 
+    def set_opinion_db(self, db) -> None:
+        """Attach the durable opinion database after construction.
+
+        The GUI may create the fetcher before the database has finished
+        opening, so the first search can proceed without waiting. Once the DB
+        is ready, later lookups and stores use it normally.
+        """
+        if db is None or db is self._opinion_db:
+            return
+        self._opinion_db = db
+        self._backfill_opinion_db()
+
     def _backfill_opinion_db(self) -> None:
         """Copy every cached opinion (old query cache) into the opinion database
         in the background, so opinions loaded before the database existed — or
@@ -1219,6 +1232,9 @@ class GoogleScholarFetcher:
         without re-parsing its HTML."""
         if self._opinion_db is None:
             return
+        if self._opinion_db_backfill_started:
+            return
+        self._opinion_db_backfill_started = True
 
         def run() -> None:
             try:
