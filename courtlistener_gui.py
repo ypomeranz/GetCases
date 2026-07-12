@@ -9464,6 +9464,22 @@ def _whiten_pdf_redactions(img, _ds: int = 4) -> list:
     return out
 
 
+def _page_fully_redacted(text: str, boxes: list, size: tuple) -> bool:
+    """True when redaction left the page with nothing worth printing:
+    erased boxes covering a good share of it and a text layer holding no
+    real words — just the page number, since case.law strips the text under
+    its redactions.  That's a headnotes page of a fully-redacted West
+    opinion (all boxes, "286" at the top); the print omits it entirely.
+    Every content page keeps dozens of words, so the margin is wide."""
+    if not boxes:
+        return False
+    W, H = size
+    area = sum((r - l) * (b - t) for l, t, r, b in boxes)
+    if area < 0.15 * W * H:
+        return False
+    return len(re.findall(r"[A-Za-z]{2,}", text or "")) < 3
+
+
 class _PdfPane(ttk.Frame):
     """A scrollable, lazily-rendered view of a PDF, embedded in the opinion
     window (pypdfium2 + Pillow).
@@ -10321,26 +10337,64 @@ class _PdfPane(ttk.Frame):
         :func:`_whiten_pdf_redactions`) — for printing, where they'd waste
         ink.  ``header_cite`` is then drawn centered on each page's whitened
         running-head line (whose redaction took the reporter citation with
-        it).  Returns how many rectangles were erased (0 without the flag)."""
+        it), at one size for the whole document: the erased bars vary a
+        little page to page, so each page's line is measured and every page
+        gets the largest fit any of them would choose.  A page the redaction
+        left with nothing but boxes and its page number (see
+        :func:`_page_fully_redacted`) is omitted from the output altogether.
+        Returns how many rectangles were erased (0 without the flag)."""
         from PIL import Image
         scale = dpi / 72.0
         # Keep the same margin-to-content proportion the viewer displays.
         margin_ratio = self._margin / max(1, self._inner_w)
         whitened = 0
+        omitted = 0
         pages: list = []
         try:
+            # Pass 1 — render and whiten, keeping each page's header line.
+            rendered: list = []   # [(full image, frac box, header box), …]
             for i, (w_pt, h_pt, frac) in enumerate(self._meta):
                 with _PDFIUM_LOCK:
                     page = self._doc[i]
                     try:
                         full = page.render(scale=scale).to_pil().convert("RGB")
+                        page_text = ""
+                        if whiten_redactions:
+                            try:
+                                tp = page.get_textpage()
+                                try:
+                                    page_text = tp.get_text_range()
+                                finally:
+                                    tp.close()
+                            except Exception:
+                                page_text = ""
                     finally:
                         page.close()
+                hbox = None
                 if whiten_redactions:
                     boxes = _whiten_pdf_redactions(full)
                     whitened += len(boxes)
-                    if header_cite and boxes:
-                        _draw_header_citation(full, boxes, header_cite)
+                    if _page_fully_redacted(page_text, boxes, full.size):
+                        omitted += 1
+                        continue
+                    if header_cite:
+                        hbox = _header_redaction_box(boxes, full.size)
+                rendered.append((full, frac, hbox))
+            # One size fits all: the largest (fullest text on ties) any
+            # page's own line would choose.
+            if header_cite:
+                fits = [_header_citation_fit(header_cite, hbox)
+                        for _full, _frac, hbox in rendered if hbox]
+                if fits:
+                    text, size = max(fits, key=lambda fs: (fs[1], len(fs[0])))
+                    font = _print_header_font(size)
+                    for full, _frac, hbox in rendered:
+                        if hbox:
+                            _draw_header_citation(full, hbox, text, font)
+            # Pass 2 — crop each page to its content box and mount it.
+            for idx in range(len(rendered)):
+                full, frac, _hbox = rendered[idx]
+                rendered[idx] = None   # free the full render as we go
                 fl, ft, fr, fb = frac
                 W, H = full.size
                 content = full.crop((int(fl * W), int(ft * H),
@@ -10357,6 +10411,8 @@ class _PdfPane(ttk.Frame):
                           save_all=True, append_images=pages[1:])
             if whitened:
                 print(f"[pdf] whitened {whitened} redaction boxes for printing")
+            if omitted:
+                print(f"[pdf] omitted {omitted} fully-redacted page(s)")
             return whitened
         finally:
             for p in pages:
@@ -10853,36 +10909,49 @@ def _print_header_font(px: int):
         return ImageFont.load_default()
 
 
-def _draw_header_citation(img, boxes: list, citation: str) -> None:
-    """Center `citation` on the page's whitened running-head line — the
-    topmost erased box that is header-shaped (in the top 12% of the page and
-    at least 15% of its width).  The font shrinks to fit the line; when even
-    that isn't enough the case name is dropped and the bare reporter cite
-    keeps the line useful."""
-    W, H = img.size
+def _header_redaction_box(boxes: list, size: tuple) -> "Optional[tuple]":
+    """The page's whitened running-head line: the topmost erased box that is
+    header-shaped (in the top 12% of the page and at least 15% of its
+    width); None when the page has no such box."""
+    W, H = size
     heads = [b for b in boxes
              if b[1] < 0.12 * H and (b[2] - b[0]) >= 0.15 * W]
-    if not heads:
-        return
-    from PIL import ImageDraw
-    l, t, r, b = min(heads, key=lambda bx: bx[1])
-    draw = ImageDraw.Draw(img)
+    return min(heads, key=lambda bx: bx[1]) if heads else None
+
+
+def _header_citation_fit(citation: str, box: tuple) -> tuple:
+    """The ``(text, font size)`` this page's running-head line would get on
+    its own: the fullest form that fits the box — the whole citation, else
+    the bare reporter cite — at the largest size that fits, floored at 9 px.
+    The caller compares fits across pages and letters every page alike."""
+    l, t, r, b = box
+    box_w, box_h = r - l, b - t
     forms = [citation]
     m = re.search(r"\b\d{1,4}\s+[A-Z]\S*", citation)
     if m and m.start() > 0:
         forms.append(citation[m.start():])      # "855 N.E.2d 286 (… 2006)"
-    box_w, box_h = r - l, b - t
     for fi, form in enumerate(forms):
         size = max(9, int(box_h * 0.72))
-        while size > 9 and draw.textlength(
-                form, font=_print_header_font(size)) > box_w * 1.04:
+        while size > 9 and _print_header_font(size).getlength(
+                form) > box_w * 1.04:
             size -= 1
-        font = _print_header_font(size)
-        if (draw.textlength(form, font=font) <= box_w * 1.04
+        if (_print_header_font(size).getlength(form) <= box_w * 1.04
                 or fi == len(forms) - 1):
-            draw.text(((l + r) // 2, (t + b) // 2), form, font=font,
-                      fill=(0, 0, 0), anchor="mm")
-            return
+            return form, size
+    return citation, 9
+
+
+def _draw_header_citation(img, box: tuple, text: str, font) -> None:
+    """Draw `text` centered on the whitened running-head line, nudged
+    inward when a size chosen from a wider page's line would run off this
+    page's edge."""
+    from PIL import ImageDraw
+    l, t, r, b = box
+    draw = ImageDraw.Draw(img)
+    half = draw.textlength(text, font=font) / 2
+    cx = max(int(half) + 8, min(img.width - int(half) - 8, (l + r) // 2))
+    draw.text((cx, (t + b) // 2), text, font=font, fill=(0, 0, 0),
+              anchor="mm")
 
 
 class _ScholarTextWindow:
