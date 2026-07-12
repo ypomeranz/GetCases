@@ -9379,6 +9379,64 @@ def _dispose_photo(photo) -> None:
             pass
 
 
+def _whiten_pdf_redactions(img, _ds: int = 4) -> int:
+    """Erase the solid black redaction rectangles from a rendered page image
+    (in place), returning how many were erased.
+
+    The static.case.law scans black out still-copyrighted West material
+    (headnotes, syllabus, key numbers) with large filled rectangles baked
+    into the page bitmap; printed, they drink ink.  Detection is sized for
+    exactly those: the image is box-averaged down 4× so solid black stays
+    near 0 while text and halftones rise, near-black blocks are grown into
+    connected components, and a component qualifies when it is wide (≥8%
+    of the page), at least a text line tall, and nearly solid — body text,
+    rules, and headings never fill their bounding box like that."""
+    from PIL import Image
+    W, H = img.size
+    w, h = max(1, W // _ds), max(1, H // _ds)
+    small = img.convert("L").resize((w, h), Image.BOX)
+    black = [v <= 48 for v in small.getdata()]
+    seen = bytearray(w * h)
+    min_w = max(6, int(0.08 * w))
+    min_h = max(3, int(0.005 * h))
+    boxes: list[tuple[int, int, int, int]] = []
+    for start in range(w * h):
+        if not black[start] or seen[start]:
+            continue
+        seen[start] = 1
+        stack = [start]
+        n = 0
+        lo_x = hi_x = start % w
+        lo_y = hi_y = start // w
+        while stack:
+            p = stack.pop()
+            n += 1
+            x, y = p % w, p // w
+            if x < lo_x:
+                lo_x = x
+            elif x > hi_x:
+                hi_x = x
+            if y < lo_y:
+                lo_y = y
+            elif y > hi_y:
+                hi_y = y
+            for q in (p - 1 if x else -1,
+                      p + 1 if x < w - 1 else -1,
+                      p - w, p + w if y < h - 1 else -1):
+                if q >= 0 and black[q] and not seen[q]:
+                    seen[q] = 1
+                    stack.append(q)
+        bw, bh = hi_x - lo_x + 1, hi_y - lo_y + 1
+        if bw >= min_w and bh >= min_h and n >= 0.88 * bw * bh:
+            boxes.append((lo_x, lo_y, hi_x, hi_y))
+    fill = 255 if img.mode == "L" else (255,) * len(img.getbands())
+    for lo_x, lo_y, hi_x, hi_y in boxes:
+        # One reduced pixel of outward pad erases the anti-aliased fringe.
+        img.paste(fill, (max(0, (lo_x - 1) * _ds), max(0, (lo_y - 1) * _ds),
+                         min(W, (hi_x + 2) * _ds), min(H, (hi_y + 2) * _ds)))
+    return len(boxes)
+
+
 class _PdfPane(ttk.Frame):
     """A scrollable, lazily-rendered view of a PDF, embedded in the opinion
     window (pypdfium2 + Pillow).
@@ -10223,15 +10281,22 @@ class _PdfPane(ttk.Frame):
             return None
         return "break"
 
-    def export_pdf(self, path: str, dpi: int = 150) -> None:
+    def export_pdf(self, path: str, dpi: int = 150,
+                   whiten_redactions: bool = False) -> int:
         """Write a PDF that matches what's shown — each page cropped to its
         content box and re-centered on a clean white page with the viewer's
         uniform margin — rather than the original scan with its wide, uneven
-        borders.  Rendered as images at `dpi` (text becomes raster)."""
+        borders.  Rendered as images at `dpi` (text becomes raster).
+
+        ``whiten_redactions=True`` additionally erases the big solid black
+        redaction rectangles the case.law scans carry (see
+        :func:`_whiten_pdf_redactions`) — for printing, where they'd waste
+        ink.  Returns how many rectangles were erased (0 without the flag)."""
         from PIL import Image
         scale = dpi / 72.0
         # Keep the same margin-to-content proportion the viewer displays.
         margin_ratio = self._margin / max(1, self._inner_w)
+        whitened = 0
         pages: list = []
         try:
             for i, (w_pt, h_pt, frac) in enumerate(self._meta):
@@ -10241,6 +10306,8 @@ class _PdfPane(ttk.Frame):
                         full = page.render(scale=scale).to_pil().convert("RGB")
                     finally:
                         page.close()
+                if whiten_redactions:
+                    whitened += _whiten_pdf_redactions(full)
                 fl, ft, fr, fb = frac
                 W, H = full.size
                 content = full.crop((int(fl * W), int(ft * H),
@@ -10255,6 +10322,9 @@ class _PdfPane(ttk.Frame):
                 raise ValueError("the PDF has no pages")
             pages[0].save(path, "PDF", resolution=float(dpi),
                           save_all=True, append_images=pages[1:])
+            if whitened:
+                print(f"[pdf] whitened {whitened} redaction boxes for printing")
+            return whitened
         finally:
             for p in pages:
                 try:
@@ -10344,6 +10414,14 @@ class _PdfPane(ttk.Frame):
 def _is_us_reports_pdf(url: str) -> bool:
     u = (url or "").lower()
     return "usrep" in u or "usreports-" in u
+
+
+# The Harvard CAP scans on static.case.law redact still-copyrighted West
+# material with big solid black rectangles baked into the page images; the
+# print path whitens those (see _whiten_pdf_redactions).  Detected from the
+# resolved PDF URL so official court/RECAP/CommonLII scans are never touched.
+def _is_redacted_case_pdf(url: "Optional[str]") -> bool:
+    return "case.law" in (url or "").lower()
 
 
 class _ScholarTextWindow:
@@ -15002,7 +15080,9 @@ class _ScholarTextWindow:
 
     def _print_pdf(self) -> None:
         """Print the PDF currently being viewed — the re-spaced/centered
-        rendering shown on screen, falling back to the original scan."""
+        rendering shown on screen, falling back to the original scan.  A
+        redacted case.law scan gets its black redaction boxes whitened so
+        they don't waste ink on paper."""
         data = getattr(self, "_pdf_bytes", None)
         if not data:
             return
@@ -15010,7 +15090,9 @@ class _ScholarTextWindow:
         os.close(fd)
         try:
             if self._pdf_pane is not None:
-                self._pdf_pane.export_pdf(path)
+                self._pdf_pane.export_pdf(
+                    path,
+                    whiten_redactions=_is_redacted_case_pdf(self._pdf_url))
             else:
                 with open(path, "wb") as fh:
                     fh.write(data)
@@ -15444,6 +15526,8 @@ class _PdfWindow:
         self._win.destroy()
 
     def _print(self) -> None:
+        # A redacted case.law scan gets its black redaction boxes whitened
+        # for paper; other sources print exactly what's shown.
         data = self._bytes
         if not data:
             return
@@ -15451,7 +15535,8 @@ class _PdfWindow:
         os.close(fd)
         try:
             if self._pane is not None:
-                self._pane.export_pdf(path)
+                self._pane.export_pdf(
+                    path, whiten_redactions=_is_redacted_case_pdf(self._url))
             else:
                 with open(path, "wb") as fh:
                     fh.write(data)
