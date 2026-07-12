@@ -10470,16 +10470,37 @@ def _is_redacted_case_pdf(url: "Optional[str]") -> bool:
 _CASE_LAW_URL_RE = re.compile(
     r"static\.case\.law/([^/]+)/(\d+)/case-pdfs/0*(\d+)-\d+\.pdf", re.I)
 
-#: Reverse of _slugify_reporter for the reporters case.law hosts, so a bare
-#: URL still yields a citation when no caller supplied one.
+#: Reverse of _slugify_reporter for the reporters case.law hosts — federal,
+#: regional, and the states' official series — so a bare URL still yields a
+#: citation when neither the metadata JSON nor any caller supplied one.
 _CASE_LAW_SLUG_REPORTERS = {_slugify_reporter(_r): _r for _r in (
+    # Federal
     "U.S.", "S. Ct.", "L. Ed.", "L. Ed. 2d", "F.", "F.2d", "F.3d", "F.4th",
     "F. App'x", "F. Supp.", "F. Supp. 2d", "F. Supp. 3d", "F.R.D.",
-    "Fed. Cl.", "B.R.", "A.", "A.2d", "A.3d", "N.E.", "N.E.2d", "N.E.3d",
-    "N.W.", "N.W.2d", "P.", "P.2d", "P.3d", "S.E.", "S.E.2d", "S.W.",
-    "S.W.2d", "S.W.3d", "So.", "So. 2d", "So. 3d", "Cal. Rptr.",
-    "Cal. Rptr. 2d", "Cal. Rptr. 3d", "N.Y.S.", "N.Y.S.2d", "N.Y.S.3d",
-    "Ill. Dec.")}
+    "Fed. Cl.", "B.R.", "U.S. App. D.C.",
+    # Regional
+    "A.", "A.2d", "A.3d", "N.E.", "N.E.2d", "N.E.3d", "N.W.", "N.W.2d",
+    "P.", "P.2d", "P.3d", "S.E.", "S.E.2d", "S.W.", "S.W.2d", "S.W.3d",
+    "So.", "So. 2d", "So. 3d",
+    # State-focused West series
+    "Cal. Rptr.", "Cal. Rptr. 2d", "Cal. Rptr. 3d", "N.Y.S.", "N.Y.S.2d",
+    "N.Y.S.3d", "Ill. Dec.",
+    # State official reporters
+    "Ala.", "Alaska", "Ariz.", "Ariz. App.", "Ark.", "Cal.", "Cal. 2d",
+    "Cal. 3d", "Cal. 4th", "Cal. 5th", "Cal. App.", "Cal. App. 2d",
+    "Cal. App. 3d", "Cal. App. 4th", "Cal. App. 5th", "Colo.", "Conn.",
+    "Conn. App.", "D.C.", "Del.", "Del. Ch.", "Fla.", "Ga.", "Ga. App.",
+    "Haw.", "Idaho", "Ill.", "Ill. 2d", "Ill. App.", "Ill. App. 2d",
+    "Ill. App. 3d", "Ind.", "Ind. App.", "Iowa", "Kan.", "Kan. App. 2d",
+    "Ky.", "La.", "Mass.", "Mass. App. Ct.", "Md.", "Md. App.", "Me.",
+    "Mich.", "Mich. App.", "Minn.", "Miss.", "Mo.", "Mont.", "N.C.",
+    "N.C. App.", "N.D.", "N.H.", "N.J.", "N.J. Super.", "N.M.", "N.Y.",
+    "N.Y.2d", "N.Y.3d", "A.D.", "A.D.2d", "A.D.3d", "Misc.", "Misc. 2d",
+    "Misc. 3d", "Neb.", "Nev.", "Ohio St.", "Ohio St. 2d", "Ohio St. 3d",
+    "Ohio App.", "Okla.", "Okla. Crim.", "Or.", "Or. App.", "Pa.",
+    "Pa. Super.", "Pa. Commw.", "R.I.", "S.C.", "S.D.", "Tenn.", "Tex.",
+    "Tex. Crim.", "Utah", "Utah 2d", "Va.", "Va. App.", "Vt.", "W. Va.",
+    "Wash.", "Wash. 2d", "Wash. App.", "Wis.", "Wis. 2d", "Wyo.")}
 
 _ANY_CITE_RE = re.compile(
     r"\b(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})\b")
@@ -10613,80 +10634,204 @@ def _caption_fields(text: str) -> tuple:
     return _titlecase_caps(raw), court, year, cite_lines
 
 
+def _case_law_case_json(url: str, timeout: int = 8) -> "Optional[dict]":
+    """The metadata JSON case.law publishes beside each scan —
+    …/{rep}/{vol}/case-pdfs/NNNN-01.pdf ↔ …/{rep}/{vol}/cases/NNNN-01.json —
+    holding the clean case name, official citation, court, and decision
+    date; None when the fetch fails.  This is the running head's first
+    source: the scans' own text is OCR, and a Fed. App'x case often isn't
+    on Scholar or CourtListener at all."""
+    json_url = re.sub(r"/case-pdfs/(\d+-\d+)\.pdf$", r"/cases/\1.json",
+                      url or "", flags=re.I)
+    if not json_url or json_url == url:
+        return None
+    try:
+        resp = _anon_session.get(json_url, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+_GEO_TAIL_WORDS = ("county", "cnty", "parish", "borough", "township",
+                   "municipality", "village")
+
+
+def _trim_geographic_tails(name: str) -> str:
+    """Bluebook rule 10.2.1(f): drop a geographic designation following a
+    comma at the end of a party name ("Bd. of Zoning Appeals of Evansville,
+    Vanderburgh County" → "… of Evansville").  Doing it here also unblocks
+    the abbreviator, which leaves a party alone when it can't parse the
+    tail; corporate designators (", Inc.") are not geographic and stay."""
+    def trim(party: str) -> str:
+        while True:
+            m = re.search(r",\s*([^,]+?)\s*$", party)
+            if not m:
+                return party
+            tail = m.group(1).strip(" .").lower()
+            words = tail.split()
+            if words and (words[-1].strip(".") in _GEO_TAIL_WORDS
+                          or tail in _STATE_BLUEBOOK):
+                party = party[:m.start()]
+                continue
+            return party
+    return " v. ".join(trim(p) for p in re.split(r"\s+v\.\s+", name or ""))
+
+
 def _case_law_print_citation(pdf_bytes: bytes, url: str, title: str = "",
                              item: "Optional[dict]" = None,
-                             cite_hint: str = "") -> str:
+                             cite_hint: str = "", client=None) -> str:
     """The Bluebook citation for *this* reporter's scan, to re-letter the
     whitened running-head line: "Name, 855 N.E.2d 286 (Ind. Ct. App. 2006)".
-    The court parenthetical follows rule 10.4 via :func:`_court_for_paren`
-    (omitted or trimmed when the reporter already conveys it).  Returns ""
-    when even the reporter citation can't be established."""
+
+    Sources, best first: the scan's parallel case.law metadata JSON (see
+    :func:`_case_law_case_json`), then whatever the calling window knows
+    (CourtListener item, window title), then a CourtListener citation
+    lookup for pieces still missing, and only then the scan's own
+    first-page caption — that text is OCR, and a Fed. App'x PDF's first
+    page often *starts* inside the previous case.  The case name is set in
+    the app's Bluebook form (:func:`abbreviate_case_name`, after a rule-
+    10.2.1(f) trim of geographic comma-tails), and the court parenthetical
+    follows rule 10.4 via :func:`_court_for_paren` (omitted or trimmed when
+    the reporter already conveys it).  Returns "" when even the reporter
+    citation can't be established."""
     m = _CASE_LAW_URL_RE.search(url or "")
     if not m:
         return ""
     slug, vol, first_page = m.group(1), m.group(2), str(int(m.group(3)))
 
-    text = ""
-    try:
-        import pypdfium2 as pdfium
-        with _PDFIUM_LOCK:
-            doc = pdfium.PdfDocument(pdf_bytes)
-            try:
-                tp = doc[0].get_textpage()
-                try:
-                    text = tp.get_text_range()
-                finally:
-                    tp.close()
-            finally:
-                doc.close()
-    except Exception:
-        text = ""
-    cap_name, cap_court, cap_year, cite_lines = _caption_fields(text)
-
-    # The citation for this reporter: a candidate counts only when it maps
-    # back to this exact PDF's URL.
-    cite = ""
-    for source in [cite_hint, title] + cite_lines:
-        for cm in _ANY_CITE_RE.finditer(source or ""):
-            c = re.sub(r"\s+", " ", cm.group(0)).strip()
-            if (_static_case_law_url(c) or "").lower() == (url or "").lower():
-                cite = c
-                break
-        if cite:
-            break
-    if not cite:
-        rep = _CASE_LAW_SLUG_REPORTERS.get(slug)
-        if not rep:
-            return ""
-        cite = f"{vol} {rep} {first_page}"
+    meta = _case_law_case_json(url) or {}
+    meta_court = meta.get("court") if isinstance(meta.get("court"), dict) \
+        else {}
+    m_name = str(meta.get("name_abbreviation") or "").strip()
+    m_court = str(meta_court.get("name_abbreviation")
+                  or meta_court.get("name") or "").strip()
+    m_year = str(meta.get("decision_date") or "")[:4]
+    if not m_year.isdigit():
+        m_year = ""
+    m_cites = [str(c.get("cite") or "").strip()
+               for c in (meta.get("citations") or []) if isinstance(c, dict)]
 
     it = item or {}
-    name = str(it.get("caseName") or it.get("case_name") or "").strip()
-    if not name and " — " in (title or ""):
+    it_name = str(it.get("caseName") or it.get("case_name") or "").strip()
+    t_name = ""
+    if " — " in (title or ""):
         cand = title.split(" — ", 1)[0].strip()
         if " v. " in cand or re.match(
                 r"(?i)^(?:in\s+re|ex\s+parte|(?:in\s+the\s+)?matter\s+of)\b",
                 cand):
-            name = cand
-    if not name:
-        name = cap_name
+            t_name = cand
+    it_date = str(it.get("dateFiled") or it.get("date_filed") or "")
+    it_year = it_date[:4] if it_date[:4].isdigit() else ""
+    court_id = str(it.get("court_id") or "").strip().lower()
+    it_court = str(it.get("court") or "").strip()
+
+    def _extract_caption() -> tuple:
+        text = ""
+        try:
+            import pypdfium2 as pdfium
+            with _PDFIUM_LOCK:
+                doc = pdfium.PdfDocument(pdf_bytes)
+                try:
+                    tp = doc[0].get_textpage()
+                    try:
+                        text = tp.get_text_range()
+                    finally:
+                        tp.close()
+                finally:
+                    doc.close()
+        except Exception:
+            text = ""
+        return _caption_fields(text)
+
+    # The citation for this reporter: a candidate counts only when it maps
+    # back to this exact PDF's URL.  The scan's caption is scanned for one
+    # only when the better sources and the slug table all came up empty.
+    caption = None
+
+    def _pick_cite(sources) -> str:
+        for source in sources:
+            for cm in _ANY_CITE_RE.finditer(source or ""):
+                c = re.sub(r"\s+", " ", cm.group(0)).strip()
+                if (_static_case_law_url(c) or "").lower() \
+                        == (url or "").lower():
+                    return c
+        return ""
+
+    cite = _pick_cite(m_cites + [cite_hint, title])
+    if not cite:
+        rep = _CASE_LAW_SLUG_REPORTERS.get(slug)
+        if rep:
+            cite = f"{vol} {rep} {first_page}"
+        else:
+            caption = _extract_caption()
+            cite = _pick_cite(caption[3])
+            if not cite:
+                return ""
+
+    name = m_name or it_name or t_name
+    year = m_year or it_year
+    have_court = bool(m_court or court_id or it_court)
+
+    # CourtListener fills what the JSON and the window couldn't.
+    cl_court_id = ""
+    cl_court = ""
+    if client is not None and not (name and year and have_court):
+        try:
+            cl = _cl_item_for_citation(client, cite, name=name) or {}
+        except Exception as exc:
+            print(f"[pdf] header CL lookup failed for {cite!r}: {exc}")
+            cl = {}
+        name = name or str(cl.get("caseName") or cl.get("case_name")
+                           or "").strip()
+        cl_date = str(cl.get("dateFiled") or cl.get("date_filed") or "")
+        year = year or (cl_date[:4] if cl_date[:4].isdigit() else "")
+        cl_court_id = str(cl.get("court_id") or "").strip().lower()
+        cl_court = str(cl.get("court") or "").strip()
+        have_court = have_court or bool(cl_court_id or cl_court)
+
+    # The scan's own caption is the last resort.
+    if not (name and year and have_court):
+        if caption is None:
+            caption = _extract_caption()
+        cap_name, cap_court, cap_year = caption[0], caption[1], caption[2]
+        name = name or cap_name
+        year = year or cap_year
+    else:
+        cap_court = ""
+
     if name:
         name = re.sub(r"<[^>]+>", "", name).strip(" ,")
+        name = _trim_geographic_tails(name)
         try:
-            name = abbreviate_case_name(name)
+            name = abbreviate_case_name(name)   # the app's Bluebook form
         except Exception:
             pass
 
-    date = str(it.get("dateFiled") or it.get("date_filed") or "")
-    year = date[:4] if date[:4].isdigit() else cap_year
-
-    court_id = str(it.get("court_id") or "").strip().lower()
-    fallback = str(it.get("court") or "").strip() or (cap_court or "")
-    court = _court_for_paren(cite, court_id, fallback)
+    if m_court:
+        court = _court_for_paren(cite, "", m_court)
+    else:
+        court = _court_for_paren(
+            cite, court_id or cl_court_id,
+            it_court or cl_court or (cap_court or ""))
 
     paren = " ".join(p for p in (court, year) if p)
     out = ", ".join(p for p in (name, cite) if p)
     return f"{out} ({paren})" if paren else out
+
+
+def _client_for_window(app) -> "Optional[object]":
+    """The window's CourtListener client for the running-head lookup, or
+    None when the app (or its token) isn't available.  Main thread only —
+    the token lives in a tk variable."""
+    try:
+        if app is not None and app._token_var.get().strip():
+            return app._get_client()
+    except Exception:
+        pass
+    return None
 
 
 def _print_header_font(px: int):
@@ -15412,7 +15557,7 @@ class _ScholarTextWindow:
             try:
                 header = _case_law_print_citation(
                     data, self._pdf_url, item=getattr(self, "_item", None),
-                    cite_hint=cite_hint)
+                    cite_hint=cite_hint, client=_client_for_window(self._app))
             except Exception as exc:
                 print(f"[pdf] header citation failed: {exc}")
         fd, path = tempfile.mkstemp(suffix=".pdf")
@@ -15865,8 +16010,9 @@ class _PdfWindow:
         header = ""
         if whiten:
             try:
-                header = _case_law_print_citation(data, self._url,
-                                                  title=self._title)
+                header = _case_law_print_citation(
+                    data, self._url, title=self._title,
+                    client=_client_for_window(self._app))
             except Exception as exc:
                 print(f"[pdf] header citation failed: {exc}")
         fd, path = tempfile.mkstemp(suffix=".pdf")
