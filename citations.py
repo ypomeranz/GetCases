@@ -249,11 +249,59 @@ _RECAP_AFTER_RE = re.compile(
     r"(\d{1,2}),\s+(\d{4})\)"
 )
 
-# The case name before the docket number, for the viewer's window title.
-_RECAP_NAME_RE = re.compile(
+# The case name before the citation — for the viewer's window title, and,
+# when the citation prints no docket number, as the RECAP search key itself.
+_RECAP_NAME_BODY = (
     r"([A-Z][\w.,'’&() -]{1,80}?\sv\.\s[\w.,'’&() -]{1,60}?|"
-    r"In\s+re\s+[\w.,'’&() -]{2,60}?),\s*"
-    r"(?:Nos?\.|Civ|Case\s+No\.)"
+    r"In\s+re\s+[\w.,'’&() -]{2,60}?)"
+)
+# … followed by the docket number ("Care One …, No. 12-6371, 2024 WL …"):
+_RECAP_NAME_RE = re.compile(
+    _RECAP_NAME_BODY + r",\s*(?:Nos?\.|Civ|Case\s+No\.)")
+# … or running right up to the cite ("Pecos River Talc LLC v. Emory,
+# 2025 WL 1249947 …") — anchored to the end of the before-window.
+_RECAP_NAME_END_RE = re.compile(_RECAP_NAME_BODY + r",\s*$")
+
+# Signal words a name grab may drag along ("See Peninsula Pathology …").
+_NAME_SIGNAL_RE = re.compile(
+    r"^(?:But\s+see|See\s+also|See|Accord|Cf|Compare|Contra|Citing|Quoting|"
+    r"E\.g)\W+\s*")
+
+
+def _clean_case_name(raw: str) -> str:
+    """A searchable case name from the text just before a citation, or ``""``
+    when the grab is unusable: leading signal words are dropped, and a "name"
+    that swallowed a reporter citation (the parallel-cite form "Smith v.
+    Jones, 123 F. Supp. 3d 456, 2015 WL …" makes the lazy name regex run to
+    the end of the window) is rejected outright — reporter junk is not a
+    name RECAP or Scholar can search."""
+    name = (raw or "").strip(" ,;")
+    while True:
+        m = _NAME_SIGNAL_RE.match(name)
+        if not m:
+            break
+        name = name[m.end():]
+    if len(name) < 6 or _iter_case_cites(name):
+        return ""
+    return name
+
+
+# A slip opinion cited by docket number alone, no WL/LEXIS number at all —
+# "Peninsula Pathology Assocs. v. Am. Int'l Indus., No. 23-1971 (4th Cir.
+# Feb. 12, 2024)" — the usual form for a decision too new (or too minor) for
+# any electronic reporter number.  The docket plus the court/date
+# parenthetical is exactly what a RECAP lookup needs.  The optional middle
+# part absorbs companion dockets ("Nos. 23-1971, 23-1980") and a slip-op pin
+# cite; a trailing WL/LEXIS number cannot follow the docket here (the comma
+# form fails the parenthetical), so those citations stay with the WL pass.
+_DOCKET_CITE_RE = re.compile(
+    r"(?:Nos?\.|Civ(?:il)?\.?\s?(?:A(?:ction)?\.?)?\s?Nos?\.?|Case\s+No\.)\s*"
+    r"([A-Za-z]{0,4}\s?[\w:.-]{3,30}?)"
+    r"((?:,\s*[\w:.-]{3,30})*?)"
+    r"(?:,\s*slip\s+op\.(?:\s+at\s+\d{1,4}(?:\s*[-–—]\s*\d{1,4})?)?)?"
+    r"\s*\(([^()]{2,45}?)\s+"
+    r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)[a-z]*\.?)\s+"
+    r"(\d{1,2}),\s+(\d{4})\)"
 )
 
 _MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
@@ -273,11 +321,14 @@ def iter_recap_cites(text: str) -> list[tuple[int, int, "str | None"]]:
     """Every WL / LEXIS citation in *text* as ``(start, end, spec)``.
 
     ``spec`` is a JSON string with the fields a RECAP lookup needs —
-    ``cite``, ``docket``, ``date`` and (when it resolved to a federal
-    court) ``court``, plus ``name`` for the window title — or ``None``
-    when the citation can't be a RECAP document (no docket/date anywhere
-    in the document, or a state court), in which case the caller should
-    treat it as an ordinary case citation."""
+    ``cite``, ``date``, ``docket`` and/or ``name``, and (when it resolved
+    to a federal court) ``court`` — or ``None`` when the citation can't be
+    a RECAP document (no docket or case name anywhere in the document, no
+    date, or a state court), in which case the caller should treat it as
+    an ordinary case citation.  A docket number is the preferred key, but
+    a citation printing none at all — "Pecos River Talc LLC v. Emory,
+    2025 WL 1249947 (E.D. Va. Apr. 30, 2025)" — still resolves when the
+    case name, federal court and date are all present."""
     index: dict = {}
     occurrences: list = []
     for m in WL_CITE_RE.finditer(text or ""):
@@ -289,8 +340,14 @@ def iter_recap_cites(text: str) -> list[tuple[int, int, "str | None"]]:
         if dm:
             info.setdefault("docket", dm.group(1).strip())
             nm = _RECAP_NAME_RE.search(before)
-            if nm:
-                info.setdefault("name", nm.group(1).strip(" ,"))
+        else:
+            # No docket printed — the case name running right up to the
+            # cite can key the RECAP lookup instead.
+            nm = _RECAP_NAME_END_RE.search(before)
+        if nm:
+            name = _clean_case_name(nm.group(1))
+            if name:
+                info.setdefault("name", name)
         am = _RECAP_AFTER_RE.match(
             re.sub(r"\s+", " ", text[m.end():m.end() + 110]))
         if am:
@@ -309,18 +366,52 @@ def iter_recap_cites(text: str) -> list[tuple[int, int, "str | None"]]:
         court_raw = info.get("court_raw", "")
         court_id = _FED_COURT_IDS.get(
             re.sub(r"[^a-z0-9]", "", court_raw.lower()))
-        # Only a federal docket + date is worth a RECAP lookup; a court
-        # named but not federal is a state court's unpublished opinion.
-        if ("docket" in info and "date" in info
-                and (court_id or not court_raw)):
-            fields = {"cite": info["cite"], "docket": info["docket"],
-                      "date": info["date"]}
+        # A federal docket + date is worth a RECAP lookup, and so is a
+        # case name + date when the citation names the federal court
+        # outright (without a docket, a name search across all courts is
+        # noise); a court named but not federal is a state court's
+        # unpublished opinion either way.
+        if "date" in info and (
+                ("docket" in info and (court_id or not court_raw))
+                or ("docket" not in info and "name" in info and court_id)):
+            fields = {"cite": info["cite"], "date": info["date"]}
+            if "docket" in info:
+                fields["docket"] = info["docket"]
             if court_id:
                 fields["court"] = court_id
             if info.get("name"):
                 fields["name"] = info["name"]
             spec = json.dumps(fields)
         out.append((start, end, spec))
+    return out
+
+
+def iter_docket_cites(text: str) -> list[tuple[int, int, str]]:
+    """Slip opinions cited by docket number with no WL/LEXIS number at all —
+    "Peninsula Pathology Assocs. v. Am. Int'l Indus., No. 23-1971 (4th Cir.
+    Feb. 12, 2024)" — as ``(start, end, spec)`` RECAP actions, spanning the
+    "No." through the closing parenthesis.  Only federal courts qualify
+    (RECAP is the PACER archive), so the court must be printed and resolve;
+    the case name just before the "No." rides along for the window title and
+    a name-keyed retry when the docket search misses."""
+    out: list = []
+    for m in _DOCKET_CITE_RE.finditer(text or ""):
+        court_raw = re.sub(r"\s+", " ", m.group(3)).strip()
+        court_id = _FED_COURT_IDS.get(
+            re.sub(r"[^a-z0-9]", "", court_raw.lower()))
+        mon = _MONTHS.get(m.group(4)[:3].lower())
+        if not court_id or not mon:
+            continue
+        fields = {"docket": m.group(1).strip(),
+                  "date": f"{m.group(6)}-{mon:02d}-{int(m.group(5)):02d}",
+                  "court": court_id}
+        before = re.sub(r"\s+", " ", text[max(0, m.start() - 90):m.start()])
+        nm = _RECAP_NAME_END_RE.search(before)
+        if nm:
+            name = _clean_case_name(nm.group(1))
+            if name:
+                fields["name"] = name
+        out.append((m.start(), m.end(), json.dumps(fields)))
     return out
 
 
@@ -399,6 +490,13 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         else:
             cite = re.sub(r"\s+", " ", text[start:end]).strip()
             matches.append((start, end, "cite", cite))
+    # Slip opinions cited by docket number alone (no WL/LEXIS number) are
+    # RECAP lookups too — "No. 23-1971 (4th Cir. Feb. 12, 2024)".
+    for start, end, spec in iter_docket_cites(text):
+        if any(start < e and s < end for s, e in recap_spans):
+            continue
+        recap_spans.append((start, end))
+        matches.append((start, end, "recap", spec))
     claimed_spans = engrep_spans + recap_spans
     for m in _iter_case_cites(text):
         if any(m.start() < e and s < m.end() for s, e in claimed_spans):
@@ -688,6 +786,47 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
         sys.exit(1)
     if any(a[0] == "recap" for _s, _e, a in plain):
         print("state WL cite must not become recap:", plain)
+        sys.exit(1)
+
+    # A slip opinion cited by docket number alone (no WL/LEXIS number) routes
+    # to RECAP; so does a WL cite with no docket but a case name, federal
+    # court and date.  A state docket-only cite stays unlinked.
+    slip = detect_links(
+        "See Peninsula Pathology Assocs. v. Am. Int'l Indus., No. 23-1971 "
+        "(4th Cir. Feb. 12, 2024); see also Pecos River Talc LLC v. Emory, "
+        "2025 WL 1249947 (E.D. Va. Apr. 30, 2025).  But Smith v. Jones, "
+        "No. A-61210-05T3 (N.J. Super. Ct. App. Div. Feb. 22, 2008) is a "
+        "state slip opinion."
+    )
+    slip_specs = [json.loads(a[1]) for _s, _e, a in slip if a[0] == "recap"]
+    if len(slip_specs) != 2:
+        print("expected 2 recap links:", slip)
+        sys.exit(1)
+    docket_spec = next((s for s in slip_specs if "docket" in s), None)
+    if not (docket_spec and docket_spec.get("docket") == "23-1971"
+            and docket_spec.get("court") == "ca4"
+            and docket_spec.get("date") == "2024-02-12"
+            and docket_spec.get("name", "").startswith("Peninsula Pathology")):
+        print("bad docket-only recap spec:", slip_specs)
+        sys.exit(1)
+    name_spec = next((s for s in slip_specs if "docket" not in s), None)
+    if not (name_spec and name_spec.get("cite") == "2025 WL 1249947"
+            and name_spec.get("court") == "vaed"
+            and name_spec.get("date") == "2025-04-30"
+            and name_spec.get("name") == "Pecos River Talc LLC v. Emory"):
+        print("bad name-keyed recap spec:", slip_specs)
+        sys.exit(1)
+
+    # A parallel-cited WL number whose name grab would swallow the reporter
+    # citation stays an ordinary case link — reporter junk is not a name
+    # RECAP can search.
+    par = detect_links("Doe v. Roe, 100 F. Supp. 3d 200, 2015 WL 1249947 "
+                       "(D. Md. Apr. 30, 2015).")
+    if any(a[0] == "recap" for _s, _e, a in par):
+        print("parallel-cited WL number must not become recap:", par)
+        sys.exit(1)
+    if not any(a == ("cite", "2015 WL 1249947") for _s, _e, a in par):
+        print("parallel-cited WL number should stay a case link:", par)
         sys.exit(1)
 
     print("\nOK:", len(found), "links;", sorted(kinds))

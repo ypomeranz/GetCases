@@ -16169,16 +16169,20 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
     if kind in ("browse", "statpdf"):
         url = value
     elif kind == "recap":
-        # The RECAP search on CourtListener, pre-filtered to the docket,
-        # court and opinion date the citation names.
+        # The RECAP search on CourtListener, pre-filtered to the docket (or,
+        # for a citation printing none, the case name), court and opinion
+        # date the citation names.
         try:
             spec = json.loads(value)
         except Exception:
             spec = {}
         params = {"type": "rd", "q": "",
-                  "docket_number": spec.get("docket", ""),
                   "entry_date_filed_after": spec.get("date", ""),
                   "entry_date_filed_before": spec.get("date", "")}
+        if spec.get("docket"):
+            params["docket_number"] = spec["docket"]
+        elif spec.get("name"):
+            params["case_name"] = spec["name"]
         if spec.get("court"):
             params["court"] = spec["court"]
         url = ("https://www.courtlistener.com/?"
@@ -16209,18 +16213,24 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
 
 def _open_recap_citation(app: "CourtListenerGUI", parent: tk.Misc,
                          spec_json: str, status=lambda _s: None) -> None:
-    """Open an unpublished opinion cited by WL/LEXIS number — "No. 12-6371,
-    2024 WL 1327972 (D.N.J. Mar. 28, 2024)" — from CourtListener's RECAP
-    (PACER) archive, located by its docket number and opinion date.  When
-    RECAP hasn't the document (or its PDF), falls back to the ordinary
-    citation path (Google Scholar, then the CourtListener opinion text)."""
+    """Open an unpublished opinion from CourtListener's RECAP (PACER)
+    archive.  The citation may print a WL/LEXIS number with a docket ("No.
+    12-6371, 2024 WL 1327972 (D.N.J. Mar. 28, 2024)"), a docket alone
+    ("No. 23-1971 (4th Cir. Feb. 12, 2024)"), or a WL/LEXIS number alone —
+    then the case name, court and date carry the lookup.  When RECAP hasn't
+    the document (or its PDF), falls back to the ordinary citation path
+    (Google Scholar — by number, or by name for a docket-only citation —
+    then the CourtListener opinion text)."""
     try:
         spec = json.loads(spec_json)
     except Exception:
         status("Couldn't read that citation.")
         return
-    cite = spec.get("cite") or "unpublished opinion"
-    title = f"{spec['name']} — {cite}" if spec.get("name") else cite
+    cite = spec.get("cite") or ""
+    docket = spec.get("docket") or ""
+    name = spec.get("name") or ""
+    label = cite or (f"No. {docket}" if docket else name) or "unpublished opinion"
+    title = f"{name} — {label}" if name and name != label else (name or label)
 
     def safe_status(s: str) -> None:
         try:
@@ -16228,7 +16238,7 @@ def _open_recap_citation(app: "CourtListenerGUI", parent: tk.Misc,
         except tk.TclError:
             pass
 
-    safe_status(f"Looking up {cite} on RECAP…")
+    safe_status(f"Looking up {label} on RECAP…")
     # Resolve these on the calling (main) thread — they touch tk variables.
     client = app._get_client() if app._token_var.get().strip() else None
     fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
@@ -16237,39 +16247,57 @@ def _open_recap_citation(app: "CourtListenerGUI", parent: tk.Misc,
         info = None
         try:
             info = cl_api.find_recap_document(
-                spec.get("docket", ""), spec.get("court"),
-                spec.get("date", ""),
+                docket, spec.get("court"), spec.get("date", ""),
                 session=(client._session if client is not None else None),
+                case_name=name or None,
             )
         except Exception as exc:
-            print(f"[recap] lookup failed for {cite!r}: {exc}")
+            print(f"[recap] lookup failed for {label!r}: {exc}")
         if info and info.get("pdf_url"):
             def open_pdf(url=info["pdf_url"], t=title):
                 _PdfWindow(app.root, url, t, safe_status, app=app,
                            is_case=True)
             app._post_root(open_pdf)
             app._post_root(lambda: safe_status(
-                f"Opened {cite} from RECAP ({info.get('description') or 'document'})."))
+                f"Opened {label} from RECAP ({info.get('description') or 'document'})."))
             return
         # RECAP doesn't have the PDF — fall back to the regular citation
         # path; failing that, at least point the browser at the docket.
-        safe_status(f"RECAP hasn't {cite} — trying Google Scholar…")
+        safe_status(f"RECAP hasn't {label} — trying Google Scholar…")
         ok = False
-        if fetcher is not None or client is not None:
+        if cite and (fetcher is not None or client is not None):
             try:
-                ok = app._try_open_citation("", cite, "", fetcher, client,
+                ok = app._try_open_citation(name, cite, "", fetcher, client,
                                             prefetch_pdf=False)
             except Exception as exc:
-                print(f"[recap] scholar fallback failed for {cite!r}: {exc}")
+                print(f"[recap] scholar fallback failed for {label!r}: {exc}")
+        elif name and fetcher is not None:
+            # A docket-only citation has no WL/LEXIS number for Scholar to
+            # resolve — search it by case name, scoped to the opinion year.
+            result = None
+            try:
+                result = fetcher.fetch_by_name(
+                    name, (spec.get("date") or "")[:4] or None)
+            except Exception as exc:
+                print(f"[recap] scholar name lookup failed for {label!r}: {exc}")
+            if result:
+                def open_scholar(u=result[0], h=result[1]) -> None:
+                    try:
+                        _ScholarTextWindow(app.root, app, u, h, item=None,
+                                           prefetch_pdf=False)
+                    except tk.TclError:
+                        pass
+                app._post_root(open_scholar)
+                ok = True
         if ok:
-            app._post_root(lambda: safe_status(f"Opened {cite}."))
+            app._post_root(lambda: safe_status(f"Opened {label}."))
         elif info and info.get("web_url"):
             webbrowser.open(info["web_url"])
             app._post_root(lambda: safe_status(
-                f"{cite}: PDF not in RECAP — opened the docket in your "
+                f"{label}: PDF not in RECAP — opened the docket in your "
                 "browser."))
         else:
-            app._post_root(lambda: safe_status(f"Not found: {cite}"))
+            app._post_root(lambda: safe_status(f"Not found: {label}"))
 
     threading.Thread(target=run, daemon=True).start()
 
