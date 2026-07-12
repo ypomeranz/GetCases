@@ -532,6 +532,7 @@ from court_catalog import (
     CIRCUIT_COURTS as _CIRCUIT_COURTS,
     COURT_BLUEBOOK as _COURT_BLUEBOOK,
     DISTRICT_COURTS as _DISTRICT_COURTS,
+    STATE_BLUEBOOK as _STATE_BLUEBOOK,
     STATE_COURTS as _STATE_COURTS,
     all_court_ids as _all_court_ids,
     bluebook_court_from_name as _bluebook_court_from_name,
@@ -9379,18 +9380,34 @@ def _dispose_photo(photo) -> None:
             pass
 
 
-def _whiten_pdf_redactions(img, _ds: int = 4) -> int:
+def _region_mostly_black(img, box, frac: float = 0.90) -> bool:
+    """True when at least `frac` of the pixels inside `box` are near-black —
+    the full-resolution confirmation that a small candidate really is a solid
+    redaction rectangle and not a bold word (whose inter-letter white always
+    drops it well below the bar)."""
+    l, t, r, b = box
+    area = (r - l) * (b - t)
+    if area <= 0:
+        return False
+    hist = img.crop(box).convert("L").histogram()
+    return sum(hist[:100]) >= frac * area
+
+
+def _whiten_pdf_redactions(img, _ds: int = 4) -> list:
     """Erase the solid black redaction rectangles from a rendered page image
-    (in place), returning how many were erased.
+    (in place), returning the erased boxes as ``[(l, t, r, b), …]`` in image
+    pixels.
 
     The static.case.law scans black out still-copyrighted West material
-    (headnotes, syllabus, key numbers) with large filled rectangles baked
-    into the page bitmap; printed, they drink ink.  Detection is sized for
-    exactly those: the image is box-averaged down 4× so solid black stays
-    near 0 while text and halftones rise, near-black blocks are grown into
-    connected components, and a component qualifies when it is wide (≥8%
-    of the page), at least a text line tall, and nearly solid — body text,
-    rules, and headings never fill their bounding box like that."""
+    (headnotes, syllabus, key numbers) with filled rectangles baked into the
+    page bitmap; printed, they drink ink.  The image is box-averaged down 4×
+    so solid black stays near 0 while text and halftones rise, and
+    near-black blocks are grown into connected components.  Two shapes
+    qualify: the big blocks (wide — ≥8% of the page — at least a text line
+    tall, and ≥88% solid, which body text and headings never are), and the
+    small one-line boxes West's key-number cites leave at paragraph heads —
+    those are additionally verified at full resolution, where anything made
+    of glyphs shows its white."""
     from PIL import Image
     W, H = img.size
     w, h = max(1, W // _ds), max(1, H // _ds)
@@ -9399,6 +9416,7 @@ def _whiten_pdf_redactions(img, _ds: int = 4) -> int:
     seen = bytearray(w * h)
     min_w = max(6, int(0.08 * w))
     min_h = max(3, int(0.005 * h))
+    max_key_h = max(4, int(0.035 * h))   # a key-cite box is ~one text line
     boxes: list[tuple[int, int, int, int]] = []
     for start in range(w * h):
         if not black[start] or seen[start]:
@@ -9427,14 +9445,23 @@ def _whiten_pdf_redactions(img, _ds: int = 4) -> int:
                     seen[q] = 1
                     stack.append(q)
         bw, bh = hi_x - lo_x + 1, hi_y - lo_y + 1
-        if bw >= min_w and bh >= min_h and n >= 0.88 * bw * bh:
+        keep = bw >= min_w and bh >= min_h and n >= 0.88 * bw * bh
+        if (not keep and 2 <= bh <= max_key_h and 2 <= bw <= int(0.3 * w)
+                and n >= 0.72 * bw * bh):
+            keep = _region_mostly_black(
+                img, (lo_x * _ds, lo_y * _ds,
+                      (hi_x + 1) * _ds, (hi_y + 1) * _ds))
+        if keep:
             boxes.append((lo_x, lo_y, hi_x, hi_y))
     fill = 255 if img.mode == "L" else (255,) * len(img.getbands())
+    out: list = []
     for lo_x, lo_y, hi_x, hi_y in boxes:
         # One reduced pixel of outward pad erases the anti-aliased fringe.
-        img.paste(fill, (max(0, (lo_x - 1) * _ds), max(0, (lo_y - 1) * _ds),
-                         min(W, (hi_x + 2) * _ds), min(H, (hi_y + 2) * _ds)))
-    return len(boxes)
+        box = (max(0, (lo_x - 1) * _ds), max(0, (lo_y - 1) * _ds),
+               min(W, (hi_x + 2) * _ds), min(H, (hi_y + 2) * _ds))
+        img.paste(fill, box)
+        out.append(box)
+    return out
 
 
 class _PdfPane(ttk.Frame):
@@ -10282,16 +10309,19 @@ class _PdfPane(ttk.Frame):
         return "break"
 
     def export_pdf(self, path: str, dpi: int = 150,
-                   whiten_redactions: bool = False) -> int:
+                   whiten_redactions: bool = False,
+                   header_cite: str = "") -> int:
         """Write a PDF that matches what's shown — each page cropped to its
         content box and re-centered on a clean white page with the viewer's
         uniform margin — rather than the original scan with its wide, uneven
         borders.  Rendered as images at `dpi` (text becomes raster).
 
-        ``whiten_redactions=True`` additionally erases the big solid black
+        ``whiten_redactions=True`` additionally erases the solid black
         redaction rectangles the case.law scans carry (see
         :func:`_whiten_pdf_redactions`) — for printing, where they'd waste
-        ink.  Returns how many rectangles were erased (0 without the flag)."""
+        ink.  ``header_cite`` is then drawn centered on each page's whitened
+        running-head line (whose redaction took the reporter citation with
+        it).  Returns how many rectangles were erased (0 without the flag)."""
         from PIL import Image
         scale = dpi / 72.0
         # Keep the same margin-to-content proportion the viewer displays.
@@ -10307,7 +10337,10 @@ class _PdfPane(ttk.Frame):
                     finally:
                         page.close()
                 if whiten_redactions:
-                    whitened += _whiten_pdf_redactions(full)
+                    boxes = _whiten_pdf_redactions(full)
+                    whitened += len(boxes)
+                    if header_cite and boxes:
+                        _draw_header_citation(full, boxes, header_cite)
                 fl, ft, fr, fb = frac
                 W, H = full.size
                 content = full.crop((int(fl * W), int(ft * H),
@@ -10422,6 +10455,289 @@ def _is_us_reports_pdf(url: str) -> bool:
 # resolved PDF URL so official court/RECAP/CommonLII scans are never touched.
 def _is_redacted_case_pdf(url: "Optional[str]") -> bool:
     return "case.law" in (url or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# Printed running head for redacted case.law scans
+# ---------------------------------------------------------------------------
+# The header redaction takes the reporter's running head — and with it the
+# citation — off every page, so the print export re-letters that line with
+# the Bluebook citation for *this* reporter.  The pieces come from the PDF
+# itself (its first-page caption prints the parties, court, and decision
+# date), from the static.case.law URL (which encodes reporter, volume, and
+# first page), and from whatever richer metadata the calling window has.
+
+_CASE_LAW_URL_RE = re.compile(
+    r"static\.case\.law/([^/]+)/(\d+)/case-pdfs/0*(\d+)-\d+\.pdf", re.I)
+
+#: Reverse of _slugify_reporter for the reporters case.law hosts, so a bare
+#: URL still yields a citation when no caller supplied one.
+_CASE_LAW_SLUG_REPORTERS = {_slugify_reporter(_r): _r for _r in (
+    "U.S.", "S. Ct.", "L. Ed.", "L. Ed. 2d", "F.", "F.2d", "F.3d", "F.4th",
+    "F. App'x", "F. Supp.", "F. Supp. 2d", "F. Supp. 3d", "F.R.D.",
+    "Fed. Cl.", "B.R.", "A.", "A.2d", "A.3d", "N.E.", "N.E.2d", "N.E.3d",
+    "N.W.", "N.W.2d", "P.", "P.2d", "P.3d", "S.E.", "S.E.2d", "S.W.",
+    "S.W.2d", "S.W.3d", "So.", "So. 2d", "So. 3d", "Cal. Rptr.",
+    "Cal. Rptr. 2d", "Cal. Rptr. 3d", "N.Y.S.", "N.Y.S.2d", "N.Y.S.3d",
+    "Ill. Dec.")}
+
+_ANY_CITE_RE = re.compile(
+    r"\b(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})\b")
+_CAPTION_DATE_RE = re.compile(
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)[a-z]*\.?\s+"
+    r"\d{1,2},\s+(\d{4})")
+_CAPTION_BREAK_RE = re.compile(
+    r"^(?:ORDER|OPINION|PER CURIAM|Syllabus|Background|West Headnotes)\b",
+    re.I)
+_ROLE_LABEL_RE = re.compile(
+    r",?\s*(?:Cross-)?(?:Appell(?:ant|ee)|Plaintiff|Defendant|Petitioner|"
+    r"Respondent|Relator|Intervenor)s?"
+    r"(?:\s*[-–—]\s*(?:Cross-)?(?:Appell(?:ant|ee)|Plaintiff|Defendant|"
+    r"Petitioner|Respondent|Relator|Intervenor)s?)*\.?(?=\s|,|$)")
+_ORDINAL_CIRCUITS = {
+    "first": "1st", "second": "2d", "third": "3d", "fourth": "4th",
+    "fifth": "5th", "sixth": "6th", "seventh": "7th", "eighth": "8th",
+    "ninth": "9th", "tenth": "10th", "eleventh": "11th",
+}
+_NAME_KEEP_CAPS = {"LLC", "LLP", "PLLC", "USA", "II", "III", "IV", "U.S.",
+                   "FBI", "SEC", "IRS", "EPA", "NLRB", "DC"}
+_NAME_SMALL_WORDS = {"of", "the", "and", "in", "on", "for", "at", "de", "la",
+                     "an", "a", "to", "by"}
+
+
+def _fed_court_abbr(line: str) -> "Optional[str]":
+    """Bluebook abbreviation when `line` names a federal court ("United
+    States Court of Appeals, Fourth Circuit." → "4th Cir."), "" for the
+    Supreme Court (never named in a parenthetical), None when the line is
+    not a federal court at all."""
+    low = " ".join((line or "").lower().split())
+    if "circuit" in low and ("court of appeals" in low
+                             or "united states" in low):
+        if "district of columbia circuit" in low:
+            return "D.C. Cir."
+        if "federal circuit" in low:
+            return "Fed. Cir."
+        m = re.search(r"\b(first|second|third|fourth|fifth|sixth|seventh|"
+                      r"eighth|ninth|tenth|eleventh)\s+circuit", low)
+        if m:
+            return f"{_ORDINAL_CIRCUITS[m.group(1)]} Cir."
+        m = re.search(r"\b(\d{1,2})(?:st|n?d|th)\s+circuit", low)
+        if m:
+            n = int(m.group(1))
+            suffix = {1: "st", 2: "d", 3: "d"}.get(n, "th")
+            return f"{n}{suffix} Cir."
+    if "district court" in low and ("united states" in low or "u.s." in low):
+        m = re.search(r"\b([nsewc])\.?\s?d\.\s+([a-z. ]+?)[.,]?$", low)
+        if m:
+            for sname in sorted(_STATE_BLUEBOOK, key=len, reverse=True):
+                if sname in m.group(2):
+                    return f"{m.group(1).upper()}.D. {_STATE_BLUEBOOK[sname]}"
+        m = re.search(r"\bdistrict of\s+([a-z. ]+?)[.,]?$", low)
+        if m:
+            for sname in sorted(_STATE_BLUEBOOK, key=len, reverse=True):
+                if sname in m.group(1):
+                    return f"D. {_STATE_BLUEBOOK[sname]}"
+    if "supreme court" in low and "united states" in low:
+        return ""
+    return None
+
+
+def _titlecase_caps(s: str) -> str:
+    """Title-case the ALL-CAPS words of a reporter caption ("BOARD OF ZONING
+    APPEALS" → "Board of Zoning Appeals"), leaving mixed-case words and
+    initialisms (LLC, U.S.) alone."""
+    out = []
+    for i, wd in enumerate(s.split()):
+        if wd.upper() != wd or not re.search(r"[A-Z]{2}", wd):
+            out.append(wd)
+            continue
+        if wd.strip(".,()'’") in _NAME_KEEP_CAPS:
+            out.append(wd)
+            continue
+        low = wd.lower()
+        if i and low.strip(".,") in _NAME_SMALL_WORDS:
+            out.append(low)
+        else:
+            out.append("Mc" + low[2:].capitalize()
+                       if low.startswith("mc") else low.capitalize())
+    return " ".join(out)
+
+
+def _caption_fields(text: str) -> tuple:
+    """(case name, court abbr or None, year, citation lines) read from a
+    case.law first page.  The caption is the surviving text above the body:
+    parties (with their role labels), docket line, court line, dates —
+    exactly the pieces the redacted running head needs back."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()][:14]
+    name_parts: list = []
+    court = None
+    year = ""
+    cite_lines: list = []
+    in_name = True
+    for ln in lines:
+        if _CAPTION_BREAK_RE.match(ln):
+            break
+        if re.fullmatch(r"\d{1,5}", ln):        # the bare page number
+            continue
+        if re.match(r"^\d{1,4}\s+\S", ln) and _ANY_CITE_RE.search(ln):
+            cite_lines.append(ln)               # "171 A.3d 204"
+            continue
+        fed = _fed_court_abbr(ln)
+        if fed is not None:
+            court = fed
+            in_name = False
+            continue
+        st = _bluebook_court_from_name(ln)
+        if st:
+            court = st
+            in_name = False
+            continue
+        if _CAPTION_DATE_RE.search(ln):
+            year = _CAPTION_DATE_RE.search(ln).group(1)  # last date wins
+            in_name = False
+            continue
+        if (re.match(r"^(?:Nos?\.|Case No\.)", ln) or "Term" in ln
+                or re.fullmatch(r"[\dA-Z][\w:().-]*", ln)
+                or re.match(r"^(?:Argued|Decided|Submitted|Filed|Heard)\b",
+                            ln)):
+            in_name = False
+            continue
+        if in_name:
+            name_parts.append(ln)
+    raw = " ".join(name_parts)
+    raw = re.sub(r"\s*\([^)]*\)\s*$", "", raw)   # "(ATTORNEY NO. …)"
+    raw = _ROLE_LABEL_RE.sub("", raw)
+    raw = re.sub(r"\s+", " ", raw).strip(" ,.")
+    raw = re.sub(r",?\s+v\.?\s+", " v. ", raw, flags=re.I)
+    raw = re.sub(r",\s*an?\s+[A-Za-z' .]+$", "", raw)  # ", an Attorney at Law"
+    return _titlecase_caps(raw), court, year, cite_lines
+
+
+def _case_law_print_citation(pdf_bytes: bytes, url: str, title: str = "",
+                             item: "Optional[dict]" = None,
+                             cite_hint: str = "") -> str:
+    """The Bluebook citation for *this* reporter's scan, to re-letter the
+    whitened running-head line: "Name, 855 N.E.2d 286 (Ind. Ct. App. 2006)".
+    The court parenthetical follows rule 10.4 via :func:`_court_for_paren`
+    (omitted or trimmed when the reporter already conveys it).  Returns ""
+    when even the reporter citation can't be established."""
+    m = _CASE_LAW_URL_RE.search(url or "")
+    if not m:
+        return ""
+    slug, vol, first_page = m.group(1), m.group(2), str(int(m.group(3)))
+
+    text = ""
+    try:
+        import pypdfium2 as pdfium
+        with _PDFIUM_LOCK:
+            doc = pdfium.PdfDocument(pdf_bytes)
+            try:
+                tp = doc[0].get_textpage()
+                try:
+                    text = tp.get_text_range()
+                finally:
+                    tp.close()
+            finally:
+                doc.close()
+    except Exception:
+        text = ""
+    cap_name, cap_court, cap_year, cite_lines = _caption_fields(text)
+
+    # The citation for this reporter: a candidate counts only when it maps
+    # back to this exact PDF's URL.
+    cite = ""
+    for source in [cite_hint, title] + cite_lines:
+        for cm in _ANY_CITE_RE.finditer(source or ""):
+            c = re.sub(r"\s+", " ", cm.group(0)).strip()
+            if (_static_case_law_url(c) or "").lower() == (url or "").lower():
+                cite = c
+                break
+        if cite:
+            break
+    if not cite:
+        rep = _CASE_LAW_SLUG_REPORTERS.get(slug)
+        if not rep:
+            return ""
+        cite = f"{vol} {rep} {first_page}"
+
+    it = item or {}
+    name = str(it.get("caseName") or it.get("case_name") or "").strip()
+    if not name and " — " in (title or ""):
+        cand = title.split(" — ", 1)[0].strip()
+        if " v. " in cand or re.match(
+                r"(?i)^(?:in\s+re|ex\s+parte|(?:in\s+the\s+)?matter\s+of)\b",
+                cand):
+            name = cand
+    if not name:
+        name = cap_name
+    if name:
+        name = re.sub(r"<[^>]+>", "", name).strip(" ,")
+        try:
+            name = abbreviate_case_name(name)
+        except Exception:
+            pass
+
+    date = str(it.get("dateFiled") or it.get("date_filed") or "")
+    year = date[:4] if date[:4].isdigit() else cap_year
+
+    court_id = str(it.get("court_id") or "").strip().lower()
+    fallback = str(it.get("court") or "").strip() or (cap_court or "")
+    court = _court_for_paren(cite, court_id, fallback)
+
+    paren = " ".join(p for p in (court, year) if p)
+    out = ", ".join(p for p in (name, cite) if p)
+    return f"{out} ({paren})" if paren else out
+
+
+def _print_header_font(px: int):
+    """A serif font at `px` pixels for the re-lettered running head, from
+    the usual system font homes; Pillow's scalable built-in is the floor."""
+    from PIL import ImageFont
+    for cand in ("/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+                 "/Library/Fonts/Times New Roman.ttf",
+                 "times.ttf",
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+                 "DejaVuSerif.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(cand, px)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(px)
+    except TypeError:            # Pillow < 10.1: fixed-size bitmap font
+        return ImageFont.load_default()
+
+
+def _draw_header_citation(img, boxes: list, citation: str) -> None:
+    """Center `citation` on the page's whitened running-head line — the
+    topmost erased box that is header-shaped (in the top 12% of the page and
+    at least 15% of its width).  The font shrinks to fit the line; when even
+    that isn't enough the case name is dropped and the bare reporter cite
+    keeps the line useful."""
+    W, H = img.size
+    heads = [b for b in boxes
+             if b[1] < 0.12 * H and (b[2] - b[0]) >= 0.15 * W]
+    if not heads:
+        return
+    from PIL import ImageDraw
+    l, t, r, b = min(heads, key=lambda bx: bx[1])
+    draw = ImageDraw.Draw(img)
+    forms = [citation]
+    m = re.search(r"\b\d{1,4}\s+[A-Z]\S*", citation)
+    if m and m.start() > 0:
+        forms.append(citation[m.start():])      # "855 N.E.2d 286 (… 2006)"
+    box_w, box_h = r - l, b - t
+    for fi, form in enumerate(forms):
+        size = max(9, int(box_h * 0.72))
+        while size > 9 and draw.textlength(
+                form, font=_print_header_font(size)) > box_w * 1.04:
+            size -= 1
+        font = _print_header_font(size)
+        if (draw.textlength(form, font=font) <= box_w * 1.04
+                or fi == len(forms) - 1):
+            draw.text(((l + r) // 2, (t + b) // 2), form, font=font,
+                      fill=(0, 0, 0), anchor="mm")
+            return
 
 
 class _ScholarTextWindow:
@@ -15082,17 +15398,29 @@ class _ScholarTextWindow:
         """Print the PDF currently being viewed — the re-spaced/centered
         rendering shown on screen, falling back to the original scan.  A
         redacted case.law scan gets its black redaction boxes whitened so
-        they don't waste ink on paper."""
+        they don't waste ink on paper, and its running-head line re-lettered
+        with the Bluebook citation the redaction took away."""
         data = getattr(self, "_pdf_bytes", None)
         if not data:
             return
+        whiten = _is_redacted_case_pdf(self._pdf_url)
+        header = ""
+        if whiten:
+            cite_hint = next(
+                (c.cite for c in getattr(self, "_case_law_pdf_choices", [])
+                 or [] if getattr(c, "url", None) == self._pdf_url), "")
+            try:
+                header = _case_law_print_citation(
+                    data, self._pdf_url, item=getattr(self, "_item", None),
+                    cite_hint=cite_hint)
+            except Exception as exc:
+                print(f"[pdf] header citation failed: {exc}")
         fd, path = tempfile.mkstemp(suffix=".pdf")
         os.close(fd)
         try:
             if self._pdf_pane is not None:
                 self._pdf_pane.export_pdf(
-                    path,
-                    whiten_redactions=_is_redacted_case_pdf(self._pdf_url))
+                    path, whiten_redactions=whiten, header_cite=header)
             else:
                 with open(path, "wb") as fh:
                     fh.write(data)
@@ -15527,16 +15855,26 @@ class _PdfWindow:
 
     def _print(self) -> None:
         # A redacted case.law scan gets its black redaction boxes whitened
-        # for paper; other sources print exactly what's shown.
+        # for paper — and its running-head line re-lettered with the Bluebook
+        # citation the redaction took away; other sources print exactly
+        # what's shown.
         data = self._bytes
         if not data:
             return
+        whiten = _is_redacted_case_pdf(self._url)
+        header = ""
+        if whiten:
+            try:
+                header = _case_law_print_citation(data, self._url,
+                                                  title=self._title)
+            except Exception as exc:
+                print(f"[pdf] header citation failed: {exc}")
         fd, path = tempfile.mkstemp(suffix=".pdf")
         os.close(fd)
         try:
             if self._pane is not None:
                 self._pane.export_pdf(
-                    path, whiten_redactions=_is_redacted_case_pdf(self._url))
+                    path, whiten_redactions=whiten, header_cite=header)
             else:
                 with open(path, "wb") as fh:
                     fh.write(data)
