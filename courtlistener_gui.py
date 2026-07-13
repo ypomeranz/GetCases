@@ -429,6 +429,101 @@ def _ui_checkbox(parent, text: str, variable, command=None):
                            command=command)
 
 
+class _HoverTip:
+    """A lightweight hover tooltip: a moment after the pointer settles on
+    ``widget`` it pops up ``text_getter()`` in a small yellow window near the
+    cursor, and hides it on leave.  ``text_getter`` is read at show time, so a
+    live status message (whose text changes) always shows its current value.
+    Nothing pops up when the text is empty."""
+
+    def __init__(self, widget, text_getter, *, delay: int = 450,
+                 wraplength: int = 520) -> None:
+        self._widget = widget
+        self._get = text_getter
+        self._delay = delay
+        self._wrap = wraplength
+        self._after: Optional[str] = None
+        self._tip: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._leave, add="+")
+        widget.bind("<Destroy>", self._leave, add="+")
+
+    def _schedule(self, _e=None) -> None:
+        self._cancel()
+        try:
+            self._after = self._widget.after(self._delay, self._show)
+        except tk.TclError:
+            self._after = None
+
+    def _cancel(self) -> None:
+        if self._after is not None:
+            try:
+                self._widget.after_cancel(self._after)
+            except tk.TclError:
+                pass
+            self._after = None
+
+    def _leave(self, _e=None) -> None:
+        self._cancel()
+        self._hide()
+
+    def _show(self) -> None:
+        self._after = None
+        try:
+            text = (self._get() or "").strip()
+        except Exception:
+            text = ""
+        if not text:
+            return
+        self._hide()
+        try:
+            x, y = self._widget.winfo_pointerxy()
+            tip = tk.Toplevel(self._widget)
+            tip.wm_overrideredirect(True)
+            try:
+                tip.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            tk.Label(
+                tip, text=text, justify="left", wraplength=self._wrap,
+                background="#fffbe6", foreground="#000000",
+                relief="solid", borderwidth=1, padx=8, pady=5,
+            ).pack()
+            tip.wm_geometry(f"+{x + 14}+{y + 18}")
+            self._tip = tip
+        except tk.TclError:
+            self._tip = None
+
+    def _hide(self) -> None:
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+
+
+def _install_status_label(parent, textvariable, *, padx=(10, 0)):
+    """The status message that sits among a case window's bottom-bar buttons.
+
+    It is packed so the *buttons* always win the horizontal space: a tiny
+    requested width means Tk lays the buttons out first, and ``fill``/``expand``
+    only lets the message spread into whatever room is left over.  When the
+    window is too narrow to show the whole message it is simply clipped — a
+    hover then pops the full text up in a tooltip (per the whole-message
+    mouse-over)."""
+    lbl = _ui_label(parent, muted=True, anchor="w", textvariable=textvariable)
+    # width=1 (1 char for the ttk label, 1 px for CTk) keeps the label's own
+    # size request negligible so no button is ever pushed off the bar.
+    try:
+        lbl.configure(width=1)
+    except tk.TclError:
+        pass
+    lbl.pack(side="left", fill="x", expand=True, padx=padx)
+    _HoverTip(lbl, textvariable.get)
+    return lbl
+
+
 def _ui_entry(parent, textvariable=None, show: Optional[str] = None):
     if _CTK_AVAILABLE:
         kw = dict(textvariable=textvariable, corner_radius=8, height=34,
@@ -11396,6 +11491,8 @@ class _ScholarTextWindow:
         self._details_case: Optional[tuple] = None  # cached (title, lines)
         self._related_loaded = False
         self._details_related: Optional[tuple] = None  # cached (title, lines)
+        self._recent_loaded = False
+        self._details_recent: Optional[tuple] = None  # cached (title, lines)
 
         txt.tag_configure("center", justify="center")
         txt.tag_configure("blockquote", lmargin1=36, lmargin2=36, rmargin=36)
@@ -11522,10 +11619,7 @@ class _ScholarTextWindow:
                 pass  # modifier not supported on this platform
 
         self._status_var = tk.StringVar()
-        _ui_label(btn_frame, muted=True, anchor="w",
-                  textvariable=self._status_var).pack(
-            side="left", fill="x", expand=True, padx=(10, 0)
-        )
+        _install_status_label(btn_frame, self._status_var)
         self._button_bar_compact: Optional[bool] = None
         btn_frame.bind("<Configure>", self._on_button_bar_configure)
 
@@ -14162,18 +14256,21 @@ class _ScholarTextWindow:
                        width=40).pack(side="right", padx=(0, 4))
 
             # What the panel shows: the case details (Oyez line-up/summary,
-            # falling back to the Court's recent decisions, then to whatever
-            # the open text reveals), the case's appellate family (appeals,
-            # decision below, remand proceedings), or the opinion's
-            # detected outline.
+            # falling back to CourtListener's cluster record, then to whatever
+            # the open text reveals), the Court's most recent decisions, the
+            # case's appellate family (appeals, decision below, remand
+            # proceedings), or the opinion's detected outline.  Case details
+            # and the recent-decisions list are separate views now, not one
+            # falling through to the other.
             mode_row = ttk.Frame(f)
             mode_row.pack(fill="x", padx=6, pady=(0, 2))
             ttk.Label(mode_row, text="Show",
                       style="ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel",
                       ).pack(side="left")
             self._details_mode_combo = ttk.Combobox(
-                mode_row, state="readonly", width=14,
-                values=("Case details", "Related cases", "Outline"),
+                mode_row, state="readonly", width=16,
+                values=("Case details", "Recent SCOTUS", "Related cases",
+                        "Outline"),
                 style="Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox",
             )
             self._details_mode_combo.current(0)
@@ -14251,7 +14348,8 @@ class _ScholarTextWindow:
             self._details_frame.pack_forget()
 
     def _details_mode(self) -> str:
-        """The side panel's selected view: "case", "related" or "outline"."""
+        """The side panel's selected view: "case", "recent", "related" or
+        "outline"."""
         combo = getattr(self, "_details_mode_combo", None)
         try:
             if combo is not None:
@@ -14260,6 +14358,8 @@ class _ScholarTextWindow:
                     return "outline"
                 if sel == "Related cases":
                     return "related"
+                if sel == "Recent SCOTUS":
+                    return "recent"
         except tk.TclError:
             pass
         return "case"
@@ -14273,6 +14373,8 @@ class _ScholarTextWindow:
             self._show_outline()
         elif mode == "related":
             self._show_related_cases()
+        elif mode == "recent":
+            self._show_recent_scotus()
         else:
             self._show_case_details()
 
@@ -14333,10 +14435,11 @@ class _ScholarTextWindow:
         self._status_var.set("Opened in your browser.")
 
     def _load_details(self) -> None:
-        """Fill the details panel: the Oyez line-up/summary for a Supreme
-        Court case; when Oyez has nothing, the Court's own recent decisions
-        (supremecourt.gov) with in-app slip-opinion links; last, whatever
-        authorship the open text itself reveals."""
+        """Fill the case-details panel: the Oyez line-up/summary for a Supreme
+        Court case; when Oyez has nothing, CourtListener's own record for the
+        case (parties, court, date, parallel citations, panel); last, whatever
+        authorship the open text itself reveals.  (The Court's recent decisions
+        are their own "Recent SCOTUS" view now, not a fallback here.)"""
         self._details_loaded = True
         self._set_details([("lbl", "Loading case details…")])
         cite = self._bb["cite"]
@@ -14344,6 +14447,15 @@ class _ScholarTextWindow:
         oyez_cites = [c for c in ([cite] + list(self._header_cites)) if c]
         name = self._bb.get("name", "")
         year = self._bb.get("year", "")
+        # Resolve the CourtListener client on the main thread (it reads tk vars),
+        # but only when a token is set — the case-details panel opens
+        # automatically for SCOTUS cases, and _get_client() pops a "Missing
+        # Token" dialog when there's none.  Oyez, the primary source, needs no
+        # token, so the CourtListener fallback simply stays unavailable.
+        client = None
+        if (self._app is not None
+                and self._app._token_var.get().strip()):
+            client = self._app._get_client()
 
         def run() -> None:
             title = "Opinions & Joins"
@@ -14361,18 +14473,17 @@ class _ScholarTextWindow:
                 except Exception as exc:
                     print(f"[details] oyez: {exc}")
             # No Oyez entry (a case too recent or too obscure for it, or a
-            # lower-court case): show what's new at One First Street instead —
-            # the Court's most recent decisions from supremecourt.gov, each
-            # with its holding and a link opening the slip opinion in-app.
-            if not lines:
+            # lower-court case that Oyez never covers): fall back to
+            # CourtListener's record for the case — the parties, deciding court,
+            # date, every parallel citation and the panel — resolved by
+            # citation.
+            if not lines and client is not None and cite:
                 try:
-                    import scotus_recent
-                    decisions = scotus_recent.fetch_recent_decisions()
-                    if decisions:
-                        title = "Recent Supreme Court Decisions"
-                        lines = self._details_lines_recent(decisions)
+                    lines = self._details_lines_cl(client, cite, name)
+                    if lines:
+                        title = "Case details · CourtListener"
                 except Exception as exc:
-                    print(f"[details] recent decisions: {exc}")
+                    print(f"[details] courtlistener: {exc}")
             if not lines:
                 lines = self._details_lines_parts()
             if not lines:
@@ -14381,6 +14492,79 @@ class _ScholarTextWindow:
             self._post(self._apply_case_details, title, lines)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _details_lines_cl(self, client, cite: str, name: str) -> list[tuple]:
+        """CourtListener's record for the cited case, used as the case-details
+        fallback when Oyez has nothing: parties, deciding court, decision date,
+        every parallel citation, precedential status and the panel, plus a link
+        to the opinion on CourtListener.  Returns [] when the citation resolves
+        to no cluster."""
+        item = _cl_item_for_citation(client, cite, name=name)
+        if not item:
+            return []
+        cluster_id = item.get("cluster_id") or item.get("id")
+        cluster: dict = {}
+        if cluster_id:
+            try:
+                cluster = client.get_cluster(
+                    int(cluster_id),
+                    fields="case_name,case_name_full,date_filed,citations,"
+                           "judges,precedential_status,absolute_url,"
+                           "nature_of_suit",
+                ) or {}
+            except Exception as exc:
+                print(f"[details] cluster fetch failed: {exc}")
+
+        case_name = re.sub(r"<[^>]+>", "", str(
+            cluster.get("case_name_full") or cluster.get("case_name")
+            or item.get("caseName") or name or "")).strip()
+        lines: list[tuple] = []
+        if case_name:
+            lines.append(("title", case_name))
+
+        court_id = str(item.get("court_id") or "").strip().lower()
+        court_label = ""
+        try:
+            import court_catalog
+            court_label = court_catalog.COURT_BLUEBOOK.get(court_id, "")
+        except Exception:
+            court_label = ""
+        if court_label:
+            lines.append(("lbl", court_label))
+
+        date = str(cluster.get("date_filed") or item.get("dateFiled")
+                   or "")[:10]
+        if date:
+            lines.append(("h", "Decided"))
+            lines.append(("", date))
+
+        cites = _gather_all_citations(client, item)
+        if cites:
+            lines.append(("h", "Citations"))
+            lines.append(("", "; ".join(cites)))
+
+        status = str(cluster.get("precedential_status") or "").strip()
+        if status:
+            lines.append(("h", "Status"))
+            lines.append(("", status))
+
+        judges = re.sub(r"<[^>]+>", "", str(cluster.get("judges") or "")).strip()
+        if judges:
+            lines.append(("h", "Panel"))
+            lines.append(("", judges))
+
+        nature = str(cluster.get("nature_of_suit") or "").strip()
+        if nature:
+            lines.append(("h", "Nature of suit"))
+            lines.append(("", nature))
+
+        rel = str(cluster.get("absolute_url") or "").strip()
+        if rel:
+            url = rel if rel.startswith("http") \
+                else "https://www.courtlistener.com" + rel
+            lines.append(("", ""))
+            lines.append(("", "View on CourtListener →", url))
+        return lines
 
     def _details_lines_recent(self, decisions: list) -> list[tuple]:
         """The recent-decisions panel: each case's name, decision date and
@@ -14405,6 +14589,51 @@ class _ScholarTextWindow:
                     description=d.description),
             ))
         return lines
+
+    # ------------------------------------------------------------------
+    # Side panel: recent Supreme Court decisions (its own view)
+    # ------------------------------------------------------------------
+
+    def _show_recent_scotus(self) -> None:
+        """The recent-SCOTUS view: cached lines when the fetch already ran,
+        else kick off the background load."""
+        cached = getattr(self, "_details_recent", None)
+        if cached is not None:
+            self._apply_details(*cached)
+        elif not self._recent_loaded:
+            self._load_recent_scotus()
+        else:  # fetch still in flight
+            self._set_details([("lbl", "Loading recent decisions…")])
+
+    def _apply_recent_scotus(self, title: str, lines: list[tuple]) -> None:
+        """Store the fetched recent decisions and show them — unless the user
+        has switched the panel to another view meanwhile."""
+        self._details_recent = (title, lines)
+        if self._details_mode() == "recent":
+            self._apply_details(title, lines)
+
+    def _load_recent_scotus(self) -> None:
+        """Fetch the Court's most recent decisions (supremecourt.gov) off-thread
+        and render them with in-app slip-opinion links."""
+        self._recent_loaded = True
+        self._set_details([("lbl", "Loading recent decisions…")])
+
+        def run() -> None:
+            title = "Recent Supreme Court Decisions"
+            try:
+                import scotus_recent
+                decisions = scotus_recent.fetch_recent_decisions()
+                if decisions:
+                    lines = self._details_lines_recent(decisions)
+                else:
+                    lines = [("lbl", "No recent decisions were found on "
+                                     "supremecourt.gov.")]
+            except Exception as exc:
+                print(f"[details] recent decisions: {exc}")
+                lines = [("lbl", f"Could not load recent decisions: {exc}")]
+            self._post(self._apply_recent_scotus, title, lines)
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _details_lines_parts(self) -> list[tuple[str, str]]:
         """Authorship gleaned from the Scholar text: the syllabus
@@ -16174,9 +16403,7 @@ class _PdfWindow:
         _ui_button(btns, "+", width=42,
                    command=lambda: self._zoom(+1)).pack(side="left", padx=(6, 10))
         self._status_var = tk.StringVar(value="Loading PDF…")
-        _ui_label(btns, muted=True, anchor="w",
-                  textvariable=self._status_var).pack(
-            side="left", fill="x", expand=True, padx=(10, 0))
+        _install_status_label(btns, self._status_var)
 
         self._body = _ui_frame(self._win)
         self._body.pack(fill="both", expand=True)
@@ -16764,9 +16991,7 @@ class _SlipOpinionWindow:
         if hist_btn is not None:
             hist_btn.pack(side="left", padx=(0, 8))
         self._status_var = tk.StringVar(value="Loading the slip opinion…")
-        _ui_label(btns, muted=True, anchor="w",
-                  textvariable=self._status_var).pack(
-            side="left", fill="x", expand=True, padx=(10, 0))
+        _install_status_label(btns, self._status_var)
 
         body = _ui_frame(win)
         body.pack(fill="both", expand=True)
@@ -17300,10 +17525,16 @@ class _BriefTextWindow:
 
         bottom = _ui_frame(win)
         bottom.pack(fill="x", padx=12, pady=(0, 10))
+        # Compile every cited authority into one downloadable zip (see
+        # _download_all_cases): cases via static.case.law / Scholar / CL,
+        # statutes and rules as their text, all Bluebook-named.
+        self._download_btn = _ui_button(
+            bottom, "Download Cited Cases…", primary=True, width=188,
+            command=self._download_all_cases,
+        )
+        self._download_btn.pack(side="right", padx=(8, 0))
         self._status_var = tk.StringVar(value="")
-        _ui_label(bottom, muted=True, anchor="w",
-                  textvariable=self._status_var).pack(
-            side="left", fill="x", expand=True)
+        _install_status_label(bottom, self._status_var, padx=(0, 0))
 
     def _render(self) -> None:
         txt = self._text
@@ -17347,6 +17578,372 @@ class _BriefTextWindow:
         if entry:
             _open_citation_in_browser(entry[0], entry[1])
         return "break"
+
+    # ------------------------------------------------------------------
+    # Download every cited authority into one zip
+    # ------------------------------------------------------------------
+
+    def _download_all_cases(self) -> None:
+        """Compile every case (and statute/rule/regulation) the brief cites into
+        a single zip the user chooses.  Cases are resolved static.case.law →
+        Scholar cache → CourtListener (parallel-cite static.case.law, then the
+        CL text) → Scholar search, so Google Scholar is only ever searched as a
+        last resort.  The work runs off-thread behind a progress dialog."""
+        import brief_compiler
+
+        authorities = brief_compiler.collect_authorities(self._src)
+        if not authorities:
+            self._status_var.set("No citations to download.")
+            return
+        n_cases = sum(1 for a in authorities if a.is_case)
+        n_other = len(authorities) - n_cases
+        path = filedialog.asksaveasfilename(
+            parent=self._win, title="Save cited authorities as…",
+            defaultextension=".zip",
+            filetypes=[("Zip archive", "*.zip"), ("All files", "*.*")],
+            initialfile="Cited Authorities.zip",
+        )
+        if not path:
+            return
+
+        # Resolve the CourtListener client and Scholar fetcher here on the main
+        # thread (they read tk variables); either may be None.
+        client = None
+        try:
+            if self._app is not None and self._app._token_var.get().strip():
+                client = self._app._get_client()
+        except Exception as exc:
+            print(f"[compile] client unavailable: {exc}")
+        fetcher = None
+        try:
+            if _SCHOLAR_AVAILABLE and self._app is not None:
+                fetcher = self._app._get_scholar()
+        except Exception as exc:
+            print(f"[compile] scholar unavailable: {exc}")
+
+        resolver = _BriefCompileResolver(client, fetcher)
+        dialog = _CompileProgressDialog(
+            self._win, total=len(authorities),
+            subtitle=f"{n_cases} case{'' if n_cases == 1 else 's'}"
+                     + (f", {n_other} statute/rule{'' if n_other == 1 else 's'}"
+                        if n_other else ""))
+        self._status_var.set(
+            f"Downloading {len(authorities)} cited "
+            f"{'authority' if len(authorities) == 1 else 'authorities'}…")
+
+        def progress(done: int, total: int, message: str) -> None:
+            dialog.post_progress(done, total, message)
+
+        def run() -> None:
+            try:
+                summary = brief_compiler.compile_to_zip(
+                    authorities, resolver, path,
+                    progress=progress,
+                    should_cancel=dialog.is_cancelled,
+                )
+            except Exception as exc:
+                dialog.post_error(str(exc))
+                self._safe_status(f"Download failed: {exc}")
+                return
+            dialog.post_done(summary)
+            msg = (f"Saved {summary.saved} of {len(authorities)} to "
+                   f"{os.path.basename(path)}"
+                   + (" (cancelled)" if summary.cancelled else ""))
+            self._safe_status(msg)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _safe_status(self, s: str) -> None:
+        try:
+            self._win.after(0, self._status_var.set, s)
+        except tk.TclError:
+            pass
+
+
+class _BriefCompileResolver:
+    """The fetching side of :mod:`brief_compiler`, built from the helpers the
+    GUI already owns.  Each method does one lookup; ``brief_compiler`` decides
+    the order they're tried in (so that ordering stays unit-testable)."""
+
+    def __init__(self, client, fetcher) -> None:
+        self._client = client
+        self._fetcher = fetcher
+
+    # -- cases ---------------------------------------------------------------
+
+    def case_law_pdf(self, cites: list[str]):
+        """(url, matched cite) for the first static.case.law PDF that exists for
+        any of *cites* — each also tried in its modern U.S.-Reports form for an
+        old nominative SCOTUS cite — or None."""
+        probe: list[str] = []
+        seen: set[str] = set()
+        for c in cites:
+            for cand in (c, _us_reports_cite(c)):
+                cand = (cand or "").strip()
+                if cand and cand not in seen:
+                    seen.add(cand)
+                    probe.append(cand)
+        if not probe:
+            return None
+        choices = _case_law_pdf_choices_for_cites(probe)
+        if choices:
+            return choices[0].url, choices[0].cite
+        return None
+
+    def pdf_bytes(self, url: str):
+        try:
+            got = _fetch_pdf_bytes(url, client=self._client)
+        except Exception as exc:
+            print(f"[compile] pdf fetch failed for {url}: {exc}")
+            return None
+        return got[0] if got else None
+
+    def scholar_cached(self, cite: str, name: str):
+        """The opinion HTML already cached for this citation (no network), or
+        None."""
+        if self._fetcher is None:
+            return None
+        try:
+            cached = self._fetcher.get_cached(f"cite2:{cite.strip()}")
+        except Exception:
+            return None
+        return cached[1] if cached else None
+
+    def cl_resolve(self, cite: str, name: str):
+        if self._client is None:
+            return None
+        try:
+            return _cl_item_for_citation(self._client, cite, name=name)
+        except Exception as exc:
+            print(f"[compile] CL resolve failed for {cite!r}: {exc}")
+            return None
+
+    def cl_case_name(self, item: dict) -> str:
+        return re.sub(r"<[^>]+>", "", str(
+            item.get("caseName") or item.get("case_name") or "")).strip()
+
+    def cl_all_cites(self, item: dict) -> list[str]:
+        if self._client is None:
+            return []
+        try:
+            return _gather_all_citations(self._client, item)
+        except Exception as exc:
+            print(f"[compile] gather cites failed: {exc}")
+            return []
+
+    def cl_opinion_text(self, item: dict):
+        if self._client is None:
+            return ""
+        try:
+            _parts, _blocks, plain, _cluster = _assemble_case_parts(
+                self._client, item)
+            return plain or ""
+        except Exception as exc:
+            print(f"[compile] CL opinion text failed: {exc}")
+            return ""
+
+    def scholar_search(self, cite: str, name: str):
+        """A live Google Scholar search — the last resort, so it only runs when
+        static.case.law, the cache and CourtListener all came up empty."""
+        if self._fetcher is None:
+            return None
+        try:
+            result = self._fetcher.fetch_by_citation(cite)
+            if not result and name:
+                result = self._fetcher.fetch_by_name(name)
+        except Exception as exc:
+            print(f"[compile] scholar search failed for {cite!r}: {exc}")
+            return None
+        return result[1] if result else None
+
+    # -- statutes / rules / regulations / Constitution -----------------------
+
+    def statute_text(self, kind: str, spec: str):
+        mod = _STATUTE_SOURCES.get(kind)
+        if mod is None:
+            return None
+        try:
+            title, section, _subs = (spec.split(":", 2) + ["", "", ""])[:3]
+            doc = mod.load_section(title, section)
+            label = mod.spec_label(spec)
+        except Exception as exc:
+            print(f"[compile] statute load failed for {spec!r}: {exc}")
+            return None
+        body = _statute_doc_to_text(doc)
+        if not body.strip():
+            return None
+        return label, body
+
+    def statute_pdf_bytes(self, url: str):
+        return self.pdf_bytes(url)
+
+    def authority_label(self, kind: str, value: str) -> str:
+        if kind == "statpdf":
+            return _stat_cite_from_url(value)
+        mod = _STATUTE_SOURCES.get(kind)
+        if mod is not None:
+            try:
+                return mod.spec_label(value)
+            except Exception:
+                pass
+        return value
+
+
+def _statute_doc_to_text(doc) -> str:
+    """Render a loaded statute/rule/regulation document to plain text: the
+    section heading, then each paragraph indented to its hierarchy level, then
+    the source credit."""
+    lines: list[str] = []
+    label = getattr(doc, "label", "") or ""
+    if label:
+        lines.append(label)
+        lines.append("")
+    for entry in getattr(doc, "paras", []):
+        try:
+            _kind, indent, text = entry
+        except Exception:
+            continue
+        if text is None:
+            continue
+        prefix = "    " * max(0, int(indent or 0))
+        lines.append(prefix + str(text))
+    credit = getattr(doc, "source_credit", "") or getattr(doc, "source_name", "")
+    if credit:
+        lines.append("")
+        lines.append(f"Source: {credit}")
+    return "\n".join(lines).strip()
+
+
+class _CompileProgressDialog:
+    """A small modal-ish dialog tracking the "Download Cited Cases" run: a
+    progress bar, the item in flight, a scrolling log of what was found where,
+    and a Cancel button that becomes Close when the run ends."""
+
+    def __init__(self, parent: tk.Misc, total: int, subtitle: str = "") -> None:
+        self._total = total
+        self._cancel = threading.Event()
+        self._done = False
+
+        self._win = _ui_toplevel(parent)
+        self._win.title("Downloading cited authorities")
+        self._win.geometry("560x420")
+        self._win.minsize(420, 300)
+        try:
+            self._win.transient(parent.winfo_toplevel())
+        except Exception:
+            pass
+
+        head = _ui_frame(self._win)
+        head.pack(fill="x", padx=14, pady=(14, 4))
+        _ui_label(head, "Compiling the brief's cited authorities", size=14,
+                  weight="bold", anchor="w").pack(side="left")
+        if subtitle:
+            sub = _ui_frame(self._win)
+            sub.pack(fill="x", padx=14, pady=(0, 4))
+            _ui_label(sub, subtitle, muted=True, anchor="w").pack(side="left")
+
+        self._bar = ttk.Progressbar(self._win, mode="determinate",
+                                    maximum=max(1, total))
+        self._bar.pack(fill="x", padx=14, pady=(6, 4))
+        self._item_var = tk.StringVar(value="Starting…")
+        _ui_label(self._win, anchor="w", muted=True,
+                  textvariable=self._item_var).pack(fill="x", padx=14)
+
+        log_frame = _ui_frame(self._win)
+        log_frame.pack(fill="both", expand=True, padx=14, pady=(6, 6))
+        self._log = tk.Text(log_frame, wrap="word", height=10,
+                            state="disabled", padx=8, pady=6,
+                            font=("TkDefaultFont", 10))
+        lvsb = ttk.Scrollbar(log_frame, orient="vertical",
+                             command=self._log.yview)
+        self._log.configure(yscrollcommand=lvsb.set)
+        lvsb.pack(side="right", fill="y")
+        self._log.pack(side="left", fill="both", expand=True)
+        self._log.tag_configure("ok", foreground="#15803d")
+        self._log.tag_configure("miss", foreground="#a31515")
+
+        btnrow = _ui_frame(self._win)
+        btnrow.pack(fill="x", padx=14, pady=(0, 12))
+        self._btn = _ui_button(btnrow, "Cancel", command=self._on_button,
+                               width=110)
+        self._btn.pack(side="right")
+        self._win.protocol("WM_DELETE_WINDOW", self._on_button)
+
+    # -- cross-thread posting -----------------------------------------------
+
+    def _post(self, fn, *args) -> None:
+        try:
+            self._win.after(0, fn, *args)
+        except tk.TclError:
+            pass
+
+    def post_progress(self, done: int, total: int, message: str) -> None:
+        self._post(self._apply_progress, done, total, message)
+
+    def _apply_progress(self, done: int, total: int, message: str) -> None:
+        try:
+            self._bar.configure(value=done)
+            self._item_var.set(f"[{min(done + 1, total)}/{total}]  {message}")
+        except tk.TclError:
+            pass
+
+    def post_done(self, summary) -> None:
+        self._post(self._apply_done, summary)
+
+    def _apply_done(self, summary) -> None:
+        self._done = True
+        try:
+            self._bar.configure(value=self._total)
+            self._log.config(state="normal")
+            for r in summary.results:
+                if r.ok:
+                    self._log.insert("end", f"✓  {r.filename}\n", ("ok",))
+                    self._log.insert(
+                        "end", f"      {r.source}\n")
+                else:
+                    self._log.insert(
+                        "end", f"✗  {r.authority.label()}\n", ("miss",))
+                    if r.detail:
+                        self._log.insert("end", f"      {r.detail}\n")
+            self._log.config(state="disabled")
+            self._log.see("end")
+            head = (f"Done — saved {summary.saved} of "
+                    f"{len(summary.results)}"
+                    + (" (cancelled)" if summary.cancelled else "") + ".")
+            self._item_var.set(head)
+            self._btn.configure(text="Close")
+        except tk.TclError:
+            pass
+
+    def post_error(self, message: str) -> None:
+        self._post(self._apply_error, message)
+
+    def _apply_error(self, message: str) -> None:
+        self._done = True
+        try:
+            self._item_var.set(f"Failed: {message}")
+            self._btn.configure(text="Close")
+        except tk.TclError:
+            pass
+
+    # -- cancel / close ------------------------------------------------------
+
+    def is_cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def _on_button(self) -> None:
+        if self._done:
+            try:
+                self._win.destroy()
+            except tk.TclError:
+                pass
+            return
+        self._cancel.set()
+        try:
+            self._item_var.set("Cancelling — finishing the current item…")
+            self._btn.configure(state="disabled")
+        except tk.TclError:
+            pass
 
 
 class _LinkedPdfWindow:
