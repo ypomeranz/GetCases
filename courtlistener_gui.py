@@ -11394,6 +11394,8 @@ class _ScholarTextWindow:
         self._details_frame: Optional[ttk.Frame] = None
         self._details_loaded = False
         self._details_case: Optional[tuple] = None  # cached (title, lines)
+        self._related_loaded = False
+        self._details_related: Optional[tuple] = None  # cached (title, lines)
 
         txt.tag_configure("center", justify="center")
         txt.tag_configure("blockquote", lmargin1=36, lmargin2=36, rmargin=36)
@@ -14161,7 +14163,9 @@ class _ScholarTextWindow:
 
             # What the panel shows: the case details (Oyez line-up/summary,
             # falling back to the Court's recent decisions, then to whatever
-            # the open text reveals) or the opinion's detected outline.
+            # the open text reveals), the case's appellate family (appeals,
+            # decision below, remand proceedings), or the opinion's
+            # detected outline.
             mode_row = ttk.Frame(f)
             mode_row.pack(fill="x", padx=6, pady=(0, 2))
             ttk.Label(mode_row, text="Show",
@@ -14169,7 +14173,7 @@ class _ScholarTextWindow:
                       ).pack(side="left")
             self._details_mode_combo = ttk.Combobox(
                 mode_row, state="readonly", width=14,
-                values=("Case details", "Outline"),
+                values=("Case details", "Related cases", "Outline"),
                 style="Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox",
             )
             self._details_mode_combo.current(0)
@@ -14247,11 +14251,15 @@ class _ScholarTextWindow:
             self._details_frame.pack_forget()
 
     def _details_mode(self) -> str:
-        """The side panel's selected view: "case" or "outline"."""
+        """The side panel's selected view: "case", "related" or "outline"."""
         combo = getattr(self, "_details_mode_combo", None)
         try:
-            if combo is not None and combo.get() == "Outline":
-                return "outline"
+            if combo is not None:
+                sel = combo.get()
+                if sel == "Outline":
+                    return "outline"
+                if sel == "Related cases":
+                    return "related"
         except tk.TclError:
             pass
         return "case"
@@ -14260,8 +14268,11 @@ class _ScholarTextWindow:
         """Fill the side panel for its selected mode."""
         if self._details_frame is None:
             return
-        if self._details_mode() == "outline":
+        mode = self._details_mode()
+        if mode == "outline":
             self._show_outline()
+        elif mode == "related":
+            self._show_related_cases()
         else:
             self._show_case_details()
 
@@ -14278,9 +14289,9 @@ class _ScholarTextWindow:
 
     def _apply_case_details(self, title: str, lines: list[tuple]) -> None:
         """Store the fetched case details and show them — unless the user
-        has switched the panel to the outline meanwhile."""
+        has switched the panel to another view meanwhile."""
         self._details_case = (title, lines)
-        if self._details_mode() != "outline":
+        if self._details_mode() == "case":
             self._apply_details(title, lines)
 
     def _set_details(self, lines: list[tuple]) -> None:
@@ -14516,6 +14527,144 @@ class _ScholarTextWindow:
             lines.append(("", ""))
             lines.append(("", "View full details on Oyez →", case.web_url))
         return lines
+
+    # ------------------------------------------------------------------
+    # Side panel: related cases (appeals, decision below, remands)
+    # ------------------------------------------------------------------
+
+    def _show_related_cases(self) -> None:
+        """The related-cases view: cached lines when the lookup already
+        ran, else kick off the background load."""
+        cached = getattr(self, "_details_related", None)
+        if cached is not None:
+            self._apply_details(*cached)
+        elif not self._related_loaded:
+            self._load_related()
+        else:  # lookup still in flight
+            self._set_details([("lbl", "Finding related cases…")])
+
+    def _apply_related_cases(self, title: str, lines: list[tuple]) -> None:
+        """Store the fetched related cases and show them — unless the user
+        has switched the panel to another view meanwhile."""
+        self._details_related = (title, lines)
+        if self._details_mode() == "related":
+            self._apply_details(title, lines)
+
+    def _load_related(self) -> None:
+        """Fill the related-cases panel off-thread: this case's appellate
+        family — the appeal that reviewed it, the decision below, later
+        proceedings on remand — assembled by case_lineage from
+        CourtListener's docket, caption and citation signals."""
+        self._related_loaded = True
+        self._set_details([("lbl", "Finding related cases…")])
+        client = self._app._get_client()
+        if client is None:
+            self._apply_related_cases("Related Cases", [
+                ("lbl", "Related cases need a CourtListener API token."),
+            ])
+            return
+
+        item = self._item or {}
+        cluster_id = item.get("cluster_id") or item.get("id")
+        court_id = (str(item.get("court_id") or "").strip().lower()
+                    or _scholar_court_id(self._blocks))
+        name = re.sub(r"<[^>]+>", "", str(
+            item.get("caseName") or item.get("case_name") or "")).strip()
+        if not name:
+            name = _scholar_caption_name(self._blocks) or self._bb.get(
+                "name", "")
+        cites: list[str] = []
+        for c in ([self._bb.get("cite", "")] + list(self._header_cites)
+                  + list(item.get("citation") or [])):
+            c = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(c))).strip()
+            if c and c not in cites:
+                cites.append(c)
+        date = str(item.get("dateFiled") or item.get("date_filed")
+                   or "")[:10]
+        docket_number = str(item.get("docketNumber")
+                            or item.get("docket_number") or "")
+        text = self._scholar_text or self._cl_text or ""
+
+        def run() -> None:
+            import case_lineage
+            try:
+                lineage = case_lineage.find_related(
+                    client, cluster_id=cluster_id, case_name=name,
+                    court_id=court_id, citations=cites, date_filed=date,
+                    docket_number=docket_number, opinion_text=text)
+                lines = self._related_lines(lineage)
+            except Exception as exc:
+                print(f"[related] lookup failed: {exc}")
+                lines = [("lbl", f"Related-case lookup failed: {exc}")]
+            self._post(self._apply_related_cases, "Related Cases", lines)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _related_lines(self, lineage) -> list[tuple]:
+        """Render a case_lineage.Lineage: each related decision is a link
+        opening the opinion, grouped by its relationship to this case,
+        with the docket's appeal history beneath."""
+        import case_lineage
+        lines: list[tuple] = []
+        groups: dict[str, list] = {}
+        for rc in lineage.related:
+            groups.setdefault(rc.relation, []).append(rc)
+        for rel in case_lineage.REL_ORDER:
+            rcs = groups.pop(rel, [])
+            if not rcs:
+                continue
+            lines.append(("h", rel))
+            for rc in rcs:
+                lines.append(("", rc.case_name,
+                              lambda rc=rc: self._open_related_case(rc)))
+                sub = " · ".join(p for p in (
+                    rc.court_label, rc.date, rc.citation) if p)
+                if rc.confidence != "confirmed":
+                    sub = f"{sub} · probable match" if sub \
+                        else "probable match"
+                if sub:
+                    lines.append(("lbl", sub))
+        if lineage.events:
+            lines.append(("h", "Docket history"))
+            for date, text in lineage.events:
+                lines.append(("lbl", f"{date}  {text}"))
+        for note in lineage.notes:
+            lines.append(("lbl", note))
+        if not lines:
+            lines = [("lbl", "No appeal, decision below, or later "
+                             "proceeding found for this case on "
+                             "CourtListener.")]
+        return lines
+
+    def _open_related_case(self, rc) -> None:
+        """Open a related case in a new opinion window — straight from its
+        CourtListener cluster when known, else by citation, else its
+        courtlistener.com page in the browser."""
+        client = self._app._get_client()
+        if rc.cluster_id and client is not None:
+            item = {"cluster_id": rc.cluster_id, "court_id": rc.court_id,
+                    "caseName": rc.case_name, "dateFiled": rc.date}
+            if rc.citation:
+                item["citation"] = [rc.citation]
+            self._status_var.set(
+                f"Fetching {rc.case_name} from CourtListener…")
+
+            def run() -> None:
+                try:
+                    parts, blocks, plain, _cluster = _assemble_case_parts(
+                        client, item)
+                    self._post(self._on_cl_link_ready, parts, blocks,
+                               plain, item)
+                except Exception as exc:
+                    self._post(self._on_cl_link_error, str(exc))
+
+            threading.Thread(target=run, daemon=True).start()
+            return
+        if rc.citation:
+            self._follow_cite_via_cl(rc.citation, name=rc.case_name)
+        elif rc.url:
+            webbrowser.open(rc.url)
+            self._status_var.set("Opened on CourtListener in your browser.")
 
     # ------------------------------------------------------------------
     # Side panel: detected outline
