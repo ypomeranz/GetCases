@@ -1188,6 +1188,28 @@ def _build_default_filename(item: dict) -> str:
     return safe
 
 
+def _named_temp_pdf_path(stem: str) -> str:
+    """A path in the system temp directory named ``<stem>.pdf``, so a PDF handed
+    to the OS print dialog already carries its Bluebook file name — if the user
+    then "Save As" from the viewer, the suggested name is already right (instead
+    of a random ``tmpXXXX.pdf``).
+
+    When that name is already taken, a number is appended (" (2)", " (3)", …);
+    if no free variant can be found, the base name is reused (overwriting the
+    existing file)."""
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", (stem or "").strip()).strip()
+    stem = stem[:120].strip(" .") or "opinion"
+    tmpdir = tempfile.gettempdir()
+    base = os.path.join(tmpdir, f"{stem}.pdf")
+    if not os.path.exists(base):
+        return base
+    for n in range(2, 1000):
+        cand = os.path.join(tmpdir, f"{stem} ({n}).pdf")
+        if not os.path.exists(cand):
+            return cand
+    return base  # couldn't differentiate — overwrite the existing file
+
+
 def _us_reports_loc_url(citation: str) -> Optional[str]:
     """
     Return the LOC CDN PDF URL for a US Reports citation, or None if the
@@ -1390,6 +1412,87 @@ def _case_law_pdf_for_cite(cite: str) -> Optional[str]:
     old nominative SCOTUS cite — or None when case.law has neither."""
     choices = _case_law_pdf_choices_for_cites([cite, _us_reports_cite(cite)])
     return choices[0].url if choices else None
+
+
+def _case_law_json_url(citation: str) -> Optional[str]:
+    """The per-case JSON URL on static.case.law for *citation* (e.g.
+    ``https://static.case.law/f-appx/1/cases/0002-01.json`` for ``1 F. App'x
+    2``), or None when the citation can't be parsed.  The JSON carries the
+    opinion text and metadata — used for Federal Appendix cases, whose scans
+    have no reliable text layer."""
+    citation = re.sub(r"<[^>]+>", "", citation).strip()
+    m = _CITE_PARSE_RE.match(citation)
+    if not m:
+        return None
+    vol, reporter, page = m.group(1), m.group(2).strip(), m.group(3)
+    slug = _slugify_reporter(reporter)
+    if not slug:
+        return None
+    return f"https://static.case.law/{slug}/{vol}/cases/{int(page):04d}-01.json"
+
+
+def _case_law_json_case(cite: str) -> "Optional[tuple[str, str]]":
+    """Fetch and parse static.case.law's per-case JSON for *cite*, returning
+    ``(opinion_text, bluebook_citation)`` or None.
+
+    The Bluebook citation is built from the JSON's own authoritative fields —
+    the abbreviated case name, the official reporter cite, and the deciding
+    court and year — never from the brief's prose.  The text is the head-matter
+    (parties, docket, panel) followed by every opinion body."""
+    url = _case_law_json_url(cite)
+    if not url:
+        return None
+    try:
+        resp = _anon_session.get(url, timeout=15)
+    except Exception as exc:
+        print(f"[case.law-json] fetch failed {url}: {exc}")
+        return None
+    if resp.status_code != 200:
+        print(f"[case.law-json] {resp.status_code} for {cite!r}")
+        return None
+    try:
+        data = resp.json()
+    except Exception as exc:
+        print(f"[case.law-json] bad JSON for {cite!r}: {exc}")
+        return None
+
+    name = re.sub(r"\s+", " ", str(
+        data.get("name_abbreviation") or data.get("name") or "")).strip()
+    cites = data.get("citations") or []
+    official = next((c.get("cite") for c in cites
+                     if isinstance(c, dict) and c.get("type") == "official"
+                     and c.get("cite")), "")
+    cite_str = official or (
+        cites[0].get("cite") if cites and isinstance(cites[0], dict) else "") \
+        or cite
+    court = str((data.get("court") or {}).get("name_abbreviation") or "").strip()
+    date = str(data.get("decision_date") or "")
+    year = date[:4] if len(date) >= 4 else ""
+    paren = " ".join(p for p in (court, year) if p)
+    stem = ", ".join(p for p in (name, cite_str) if p) or cite_str
+    if paren:
+        stem = f"{stem} ({paren})" if stem else f"({paren})"
+
+    body = data.get("casebody") or {}
+    # Some CAP exports nest the opinion under casebody["data"].
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        body = body["data"]
+    chunks: list[str] = []
+    head = str(body.get("head_matter") or "").strip()
+    if head:
+        chunks.append(head)
+    for op in body.get("opinions") or []:
+        if not isinstance(op, dict):
+            continue
+        text = str(op.get("text") or "").strip()
+        if text:
+            author = str(op.get("author") or "").strip()
+            chunks.append(f"{author}\n{text}" if author
+                          and not text.startswith(author) else text)
+    text = "\n\n".join(chunks).strip()
+    if not text:
+        return None
+    return text, stem
 
 
 def _link_name(text: str) -> str:
@@ -7797,6 +7900,96 @@ def _dump_to_rtf(
     if par_open:
         out.append("\\par\n")
     return "".join(out)
+
+
+def _blocks_rtf_body(blocks) -> str:
+    """An RTF body built straight from parsed opinion blocks — no Tk widget —
+    so the "Download Cited Cases" compiler can export an opinion to RTF off the
+    main thread.  Mirrors :func:`_dump_to_rtf`'s run handling (the same
+    ``_run_to_rtf`` codes for italic/bold/small/super/underline and the purple
+    star-pagination markers), producing the same document the reader's
+    "Export → RTF" does.  The block list already holds the whole opinion,
+    footnotes included, so nothing else need be appended."""
+    out: list[str] = []
+    for b in blocks:
+        spans = getattr(b, "spans", None) or []
+        if not spans:
+            continue
+        kind = getattr(b, "kind", "para")
+        if kind == "center":
+            prefix = "\\pard\\qc\\sa120 "
+        elif kind == "blockquote":
+            prefix = "\\pard\\li720\\ri720\\sa120 "
+        else:
+            prefix = "\\pard\\sa120 "
+        runs: list[str] = []
+        for s in spans:
+            text = getattr(s, "text", "") or ""
+            if not text:
+                continue
+            active = {
+                "fnt_"
+                + ("1" if getattr(s, "italic", False) else "0")
+                + ("1" if getattr(s, "bold", False) else "0")
+                + ("1" if getattr(s, "small", False) else "0")
+                + ("1" if getattr(s, "sup", False) else "0")
+            }
+            if getattr(s, "underline", False):
+                active.add("underline")
+            if getattr(s, "pagenum", False):
+                active.add("pagenum")
+            runs.append(_run_to_rtf(text, active))
+        joined = "".join(runs)
+        if not joined.strip():
+            continue
+        out.append(prefix + joined + "\\par\n")
+    return "".join(out)
+
+
+def _opinion_rtf_from_blocks(blocks, citation_line: str = "") -> str:
+    """A complete two-column RTF document for an opinion, from parsed blocks.
+
+    When *citation_line* (the Bluebook citation) is given it becomes a centered
+    running head on every page — matching the reader's RTF export — over a
+    page-number footer.  Used by the brief-authority compiler, which has no live
+    reader window to dump from."""
+    body = _blocks_rtf_body(blocks)
+    if citation_line:
+        header = ("{\\header\\pard\\qc\\fs18\\i "
+                  + _rtf_escape(citation_line.rstrip(".")) + "\\par}\n")
+        return (_RTF_HEADER + "\\sectd\\sbknone\\cols2\\colsx432\n"
+                + header + "{\\footer\\pard\\qc\\fs18\\chpgn\\par}\n"
+                + body + "}")
+    return _rtf_document(body, two_columns=True, page_footer=True)
+
+
+def _scholar_item_from_blocks(blocks, fallback_name: str = "",
+                              fallback_cite: str = "") -> dict:
+    """A search-result-shaped item (caseName, citation, dateFiled, court_id)
+    scraped from an opinion's own header blocks, so :func:`_build_default_filename`
+    can produce a Bluebook file name even when CourtListener has no record of
+    the case (a Google-Scholar-only opinion)."""
+    name = _scholar_caption_name(blocks) or fallback_name
+    header = "  ".join(
+        b.text() for b in blocks[:8]
+        if getattr(b, "kind", "") in ("center", "heading")
+    )
+    header = re.sub(r"\bU\.\s+S\.", "U.S.", header)
+    header = re.sub(r"\b(\d{1,4})\s+US\s+(\d{1,5})\b", r"\1 U.S. \2", header)
+    cite = ""
+    m = _TEXT_CITE_RE.search(header)
+    if m:
+        cite = re.sub(r"\s+", " ", m.group(0)).strip()
+    if not cite:
+        cite = fallback_cite
+    years = re.findall(r"\b(1[6-9]\d{2}|20\d{2})\b", header)
+    year = years[-1] if years else ""
+    return {
+        "caseName": name,
+        "citation": [cite] if cite else [],
+        "dateFiled": f"{year}-01-01" if year else "",
+        "court_id": _scholar_court_id(blocks),
+    }
 
 
 def _plain_without_layout_chars(
@@ -16108,8 +16301,9 @@ class _ScholarTextWindow:
                     cite_hint=cite_hint, client=_client_for_window(self._app))
             except Exception as exc:
                 print(f"[pdf] header citation failed: {exc}")
-        fd, path = tempfile.mkstemp(suffix=".pdf")
-        os.close(fd)
+        # Name the print file the same as "Download PDF" would, so a Save-As
+        # from the viewer already carries the Bluebook citation.
+        path = _named_temp_pdf_path(_build_default_filename(self._filename_item()))
         try:
             if self._pdf_pane is not None:
                 self._pdf_pane.export_pdf(
@@ -16561,8 +16755,10 @@ class _PdfWindow:
                     client=_client_for_window(self._app))
             except Exception as exc:
                 print(f"[pdf] header citation failed: {exc}")
-        fd, path = tempfile.mkstemp(suffix=".pdf")
-        os.close(fd)
+        # Same file name "Download PDF" would offer, so a Save-As from the
+        # viewer already carries the proper name.
+        stem = re.sub(r"[^\w.-]+", "_", self._title).strip("_") or "statute"
+        path = _named_temp_pdf_path(stem)
         try:
             if self._pane is not None:
                 self._pane.export_pdf(
@@ -17047,8 +17243,9 @@ class _SlipOpinionWindow:
     def _print(self) -> None:
         if not self._bytes:
             return
-        fd, path = tempfile.mkstemp(suffix=".pdf")
-        os.close(fd)
+        # Same file name "Download PDF" would offer for this slip opinion.
+        stem = re.sub(r"[^\w.-]+", "_", self._title).strip("_") or "slip_opinion"
+        path = _named_temp_pdf_path(stem)
         try:
             if self._pane is not None:
                 self._pane.export_pdf(path)
@@ -17584,11 +17781,13 @@ class _BriefTextWindow:
     # ------------------------------------------------------------------
 
     def _download_all_cases(self) -> None:
-        """Compile every case (and statute/rule/regulation) the brief cites into
-        a single zip the user chooses.  Cases are resolved static.case.law →
-        Scholar cache → CourtListener (parallel-cite static.case.law, then the
-        CL text) → Scholar search, so Google Scholar is only ever searched as a
-        last resort.  The work runs off-thread behind a progress dialog."""
+        """Compile every authority the brief cites into a single zip the user
+        chooses, each file named with its proper Bluebook citation.  Federal
+        Appendix cases come from static.case.law's JSON as text; unpublished
+        opinions from RECAP; every other case is exported as RTF from the saved
+        Google Scholar copy, then CourtListener, then (only if it must) a fresh
+        Google Scholar search; statutes and rules as their text.  The work runs
+        off-thread behind a progress dialog."""
         import brief_compiler
 
         authorities = brief_compiler.collect_authorities(self._src)
@@ -17660,6 +17859,36 @@ class _BriefTextWindow:
             pass
 
 
+def _parse_opinion_blocks_safe(html: str):
+    """``parse_opinion_blocks`` with the import and failures swallowed, for the
+    compiler's worker thread."""
+    try:
+        from google_scholar import parse_opinion_blocks
+        return parse_opinion_blocks(html or "")
+    except Exception as exc:
+        print(f"[compile] block parse failed: {exc}")
+        return []
+
+
+def _recap_stem(name: str, cite: str, docket: str, court, date: str) -> str:
+    """A Bluebook file stem for an unpublished opinion:
+    ``Name, No. Docket, WL-cite (Court Date)``."""
+    bits = [b for b in (name, f"No. {docket}" if docket else "", cite) if b]
+    stem = ", ".join(bits) or (name or "Unpublished opinion")
+    court_label = ""
+    try:
+        import court_catalog
+        court_label = court_catalog.COURT_BLUEBOOK.get(
+            str(court or "").strip().lower(), "")
+    except Exception:
+        court_label = ""
+    year = date[:4] if date and len(date) >= 4 else ""
+    paren = " ".join(p for p in (court_label, year) if p)
+    if paren:
+        stem = f"{stem} ({paren})"
+    return stem
+
+
 class _BriefCompileResolver:
     """The fetching side of :mod:`brief_compiler`, built from the helpers the
     GUI already owns.  Each method does one lookup; ``brief_compiler`` decides
@@ -17671,25 +17900,6 @@ class _BriefCompileResolver:
 
     # -- cases ---------------------------------------------------------------
 
-    def case_law_pdf(self, cites: list[str]):
-        """(url, matched cite) for the first static.case.law PDF that exists for
-        any of *cites* — each also tried in its modern U.S.-Reports form for an
-        old nominative SCOTUS cite — or None."""
-        probe: list[str] = []
-        seen: set[str] = set()
-        for c in cites:
-            for cand in (c, _us_reports_cite(c)):
-                cand = (cand or "").strip()
-                if cand and cand not in seen:
-                    seen.add(cand)
-                    probe.append(cand)
-        if not probe:
-            return None
-        choices = _case_law_pdf_choices_for_cites(probe)
-        if choices:
-            return choices[0].url, choices[0].cite
-        return None
-
     def pdf_bytes(self, url: str):
         try:
             got = _fetch_pdf_bytes(url, client=self._client)
@@ -17698,63 +17908,117 @@ class _BriefCompileResolver:
             return None
         return got[0] if got else None
 
-    def scholar_cached(self, cite: str, name: str):
-        """The opinion HTML already cached for this citation (no network), or
-        None."""
-        if self._fetcher is None:
+    def is_fed_appx(self, cite: str) -> bool:
+        return bool(_FED_APPX_RE.search(cite or ""))
+
+    def fed_appx_text(self, cite: str):
+        """(opinion text, Bluebook citation) parsed from static.case.law's
+        per-case JSON, or None.  Federal Appendix scans have no reliable text
+        layer, so the JSON — which carries the opinion and authoritative
+        metadata — is the source."""
+        try:
+            return _case_law_json_case(cite)
+        except Exception as exc:
+            print(f"[compile] case.law JSON failed for {cite!r}: {exc}")
+            return None
+
+    def case_rtf(self, cite: str, name: str):
+        """(rtf, Bluebook citation, source) for a published case, or None.
+
+        The opinion is taken, in order, from the saved Google Scholar copy, then
+        CourtListener, then — only if it must — a fresh Google Scholar search.
+        The citation for the file name comes from the opinion and is supplemented
+        by the CourtListener API."""
+        blocks = None
+        item = None
+        source = ""
+        # 1) Saved Google Scholar copy (cache only — no network).
+        if self._fetcher is not None:
+            try:
+                cached = self._fetcher.get_cached(f"cite2:{cite.strip()}")
+            except Exception:
+                cached = None
+            if cached:
+                blocks = _parse_opinion_blocks_safe(cached[1])
+                if blocks:
+                    source = "Google Scholar (cache)"
+        # 2) CourtListener.
+        if not blocks and self._client is not None:
+            try:
+                item = _cl_item_for_citation(self._client, cite, name=name)
+                if item is not None:
+                    _parts, cl_blocks, _plain, _cluster = _assemble_case_parts(
+                        self._client, item)
+                    if cl_blocks:
+                        blocks = cl_blocks
+                        source = "CourtListener"
+            except Exception as exc:
+                print(f"[compile] CL text failed for {cite!r}: {exc}")
+        # 3) Fresh Google Scholar search — the last resort.
+        if not blocks and self._fetcher is not None:
+            try:
+                result = self._fetcher.fetch_by_citation(cite)
+                if not result and name:
+                    result = self._fetcher.fetch_by_name(name)
+            except Exception as exc:
+                print(f"[compile] scholar search failed for {cite!r}: {exc}")
+                result = None
+            if result:
+                blocks = _parse_opinion_blocks_safe(result[1])
+                if blocks:
+                    source = "Google Scholar (search)"
+        if not blocks:
+            return None
+        # Supplement the citation via CourtListener when the text came from
+        # Scholar, so the file name is authoritative (skipped when CL already
+        # resolved the case above).
+        if item is None and self._client is not None:
+            try:
+                item = _cl_item_for_citation(self._client, cite, name=name)
+            except Exception:
+                item = None
+        stem = self._case_stem(item, blocks, cite, name)
+        return _opinion_rtf_from_blocks(blocks, stem), stem, source
+
+    def recap_pdf(self, spec_json: str):
+        """(pdf bytes, Bluebook citation) for an unpublished opinion from the
+        RECAP/PACER archive, or None — reusing the app's existing RECAP
+        document downloader."""
+        if self._client is None:
             return None
         try:
-            cached = self._fetcher.get_cached(f"cite2:{cite.strip()}")
+            spec = json.loads(spec_json)
         except Exception:
             return None
-        return cached[1] if cached else None
-
-    def cl_resolve(self, cite: str, name: str):
-        if self._client is None:
-            return None
+        docket = spec.get("docket") or ""
+        name = spec.get("name") or ""
+        court = spec.get("court")
+        date = spec.get("date", "")
+        cite = spec.get("cite") or ""
         try:
-            return _cl_item_for_citation(self._client, cite, name=name)
+            info = cl_api.find_recap_document(
+                docket, court, date,
+                session=self._client._session, case_name=name or None)
         except Exception as exc:
-            print(f"[compile] CL resolve failed for {cite!r}: {exc}")
+            print(f"[compile] recap lookup failed: {exc}")
             return None
-
-    def cl_case_name(self, item: dict) -> str:
-        return re.sub(r"<[^>]+>", "", str(
-            item.get("caseName") or item.get("case_name") or "")).strip()
-
-    def cl_all_cites(self, item: dict) -> list[str]:
-        if self._client is None:
-            return []
-        try:
-            return _gather_all_citations(self._client, item)
-        except Exception as exc:
-            print(f"[compile] gather cites failed: {exc}")
-            return []
-
-    def cl_opinion_text(self, item: dict):
-        if self._client is None:
-            return ""
-        try:
-            _parts, _blocks, plain, _cluster = _assemble_case_parts(
-                self._client, item)
-            return plain or ""
-        except Exception as exc:
-            print(f"[compile] CL opinion text failed: {exc}")
-            return ""
-
-    def scholar_search(self, cite: str, name: str):
-        """A live Google Scholar search — the last resort, so it only runs when
-        static.case.law, the cache and CourtListener all came up empty."""
-        if self._fetcher is None:
+        if not info or not info.get("pdf_url"):
             return None
-        try:
-            result = self._fetcher.fetch_by_citation(cite)
-            if not result and name:
-                result = self._fetcher.fetch_by_name(name)
-        except Exception as exc:
-            print(f"[compile] scholar search failed for {cite!r}: {exc}")
+        data = self.pdf_bytes(info["pdf_url"])
+        if not data:
             return None
-        return result[1] if result else None
+        return data, _recap_stem(name, cite, docket, court, date)
+
+    def _case_stem(self, item, blocks, cite: str, name: str) -> str:
+        """The Bluebook file stem for a case — from the CourtListener record
+        when available, else scraped from the opinion's own header."""
+        if item:
+            stem = _build_default_filename(item)
+            if stem and stem != "opinion":
+                return stem
+        return _build_default_filename(
+            _scholar_item_from_blocks(blocks, fallback_name=name,
+                                      fallback_cite=cite))
 
     # -- statutes / rules / regulations / Constitution -----------------------
 
