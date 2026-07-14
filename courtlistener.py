@@ -296,7 +296,7 @@ class CourtListenerClient:
         case_name__icontains: str | None = None,
         precedential_status: str | None = None,
         citation: str | None = None,
-        ordering: str = "-date_filed",
+        ordering: str | None = None,
         fields: str | None = None,
         page_size: int = 20,
         extra: dict[str, Any] | None = None,
@@ -322,7 +322,8 @@ class CourtListenerClient:
             Filter by a parallel citation string.
         ordering:
             Field(s) to sort by. Prefix with ``-`` for descending.
-            Default: ``"-date_filed"``.
+            The clusters endpoint rejects the parameter ("Unknown filter
+            parameters are not allowed"), so none is sent by default.
         fields:
             Comma-separated list of fields to return.
         page_size:
@@ -383,7 +384,7 @@ class CourtListenerClient:
         date_filed__lte: str | None = None,
         type: str | None = None,
         cluster: int | None = None,
-        ordering: str = "-cluster__date_filed,id",
+        ordering: str | None = None,
         fields: str | None = None,
         page_size: int = 20,
         extra: dict[str, Any] | None = None,
@@ -408,7 +409,9 @@ class CourtListenerClient:
         cluster:
             Return only opinions belonging to this cluster ID.
         ordering:
-            Sort field(s). Default: ``"-cluster__date_filed,id"``.
+            Sort field(s).  The opinions endpoint rejects the parameter
+            ("Unknown filter parameters are not allowed"), so none is
+            sent unless the caller asks for one.
         fields:
             Comma-separated list of fields to return.
         page_size:
@@ -531,7 +534,7 @@ class CourtListenerClient:
         docket_number: str | None = None,
         date_filed__gte: str | None = None,
         date_filed__lte: str | None = None,
-        ordering: str = "-date_filed,id",
+        ordering: str | None = None,
         fields: str | None = None,
         page_size: int = 20,
         extra: dict[str, Any] | None = None,
@@ -552,7 +555,9 @@ class CourtListenerClient:
         date_filed__lte:
             Filed on or before this ISO-8601 date.
         ordering:
-            Sort field(s).
+            Sort field(s).  The dockets endpoint rejects the parameter
+            outright ("Unknown filter parameters are not allowed"), so
+            none is sent unless the caller asks for one.
         fields:
             Comma-separated list of fields to return.
         page_size:
