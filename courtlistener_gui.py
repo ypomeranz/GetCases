@@ -13881,6 +13881,17 @@ class _ScholarTextWindow:
         except tk.TclError:
             pass
 
+    def _citation_name(self) -> str:
+        """The party-name prefix of the Bluebook citation — the portion set
+        in italics (Bluebook rule 2/10).  For a manually edited citation the
+        name is parsed from the override, which can differ from the stored
+        caption; otherwise it is the case name."""
+        edited = getattr(self, "_base_citation_override", "")
+        if edited:
+            _plain, name = format_edited_citation(edited, None, ())
+            return name.replace("'", "’")
+        return (self._bb["name"] or "").replace("'", "’")
+
     def _bluebook_citation(
         self, pin: Optional[str], writer: str = "",
         extra_parens: tuple[str, ...] = (),
@@ -14392,7 +14403,7 @@ class _ScholarTextWindow:
             doc.append("\\markboth{%d}{%d}%%\n" % (first_page, first_page))
         # Bluebook rule 2/10: only the party names are italicized; the rest
         # of the citation (comma onward — reporter, court, year) is upright.
-        head_name = (self._bb["name"] or "").replace("'", "’")
+        head_name = self._citation_name()
         if head_name and case_line.startswith(head_name):
             head_cite = ("\\textit{%s}%s"
                          % (_latex_escape(head_name),
@@ -14513,12 +14524,11 @@ class _ScholarTextWindow:
         """
         txt = self._text
         fn_links = self._fn_link_map()
-        bb = self._bb
         case_line = self._bluebook_citation(None)[0]
         sections = self._export_section_list()
 
         blocks: list[str] = []
-        name = (bb["name"] or "").replace("'", "’")
+        name = self._citation_name()
         if name:
             blocks.append("# " + _md_escape(name))
             if case_line.startswith(name):
