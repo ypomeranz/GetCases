@@ -8521,7 +8521,7 @@ _LATEX_PREAMBLE = r"""\documentclass[11pt]{article}
 % measured, and when the case line would intrude on the range (kept at
 % its natural width) it is scaled down just enough to fit beside it.
 \newcommand{\opheadline}{%
-  \sbox0{\small\itshape\opinionhead}%
+  \sbox0{\small\opinionhead}%
   \sbox1{\small\reporterhead}%
   \setlength{\opheadavail}{\headwidth}%
   \ifdim\wd1>0pt
@@ -14390,10 +14390,19 @@ class _ScholarTextWindow:
         if has_marks and first_page is not None:
             doc.append("\\opfirstreporterpage=%d\\relax%%\n" % first_page)
             doc.append("\\markboth{%d}{%d}%%\n" % (first_page, first_page))
+        # Bluebook rule 2/10: only the party names are italicized; the rest
+        # of the citation (comma onward — reporter, court, year) is upright.
+        head_name = (self._bb["name"] or "").replace("'", "’")
+        if head_name and case_line.startswith(head_name):
+            head_cite = ("\\textit{%s}%s"
+                         % (_latex_escape(head_name),
+                            _latex_escape(case_line[len(head_name):])))
+        else:
+            head_cite = _latex_escape(case_line)
         for i, (label, rs, rend, _kind) in enumerate(sections):
             if i:
                 doc.append("\\clearpage\n")
-            head = _latex_escape(case_line)
+            head = head_cite
             if label:
                 head += " --- " + _latex_escape(label)
             doc.append("\\renewcommand{\\opinionhead}{%s}%%\n" % head)
