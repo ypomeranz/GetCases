@@ -35,6 +35,7 @@ import urllib.parse
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace as _dc_replace
+from functools import lru_cache
 
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
@@ -595,7 +596,19 @@ def _ensure_modern_ttk_styles(widget: tk.Misc) -> None:
     _MODERN_TTK_READY = True
 
 
-from bluebook_names import abbreviate_case_name
+from bluebook_names import (
+    abbreviate_case_name,
+    collapse_personal_all_caps_run,
+    courtlistener_case_name,
+    normal_case_caption,
+)
+from citation_overrides import (
+    citation_identity_keys,
+    clean_base_citation,
+    find_override,
+    format_edited_citation,
+    update_overrides,
+)
 from cl_parse import parse_cl_html as _parse_cl_html
 import courtlistener as cl_api
 from courtlistener import CourtListenerClient, CourtListenerError
@@ -1431,6 +1444,57 @@ def _case_law_json_url(citation: str) -> Optional[str]:
     return f"https://static.case.law/{slug}/{vol}/cases/{int(page):04d}-01.json"
 
 
+@lru_cache(maxsize=256)
+def _case_law_metadata(cite: str) -> "Optional[dict]":
+    """Authoritative per-case metadata for a reporter citation, cached for the
+    life of the app.  A citation-keyed URL cannot drift to a merely similar
+    case, so its capitalization is safe to prefer over OCR/title-casing guesses.
+    """
+    url = _case_law_json_url(cite)
+    if not url:
+        return None
+    try:
+        resp = _anon_session.get(url, timeout=10)
+    except Exception as exc:
+        print(f"[case.law-json] metadata fetch failed {url}: {exc}")
+        return None
+    if resp.status_code != 200:
+        print(f"[case.law-json] {resp.status_code} for {cite!r}")
+        return None
+    try:
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception as exc:
+        print(f"[case.law-json] bad JSON for {cite!r}: {exc}")
+        return None
+
+
+def _case_law_name_for_cites(cites) -> str:
+    """First authoritative case name available for these parallel reporters."""
+    seen: set[str] = set()
+    attempted = 0
+    for raw in cites:
+        cite = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(raw or ""))).strip()
+        key = re.sub(r"\s+", "", cite).lower()
+        if not cite or key in seen:
+            continue
+        seen.add(key)
+        if not _case_law_json_url(cite):
+            continue
+        attempted += 1
+        data = _case_law_metadata(cite)
+        if not data:
+            continue
+        name = re.sub(r"\s+", " ", str(
+            data.get("name_abbreviation") or data.get("name") or ""
+        )).strip()
+        if name:
+            return name
+        if attempted >= 6:
+            break
+    return ""
+
+
 def _case_law_json_case(cite: str) -> "Optional[tuple[str, str]]":
     """Fetch and parse static.case.law's per-case JSON for *cite*, returning
     ``(opinion_text, bluebook_citation)`` or None.
@@ -1439,21 +1503,8 @@ def _case_law_json_case(cite: str) -> "Optional[tuple[str, str]]":
     the abbreviated case name, the official reporter cite, and the deciding
     court and year — never from the brief's prose.  The text is the head-matter
     (parties, docket, panel) followed by every opinion body."""
-    url = _case_law_json_url(cite)
-    if not url:
-        return None
-    try:
-        resp = _anon_session.get(url, timeout=15)
-    except Exception as exc:
-        print(f"[case.law-json] fetch failed {url}: {exc}")
-        return None
-    if resp.status_code != 200:
-        print(f"[case.law-json] {resp.status_code} for {cite!r}")
-        return None
-    try:
-        data = resp.json()
-    except Exception as exc:
-        print(f"[case.law-json] bad JSON for {cite!r}: {exc}")
+    data = _case_law_metadata(cite)
+    if not data:
         return None
 
     name = re.sub(r"\s+", " ", str(
@@ -1666,10 +1717,13 @@ def _item_from_cluster(cluster: dict) -> dict:
             v, r, p = c.get("volume"), c.get("reporter"), c.get("page")
             if v and r and p:
                 cites.append(f"{v} {r} {p}")
+    short_name = cluster.get("case_name") or ""
+    full_name = cluster.get("case_name_full") or ""
     item: dict = {
         "cluster_id": cluster.get("id"),
-        "caseName": cluster.get("case_name")
-        or cluster.get("case_name_full") or "",
+        "caseName": short_name or full_name,
+        "case_name": short_name,
+        "case_name_full": full_name,
         "citation": cites,
         "dateFiled": cluster.get("date_filed") or "",
     }
@@ -7276,23 +7330,7 @@ def _titlecase_caps(s: str) -> str:
     'Mercy Hospital', 'UNITED STATES' → 'United States', 'IN RE GAULT' →
     'In re Gault'.  Mixed-case words, abbreviations, and entity initialisms
     ('LLC', 'LLP') pass through unchanged."""
-    out: list[str] = []
-    for i, w in enumerate(s.split()):
-        if not w.isupper() or re.fullmatch(r"(?:[A-Z]\.)+,?", w):
-            out.append(w)
-            continue
-        if w.replace("’", "'").rstrip(".,'").lower() in _ENTITY_INITIALISMS:
-            out.append(w)  # keep 'LLC', 'LLP', 'PLLC', … uppercase
-            continue
-        core = w.lower()
-        if i > 0 and core.strip(".,'") in _CAPTION_SMALL_WORDS:
-            out.append(core)
-            continue
-        word = "'".join(p[:1].upper() + p[1:] if p else p for p in core.split("'"))
-        if word.startswith("Mc") and len(word) > 2:
-            word = "Mc" + word[2].upper() + word[3:]
-        out.append(word)
-    return " ".join(out)
+    return normal_case_caption(s)
 
 
 # Entity abbreviations that legitimately end a party name with a period, so the
@@ -7479,27 +7517,9 @@ def _caption_party(s: str) -> str:
     # ("Acme Co.", "Foo Corp.", "Bar Inc.").
     if s.endswith(".") and not _party_ends_in_abbrev(s):
         s = s[:-1].rstrip()
-    tokens = s.split()
-    # The all-caps-run heuristic ("Brent BREWBAKER" → "BREWBAKER") fires only
-    # when (a) some all-caps token is a real *name* (not just an "LLC"/"INC."
-    # suffix — "Tedford's Tenancy, LLC" is not a mixed-case caption), and
-    # (b) every token it would drop is given-name-shaped (pure alpha or an
-    # initial) — a dropped "Records," means a corporate name in mixed case
-    # ("A&M Records, Inc."), not given names.  "&", numerals and entity
-    # suffixes then ride along with the caps run ("FENNER & SMITH",
-    # "LOCAL 174", "…OIL CO., Inc.") even though str.isupper() is False.
-    keep = [w for w in tokens
-            if (w.isupper() and len(w.strip(".,'")) > 1)
-            or w == "&" or w.rstrip(".,").isdigit()
-            or _ENTITY_SUFFIX_RE.fullmatch(w.rstrip(","))]
-    namey = [w for w in keep
-             if w.isupper() and len(w.strip(".,'")) > 1
-             and not _ENTITY_SUFFIX_RE.fullmatch(w.strip(",."))]
-    dropped = [w for w in tokens if w not in keep]
-    if (namey and len(keep) < len(tokens)
-            and all(re.fullmatch(r"[A-Za-z'’-]+|[A-Za-z]\.", w)
-                    for w in dropped)):
-        s = " ".join(keep)
+    # Scholar signals surnames with all caps ("Corrine Morgan THOMAS"), but
+    # entity initialisms ("McDonald's USA, LLC") must remain intact.
+    s = collapse_personal_all_caps_run(s)
     return _titlecase_caps(s).strip(" ,;&")
 
 
@@ -11012,21 +11032,7 @@ def _titlecase_caps(s: str) -> str:
     """Title-case the ALL-CAPS words of a reporter caption ("BOARD OF ZONING
     APPEALS" → "Board of Zoning Appeals"), leaving mixed-case words and
     initialisms (LLC, U.S.) alone."""
-    out = []
-    for i, wd in enumerate(s.split()):
-        if wd.upper() != wd or not re.search(r"[A-Z]{2}", wd):
-            out.append(wd)
-            continue
-        if wd.strip(".,()'’") in _NAME_KEEP_CAPS:
-            out.append(wd)
-            continue
-        low = wd.lower()
-        if i and low.strip(".,") in _NAME_SMALL_WORDS:
-            out.append(low)
-        else:
-            out.append("Mc" + low[2:].capitalize()
-                       if low.startswith("mc") else low.capitalize())
-    return " ".join(out)
+    return normal_case_caption(s)
 
 
 def _caption_fields(text: str) -> tuple:
@@ -11482,6 +11488,16 @@ class _ScholarTextWindow:
         self._fn_tip: Optional[tk.Toplevel] = None
         self._is_scotus = False  # set by _compute_bluebook_parts
         self._bb = self._compute_bluebook_parts()
+        self._citation_override_keys = citation_identity_keys(
+            self._item,
+            self._bb.get("cite", ""),
+            self._header_cites,
+            self._scholar_url,
+        )
+        self._base_citation_override = find_override(
+            _load_config().get("citation_overrides", {}),
+            self._citation_override_keys,
+        )
         if not self._cl_primary:
             self._refine_part_labels(self._parts)
         # Whether Google Scholar actually carries the opinion text (it usually
@@ -11785,6 +11801,11 @@ class _ScholarTextWindow:
         _ui_checkbox(
             btn_frame, "Copy with citation", self._copy_with_cite,
         ).pack(side="left", padx=(0, 10))
+        self._edit_citation_btn = _ui_button(
+            btn_frame, "Edit citation…", command=self._edit_base_citation,
+            width=108,
+        )
+        self._edit_citation_btn.pack(side="left", padx=(0, 10))
         self._justify_text = tk.BooleanVar(value=False)
         _ui_checkbox(
             btn_frame, "Justify Opinion Text.", self._justify_text,
@@ -11820,6 +11841,98 @@ class _ScholarTextWindow:
         # (the checkbox above defaults on and the window is sized to fit it).
         if self._is_scotus:
             self._toggle_details()
+
+    def _automatic_base_citation(self) -> str:
+        """The app-computed citation without a pinpoint or final period."""
+        bb = self._bb
+        name = bb.get("name", "")
+        cite = bb.get("cite", "")
+        value = f"{name}, {cite}" if name and cite else (name or cite)
+        paren = " ".join(p for p in (bb.get("court", ""), bb.get("year", "")) if p)
+        return f"{value} ({paren})" if value and paren else value
+
+    def _set_base_citation_override(self, value: str) -> None:
+        """Persist a custom base citation, or restore the automatic one."""
+        old_history_key = self._history_key()
+        value = clean_base_citation(value)
+        data = _load_config()
+        data["citation_overrides"] = update_overrides(
+            data.get("citation_overrides", {}),
+            self._citation_override_keys,
+            value,
+        )
+        _save_config(data)
+        self._base_citation_override = value
+
+        title = self._title_citation()
+        if title:
+            self._win.title(title)
+            app = self._app
+            if app is not None and hasattr(app, "retitle_case_view"):
+                app.retitle_case_view(old_history_key, title)
+        self._status_var.set(
+            "Saved the custom citation for future use."
+            if value else "Restored automatic Bluebooking for this opinion."
+        )
+
+    def _edit_base_citation(self) -> None:
+        """Edit the no-pincite citation used by copy and export operations."""
+        if not self._citation_override_keys:
+            messagebox.showwarning(
+                "Edit Citation",
+                "This opinion has no stable reporter or database identifier, so a "
+                "citation override cannot yet be saved for future use.",
+                parent=self._win,
+            )
+            return
+
+        dlg = _ui_toplevel(self._win)
+        dlg.title("Edit Base Citation")
+        dlg.transient(self._win)
+        dlg.resizable(True, False)
+        frame = _ui_frame(dlg)
+        frame.pack(fill="both", expand=True, padx=16, pady=14)
+        ttk.Label(
+            frame,
+            text=("Edit the citation without a pinpoint page. Pinpoints and opinion "
+                  "writer parentheticals will still be added automatically when you copy."),
+            wraplength=650,
+            justify="left",
+        ).pack(fill="x", pady=(0, 10))
+        value = tk.StringVar(
+            value=self._base_citation_override or self._automatic_base_citation()
+        )
+        entry = ttk.Entry(frame, textvariable=value, width=90)
+        entry.pack(fill="x")
+        entry.select_range(0, "end")
+        entry.focus_set()
+
+        buttons = _ui_frame(frame)
+        buttons.pack(fill="x", pady=(14, 0))
+
+        def save() -> None:
+            edited = clean_base_citation(value.get())
+            if not edited:
+                messagebox.showwarning(
+                    "Edit Citation", "Enter a base citation, or choose Use Automatic.",
+                    parent=dlg,
+                )
+                return
+            self._set_base_citation_override(edited)
+            dlg.destroy()
+
+        _ui_button(buttons, "Save", command=save, primary=True, width=86).pack(side="right")
+        _ui_button(buttons, "Cancel", command=dlg.destroy, width=86).pack(
+            side="right", padx=(0, 8)
+        )
+        _ui_button(
+            buttons, "Use Automatic",
+            command=lambda: (self._set_base_citation_override(""), dlg.destroy()),
+            width=116,
+        ).pack(side="left")
+        dlg.bind("<Return>", lambda _e: save())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.grab_set()
 
     def _on_button_bar_configure(self, event) -> None:
         compact = event.width < 760
@@ -11865,6 +11978,7 @@ class _ScholarTextWindow:
             (self._cl_btn, 150, 118),
             (self._zoom_out_btn, 42, 34),
             (self._zoom_in_btn, 42, 34),
+            (self._edit_citation_btn, 108, 88),
         )
         for btn, normal, small in widths:
             _set_ui_button_width(btn, small if compact else normal)
@@ -13590,6 +13704,9 @@ class _ScholarTextWindow:
         court-year parenthetical — e.g. "Roe v. Wade, 410 U.S. 113, 93 S. Ct.
         705, 35 L. Ed. 2d 147 (1973)".  Lexis/Westlaw and neutral (year-volume)
         cites are dropped (``_is_paginable_cite``)."""
+        edited = getattr(self, "_base_citation_override", "")
+        if edited:
+            return edited
         bb = self._bb
         name = bb.get("name", "")
         seen: set = set()
@@ -13630,49 +13747,86 @@ class _ScholarTextWindow:
         return title
 
     def _enrich_citation(self) -> None:
-        """Ping CourtListener in the background for the authoritative court and
-        year and update the title's Bluebook citation.  The court parenthetical
-        for federal-district and lower courts (e.g. "(S.D.N.Y. 2014)" for an
-        ``F. Supp.`` case) can't be derived from the opinion text, and the year
-        is sometimes missing — so we ask CourtListener.  Skipped when the court
-        already came from CourtListener and the year is known (nothing to add)."""
-        if not _SCHOLAR_AVAILABLE:
-            return
+        """Enrich capitalization, court, and year in the background.
+
+        The chosen reporter is tried against static.case.law first; if it has no
+        file, CourtListener supplies parallel reporters and those predictable
+        static.case.law paths are tried too.  This recovers authoritative forms
+        such as O'Brien and NBCUniversal instead of guessing from an all-caps
+        caption.  If CAP has no copy, the exact CourtListener cluster's own
+        case-name casing is the final name fallback.  CourtListener also
+        supplies a missing lower-court parenthetical or year.
+        """
         bb = self._bb
         if not bb.get("cite"):
             return
+        need_name = not bool(getattr(self, "_base_citation_override", ""))
         need_year = not bb.get("year")
         # SCOTUS takes no court parenthetical; otherwise we need a reliable
         # court, which we only have when CourtListener supplied the court id.
         need_court = (not self._is_scotus) and not getattr(
             self, "_court_from_cl", False
         )
-        if not (need_year or need_court):
-            return
-        if not self._app._token_var.get().strip():
-            return  # no CourtListener token to ask
         cite = bb["cite"]
         case_name = bb.get("name", "")
         item = dict(self._item)
+        candidate_cites = [cite, *self._header_cites, *(item.get("citation") or [])]
+        client = None
+        try:
+            if self._app is not None and self._app._token_var.get().strip():
+                client = self._app._get_client()
+        except Exception:
+            client = None
 
         def run() -> None:
-            client = self._app._get_client()
-            if client is None:
-                return
-            try:
-                court_id, year = self._cl_court_and_year(
-                    client, cite, item, name=case_name)
-            except Exception as exc:
-                print(f"[bb-enrich] CourtListener lookup failed: {exc}")
-                return
+            authoritative_name = _case_law_name_for_cites(candidate_cites) if need_name else ""
+            court_id = year = ""
+            target = None
+            if client is not None:
+                if need_year or need_court:
+                    try:
+                        court_id, year = self._cl_court_and_year(
+                            client, cite, item, name=case_name)
+                    except Exception as exc:
+                        print(f"[bb-enrich] CourtListener lookup failed: {exc}")
+                # When the selected reporter has no CAP file, CourtListener's
+                # exact citation lookup exposes alternate reporters that may.
+                if need_name and not authoritative_name:
+                    try:
+                        target = _cl_item_for_citation(client, cite, name=case_name)
+                    except Exception as exc:
+                        print(f"[bb-enrich] alternate-reporter lookup failed: {exc}")
+                    if target:
+                        authoritative_name = _case_law_name_for_cites(
+                            target.get("citation") or []
+                        )
+                        # CAP remains first choice.  If none of the exact
+                        # cluster's parallel reporters exists there, retain
+                        # CourtListener's own mixed capitalization rather than
+                        # relying on local title-casing guesses.
+                        if not authoritative_name:
+                            cl_name = courtlistener_case_name(target)
+                            if (cl_name and (not case_name
+                                    or _name_match_score(case_name, cl_name)
+                                    >= _NAME_MATCH_MIN)):
+                                authoritative_name = cl_name
             new_court = bb.get("court", "")
             if need_court and court_id:
                 new_court = _court_for_paren(
                     cite, court_id.strip().lower(), new_court
                 )
             new_year = year or bb.get("year", "")
-            if new_court != bb.get("court", "") or new_year != bb.get("year", ""):
-                self._post(self._apply_enriched_citation, new_court, new_year)
+            new_name = bb.get("name", "")
+            if authoritative_name:
+                new_name = abbreviate_case_name(
+                    normal_case_caption(authoritative_name)
+                )
+            if (new_court != bb.get("court", "")
+                    or new_year != bb.get("year", "")
+                    or new_name != bb.get("name", "")):
+                self._post(
+                    self._apply_enriched_citation, new_court, new_year, new_name
+                )
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -13705,9 +13859,16 @@ class _ScholarTextWindow:
                 print(f"[bb-enrich] docket lookup failed: {exc}")
         return court_id, year
 
-    def _apply_enriched_citation(self, court: str, year: str) -> None:
+    def _apply_enriched_citation(
+        self, court: str, year: str, name: str = ""
+    ) -> None:
+        old_history_key = self._history_key()
         self._bb["court"] = court
         self._bb["year"] = year
+        # A user edit always wins, including over a metadata request that began
+        # before the edit dialog was saved.
+        if name and not getattr(self, "_base_citation_override", ""):
+            self._bb["name"] = name
         try:
             title = self._title_citation()
             if title and self._win.winfo_exists():
@@ -13716,7 +13877,7 @@ class _ScholarTextWindow:
                 # enriched citation (court/year), without re-promoting it.
                 app = self._app
                 if app is not None and hasattr(app, "retitle_case_view"):
-                    app.retitle_case_view(self._history_key(), title)
+                    app.retitle_case_view(old_history_key, title)
         except tk.TclError:
             pass
 
@@ -13727,6 +13888,26 @@ class _ScholarTextWindow:
         """Return (plain, rtf-fragment) forms of the Bluebook citation.
         `extra_parens` follow the writer parenthetical — e.g. "footnote
         omitted" (Bluebook rule 5.2(d))."""
+        edited = getattr(self, "_base_citation_override", "")
+        if edited:
+            suffixes = tuple(p for p in (writer, *extra_parens) if p)
+            plain, name = format_edited_citation(edited, pin, suffixes)
+            rest = plain[len(name):]
+            name = name.replace("'", "’")
+            rest = rest.replace("'", "’")
+            plain = name + rest
+            if name:
+                rtf = (
+                    "\\par\\pard\\sa120 {\\i "
+                    + _rtf_escape(name)
+                    + "}"
+                    + _rtf_escape(rest)
+                    + "\\par\n"
+                )
+            else:
+                rtf = "\\par\\pard\\sa120 " + _rtf_escape(plain) + "\\par\n"
+            return plain, rtf
+
         bb = self._bb
         name, cite, court, year = bb["name"], bb["cite"], bb["court"], bb["year"]
         rest = ""

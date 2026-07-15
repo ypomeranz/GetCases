@@ -93,7 +93,7 @@ The app caches Google Scholar results and PDF downloads to speed up repeated loo
 
 For English Reports PDFs, if the app can’t fetch them directly, it will open a browser window for you to pass CloudFlare – once cleared, the PDF downloads automatically.
 
-All text viewers support copy with Bluebook citation (Ctrl+C / Cmd+C) – the copied text includes a properly formatted citation appended at the end.
+All text viewers support copy with Bluebook citation (Ctrl+C / Cmd+C) – the copied text includes a properly formatted citation appended at the end. In a case viewer, **Edit citation…** lets you correct the base citation once; the correction is saved locally and reused while pinpoint pages continue to be added automatically.
 
 You can export opinions from the Export ▾ menu: as RTF (two‑column, with running heads) for word processors; as a print‑ready PDF typeset with LaTeX (single column, justified, Century Schoolbook, footnotes at the foot of the page that cites them, and a running head showing the reporter page range visible on each sheet) if a LaTeX installation (TeX Live, MiKTeX, or Tectonic) is available; or as Markdown with footnotes and star pagination preserved – offered automatically when LaTeX isn’t installed.
 

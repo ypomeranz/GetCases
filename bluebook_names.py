@@ -430,7 +430,7 @@ _ORG_WORDS = {
     "dairy", "drug", "drugs", "farms", "foods", "furniture", "gas",
     "grocery", "hardware", "herald", "homes", "jewelers", "journal",
     "lines", "lodge", "lumber", "media", "mill", "mills", "ministries",
-    "motors", "news", "oil", "optical", "outfitters", "packing",
+    "motors", "news", "nursery", "oil", "optical", "outfitters", "packing",
     "pictures", "pizza", "post", "press", "realty", "records", "shop",
     "shops", "steel", "store", "stores", "studios", "supply", "temple",
     "theaters", "theatres", "times", "tribune", "trust", "works",
@@ -544,12 +544,181 @@ ahmed ahmad aharon akiva ali amit anil ari arjun aviva avi avram baruch
 boris chaim chana chaya devorah dimitri dmitri dov efraim eliezer elchanan
 esther ezriel fatima francois giovanni gitel hans hassan henri hiroshi
 hussein ibrahim igor jacques johan johanan jurgen kenji khalid klaus kofi
-kwame lars luigi malka meir menachem mendel mikhail minh mohamed mohammed
+kwame lars leinani luigi malka meir menachem mendel mikhail minh mohamed mohammed
 moshe mordechai muhammad naftali nikolai olaf pierre pinchas priya rajesh
 ramesh reuven rivka sanjay sergei shira shlomo shmuel sunil svetlana takeshi
 tatiana tova tzvi vijay vladimir werner wolfgang yaakov yael yehuda yehoshua
 yisroel yitzchak yochanan yosef yuri zev
 """.split())
+
+
+def is_recognized_given_name(token: str) -> bool:
+    """Whether *token* is a given name recognized by the conservative
+    personal-name heuristic used by this module.
+
+    Ordinary title-case caption parsing uses this before discarding a leading
+    word.  Mixed-case Scholar captions use :func:`is_personal_all_caps_run`.
+    """
+    key = re.sub(r"[^A-Za-z]", "", token or "").lower()
+    return bool(key and key in _GIVEN_NAMES)
+
+
+_NONPERSON_CAPS = frozenset({
+    "USA", "US", "U.S.", "FBI", "SEC", "IRS", "EPA", "NLRB", "FCC", "FTC",
+    "CATV", "LLC", "LLP", "LLLP", "PLLC", "PLC", "LP", "PC", "PA",
+    "KAISHA",
+})
+
+
+def is_personal_all_caps_run(
+    capitalized_tokens: list[str], dropped_tokens: list[str]
+) -> bool:
+    """Whether an all-caps run safely represents a person's surname.
+
+    This supports mixed Scholar captions such as ``Brent BREWBAKER`` while
+    explicitly rejecting entity initialisms in ``McDonald's USA``.
+    """
+    names: list[str] = []
+    for token in capitalized_tokens:
+        display = token.replace("’", "'").strip(",.")
+        key = re.sub(r"[^A-Za-z]", "", display).lower()
+        if (display in _NONPERSON_CAPS
+                or key in _ORG_WORDS
+                or key in _T6_WORDS):
+            return False
+        names.append(token)
+
+    # Do not gate this on the given-name dictionary: no static list can cover
+    # every litigant.  Instead require a capitalized, name-shaped prefix and
+    # prove that every retained caps token is surname-like rather than an
+    # organizational descriptor such as USA, MEDIA, or COMPANY.
+    dropped = list(dropped_tokens)
+    if len(dropped) >= 2 and [t.rstrip(".").lower() for t in dropped[:2]] == [
+        "the", "honorable"
+    ]:
+        dropped = dropped[2:]
+    if any(token.rstrip(".").lower() in {"a", "an", "the"} for token in dropped):
+        return False
+    return bool(names) and bool(dropped) and all(
+        bool(re.fullmatch(
+            r"[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]*|[A-Z]\."
+            r"|(?i:Mr|Mrs|Ms|Miss|Dr|Hon)\.",
+            token,
+        ))
+        for token in dropped
+    )
+
+
+_CAPS_ENTITY_SUFFIX_RE = re.compile(
+    r"(?:inc|incorporated|l\.?l\.?c|l\.?l\.?p|l\.?p|ltd|ltda|p\.?l\.?c|"
+    r"p\.?c|s\.?a|s\.?p\.?a|a\.?g|n\.?v|s\.?l|gmbh|co|corp|n\.?a)\.?",
+    re.IGNORECASE,
+)
+
+
+def collapse_personal_all_caps_run(text: str) -> str:
+    """Keep only an all-caps personal-name run in a mixed-case caption.
+
+    Scholar commonly renders a person as ``Corrine Morgan THOMAS``.  Entity
+    captions can look similar (``McDonald's USA, LLC``), so organizational
+    words and initialisms must not serve as evidence of a surname.
+    """
+    tokens = text.split()
+    kept_flags = [
+        (token.isupper() and len(token.strip(".,'")) > 1)
+        or token == "&"
+        or token.rstrip(".,").isdigit()
+        or bool(_CAPS_ENTITY_SUFFIX_RE.fullmatch(token.rstrip(",")))
+        for token in tokens
+    ]
+    kept = [token for token, keep in zip(tokens, kept_flags) if keep]
+    namey = [
+        token for token in kept
+        if token.isupper()
+        and len(token.strip(".,'")) > 1
+        and not _CAPS_ENTITY_SUFFIX_RE.fullmatch(token.strip(",."))
+    ]
+    dropped = [token for token, keep in zip(tokens, kept_flags) if not keep]
+    first_kept = next((i for i, keep in enumerate(kept_flags) if keep), len(tokens))
+    if any(not keep for keep in kept_flags[first_kept + 1:]):
+        return text
+    if (namey and len(kept) < len(tokens)
+            and is_personal_all_caps_run(namey, dropped)):
+        return " ".join(kept).strip(" ,;&")
+    return text
+
+
+_CAPTION_SMALL_WORDS = frozenset({
+    "of", "the", "and", "v", "vs", "in", "re", "for", "on", "a", "an",
+    "to", "by", "at", "as", "or", "ex", "rel", "et", "al", "de", "la",
+})
+_CAPTION_KEEP_CAPS = frozenset({
+    "LLC", "LLP", "LLLP", "PLLC", "PLC", "LP", "PC", "PA", "N.A.",
+    "U.S.", "USA", "FBI", "SEC", "IRS", "EPA", "NLRB", "FCC", "FTC",
+    "II", "III", "IV",
+})
+
+
+def normal_case_caption(text: str) -> str:
+    """Normal-case the all-caps words in a case caption without damaging
+    apostrophe or ``Mc`` surnames.
+
+    Mixed-case words (including brands such as ``NBCUniversal``) pass through
+    exactly as supplied.  When a source supplies only all caps, conventional
+    forms such as ``O'BRIEN`` and ``MCFADDEN`` become ``O'Brien`` and
+    ``McFadden``; truly unusual brand casing is later recoverable from the
+    reporter's authoritative metadata.
+    """
+    out: list[str] = []
+    for i, word in enumerate((text or "").split()):
+        letters = [c for c in word if c.isalpha()]
+        # Ordinary mixed case passes through, but a mostly-uppercase OCR form
+        # such as McFADDEN is still an all-caps word for normalization purposes.
+        if (not letters
+                or (any(c.islower() for c in letters)
+                    and sum(c.isupper() for c in letters) <= len(letters) // 2)):
+            out.append(word)
+            continue
+        stripped = word.replace("’", "'").strip(".,()'\"")
+        if (stripped in _CAPTION_KEEP_CAPS
+                or re.fullmatch(r"(?:[A-Z]\.)+", stripped)):
+            out.append(word)
+            continue
+        low = word.lower()
+        if i and low.strip(".,()'\"") in _CAPTION_SMALL_WORDS:
+            out.append(low)
+            continue
+
+        # Capitalize each apostrophe/hyphen component independently so Python's
+        # ordinary str.capitalize() does not produce O'brien.  Then apply the
+        # conventional internal capital after Mc.
+        pieces = re.split(r"(['’-])", low)
+        fixed = "".join(
+            piece[:1].upper() + piece[1:] if j % 2 == 0 and piece else piece
+            for j, piece in enumerate(pieces)
+        )
+        if fixed.startswith("Mc") and len(fixed) > 2 and fixed[2].isalpha():
+            fixed = "Mc" + fixed[2].upper() + fixed[3:]
+        out.append(fixed)
+    return " ".join(out)
+
+
+def courtlistener_case_name(record: dict) -> str:
+    """Return CourtListener's best case-name field without changing its case.
+
+    API endpoints use different key styles.  The abbreviated name is preferred
+    because it is closest to the form needed for a citation; the full caption
+    remains a fallback.  Preserving the API's casing lets names such as
+    ``NBCUniversal`` repair title-casing guesses when CAP metadata is absent.
+    """
+    if not isinstance(record, dict):
+        return ""
+    for key in ("case_name", "caseName", "case_name_full", "caseNameFull"):
+        value = re.sub(r"<[^>]+>", "", str(record.get(key) or ""))
+        value = re.sub(r"\s+", " ", value).strip()
+        if value:
+            return value
+    return ""
 
 def _plural(word: str, abbr: str) -> tuple[str, str] | None:
     """Derive the plural entry per T6 ("add s"), or None when the

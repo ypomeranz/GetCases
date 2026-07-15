@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Optional
 
 import citations
-from bluebook_names import abbreviate_case_name
+from bluebook_names import abbreviate_case_name, normal_case_caption
 
 _SCHEMA_VERSION = 2
 
@@ -201,24 +201,7 @@ def _smart_titlecase(s: str) -> str:
     abbreviator doesn't mistake an all-caps party for an initialism (which would
     turn 'ROE' into 'R.O.E.').  A ``tkinter``-free cousin of the GUI's
     ``_titlecase_caps``; mixed-case words and dotted initialisms pass through."""
-    out: list[str] = []
-    for i, w in enumerate(s.split()):
-        if any(c.islower() for c in w) or re.fullmatch(r"(?:[A-Za-z]\.)+,?", w):
-            out.append(w)  # already cased, or a dotted initialism (U.S., L.L.C.)
-            continue
-        bare = w.lower().strip(".,'")
-        if bare in _ENTITY_KEEP:
-            out.append(w)  # keep 'LLC', 'INC', … as written
-            continue
-        core = w.lower()
-        if i > 0 and bare in _CAPTION_SMALL:
-            out.append(core)
-            continue
-        word = "'".join(p[:1].upper() + p[1:] if p else p for p in core.split("'"))
-        if word.startswith("Mc") and len(word) > 2:
-            word = "Mc" + word[2].upper() + word[3:]
-        out.append(word)
-    return " ".join(out)
+    return normal_case_caption(s)
 
 
 def _norm_party_side(s: str) -> str:
