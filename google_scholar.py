@@ -661,7 +661,15 @@ _SEP_HEADER_RE = re.compile(
 # Syllabus disposition lines ("BLACKMUN, J., delivered the opinion…;
 # STEWART, J., filed a concurring opinion…") look like separate-opinion
 # headers but are not.
-_NOT_SEP_RE = re.compile(r"\b(?:filed|delivered|announced)\b", re.IGNORECASE)
+_NOT_SEP_RE = re.compile(
+    r"\b(?:filed|delivered|announced)\b"
+    # A vote/join note can mention somebody else's "dissenting opinion"
+    # without opening another opinion: "WHITE concurs in Paragraph 2 of
+    # BLACKMUN'S dissenting opinion."  The broad header pattern otherwise
+    # mistakes the referenced role word for White's own role.
+    r"|\bconcurs?\s+in\b.{0,160}\b(?:concurring|dissenting)\s+opinion\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # A separate opinion introduced *without* "concurring"/"dissenting": the bare
 # old-style attribution ("MR. JUSTICE HOLMES:" opening his separate opinion in
@@ -677,6 +685,24 @@ _BARE_SEP_HEADER_RE = re.compile(
     r"[A-Z][\w.'’-]+\s*[.:]"
     r"|[A-Z][\w.'’-]+,\s*(?:C\.\s*)?J\.)$",
     re.IGNORECASE,
+)
+
+# Some U.S. Reports separate opinions omit the role from the byline and put a
+# joinder clause there instead:
+#
+#   MR. JUSTICE BLACKMUN, with whom THE CHIEF JUSTICE and MR. JUSTICE BLACK join.
+#   I dissent, and I do so for two reasons: ...
+#
+# Treat the standalone joinder byline as a keyword-less attribution; the
+# following paragraphs determine whether it is a concurrence or dissent via
+# _peek_sep_kind.  Requiring the complete ``with whom ... join(s)`` form keeps
+# ordinary references to a justice, and syllabus lines that merely announce a
+# filed opinion, from becoming false boundaries.
+_JOINED_SEP_HEADER_RE = re.compile(
+    r"^\s*(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(?:CHIEF\s+)?JUSTICE\s+"
+    r"[A-Z][\w.'’-]+\s*,\s*with\s+whom\s+.{1,180}?\bjoins?\s*[.:]?\s*"
+    r"(?:(?:\[[^\]\s]{1,6}\]|[*†‡]|\d{1,2})\s*)*$",
+    re.IGNORECASE | re.DOTALL,
 )
 
 # An explicit hand-off to a separate opinion that never says which way it
@@ -954,6 +980,10 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
                 maj_author_idx = i
             else:
                 bare_headers.append((i, _peek_sep_kind(blocks, i), t))
+            continue
+        if len(t) <= 260 and _JOINED_SEP_HEADER_RE.match(t):
+            label = t if len(t) <= 90 else t[:87] + "…"
+            bare_headers.append((i, _peek_sep_kind(blocks, i), label))
             continue
         if _MAJ_PHRASE_RE.search(t[:160]) and _MAJ_ATTRIB_RE.match(t):
             # Candidates are collected over the whole document: an attribution
