@@ -111,6 +111,21 @@ class CaptionCapitalizationTests(unittest.TestCase):
                      "Miss Universe L.P. v. Smith"):
             self.assertEqual(abbreviate_case_name(name), name)
 
+    def test_mid_name_municipal_unit_is_omitted(self):
+        # Doremus v. Bd. of Educ. of Hawthorne, 342 U.S. 429 (1952): rule
+        # 10.2.1(f) omits "city of"/"borough of" and like expressions unless
+        # they begin the party name.
+        self.assertEqual(
+            abbreviate_case_name(normal_case_caption(
+                "DOREMUS ET AL. v. BOARD OF EDUCATION OF THE BOROUGH OF "
+                "HAWTHORNE ET AL.")),
+            "Doremus v. Bd. of Educ. of Hawthorne",
+        )
+        self.assertEqual(
+            abbreviate_case_name("City of New York v. Doe"),
+            "City of New York v. Doe",
+        )
+
     def test_caption_role_designations_are_stripped(self):
         self.assertEqual(
             abbreviate_case_name(

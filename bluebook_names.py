@@ -399,6 +399,17 @@ _MUNICIPAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The same unit expressions in mid-name position are omitted (rule
+# 10.2.1(f)): "Board of Education of the Borough of Hawthorne" -> "Board of
+# Education of Hawthorne", "Mayor of the City of New York" -> "Mayor of New
+# York".  The lookbehind confines the omission to mid-name — a party that
+# *begins* with the expression ("City of New York") is untouched.
+_MID_GEO_UNIT_RE = re.compile(
+    r"(?<=\w)(\s+of)\s+(?:the\s+)?"
+    r"(?:City|Town|Township|Village|Borough|County|Parish)\s+of\b",
+    re.IGNORECASE,
+)
+
 # The suffix mirror of the same rule: "Cook County", "Jefferson Parish", "New
 # York City" name a unit whose words together are the place's proper name, so
 # the whole party stays unabbreviated ("Soldal v. Cook County", never "Cook
@@ -1044,6 +1055,11 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     p = re.sub(r"\bUnited States of America\b", "United States", p,
                flags=re.IGNORECASE)
     p = _STATE_OF_RE.sub("", p)  # "State of Washington" -> "Washington"
+    # Rule 10.2.1(f): "city of," "county of," and like expressions are
+    # omitted unless they begin the party name — "Bd. of Educ. of the
+    # Borough of Hawthorne" -> "Bd. of Educ. of Hawthorne", while "City of
+    # New York" as the whole party keeps its prefix (handled below).
+    p = _MID_GEO_UNIT_RE.sub(r"\1", p)
 
     # Relator construction (rule 10.2.1(b)): split "<party> ex rel. <relator>".
     # The named party keeps its full geographic name (rule 10.2.2) — restored
@@ -1307,6 +1323,16 @@ if __name__ == "__main__":
         ("Township of Willingboro v. Doe", "Township of Willingboro v. Doe"),
         ("Parish of Jefferson v. Doe", "Parish of Jefferson v. Doe"),
         ("Town of Greece v. Susan Galloway", "Town of Greece v. Galloway"),
+        # Mid-name "city of"/"borough of" expressions are omitted (rule
+        # 10.2.1(f)); the same expression *beginning* a party name is kept
+        # (see the City/Village/Township cases above).
+        ("Doremus v. Board of Education of the Borough of Hawthorne",
+         "Doremus v. Bd. of Educ. of Hawthorne"),
+        ("Board of Education of Township of Piscataway v. Taxman",
+         "Bd. of Educ. of Piscataway v. Taxman"),
+        ("Board of Education of Kiryas Joel Village School District "
+         "v. Grumet",
+         "Bd. of Educ. of Kiryas Joel Vill. Sch. Dist. v. Grumet"),
         ("Soldal v. Cook County", "Soldal v. Cook County"),
         ("Los Angeles County v. Humphries", "Los Angeles County v. Humphries"),
         ("Washington County v. Gunther", "Washington County v. Gunther"),
