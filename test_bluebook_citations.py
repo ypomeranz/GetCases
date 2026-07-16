@@ -1,11 +1,15 @@
+import json
 import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 os.environ["GETCASES_SKIP_DEPENDENCY_PROMPT"] = "1"
 
 from bluebook_names import (
+    apply_caption_case_reference,
     abbreviate_case_name,
+    caption_case_reference_tokens,
     collapse_personal_all_caps_run,
     courtlistener_case_name,
     is_personal_all_caps_run,
@@ -26,6 +30,10 @@ from courtlistener_gui import (
     _cut_companion_cases,
     _nominative_display_cite,
     _pick_combined_opinion,
+    _recap_citation_ranges,
+    _recap_spec_index,
+    _scholar_caption_name,
+    _special_citation_ranges,
     _wisconsin_display_cite,
 )
 from google_scholar import Block, OpinionPart, Span
@@ -44,6 +52,11 @@ class CaptionCapitalizationTests(unittest.TestCase):
             normal_case_caption("NBCUniversal Media, LLC"),
             "NBCUniversal Media, LLC",
         )
+
+    def test_naacp_survives_all_caps_caption_normalization(self):
+        name = normal_case_caption("NAACP v. ALABAMA")
+        self.assertEqual(name, "NAACP v. Alabama")
+        self.assertEqual(abbreviate_case_name(name), "NAACP v. Alabama")
 
     def test_courtlistener_name_preserves_api_capitalization(self):
         self.assertEqual(
@@ -253,6 +266,40 @@ class CaptionCapitalizationTests(unittest.TestCase):
 
 
 class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
+    def test_in_re_caption_uses_alias_role_and_page_markers_as_boundaries(self):
+        blocks = [
+            Block("center", [
+                Span(
+                    "IN RE: IMERYS TALC AMERICA, INC., a/k/a Luzenac "
+                    "America, Inc. a/k/a Imerys Talc Ohio Inc. a/k/a "
+                    "Imerys Talc Delaware, Inc., et al., Debtors "
+                ),
+                Span("*362", pagenum=True),
+                Span(" Cyprus Historical Excess Insurers, Appellants."),
+            ]),
+            Block("para", [Span(
+                "Appellees Imerys Talc America, Inc. and its affiliates "
+                "filed for bankruptcy."
+            )]),
+        ]
+
+        name = _scholar_caption_name(blocks)
+
+        self.assertEqual(
+            abbreviate_case_name(name),
+            "In re Imerys Talc Am., Inc.",
+        )
+
+    def test_lowercase_words_do_not_end_a_procedural_case_name(self):
+        blocks = [Block("center", [Span(
+            "IN RE TITLE, BALLOT TITLE & SUBMISSION CLAUSE FOR 2015-2016 #156"
+        )])]
+
+        self.assertEqual(
+            _scholar_caption_name(blocks),
+            "In re Title, Ballot Title & Submission Clause for 2015-2016 #156",
+        )
+
     def test_multiple_party_words_are_omitted(self):
         # Rule 10.2.1(a): "et Wife", "et vir", "and Others" drop.
         self.assertEqual(
@@ -297,6 +344,17 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
         self.assertEqual(
             abbreviate_case_name("Ethel Aka v. Washington Hospital Center"),
             "Aka v. Wash. Hosp. Ctr.",
+        )
+
+    def test_in_re_alias_chain_and_role_tail_drop_as_one_unit(self):
+        self.assertEqual(
+            abbreviate_case_name(normal_case_caption(
+                "IN RE: IMERYS TALC AMERICA, INC., a/k/a Luzenac America, "
+                "Inc. a/k/a Imerys Talc Ohio Inc. a/k/a Imerys Talc "
+                "Delaware, Inc., et al., Debtors *362 Cyprus Historical "
+                "Excess Insurers, Appellants."
+            )),
+            "In re Imerys Talc Am., Inc.",
         )
 
     def test_turned_comma_apostrophe_surname(self):
@@ -420,6 +478,26 @@ class RefineCaptionCaseTests(unittest.TestCase):
             "AM General LLC v. Activision Blizzard, Inc.",
         )
 
+    def test_single_anchored_gmac_occurrence_restores_initialism(self):
+        # Murray v. GMAC Mortgage Corp., 434 F.3d 948 (7th Cir. 2006):
+        # the opinion spells the full name only once, then uses "GMACM".
+        name = normal_case_caption(
+            "MURRAY v. GMAC MORTGAGE CORPORATION")
+        body = (
+            "After her debts had been discharged, Nancy Murray received a "
+            "credit solicitation from GMAC Mortgage, which had learned her "
+            "address from credit bureaus. GMACM offered Murray a loan."
+        )
+
+        refined = refine_caption_case(name, body)
+
+        self.assertEqual(refined, "Murray v. GMAC Mortgage Corporation")
+        self.assertEqual(caption_case_reference_tokens(refined, body), ())
+        self.assertEqual(
+            abbreviate_case_name(refined),
+            "Murray v. GMAC Mortg. Corp.",
+        )
+
     def test_caps_styled_surnames_are_typography_not_spelling(self):
         # Opinions that set party surnames in caps mid-prose must not
         # rewrite the caption's ordinary spelling.
@@ -443,6 +521,39 @@ class RefineCaptionCaseTests(unittest.TestCase):
         self.assertEqual(
             normal_case_caption("MERCEXCHANGE, L.L.C."),
             "Mercexchange, L.L.C.",
+        )
+
+    def test_opinion_evidence_prevents_entity_reference_lookup(self):
+        name = normal_case_caption("NBCUNIVERSAL MEDIA, LLC v. DOE")
+        body = ("NBCUniversal Media, LLC distributes programming. "
+                "Doe later contacted NBCUniversal Media.")
+        refined = refine_caption_case(name, body)
+
+        self.assertEqual(refined, "NBCUniversal Media, LLC v. Doe")
+        self.assertEqual(caption_case_reference_tokens(refined, body), ())
+
+    def test_reference_can_only_donate_case_to_existing_words(self):
+        name = normal_case_caption("NBCUNIVERSAL MEDIA, LLC v. DOE")
+        unresolved = caption_case_reference_tokens(name, "")
+
+        self.assertEqual(unresolved, ("nbcuniversal",))
+        self.assertEqual(
+            apply_caption_case_reference(
+                name,
+                "NBCUniversal Holdings, LLC v. Completely Different Party",
+                unresolved,
+            ),
+            "NBCUniversal Media, LLC v. Doe",
+        )
+
+    def test_reference_with_different_parties_cannot_substitute_caption(self):
+        name = "Nbcuniversal Media, LLC v. Doe"
+        self.assertEqual(
+            apply_caption_case_reference(
+                name, "Another Plaintiff v. Another Defendant",
+                ("nbcuniversal",),
+            ),
+            name,
         )
 
 
@@ -493,6 +604,44 @@ class ReporterAndDecisionDateTests(unittest.TestCase):
                     _nominative_display_cite(modern, [modern, nominative]),
                     expected,
                 )
+
+    def test_early_scotus_window_title_does_not_repeat_combined_reporters(self):
+        win = object.__new__(_ScholarTextWindow)
+        win._base_citation_override = ""
+        win._bb = {
+            "name": "Stuart v. Laird",
+            "cite": "5 U.S. 299",
+            "display_cite": "5 U.S. (1 Cranch) 299",
+            "court": "",
+            "year": "1803",
+            "omit_parenthetical": "",
+        }
+        win._header_cites = ["5 U.S. 299", "1 Cranch 299"]
+        win._item = {"citation": ["5 U.S. 299", "1 Cranch 299"]}
+
+        self.assertEqual(
+            win._title_citation(),
+            "Stuart v. Laird, 5 U.S. (1 Cranch) 299 (1803)",
+        )
+
+    def test_early_scotus_window_title_keeps_parallels_without_combined_cite(self):
+        win = object.__new__(_ScholarTextWindow)
+        win._base_citation_override = ""
+        win._bb = {
+            "name": "Stuart v. Laird",
+            "cite": "5 U.S. 299",
+            "display_cite": "5 U.S. 299",
+            "court": "",
+            "year": "1803",
+            "omit_parenthetical": "",
+        }
+        win._header_cites = ["1 Cranch 299"]
+        win._item = {"citation": []}
+
+        self.assertEqual(
+            win._title_citation(),
+            "Stuart v. Laird, 5 U.S. 299, 1 Cranch 299 (1803)",
+        )
 
     def test_scotus_header_year_beats_rehearing_date(self):
         win = object.__new__(_ScholarTextWindow)
@@ -570,6 +719,210 @@ class ReporterAndDecisionDateTests(unittest.TestCase):
         bb = win._compute_bluebook_parts()
 
         self.assertEqual(bb["display_cite"], "409 Mich. 672")
+
+
+class CitationEnrichmentTriggerTests(unittest.TestCase):
+    @staticmethod
+    def _win(*, court: str, year: str, is_scotus: bool = False):
+        win = object.__new__(_ScholarTextWindow)
+        win._bb = {
+            "name": "Example v. Example",
+            "cite": "10 F.4th 20",
+            "court": court,
+            "year": year,
+        }
+        win._item = {"citation": ["10 F.4th 20"]}
+        win._header_cites = []
+        win._base_citation_override = ""
+        win._is_scotus = is_scotus
+        win._app = None
+        win._post = Mock()
+        return win
+
+    def test_known_opinion_court_and_year_start_no_external_work(self):
+        win = object.__new__(_ScholarTextWindow)
+        win._item = {}
+        win._blocks = [
+            Block("center", [Span("10 F.4th 20 (2024)")]),
+            Block("center", [Span("Example v. Example")]),
+            Block("center", [Span(
+                "United States Court of Appeals, Eleventh Circuit."
+            )]),
+            Block("para", [Span("JORDAN, Circuit Judge:")]),
+        ]
+        win._bb = win._compute_bluebook_parts()
+        win._base_citation_override = ""
+        win._app = None
+        win._post = Mock()
+
+        self.assertEqual(win._bb["court"], "11th Cir.")
+        self.assertEqual(win._bb["year"], "2024")
+
+        with (
+            patch("courtlistener_gui.threading.Thread") as thread,
+            patch("courtlistener_gui._case_law_name_for_cites") as cap_name,
+            patch("courtlistener_gui._case_law_metadata") as cap_metadata,
+            patch("courtlistener_gui._cl_item_for_citation") as cl_lookup,
+        ):
+            win._enrich_citation()
+
+        thread.assert_not_called()
+        cap_name.assert_not_called()
+        cap_metadata.assert_not_called()
+        cl_lookup.assert_not_called()
+
+    def test_opened_opinion_caption_controls_and_local_body_fixes_case(self):
+        win = object.__new__(_ScholarTextWindow)
+        win._item = {
+            "case_name": "Different Metadata Name v. Other Party",
+            "citation": ["10 F.4th 20"],
+        }
+        win._blocks = [
+            Block("center", [Span("NBCUNIVERSAL MEDIA, LLC v. DOE")]),
+            Block("center", [Span("10 F.4th 20 (2024)")]),
+            Block("center", [Span(
+                "United States Court of Appeals, Eleventh Circuit."
+            )]),
+            Block("para", [Span(
+                "NBCUniversal Media, LLC sued Doe. "
+                "NBCUniversal Media later appealed."
+            )]),
+        ]
+
+        win._bb = win._compute_bluebook_parts()
+        win._base_citation_override = ""
+        win._app = None
+        win._post = Mock()
+
+        self.assertEqual(win._bb["name"], "NBCUniversal Media, LLC v. Doe")
+        self.assertEqual(win._bb["_caption_case_unresolved"], ())
+        with (
+            patch("courtlistener_gui.threading.Thread") as thread,
+            patch("courtlistener_gui._case_law_name_for_cites") as cap_name,
+        ):
+            win._enrich_citation()
+        thread.assert_not_called()
+        cap_name.assert_not_called()
+
+    def test_known_scotus_status_and_year_start_no_external_work(self):
+        # A Supreme Court citation correctly has no court abbreviation in its
+        # parenthetical; known SCOTUS status satisfies the court requirement.
+        win = self._win(court="", year="2024", is_scotus=True)
+
+        with patch("courtlistener_gui.threading.Thread") as thread:
+            win._enrich_citation()
+
+        thread.assert_not_called()
+
+    def test_missing_year_starts_the_enrichment_path(self):
+        win = self._win(court="11th Cir.", year="")
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with (
+            patch("courtlistener_gui.threading.Thread", ImmediateThread),
+            patch("courtlistener_gui._case_law_name_for_cites") as cap_name,
+            patch(
+                "courtlistener_gui._case_law_metadata",
+                return_value={"decision_date": "2023-06-01"},
+            ) as cap_metadata,
+        ):
+            win._enrich_citation()
+
+        cap_name.assert_not_called()
+        cap_metadata.assert_called_once_with("10 F.4th 20")
+        win._post.assert_called_once()
+
+    def test_unresolved_entity_case_uses_only_capitalization_donor(self):
+        win = self._win(court="11th Cir.", year="2024")
+        win._bb["name"] = "Nbcuniversal Media, LLC v. Doe"
+        win._bb["_caption_case_unresolved"] = ("nbcuniversal",)
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with (
+            patch("courtlistener_gui.threading.Thread", ImmediateThread),
+            patch(
+                "courtlistener_gui._case_law_name_for_cites",
+                return_value=(
+                    "NBCUniversal Holdings, LLC v. Completely Different Party"
+                ),
+            ) as cap_name,
+            patch("courtlistener_gui._case_law_metadata") as cap_metadata,
+            patch("courtlistener_gui._cl_item_for_citation") as cl_lookup,
+        ):
+            win._enrich_citation()
+
+        cap_name.assert_called_once()
+        cap_metadata.assert_not_called()
+        cl_lookup.assert_not_called()
+        win._post.assert_called_once_with(
+            win._apply_enriched_citation,
+            "11th Cir.",
+            "2024",
+            "NBCUniversal Media, LLC v. Doe",
+        )
+
+
+class OpinionUnpublishedCaseLinkTests(unittest.TestCase):
+    def test_wl_link_inherits_docket_from_full_opinion_text(self):
+        full_text = (
+            "Care One Mgmt., LLC v. United Healthcare Workers E., "
+            "No. 12-6371, 2024 WL 1327972, at *7 "
+            "(D.N.J. Mar. 28, 2024). Later the court cited "
+            "2024 WL 1327972, at *9 (D.N.J. Mar. 28, 2024)."
+        )
+        index = _recap_spec_index(full_text)
+
+        ranges = _recap_citation_ranges(
+            "2024 WL 1327972, at *9 (D.N.J. Mar. 28, 2024).",
+            index,
+        )
+
+        self.assertEqual(len(ranges), 1)
+        self.assertEqual(ranges[0][2][0], "recap")
+        spec = json.loads(ranges[0][2][1])
+        self.assertEqual(spec["docket"], "12-6371")
+        self.assertEqual(spec["court"], "njd")
+        self.assertEqual(spec["date"], "2024-03-28")
+
+    def test_docket_only_opinion_citation_gets_recap_action(self):
+        text = (
+            "Peninsula Pathology Assocs. v. Am. Int'l Indus., "
+            "No. 23-1971 (4th Cir. Feb. 12, 2024)"
+        )
+
+        ranges = _special_citation_ranges([Span(text)], {})
+
+        self.assertEqual(len(ranges), 1)
+        self.assertEqual(ranges[0][2][0], "recap")
+        spec = json.loads(ranges[0][2][1])
+        self.assertEqual(spec["docket"], "23-1971")
+        self.assertEqual(spec["court"], "ca4")
+
+    def test_opinion_recap_action_uses_brief_reader_opener(self):
+        win = object.__new__(_ScholarTextWindow)
+        spec = json.dumps({"docket": "23-1971", "court": "ca4"})
+        win._link_actions = {"link": ("recap", spec)}
+        win._app = Mock()
+        win._win = Mock()
+        win._status_var = Mock()
+
+        with patch("courtlistener_gui._open_recap_citation") as opener:
+            win._follow_link("link")
+
+        opener.assert_called_once_with(
+            win._app, win._win, spec, win._status_var.set)
 
 
 class FederalTrialCourtTests(unittest.TestCase):

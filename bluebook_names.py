@@ -681,7 +681,7 @@ _CAPTION_SMALL_WORDS = frozenset({
 _CAPTION_KEEP_CAPS = frozenset({
     "LLC", "LLP", "LLLP", "PLLC", "PLC", "LP", "PC", "PA", "N.A.",
     "U.S.", "USA", "FBI", "SEC", "IRS", "EPA", "NLRB", "FCC", "FTC",
-    "II", "III", "IV",
+    "NAACP", "II", "III", "IV",
 })
 
 
@@ -754,6 +754,76 @@ def normal_case_caption(text: str) -> str:
     return " ".join(out)
 
 
+def _caption_token_case_votes(
+    tokens: list[str], cores: list[str], i: int, body_text: str,
+) -> tuple[dict[str, int], bool]:
+    """Return prose spellings for one caption token and whether they are
+    unanchored.
+
+    Keeping this evidence collection separate lets both local refinement and
+    the external-fallback gate apply exactly the same reliability rules.
+    """
+    core = cores[i]
+    votes: dict[str, int] = {}
+    for j in (i - 1, i + 1):
+        if not 0 <= j < len(tokens):
+            continue
+        nb = cores[j]
+        if len(nb) < 2 or nb.lower() in ("v", "vs"):
+            continue
+        # The caption may abbreviate what the prose spells out
+        # ("Corp." / "Corporation"): let the anchor run on in lowercase.
+        nb_pat = re.escape(nb) + r"[a-z]*"
+        if j < i:
+            pat = re.compile(
+                r"\b(%s)[\W_]{1,3}(%s)\b" % (nb_pat, re.escape(core)),
+                re.IGNORECASE)
+            g_tok, g_nb = 2, 1
+        else:
+            pat = re.compile(
+                r"\b(%s)[\W_]{1,3}(%s)\b" % (re.escape(core), nb_pat),
+                re.IGNORECASE)
+            g_tok, g_nb = 1, 2
+        for m in pat.finditer(body_text):
+            if not re.search(r"[a-z]", m.group(g_nb)):
+                continue  # all-caps context: no casing signal
+            spelling = m.group(g_tok)
+            if not spelling.islower():
+                votes[spelling] = votes.get(spelling, 0) + 1
+    unanchored = not votes
+    if unanchored:
+        for m in re.finditer(r"\b%s\b" % re.escape(core), body_text,
+                             re.IGNORECASE):
+            spelling = m.group(0)
+            if not spelling.islower():
+                votes[spelling] = votes.get(spelling, 0) + 1
+    return votes, unanchored
+
+
+def _reliable_caption_spelling(
+    core: str, votes: dict[str, int], unanchored: bool,
+) -> str:
+    """The spelling supported strongly enough to use, or an empty string."""
+    if not votes:
+        return ""
+    best = max(votes, key=lambda s: votes[s])
+    cur = votes.get(core, 0)
+    if best != core and votes[best] <= cur:
+        best = core
+    if best.isupper():
+        if len(core) > 4:
+            return ""  # long caps are typography, not acronym spelling
+        if unanchored and (votes[best] < 3 or votes[best] <= 2 * cur):
+            return ""
+        # One occurrence is enough when an adjacent caption word anchors it
+        # in ordinary mixed-case prose ("GMAC Mortgage").  The stricter
+        # repeated-evidence rule remains for bare occurrences, where an
+        # opinion's small-caps treatment of a surname could look identical.
+    elif unanchored and votes[best] < 2:
+        return ""
+    return best
+
+
 def refine_caption_case(name: str, body_text: str) -> str:
     """Correct title-casing guesses for an all-caps caption by consulting
     the opinion's own mixed-case prose.
@@ -776,9 +846,10 @@ def refine_caption_case(name: str, body_text: str) -> str:
         and is ignored;
       * an all-lowercase spelling is never adopted — prose legitimately
         lowercases articles ("the Boeing Company") that a caption keeps;
-      * an ALL-CAPS spelling is adopted only for initialism-length tokens
-        (≤ 4 letters) with repeated evidence: opinions that set party
-        surnames in caps ("SMITH argues…") are typography, not spelling.
+      * an ALL-CAPS spelling is adopted only for initialism-length tokens.
+        One occurrence suffices when a mixed-case adjacent party-name word
+        anchors it; otherwise repeated evidence is required because opinions
+        may set party surnames in caps.
     """
     if not name or not body_text:
         return name
@@ -791,54 +862,115 @@ def refine_caption_case(name: str, body_text: str) -> str:
         if (len(core) < 2 or core.lower() in ("v", "vs")
                 or not tok.strip(".,;:()'\"").isalpha()):
             continue
-        votes: dict[str, int] = {}
-        for j in (i - 1, i + 1):
-            if not 0 <= j < len(tokens):
-                continue
-            nb = cores[j]
-            if len(nb) < 2 or nb.lower() in ("v", "vs"):
-                continue
-            # The caption may abbreviate what the prose spells out
-            # ("Corp." / "Corporation"): let the anchor run on in lowercase.
-            nb_pat = re.escape(nb) + r"[a-z]*"
-            if j < i:
-                pat = re.compile(
-                    r"\b(%s)[\W_]{1,3}(%s)\b" % (nb_pat, re.escape(core)),
-                    re.IGNORECASE)
-                g_tok, g_nb = 2, 1
-            else:
-                pat = re.compile(
-                    r"\b(%s)[\W_]{1,3}(%s)\b" % (re.escape(core), nb_pat),
-                    re.IGNORECASE)
-                g_tok, g_nb = 1, 2
-            for m in pat.finditer(body_text):
-                if not re.search(r"[a-z]", m.group(g_nb)):
-                    continue  # all-caps context: no casing signal
-                spelling = m.group(g_tok)
-                if not spelling.islower():
-                    votes[spelling] = votes.get(spelling, 0) + 1
-        unanchored = not votes
-        if unanchored:
-            for m in re.finditer(r"\b%s\b" % re.escape(core), body_text,
-                                 re.IGNORECASE):
-                spelling = m.group(0)
-                if not spelling.islower():
-                    votes[spelling] = votes.get(spelling, 0) + 1
-        if not votes:
-            continue
-        best = max(votes, key=lambda s: votes[s])
-        cur = votes.get(core, 0)
-        if best == core or votes[best] <= cur:
-            continue
-        if best.isupper():
-            if len(core) > 4 or votes[best] < 2:
-                continue  # caps typography, not spelling
-            if unanchored and (votes[best] < 3 or votes[best] <= 2 * cur):
-                continue
-        elif unanchored and votes[best] < 2:
-            continue
-        tokens[i] = tok.replace(core, best)
+        votes, unanchored = _caption_token_case_votes(
+            tokens, cores, i, body_text)
+        best = _reliable_caption_spelling(core, votes, unanchored)
+        if best and best != core:
+            tokens[i] = tok.replace(core, best)
     return " ".join(tokens)
+
+
+_CAPTION_ENTITY_MARKERS = frozenset({
+    "association", "associates", "authority", "bank", "board", "company",
+    "co", "communications", "corp", "corporation", "enterprises",
+    "foundation", "group", "holdings", "hospital", "inc", "industries",
+    "insurance", "limited", "llc", "llp", "lp", "media", "mortgage",
+    "network", "partners", "plc", "products", "services", "systems",
+    "technologies", "technology", "trust", "university",
+})
+_CAPTION_ORDINARY_ENTITY_WORDS = _CAPTION_ENTITY_MARKERS | frozenset({
+    "american", "central", "city", "county", "department", "east",
+    "eastern", "federal", "first", "general", "health", "international",
+    "medical", "mutual", "national", "new", "north", "northern", "public",
+    "resources", "school", "south", "southern", "state", "states", "the",
+    "united", "west", "western",
+})
+
+
+def caption_case_reference_tokens(name: str, body_text: str) -> tuple[str, ...]:
+    """Return entity-name tokens whose capitalization remains unresolved.
+
+    The fallback is intentionally narrow: a token must have been reduced to
+    ordinary title case, look like an organization-specific word, and lack
+    reliable mixed-case evidence in the opinion itself.  Ordinary party names
+    therefore do not cause an external lookup merely because the caption was
+    printed in capitals.
+    """
+    tokens = name.split()
+    cores = [re.sub(r"[^A-Za-z]", "", t) for t in tokens]
+    result: list[str] = []
+    start = 0
+    parties: list[range] = []
+    for i, core in enumerate(cores):
+        if core.lower() in ("v", "vs"):
+            parties.append(range(start, i))
+            start = i + 1
+    parties.append(range(start, len(tokens)))
+
+    for party in parties:
+        party_words = {cores[i].lower() for i in party if cores[i]}
+        entity_context = bool(party_words & _CAPTION_ENTITY_MARKERS)
+        for i in party:
+            core = cores[i]
+            low = core.lower()
+            if (len(core) < 5 or not core[:1].isupper()
+                    or not core[1:].islower()
+                    or not tokens[i].strip(".,;:()'\"").isalpha()
+                    or low in _CAPTION_ORDINARY_ENTITY_WORDS):
+                continue
+            # A long apparent compound containing an organization word (as
+            # in Nbcuniversal) is entity-like even when no suffix survived.
+            compound_entity = len(core) >= 8 and any(
+                marker in low[2:] for marker in (
+                    "media", "network", "systems", "tech", "universal",
+                    "global", "communications", "entertainment",
+                )
+            )
+            if not (entity_context or compound_entity):
+                continue
+            votes, unanchored = _caption_token_case_votes(
+                tokens, cores, i, body_text or "")
+            if _reliable_caption_spelling(core, votes, unanchored):
+                continue
+            if low not in result:
+                result.append(low)
+    return tuple(result)
+
+
+def apply_caption_case_reference(
+    name: str, reference_name: str, unresolved: tuple[str, ...],
+) -> str:
+    """Copy casing for unresolved *existing* words from a reference caption.
+
+    This cannot substitute a case name: only case-insensitively identical
+    tokens are changed, so words, punctuation, party order, and caption length
+    remain those derived from the opinion.
+    """
+    wanted = set(unresolved)
+    if not name or not reference_name or not wanted:
+        return name
+    spellings: dict[str, set[str]] = {}
+    for m in re.finditer(r"[A-Za-z]+", reference_name):
+        spelling = m.group(0)
+        key = spelling.lower()
+        if key not in wanted or spelling.islower():
+            continue
+        # Long ALL-CAPS words in metadata may be display typography rather
+        # than an entity's spelling.  Mixed case is the useful brand signal.
+        if spelling.isupper() and len(spelling) > 4:
+            continue
+        spellings.setdefault(key, set()).add(spelling)
+    donors = {
+        key: next(iter(values)) for key, values in spellings.items()
+        if len(values) == 1
+    }
+    if not donors:
+        return name
+    return re.sub(
+        r"[A-Za-z]+",
+        lambda m: donors.get(m.group(0).lower(), m.group(0)),
+        name,
+    )
 
 
 def courtlistener_case_name(record: dict) -> str:
@@ -846,8 +978,9 @@ def courtlistener_case_name(record: dict) -> str:
 
     API endpoints use different key styles.  The abbreviated name is preferred
     because it is closest to the form needed for a citation; the full caption
-    remains a fallback.  Preserving the API's casing lets names such as
-    ``NBCUniversal`` repair title-casing guesses when CAP metadata is absent.
+    remains a fallback.  Callers that use this metadata for matching need the
+    source spelling preserved even though it must not replace an opened
+    opinion's own caption.
     """
     if not isinstance(record, dict):
         return ""
@@ -1424,12 +1557,15 @@ def abbreviate_case_name(name: str) -> str:
     # A d/b/a or a/k/a clause names an alias, not the party; when the alias
     # is the citation name it replaced the party upstream, so a surviving
     # clause drops: "…Life Advocates, dba NIFLA, et al." / "Robertson
-    # a/k/a Mitchell Robinson a/k/a …".  Bare "aka" is left alone — it is
-    # a real surname (Aka v. Wash. Hosp. Ctr.).
+    # a/k/a Mitchell Robinson a/k/a …".  Once an alias marker begins, the
+    # remainder of that party is alias/designation matter; consuming it as a
+    # unit avoids leaving corporate-suffix debris from a chain of aliases.
+    # Bare "aka" is left alone — it is a real surname (Aka v. Wash. Hosp.
+    # Ctr.).
     name = re.sub(
         r",?\s+(?:d/b/a|d\.b\.a\.|dba|a/k/a|a\.k\.a\.|f/k/a|f\.k\.a\.|"
         r"doing\s+business\s+as|also\s+known\s+as|formerly\s+known\s+as)\s+"
-        r"[^,;]*?(?=,|;|\s+vs?\.\s+|$)",
+        r".*?(?=\s+vs?\.\s+|$)",
         "", name, flags=re.IGNORECASE)
     if not name:
         return name

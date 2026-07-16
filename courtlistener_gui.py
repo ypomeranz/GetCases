@@ -598,7 +598,9 @@ def _ensure_modern_ttk_styles(widget: tk.Misc) -> None:
 
 
 from bluebook_names import (
+    apply_caption_case_reference,
     abbreviate_case_name,
+    caption_case_reference_tokens,
     collapse_personal_all_caps_run,
     courtlistener_case_name,
     is_recognized_given_name,
@@ -638,6 +640,8 @@ from citations import (
     build_short_cite_index as _build_short_cite_index,
     cite_target_from_text as _cite_target_from_text,
     detect_links as detect_brief_links,
+    iter_docket_cites as _iter_docket_cites,
+    iter_recap_cites as _iter_recap_cites,
 )
 from court_catalog import (
     CATALOG as _COURT_CATALOG,
@@ -1392,6 +1396,12 @@ _NOMINATIVE_CITE_RE = re.compile(
     r"\b(\d{1,2})\s+(Dall|Dallas|Cranch|Wheat|Wheaton|Pet|Peters|How|Howard|"
     r"Black|Wall|Wallace)\.?\s+(\d{1,4})\b"
 )
+_NOMINATIVE_DISPLAY_RE = re.compile(
+    r"^\s*(\d+)\s+U\.S\.\s+\((\d+)\s+"
+    r"(Dall|Dallas|Cranch|Wheat|Wheaton|Pet|Peters|How|Howard|"
+    r"Black|Wall|Wallace)\.?\)\s+(\d+)\s*$",
+    re.IGNORECASE,
+)
 
 _WI_NEUTRAL_CITE_RE = re.compile(r"^\d{4}\s+WI(?:\s+App)?\s+\d+$")
 _WI_OFFICIAL_CITE_RE = re.compile(r"^\d+\s+Wis\.\s*(?:2d\s+)?\d+$")
@@ -1422,6 +1432,28 @@ def _nominative_display_cite(us_cite: str, citations) -> str:
         reporter = _NOMINATIVE_CANON.get(nm.group(2).lower(), nm.group(2))
         return f"{um.group(1)} U.S. ({nm.group(1)} {reporter}) {um.group(2)}"
     return ""
+
+
+def _nominative_display_component_keys(display_cite: str) -> set[str]:
+    """Normalized component cites represented by a combined nominative cite.
+
+    ``5 U.S. (1 Cranch) 299`` already conveys both ``5 U.S. 299`` and
+    ``1 Cranch 299``.  Returning their identity keys lets the case-window title
+    suppress those redundant standalone parallels while retaining them when a
+    combined display cite could not be built.
+    """
+    m = _NOMINATIVE_DISPLAY_RE.fullmatch(display_cite or "")
+    if not m:
+        return set()
+    reporter = _NOMINATIVE_CANON.get(m.group(3).lower(), m.group(3))
+    components = (
+        f"{m.group(1)} U.S. {m.group(4)}",
+        f"{m.group(2)} {reporter} {m.group(4)}",
+    )
+    return {
+        re.sub(r"[^a-z0-9]", "", component.lower())
+        for component in components
+    }
 
 
 def _wisconsin_display_cite(citations) -> str:
@@ -1534,7 +1566,11 @@ _CAP_VENDOR_REPORTER_RE = re.compile(
 
 
 def _case_law_name_for_cites(cites) -> str:
-    """First authoritative case name available for these parallel reporters."""
+    """First CAP caption usable as a capitalization reference.
+
+    An opened opinion's case name remains authoritative; callers may copy only
+    casing for identical words from this value, never substitute the caption.
+    """
     seen: set[str] = set()
     attempted = 0
     for raw in cites:
@@ -1701,13 +1737,50 @@ _CITE_CONNECTIVE_RE = re.compile(
 _CITE_YEAR_RE = re.compile(r"\s*\(\d{4}[a-z]?\)")
 
 
-def _special_citation_ranges(spans) -> "list[tuple[int, int, tuple[str, str]]]":
+def _recap_cite_key(cite: str) -> str:
+    """Stable lookup key for a WL/LEXIS citation."""
+    return re.sub(r"[^a-z0-9]", "", (cite or "").lower())
+
+
+def _recap_spec_index(text: str) -> dict[str, str]:
+    """WL/LEXIS cite → merged RECAP spec for a whole opinion.
+
+    The brief detector carries a docket printed in the first full citation to
+    later short-form occurrences.  Building this once per opinion preserves
+    that behavior even though the opinion reader renders one block at a time.
+    """
+    out: dict[str, str] = {}
+    for start, end, spec in _iter_recap_cites(text or ""):
+        if spec:
+            out[_recap_cite_key(text[start:end])] = spec
+    return out
+
+
+def _recap_citation_ranges(
+    text: str, spec_index: Optional[dict[str, str]] = None,
+) -> list[tuple[int, int, tuple[str, str]]]:
+    """RECAP link ranges in one rendered block, using whole-opinion context."""
+    out: list[tuple[int, int, tuple[str, str]]] = []
+    index = spec_index or {}
+    for start, end, spec in _iter_recap_cites(text or ""):
+        spec = spec or index.get(_recap_cite_key(text[start:end]))
+        if spec:
+            out.append((start, end, ("recap", spec)))
+    for start, end, spec in _iter_docket_cites(text or ""):
+        out.append((start, end, ("recap", spec)))
+    return out
+
+
+def _special_citation_ranges(
+    spans, recap_spec_index: Optional[dict[str, str]] = None,
+) -> "list[tuple[int, int, tuple[str, str]]]":
     """Character ranges in a block's concatenated span text that should render
     as a single one of *our* links instead of Google Scholar's, paired with the
     action to use:
 
       * English Reports cites in our index → ("engrep", spec) — the CommonLII scan
       * Federal Appendix cites             → ("cite", cite)   — the case.law PDF
+      * unpublished federal cases          → ("recap", spec)  — RECAP/docket
 
     Each such cite is extended forward over a trailing "(year)" and backward over
     any parallel citations to a Scholar-hyperlinked case name, so the whole
@@ -1736,6 +1809,7 @@ def _special_citation_ranges(spans) -> "list[tuple[int, int, tuple[str, str]]]":
 
     # The cites we link ourselves, as (start, end, action).
     targets: list[tuple[int, int, tuple[str, str]]] = []
+    targets.extend(_recap_citation_ranges(text, recap_spec_index))
     for m in eng_rep.ER_CITE_RE.finditer(text):
         spec = eng_rep.cite_spec(m)
         if eng_rep.resolve(spec):  # only cases we actually have
@@ -7839,6 +7913,34 @@ def _cut_companion_cases(text: str) -> str:
     return text
 
 
+_PROCEDURAL_ALIAS_RE = re.compile(
+    r",?\s+(?:d/b/a|d\.b\.a\.|dba|a/k/a|a\.k\.a\.|f/k/a|f\.k\.a\.|"
+    r"doing\s+business\s+as|also\s+known\s+as|formerly\s+known\s+as)\s+",
+    re.IGNORECASE,
+)
+
+
+def _trim_procedural_caption(text: str) -> str:
+    """Remove structural matter following an ``In re``-style case name.
+
+    Lowercase text alone is not a boundary (``In re Estate of Smith`` and
+    ballot-title matters need it).  Alias introductions and comma-delimited
+    litigation roles are reliable boundaries, however: neither identifies the
+    primary party used in the citation.  Cutting at the marker also handles a
+    run of aliases whose individual corporate suffixes contain commas.
+    """
+    alias = _PROCEDURAL_ALIAS_RE.search(text or "")
+    if alias:
+        text = text[:alias.start()]
+    text = re.sub(
+        r",\s*(?:et\s+al\.?|debtors?|appellants?|appellees?|petitioners?|"
+        r"respondents?|relators?|movants?|claimants?|plaintiffs?|defendants?|"
+        r"creditors?|trustees?)\b.*$",
+        "", text, flags=re.IGNORECASE,
+    )
+    return text.strip().rstrip(",")
+
+
 def _scholar_caption_name(blocks) -> str:
     """Bluebook case name derived from the Scholar page's party caption."""
     for b in blocks[:8]:
@@ -7847,7 +7949,12 @@ def _scholar_caption_name(blocks) -> str:
         # Keep a trailing period here — it may belong to an entity abbreviation
         # ending the caption ("… v. Acme Co."); _caption_party drops only a
         # stray one.
-        t = re.sub(r"\s+", " ", b.text()).strip()
+        # A reporter star-page can occur in the middle of a long, wrapped
+        # caption.  It is pagination metadata, not part of the case name.
+        t = re.sub(
+            r"\s+", " ",
+            "".join(s.text for s in b.spans if not s.pagenum),
+        ).strip()
         # An Alabama-style "(Re <underlying case>)" cross-reference carries
         # its own " v. " and would masquerade as this case's caption.
         t = strip_related_case_note(t)
@@ -7860,11 +7967,7 @@ def _scholar_caption_name(blocks) -> str:
         # matter's own title ("In re Title, Ballot Title & Submission
         # Clause for 2015-2016 #156").
         if re.match(r"(?:IN\s+RE|EX\s+PARTE|(?:IN\s+THE\s+)?MATTER\s+OF)\b", t, re.IGNORECASE):
-            t2 = _cut_companion_cases(t)
-            t2 = re.sub(
-                r",\s*(?:debtors?|appell\w+|petitioners?|respondents?|"
-                r"relators?|movants?|claimants?|et al\.?)\b.*$",
-                "", t2, flags=re.IGNORECASE)
+            t2 = _cut_companion_cases(_trim_procedural_caption(t))
             return refine_caption_case(
                 _titlecase_caps(t2.strip()), _scholar_body_text(blocks))
         # Google Scholar renders the party separator in lowercase ("… v. …")
@@ -11748,6 +11851,9 @@ class _ScholarTextWindow:
         # (volume, reporter) → first pages, so short forms ("410 U.S. at 152")
         # link back to the full citation's case.  Rebuilt on each render.
         self._short_cite_index: dict[tuple[str, str], list[int]] = {}
+        # WL/LEXIS cite → RECAP spec, built over the whole opinion so a docket
+        # printed once also powers links on later short-form occurrences.
+        self._recap_spec_index: dict[str, str] = {}
         # The most recently emitted citation's action — a case ("cite", base),
         # a statute ("usc"/"cfr"/"rule"/"const"/"statpdf"/…), etc. — so an "Id."
         # links back to whatever was last cited.  Reset per render.
@@ -12577,6 +12683,9 @@ class _ScholarTextWindow:
                 if not text:
                     return
         matches: list[tuple[int, int, str, re.Match]] = []
+        for start, end, action in _recap_citation_ranges(
+                text, self._recap_spec_index):
+            matches.append((start, end, "recap", action[1]))
         for m in _TEXT_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "cite", m))
         for m in us_code.USC_CITE_RE.finditer(text):
@@ -12636,6 +12745,8 @@ class _ScholarTextWindow:
                 if pin_m:
                     cite += "@" + pin_m.group(1)
                 action = ("cite", cite)
+            elif kind == "recap":
+                action = ("recap", m)  # m is the pre-built JSON spec
             elif kind == "usc":
                 action = ("usc", us_code.cite_spec(m))
             elif kind == "rule":
@@ -12774,10 +12885,10 @@ class _ScholarTextWindow:
                        "".join(s.text for s in block.spans if not s.pagenum)).strip()
             )
         )
-        # English Reports and Federal Appendix citations render as a single one
-        # of our links spanning the whole reference (case name → parallel cites →
-        # cite), replacing any Google Scholar links inside it.
-        link_ranges = _special_citation_ranges(block.spans)
+        # English Reports, Federal Appendix, and unpublished federal opinions
+        # render as one of our links, replacing any Scholar link inside it.
+        link_ranges = _special_citation_ranges(
+            block.spans, self._recap_spec_index)
         if link_ranges:
             self._insert_spans_with_links(block, block_tags, neutral, link_ranges)
         else:
@@ -12931,6 +13042,7 @@ class _ScholarTextWindow:
         self._page_pos: dict[int, str] = {}    # star page → start index
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(self._scholar_text)
+        self._recap_spec_index = _recap_spec_index(self._scholar_text)
         self._last_cite_action = None
         self._pending_id = None
         self._const_linked = set()
@@ -13572,6 +13684,8 @@ class _ScholarTextWindow:
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(
             self._scholar_text or self._cl_text or "")
+        self._recap_spec_index = _recap_spec_index(
+            self._scholar_text or self._cl_text or "")
         self._last_cite_action = None
         self._pending_id = None
         self._const_linked = set()
@@ -13676,9 +13790,12 @@ class _ScholarTextWindow:
 
     def _compute_bluebook_parts(self) -> dict[str, str]:
         item = self._item
-        name = re.sub(
+        item_name = re.sub(
             r"<[^>]+>", "", item.get("caseName") or item.get("case_name") or ""
         ).strip()
+        # The opened opinion owns its caption.  Search-result/API metadata is
+        # only a fallback when no caption can be read from the opinion itself.
+        name = _scholar_caption_name(self._blocks) or item_name
 
         # Scholar's header lists each parallel cite on its own line.  When
         # the page has star pagination, pick the reporter the stars follow
@@ -13821,16 +13938,15 @@ class _ScholarTextWindow:
         if not year and header_years:
             year = header_years[-1]
 
-        if not name:
-            name = _scholar_caption_name(self._blocks)
         if not name and self._blocks:
             first = self._blocks[0].text().strip()
             name = re.split(r",\s*\d{1,4}\s", first)[0].strip().rstrip(",")[:120]
+        opinion_body = _scholar_body_text(self._blocks)
+        name = refine_caption_case(normal_case_caption(name), opinion_body)
+        unresolved_caption_case = caption_case_reference_tokens(
+            name, opinion_body)
 
         court_id = str(item.get("court_id") or "").strip().lower()
-        # Whether the court came from CourtListener (authoritative) or had to be
-        # guessed from the opinion text — the enrichment pings CL when guessed.
-        self._court_from_cl = bool(court_id)
         if not court_id:
             court_id = _scholar_court_id(self._blocks)
         is_scotus = "scotus" in court_id or bool(
@@ -13908,6 +14024,7 @@ class _ScholarTextWindow:
             "name": name, "cite": cite, "display_cite": display_cite,
             "court": court_abbr, "year": year,
             "omit_parenthetical": omit_parenthetical, "pin_kind": pin_kind,
+            "_caption_case_unresolved": unresolved_caption_case,
         }
 
     def _writer_parenthetical(self, part) -> str:
@@ -14126,6 +14243,7 @@ class _ScholarTextWindow:
         seen: set = set()
         cites: list[str] = []
         display_key = re.sub(r"\s+", "", display_cite).lower()
+        display_component_keys = _nominative_display_component_keys(display_cite)
         source_cites = ([display_cite] + list(self._header_cites)
                         + list((self._item or {}).get("citation", []) or []))
         for pos, c in enumerate(source_cites):
@@ -14139,7 +14257,9 @@ class _ScholarTextWindow:
             if "(" not in c:
                 c = _respace_reporter_in_cite(c)
             key = re.sub(r"\s+", "", c).lower()
-            if pos and key in display_key:
+            identity_key = re.sub(r"[^a-z0-9]", "", c.lower())
+            if pos and (key in display_key
+                        or identity_key in display_component_keys):
                 continue
             if key not in seen:
                 seen.add(key)
@@ -14167,41 +14287,48 @@ class _ScholarTextWindow:
         return title
 
     def _enrich_citation(self) -> None:
-        """Enrich capitalization, court, and year in the background.
+        """Fill missing metadata and, narrowly, unresolved entity-name casing.
 
-        The chosen reporter is tried against static.case.law first; if it has no
-        file, CourtListener supplies parallel reporters and those predictable
-        static.case.law paths are tried too.  This recovers authoritative forms
-        such as O'Brien and NBCUniversal instead of guessing from an all-caps
-        caption.  If CAP has no copy, the exact CourtListener cluster's own
-        case-name casing is the final name fallback.  CourtListener also
-        supplies a missing lower-court parenthetical or year.
+        When the opinion has already supplied both values, this method returns
+        before consulting another source unless an organization-like caption
+        token lacks reliable casing evidence in the opinion.  In that one case,
+        static.case.law may donate capitalization for the identical word; it
+        can never replace the opinion's caption.
         """
         bb = self._bb
         if not bb.get("cite"):
             return
-        need_name = not bool(getattr(self, "_base_citation_override", ""))
         need_year = not bb.get("year")
-        # SCOTUS takes no court parenthetical; otherwise we need a reliable
-        # court, which we only have when CourtListener supplied the court id.
-        need_court = (not self._is_scotus) and not getattr(
-            self, "_court_from_cl", False
+        # SCOTUS takes no court parenthetical; known Supreme Court status is
+        # therefore a complete court value.  For every other jurisdiction, a
+        # nonempty abbreviation parsed from the opinion is sufficient.
+        need_court = (not self._is_scotus) and not bb.get("court")
+        unresolved_case = tuple(bb.get("_caption_case_unresolved") or ())
+        need_caption_case = bool(
+            unresolved_case
+            and not getattr(self, "_base_citation_override", "")
         )
+        if not (need_year or need_court or need_caption_case):
+            return
+
         cite = bb["cite"]
         case_name = bb.get("name", "")
         item = dict(self._item)
         candidate_cites = [cite, *self._header_cites, *(item.get("citation") or [])]
         client = None
-        try:
-            if self._app is not None and self._app._token_var.get().strip():
-                client = self._app._get_client()
-        except Exception:
-            client = None
+        if need_year or need_court:
+            try:
+                if self._app is not None and self._app._token_var.get().strip():
+                    client = self._app._get_client()
+            except Exception:
+                client = None
 
         def run() -> None:
-            authoritative_name = _case_law_name_for_cites(candidate_cites) if need_name else ""
+            reference_name = (
+                _case_law_name_for_cites(candidate_cites)
+                if need_caption_case else ""
+            )
             court_id = year = ""
-            target = None
             if client is not None:
                 if need_year or need_court:
                     try:
@@ -14209,27 +14336,6 @@ class _ScholarTextWindow:
                             client, cite, item, name=case_name)
                     except Exception as exc:
                         print(f"[bb-enrich] CourtListener lookup failed: {exc}")
-                # When the selected reporter has no CAP file, CourtListener's
-                # exact citation lookup exposes alternate reporters that may.
-                if need_name and not authoritative_name:
-                    try:
-                        target = _cl_item_for_citation(client, cite, name=case_name)
-                    except Exception as exc:
-                        print(f"[bb-enrich] alternate-reporter lookup failed: {exc}")
-                    if target:
-                        authoritative_name = _case_law_name_for_cites(
-                            target.get("citation") or []
-                        )
-                        # CAP remains first choice.  If none of the exact
-                        # cluster's parallel reporters exists there, retain
-                        # CourtListener's own mixed capitalization rather than
-                        # relying on local title-casing guesses.
-                        if not authoritative_name:
-                            cl_name = courtlistener_case_name(target)
-                            if (cl_name and (not case_name
-                                    or _name_match_score(case_name, cl_name)
-                                    >= _NAME_MATCH_MIN)):
-                                authoritative_name = cl_name
             if need_year and not year:
                 # No CourtListener year (no token, or no cluster match):
                 # CAP's decision_date covers the early U.S. Reports, whose
@@ -14248,9 +14354,9 @@ class _ScholarTextWindow:
                 )
             new_year = year or bb.get("year", "")
             new_name = bb.get("name", "")
-            if authoritative_name:
-                new_name = abbreviate_case_name(
-                    normal_case_caption(authoritative_name)
+            if reference_name:
+                new_name = apply_caption_case_reference(
+                    new_name, reference_name, unresolved_case
                 )
             if (new_court != bb.get("court", "")
                     or new_year != bb.get("year", "")
@@ -15901,6 +16007,10 @@ class _ScholarTextWindow:
         if kind == "engrep":
             _open_eng_rep(self._win, value, self._status_var.set,
                           app=self._app)
+            return
+        if kind == "recap":
+            _open_recap_citation(
+                self._app, self._win, value, self._status_var.set)
             return
         # A Scholar case URL may carry a pincite, a reporter cite, and the case
         # name ("<url>\tpin=565\tcite=…\tname=…") so a failed/blocked fetch can
