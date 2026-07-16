@@ -706,8 +706,13 @@ def normal_case_caption(text: str) -> str:
             out.append(word)
             continue
         stripped = word.replace("’", "'").strip(".,()'\"")
+        # An all-caps word containing "&" is a firm's initialism (AT&T,
+        # A&M, S&P, H&R) — English words never carry one, so caps are safe.
+        # The dotted-initialism check tolerates a final letter left bare by
+        # the strip above ("L.L.C." arrives here as "L.L.C").
         if (stripped in _CAPTION_KEEP_CAPS
-                or re.fullmatch(r"(?:[A-Z]\.)+", stripped)):
+                or "&" in stripped
+                or re.fullmatch(r"(?:[A-Z]\.)+[A-Z]?", stripped)):
             out.append(word)
             continue
         low = word.lower()
@@ -738,15 +743,22 @@ def refine_caption_case(name: str, body_text: str) -> str:
     says whether US is the word (Toys R Us) or an initialism (US Dominion).
     The body settles it — the parties are named in ordinary prose
     ("Plaintiffs US Dominion, Inc. …").  Each purely alphabetic caption
-    token is searched in *body_text* anchored to an adjacent caption token
-    (so the lookup finds this party, not a stray "us" elsewhere), and a
-    body spelling that outvotes the guess is adopted.  Guards:
+    token is searched in *body_text*, preferably anchored to an adjacent
+    caption token (so the lookup finds this party, not a stray "us"
+    elsewhere); the anchor may continue in lowercase, so the caption's
+    "Corp." still matches the body's "Corporation".  A token with no
+    anchored evidence — a single-word party such as "IBM v. …" — falls
+    back to unanchored occurrences under stricter thresholds.  A body
+    spelling that outvotes the guess is adopted.  Guards:
 
       * a match whose anchoring neighbor has no lowercase letter (an
         all-caps heading, or the caption itself) carries no casing signal
         and is ignored;
-      * an all-lowercase winner is never adopted — prose legitimately
-        lowercases articles ("the Boeing Company") that a caption keeps.
+      * an all-lowercase spelling is never adopted — prose legitimately
+        lowercases articles ("the Boeing Company") that a caption keeps;
+      * an ALL-CAPS spelling is adopted only for initialism-length tokens
+        (≤ 4 letters) with repeated evidence: opinions that set party
+        surnames in caps ("SMITH argues…") are typography, not spelling.
     """
     if not name or not body_text:
         return name
@@ -766,29 +778,46 @@ def refine_caption_case(name: str, body_text: str) -> str:
             nb = cores[j]
             if len(nb) < 2 or nb.lower() in ("v", "vs"):
                 continue
+            # The caption may abbreviate what the prose spells out
+            # ("Corp." / "Corporation"): let the anchor run on in lowercase.
+            nb_pat = re.escape(nb) + r"[a-z]*"
             if j < i:
                 pat = re.compile(
-                    r"\b(%s)[\W_]{1,3}(%s)\b" % (re.escape(nb),
-                                                 re.escape(core)),
+                    r"\b(%s)[\W_]{1,3}(%s)\b" % (nb_pat, re.escape(core)),
                     re.IGNORECASE)
                 g_tok, g_nb = 2, 1
             else:
                 pat = re.compile(
-                    r"\b(%s)[\W_]{1,3}(%s)\b" % (re.escape(core),
-                                                 re.escape(nb)),
+                    r"\b(%s)[\W_]{1,3}(%s)\b" % (re.escape(core), nb_pat),
                     re.IGNORECASE)
                 g_tok, g_nb = 1, 2
             for m in pat.finditer(body_text):
                 if not re.search(r"[a-z]", m.group(g_nb)):
                     continue  # all-caps context: no casing signal
                 spelling = m.group(g_tok)
-                votes[spelling] = votes.get(spelling, 0) + 1
+                if not spelling.islower():
+                    votes[spelling] = votes.get(spelling, 0) + 1
+        unanchored = not votes
+        if unanchored:
+            for m in re.finditer(r"\b%s\b" % re.escape(core), body_text,
+                                 re.IGNORECASE):
+                spelling = m.group(0)
+                if not spelling.islower():
+                    votes[spelling] = votes.get(spelling, 0) + 1
         if not votes:
             continue
         best = max(votes, key=lambda s: votes[s])
-        if (best != core and votes[best] > votes.get(core, 0)
-                and not best.islower()):
-            tokens[i] = tok.replace(core, best)
+        cur = votes.get(core, 0)
+        if best == core or votes[best] <= cur:
+            continue
+        if best.isupper():
+            if len(core) > 4 or votes[best] < 2:
+                continue  # caps typography, not spelling
+            if unanchored and (votes[best] < 3 or votes[best] <= 2 * cur):
+                continue
+        elif unanchored and votes[best] < 2:
+            continue
+        tokens[i] = tok.replace(core, best)
     return " ".join(tokens)
 
 

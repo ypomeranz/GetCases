@@ -198,6 +198,62 @@ class RefineCaptionCaseTests(unittest.TestCase):
             "Us Dominion, Inc. v. Byrne",
         )
 
+    def test_single_token_party_uses_unanchored_evidence(self):
+        # "IBM v. JOHNSON" leaves IBM with no adjacent anchor token; the
+        # bare-word fallback still corrects it given repeated evidence.
+        self.assertEqual(
+            refine_caption_case(
+                "Ibm v. Johnson",
+                "IBM manufactures computers. Johnson worked for IBM "
+                "until IBM terminated him."),
+            "IBM v. Johnson",
+        )
+
+    def test_spelled_out_prose_still_anchors_caption_abbreviation(self):
+        # The caption's "Corp." anchors against the body's "Corporation".
+        self.assertEqual(
+            refine_caption_case(
+                "It Corp. v. County of Imperial",
+                "IT Corporation contracted with the County. "
+                "IT Corporation then sued."),
+            "IT Corp. v. County of Imperial",
+        )
+
+    def test_am_general_initialism_restored(self):
+        self.assertEqual(
+            refine_caption_case(
+                normal_case_caption(
+                    "AM GENERAL LLC v. ACTIVISION BLIZZARD, INC."),
+                "AM General LLC manufactures the Humvee. "
+                "AM General LLC sued Activision."),
+            "AM General LLC v. Activision Blizzard, Inc.",
+        )
+
+    def test_caps_styled_surnames_are_typography_not_spelling(self):
+        # Opinions that set party surnames in caps mid-prose must not
+        # rewrite the caption's ordinary spelling.
+        self.assertEqual(
+            refine_caption_case(
+                "United States v. Smith",
+                "SMITH was convicted. SMITH argues the evidence was "
+                "insufficient. SMITH appeals."),
+            "United States v. Smith",
+        )
+
+    def test_ampersand_and_dotted_initialisms_keep_caps(self):
+        self.assertEqual(
+            normal_case_caption("AT&T CORP. v. IOWA UTILITIES BOARD"),
+            "AT&T Corp. v. Iowa Utilities Board",
+        )
+        self.assertEqual(
+            normal_case_caption("A&M RECORDS, INC. v. NAPSTER, INC."),
+            "A&M Records, Inc. v. Napster, Inc.",
+        )
+        self.assertEqual(
+            normal_case_caption("MERCEXCHANGE, L.L.C."),
+            "Mercexchange, L.L.C.",
+        )
+
 
 class CitationOverrideTests(unittest.TestCase):
     def test_override_is_shared_by_parallel_reporters(self):
