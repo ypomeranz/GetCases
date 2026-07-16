@@ -6,6 +6,7 @@ from bluebook_names import (
     courtlistener_case_name,
     is_personal_all_caps_run,
     normal_case_caption,
+    refine_caption_case,
 )
 from citation_overrides import (
     add_pin_to_base,
@@ -148,6 +149,53 @@ class CaptionCapitalizationTests(unittest.TestCase):
             abbreviate_case_name(
                 "Standard Oil Co., Defendant-Appellant v. United States"),
             "Standard Oil Co. v. United States",
+        )
+
+
+class RefineCaptionCaseTests(unittest.TestCase):
+    """The opinion's own prose settles casing an all-caps caption destroys."""
+
+    def test_body_restores_initialism_capitalization(self):
+        # US Dominion, Inc. v. Byrne, 600 F. Supp. 3d 24 (D.D.C. 2022):
+        # "US DOMINION" title-cases to "Us Dominion"; the body knows better.
+        name = normal_case_caption("US DOMINION, INC. v. BYRNE.")
+        self.assertEqual(name, "Us Dominion, Inc. v. Byrne.")
+        body = ("Plaintiffs US Dominion, Inc., Dominion Voting Systems, "
+                "Inc., and their affiliates sued Patrick Byrne. US "
+                "Dominion, Inc. alleges defamation.")
+        self.assertEqual(
+            refine_caption_case(name, body),
+            "US Dominion, Inc. v. Byrne.",
+        )
+
+    def test_body_confirms_title_case_where_us_is_a_word(self):
+        name = normal_case_caption("TOYS R US, INC. v. SMITH")
+        body = "Toys R Us, Inc. operates stores. Smith sued Toys R Us, Inc."
+        self.assertEqual(
+            refine_caption_case(name, body), "Toys R Us, Inc. v. Smith")
+
+    def test_prose_articles_never_decapitalize_the_name(self):
+        self.assertEqual(
+            refine_caption_case(
+                "The Boeing Co. v. Smith",
+                "Smith sued the Boeing Company. Later the Boeing Company "
+                "answered."),
+            "The Boeing Co. v. Smith",
+        )
+
+    def test_all_caps_headings_carry_no_signal(self):
+        self.assertEqual(
+            refine_caption_case(
+                "Toys R Us, Inc. v. Smith",
+                "TOYS R US IS LIABLE. The court holds Toys R Us, Inc. "
+                "liable."),
+            "Toys R Us, Inc. v. Smith",
+        )
+
+    def test_no_body_is_a_no_op(self):
+        self.assertEqual(
+            refine_caption_case("Us Dominion, Inc. v. Byrne", ""),
+            "Us Dominion, Inc. v. Byrne",
         )
 
 

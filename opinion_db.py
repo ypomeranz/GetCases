@@ -48,6 +48,7 @@ import citations
 from bluebook_names import (
     abbreviate_case_name,
     normal_case_caption,
+    refine_caption_case,
     strip_related_case_note,
 )
 
@@ -93,6 +94,27 @@ def _blocks_text(blocks: list) -> str:
         return blocks_to_text(blocks)
     except Exception:
         return ""
+
+
+def _prose_text(blocks: list, cap: int = 40000) -> str:
+    """The opinion's prose paragraphs, joined — the mixed-case evidence
+    :func:`refine_caption_case` reads party-name capitalization from.
+    Caption/header lines are excluded: Scholar's caption styles (all-caps
+    and surname-caps) are exactly the guesswork being corrected.  Capped:
+    the parties are named within the first pages."""
+    out: list[str] = []
+    total = 0
+    for b in blocks:
+        if getattr(b, "kind", None) in ("center", "heading"):
+            continue
+        t = re.sub(r"\s+", " ", b.text()).strip()
+        if not t:
+            continue
+        out.append(t)
+        total += len(t)
+        if total > cap:
+            break
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +293,9 @@ def extract_record(
         raw_name = _caption_name(blocks)
         if raw_name:
             raw_name = _smart_titlecase(raw_name)  # caption is often ALL CAPS
+            # The body's mixed-case prose corrects ambiguous title-casing
+            # guesses ("Us Dominion" -> "US Dominion").
+            raw_name = refine_caption_case(raw_name, _prose_text(blocks))
     name = abbreviate_case_name(raw_name) if raw_name else ""
 
     cites = _header_cites(blocks)

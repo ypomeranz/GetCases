@@ -601,6 +601,7 @@ from bluebook_names import (
     collapse_personal_all_caps_run,
     courtlistener_case_name,
     normal_case_caption,
+    refine_caption_case,
     strip_related_case_note,
 )
 from citation_overrides import (
@@ -7657,10 +7658,32 @@ def _scholar_caption_name(blocks) -> str:
                 sides[1] = sides[1][: cm.start() + 1]
             left, right = _caption_party(sides[0]), _caption_party(sides[1])
             if left and right:
-                return f"{left} v. {right}"
+                return refine_caption_case(
+                    f"{left} v. {right}", _scholar_body_text(blocks))
         if re.match(r"(?:IN\s+RE|EX\s+PARTE|(?:IN\s+THE\s+)?MATTER\s+OF)\b", t, re.IGNORECASE):
-            return _titlecase_caps(t.split(",")[0].strip())
+            return refine_caption_case(
+                _titlecase_caps(t.split(",")[0].strip()),
+                _scholar_body_text(blocks))
     return ""
+
+
+def _scholar_body_text(blocks) -> str:
+    """The opinion's prose paragraphs, joined — the mixed-case evidence
+    :func:`refine_caption_case` reads party-name capitalization from.
+    Capped: the parties are named within the first pages."""
+    out: list = []
+    total = 0
+    for b in blocks:
+        if b.kind in ("center", "heading"):
+            continue  # caption/heading lines: their casing is stylized
+        t = re.sub(r"\s+", " ", b.text()).strip()
+        if not t:
+            continue
+        out.append(t)
+        total += len(t)
+        if total > 40000:
+            break
+    return "\n".join(out)
 
 
 def _scholar_source_segments(source: str) -> list[str]:

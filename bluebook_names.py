@@ -729,6 +729,69 @@ def normal_case_caption(text: str) -> str:
     return " ".join(out)
 
 
+def refine_caption_case(name: str, body_text: str) -> str:
+    """Correct title-casing guesses for an all-caps caption by consulting
+    the opinion's own mixed-case prose.
+
+    An all-caps caption destroys the case information: "US DOMINION, INC.
+    v. BYRNE" title-cases to "Us Dominion…" because nothing in the caption
+    says whether US is the word (Toys R Us) or an initialism (US Dominion).
+    The body settles it — the parties are named in ordinary prose
+    ("Plaintiffs US Dominion, Inc. …").  Each purely alphabetic caption
+    token is searched in *body_text* anchored to an adjacent caption token
+    (so the lookup finds this party, not a stray "us" elsewhere), and a
+    body spelling that outvotes the guess is adopted.  Guards:
+
+      * a match whose anchoring neighbor has no lowercase letter (an
+        all-caps heading, or the caption itself) carries no casing signal
+        and is ignored;
+      * an all-lowercase winner is never adopted — prose legitimately
+        lowercases articles ("the Boeing Company") that a caption keeps.
+    """
+    if not name or not body_text:
+        return name
+    tokens = name.split()
+    if len(tokens) < 2:
+        return name
+    cores = [re.sub(r"[^A-Za-z]", "", t) for t in tokens]
+    for i, tok in enumerate(tokens):
+        core = cores[i]
+        if (len(core) < 2 or core.lower() in ("v", "vs")
+                or not tok.strip(".,;:()'\"").isalpha()):
+            continue
+        votes: dict[str, int] = {}
+        for j in (i - 1, i + 1):
+            if not 0 <= j < len(tokens):
+                continue
+            nb = cores[j]
+            if len(nb) < 2 or nb.lower() in ("v", "vs"):
+                continue
+            if j < i:
+                pat = re.compile(
+                    r"\b(%s)[\W_]{1,3}(%s)\b" % (re.escape(nb),
+                                                 re.escape(core)),
+                    re.IGNORECASE)
+                g_tok, g_nb = 2, 1
+            else:
+                pat = re.compile(
+                    r"\b(%s)[\W_]{1,3}(%s)\b" % (re.escape(core),
+                                                 re.escape(nb)),
+                    re.IGNORECASE)
+                g_tok, g_nb = 1, 2
+            for m in pat.finditer(body_text):
+                if not re.search(r"[a-z]", m.group(g_nb)):
+                    continue  # all-caps context: no casing signal
+                spelling = m.group(g_tok)
+                votes[spelling] = votes.get(spelling, 0) + 1
+        if not votes:
+            continue
+        best = max(votes, key=lambda s: votes[s])
+        if (best != core and votes[best] > votes.get(core, 0)
+                and not best.islower()):
+            tokens[i] = tok.replace(core, best)
+    return " ".join(tokens)
+
+
 def courtlistener_case_name(record: dict) -> str:
     """Return CourtListener's best case-name field without changing its case.
 
