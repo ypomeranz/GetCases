@@ -92,6 +92,38 @@ class CaptionCapitalizationTests(unittest.TestCase):
             "Deslandes v. McDonald's USA LLC",
         )
 
+    def test_titled_person_reduces_to_surname(self):
+        # Pecos River Talc LLC v. Emory (E.D. Va. 2026): the honorific drops
+        # and the surname survives an unrecognized middle name.
+        self.assertEqual(
+            abbreviate_case_name(
+                "Pecos River Talc LLC v. Dr. Theresa Swain Emory"),
+            "Pecos River Talc LLC v. Emory",
+        )
+        self.assertEqual(
+            abbreviate_case_name("Smith v. Sgt. William Brown, Jr."),
+            "Smith v. Brown",
+        )
+
+    def test_title_never_truncates_a_brand_name(self):
+        for name in ("Dr Pepper Bottling Co. v. Smith",
+                     "Mrs. Fields Cookies v. Smith",
+                     "Miss Universe L.P. v. Smith"):
+            self.assertEqual(abbreviate_case_name(name), name)
+
+    def test_caption_role_designations_are_stripped(self):
+        self.assertEqual(
+            abbreviate_case_name(
+                "Pecos River Talc LLC, Plaintiff, v. "
+                "Dr. Theresa Swain Emory, et al., Defendants."),
+            "Pecos River Talc LLC v. Emory",
+        )
+        self.assertEqual(
+            abbreviate_case_name(
+                "Standard Oil Co., Defendant-Appellant v. United States"),
+            "Standard Oil Co. v. United States",
+        )
+
 
 class CitationOverrideTests(unittest.TestCase):
     def test_override_is_shared_by_parallel_reporters(self):

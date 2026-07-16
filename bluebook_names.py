@@ -413,6 +413,21 @@ _GEO_SUFFIX_RE = re.compile(
 # Personal-name suffixes, dropped along with the given name
 _NAME_SUFFIX_RE = re.compile(r",?\s+(?:jr|sr|ii|iii|iv)\.?\s*$", re.IGNORECASE)
 
+# Honorifics and ranks ahead of a personal name ("Dr. Theresa Swain Emory",
+# "Sgt. William Brown").  The title itself is omitted (rule 10.2.1(e)), and
+# its presence marks the party as a natural person, so an unrecognized
+# middle name no longer blocks the surname reduction.  Stripping is gated on
+# what follows still parsing as a personal name — the next word must be a
+# recognized given name — so "Dr Pepper Bottling Co." and "General Motors
+# Corp." are never truncated.
+_PERSONAL_TITLE_RE = re.compile(
+    r"^(?:dr|mr|mrs|ms|miss|messrs|prof(?:essor)?|rev(?:erend)?|"
+    r"hon(?:orable)?|fr|sgt|sergeant|lt|lieutenant|capt(?:ain)?|"
+    r"col(?:onel)?|maj(?:or)?|gen(?:eral)?|det(?:ective)?|officer|deputy|"
+    r"sheriff)\.?\s+",
+    re.IGNORECASE,
+)
+
 # Particles kept with the surname: "Nathan Van Buren" -> "Van Buren"
 # (compared against dot-stripped lowercase tokens)
 _SURNAME_PARTICLES = {
@@ -764,8 +779,24 @@ _PHRASE_RE = re.compile(
 )
 _PHRASE_MAP = {p: a for p, a in _PHRASES}
 
-_ET_AL_RE = re.compile(r",?\s+et\s+al\.?\s*$", re.IGNORECASE)
+_ET_AL_RE = re.compile(r",?\s+et\s+als?\.?\s*$", re.IGNORECASE)
 _V_SPLIT_RE = re.compile(r"\s+vs?\.\s+")
+
+# Procedural party designations from a reporter caption — "…, Plaintiff,"
+# "…, et al., Defendants.", "…, Defendant-Appellant" — describe the party's
+# role and are no part of the name (rule 10.2.1).  Stripped from the right,
+# alternating with "et al." (rule 10.2.1(a)), until neither remains.  The
+# leading comma is required so a party whose own name ends in one of these
+# words is never clipped.
+_ROLE_WORD = (
+    r"(?:cross-|counter-|third-party )?"
+    r"(?:appell(?:ants?|ees?)|plaintiffs?|defendants?|petitioners?|"
+    r"respondents?|relators?|intervenors?|movants?|claimants?|garnishees?)"
+)
+_PARTY_ROLE_RE = re.compile(
+    r",\s*" + _ROLE_WORD + r"(?:\s*[-–—/]\s*" + _ROLE_WORD + r")*\.?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _strip_given_names(p: str) -> str | None:
@@ -774,6 +805,13 @@ def _strip_given_names(p: str) -> str | None:
     p = _NAME_SUFFIX_RE.sub("", p)
     if "," in p or "&" in p or re.search(r"\bof\b", p, re.IGNORECASE):
         return None
+    titled = False
+    while True:
+        m = _PERSONAL_TITLE_RE.match(p)
+        if not m:
+            break
+        p = p[m.end():]
+        titled = True
     tokens = p.split()
     if not 2 <= len(tokens) <= 4:
         return None
@@ -795,9 +833,11 @@ def _strip_given_names(p: str) -> str | None:
         i -= 1
     # Everything before the surname must itself be a given name, an
     # initial, or a particle ("John W. Smith" — but not "Chase Manhattan
-    # Bank", whose middle token flunks this check)
+    # Bank", whose middle token flunks this check).  A stripped honorific
+    # already establishes a natural person, so under one any name-shaped
+    # middle token passes ("Dr. Theresa Swain Emory" -> "Emory").
     for t, tl in zip(tokens[1:i], low[1:i]):
-        if not (tl in _GIVEN_NAMES or tl in _SURNAME_PARTICLES
+        if not (titled or tl in _GIVEN_NAMES or tl in _SURNAME_PARTICLES
                 or re.fullmatch(r"[A-Z]\.?", t)):
             return None
     return " ".join(tokens[i:])
@@ -994,7 +1034,12 @@ def _is_bare_place(place: str) -> bool:
 
 def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     p = re.sub(r"\s+", " ", party).strip()
-    p = _ET_AL_RE.sub("", p)
+    while True:  # designations and "et al." peel off the right in turn
+        q = _ET_AL_RE.sub("", p.rstrip(" ,;")).rstrip(" ,;")
+        q = _PARTY_ROLE_RE.sub("", q)
+        if q == p:
+            break
+        p = q
     p = re.sub(r"^the\s+", "", p, flags=re.IGNORECASE)  # rule 10.2.1(d)
     p = re.sub(r"\bUnited States of America\b", "United States", p,
                flags=re.IGNORECASE)
@@ -1318,6 +1363,25 @@ if __name__ == "__main__":
         ("Sara Lee, Inc. v. Kraft Foods", "Sara Lee, Inc. v. Kraft Foods"),
         ("Dean Witter Reynolds, Inc. v. Byrd",
          "Dean Witter Reynolds, Inc. v. Byrd"),
+        # An honorific or rank marks a natural person: the title drops (rule
+        # 10.2.1(e)) and the surname reduction applies even through an
+        # unrecognized middle name — but a brand or firm whose name merely
+        # starts with such a word is never truncated.
+        ("Pecos River Talc LLC v. Dr. Theresa Swain Emory",
+         "Pecos River Talc LLC v. Emory"),
+        ("Smith v. Sgt. William Brown, Jr.", "Smith v. Brown"),
+        ("Doe v. Officer Daniel Pantaleo", "Doe v. Pantaleo"),
+        ("Jones v. Lt. Col. James Wilson", "Jones v. Wilson"),
+        ("Dr Pepper Bottling Co. v. Smith", "Dr Pepper Bottling Co. v. Smith"),
+        ("Mrs. Fields Cookies v. Smith", "Mrs. Fields Cookies v. Smith"),
+        ("Miss Universe L.P. v. Smith", "Miss Universe L.P. v. Smith"),
+        # Party designations from a reporter caption strip from the right,
+        # alternating with "et al." (rules 10.2.1, 10.2.1(a)).
+        ("Pecos River Talc LLC, Plaintiff, v. Dr. Theresa Swain Emory, "
+         "et al., Defendants.",
+         "Pecos River Talc LLC v. Emory"),
+        ("Standard Oil Co., Defendant-Appellant v. United States",
+         "Standard Oil Co. v. United States"),
         # Stray trailing period from the source is dropped; a period that
         # belongs to a trailing abbreviation or initialism is kept.
         ("Ex parte Young.", "Ex parte Young"),
