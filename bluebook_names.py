@@ -562,7 +562,7 @@ tom tommie tommy toni tony tonya tracey traci tracy travis trevor tricia
 trisha troy tyler tyrone ulysses ursula valerie vance vanessa valentino velma vera
 verna vernon veronica vicki vickie vicky victor victoria vincent viola
 violet virgil virginia vivian wade wallace walter wanda warren wayne wendell
-wendy wesley wilbert wilbur wilfred willa willard william willie willis
+wendy wesley wilbert xavier wilbur wilfred willa willard william willie willis
 wilma winfield winifred winston woodrow yesenia yolanda yvette yvonne
 zachary zelda
 """.split()) | frozenset("""
@@ -695,8 +695,12 @@ def normal_case_caption(text: str) -> str:
     ``McFadden``; truly unusual brand casing is later recoverable from the
     reporter's authoritative metadata.
     """
+    # The earliest reports print the apostrophe as a turned comma, which
+    # OCR renders U+2018 ("M‘INTOSH"): normalize it to the plain apostrophe
+    # every downstream pattern understands.
+    text = (text or "").replace("‘", "'")
     out: list[str] = []
-    words = (text or "").split()
+    words = text.split()
     for i, word in enumerate(words):
         letters = [c for c in word if c.isalpha()]
         # Ordinary mixed case passes through, but a mostly-uppercase OCR form
@@ -1400,7 +1404,9 @@ def abbreviate_case_name(name: str) -> str:
     Bluebook rule 10.2.2 (= Indigo Book R8.3), dropping given names of
     individuals (rule 10.2.1(g)) and "State of" prefixes (10.2.1(f)).
     Safe to call twice."""
-    name = re.sub(r"\s+", " ", name or "").strip()
+    # OCR renders the early reports' turned-comma apostrophe as U+2018
+    # ("M‘Intosh"); normalize so name patterns and casing rules see it.
+    name = re.sub(r"\s+", " ", (name or "").replace("‘", "'")).strip()
     # Strip any "(Re <underlying case>)" cross-reference before splitting:
     # its own " v. " would otherwise masquerade as this case's separator.
     name = strip_related_case_note(name)
@@ -1414,6 +1420,16 @@ def abbreviate_case_name(name: str) -> str:
     name = re.sub(
         r",?\s+(?:et|and|&)\s+(?:ux(?:or)?|vir|wife|husband|others?|another)"
         r"\.?(?=[\s,.]|$)",
+        "", name, flags=re.IGNORECASE)
+    # A d/b/a or a/k/a clause names an alias, not the party; when the alias
+    # is the citation name it replaced the party upstream, so a surviving
+    # clause drops: "…Life Advocates, dba NIFLA, et al." / "Robertson
+    # a/k/a Mitchell Robinson a/k/a …".  Bare "aka" is left alone — it is
+    # a real surname (Aka v. Wash. Hosp. Ctr.).
+    name = re.sub(
+        r",?\s+(?:d/b/a|d\.b\.a\.|dba|a/k/a|a\.k\.a\.|f/k/a|f\.k\.a\.|"
+        r"doing\s+business\s+as|also\s+known\s+as|formerly\s+known\s+as)\s+"
+        r"[^,;]*?(?=,|;|\s+vs?\.\s+|$)",
         "", name, flags=re.IGNORECASE)
     if not name:
         return name

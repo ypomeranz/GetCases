@@ -276,6 +276,45 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
             "Escola v. Coca Cola Bottling Co. of Fresno",
         )
 
+    def test_alias_clauses_drop_but_full_name_stays(self):
+        # NIFLA v. Becerra, 138 S. Ct. 2361 (2018): the d/b/a alias is not
+        # the Bluebook name — the first party keeps its full (abbreviated)
+        # name and the alias clause drops.
+        self.assertEqual(
+            abbreviate_case_name(
+                "National Institute of Family and Life Advocates, dba "
+                "NIFLA, et al., Petitioners, v. Xavier Becerra, Attorney "
+                "General of California, et al."),
+            "Nat'l Inst. of Fam. & Life Advocs. v. Becerra",
+        )
+        self.assertEqual(
+            abbreviate_case_name(
+                "United States v. Mitchell Robertson a/k/a Mitchell "
+                "Robinson a/k/a Bryheer McMichael"),
+            "United States v. Robertson",
+        )
+        # Bare "aka" is a real surname, never an alias marker.
+        self.assertEqual(
+            abbreviate_case_name("Ethel Aka v. Washington Hospital Center"),
+            "Aka v. Wash. Hosp. Ctr.",
+        )
+
+    def test_turned_comma_apostrophe_surname(self):
+        # Johnson v. M'Intosh, 21 U.S. (8 Wheat.) 543 (1823): OCR renders
+        # the turned-comma apostrophe as U+2018 ("M‘INTOSH"); the caption
+        # party is the single nominal ejectment plaintiff and stays whole
+        # (CAP's own name_abbreviation is "Johnson & Graham's Lessee v.
+        # McIntosh").
+        self.assertEqual(
+            normal_case_caption("WILLIAM M‘INTOSH."),
+            "William M'Intosh.",
+        )
+        self.assertEqual(
+            abbreviate_case_name(
+                "Johnson & Graham's Lessee v. William M‘intosh"),
+            "Johnson & Graham's Lessee v. M'intosh",
+        )
+
     def test_companion_cases_cut_at_the_earliest_boundary(self):
         # Bostock: the companion party's own periods ("Inc.") defeat the
         # simple lookahead; the fallback cuts before "Altitude".

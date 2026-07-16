@@ -1493,11 +1493,39 @@ def _case_law_json_url(citation: str) -> Optional[str]:
     return f"https://static.case.law/{slug}/{vol}/cases/{int(page):04d}-01.json"
 
 
+@lru_cache(maxsize=64)
+def _case_law_volume_metadata(slug: str, vol: str) -> tuple:
+    """The volume's ``CasesMetadata.json`` on static.case.law, as a tuple of
+    per-case dicts (empty when absent).  Each entry carries the canonical
+    ``citations`` and the actual ``file_name`` — the key to volumes whose
+    scan pagination diverges from the citation's page (CAP's earliest U.S.
+    Reports volumes: Johnson v. McIntosh, 21 U.S. 543, lives at 0240-01)."""
+    url = f"https://static.case.law/{slug}/{vol}/CasesMetadata.json"
+    try:
+        resp = _anon_session.get(url, timeout=10)
+        if resp.status_code != 200:
+            return ()
+        data = resp.json()
+        return tuple(data) if isinstance(data, list) else ()
+    except Exception as exc:
+        print(f"[case.law-json] volume metadata failed {url}: {exc}")
+        return ()
+
+
+def _cite_key(cite: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(cite or "").lower())
+
+
 @lru_cache(maxsize=256)
 def _case_law_metadata(cite: str) -> "Optional[dict]":
     """Authoritative per-case metadata for a reporter citation, cached for the
     life of the app.  A citation-keyed URL cannot drift to a merely similar
     case, so its capitalization is safe to prefer over OCR/title-casing guesses.
+
+    When the page-keyed URL misses, the volume's ``CasesMetadata.json`` is
+    consulted and the case matched by its canonical citation — CAP's early
+    U.S. Reports scans are paginated differently from the citations they
+    carry, so the direct path 404s for every early Supreme Court case.
     """
     url = _case_law_json_url(cite)
     if not url:
@@ -1507,15 +1535,42 @@ def _case_law_metadata(cite: str) -> "Optional[dict]":
     except Exception as exc:
         print(f"[case.law-json] metadata fetch failed {url}: {exc}")
         return None
-    if resp.status_code != 200:
+    if resp.status_code == 200:
+        try:
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            print(f"[case.law-json] bad JSON for {cite!r}: {exc}")
+            return None
+    m = _CITE_PARSE_RE.match(re.sub(r"<[^>]+>", "", cite).strip())
+    slug = _slugify_reporter(m.group(2).strip()) if m else ""
+    if not (m and slug):
         print(f"[case.law-json] {resp.status_code} for {cite!r}")
         return None
-    try:
-        data = resp.json()
-        return data if isinstance(data, dict) else None
-    except Exception as exc:
-        print(f"[case.law-json] bad JSON for {cite!r}: {exc}")
-        return None
+    want = _cite_key(cite)
+    for entry in _case_law_volume_metadata(slug, m.group(1)):
+        if not isinstance(entry, dict):
+            continue
+        if any(_cite_key(c.get("cite")) == want
+               for c in entry.get("citations") or [] if isinstance(c, dict)):
+            fn = str(entry.get("file_name") or "").strip()
+            if fn:
+                try:
+                    r2 = _anon_session.get(
+                        f"https://static.case.law/{slug}/{m.group(1)}"
+                        f"/cases/{fn}.json",
+                        timeout=10,
+                    )
+                    if r2.status_code == 200 and isinstance(r2.json(), dict):
+                        return r2.json()
+                except Exception as exc:
+                    print(f"[case.law-json] file fetch failed {fn}: {exc}")
+            # The metadata entry alone still carries the authoritative
+            # name, citations, court, and decision date.
+            return entry
+    print(f"[case.law-json] {resp.status_code} for {cite!r} "
+          f"(no volume-metadata match)")
+    return None
 
 
 def _case_law_name_for_cites(cites) -> str:
@@ -14213,6 +14268,17 @@ class _ScholarTextWindow:
                                     or _name_match_score(case_name, cl_name)
                                     >= _NAME_MATCH_MIN)):
                                 authoritative_name = cl_name
+            if need_year and not year:
+                # No CourtListener year (no token, or no cluster match):
+                # CAP's decision_date covers the early U.S. Reports, whose
+                # Scholar pages print no year at all ("2 U.S. 409 (____)").
+                for c in candidate_cites[:4]:
+                    c = re.sub(r"<[^>]+>", "", str(c or "")).strip()
+                    cap = _case_law_metadata(c) if c else None
+                    d = str((cap or {}).get("decision_date") or "")
+                    if len(d) >= 4 and d[:4].isdigit():
+                        year = d[:4]
+                        break
             new_court = bb.get("court", "")
             if need_court and court_id:
                 new_court = _court_for_paren(
