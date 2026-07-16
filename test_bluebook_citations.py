@@ -1,4 +1,8 @@
+import os
 import unittest
+from types import SimpleNamespace
+
+os.environ["GETCASES_SKIP_DEPENDENCY_PROMPT"] = "1"
 
 from bluebook_names import (
     abbreviate_case_name,
@@ -15,6 +19,14 @@ from citation_overrides import (
     format_edited_citation,
     update_overrides,
 )
+from courtlistener_gui import (
+    _ScholarTextWindow,
+    _combined_parts_cover_typed,
+    _nominative_display_cite,
+    _pick_combined_opinion,
+    _wisconsin_display_cite,
+)
+from google_scholar import Block, OpinionPart, Span
 
 
 class CaptionCapitalizationTests(unittest.TestCase):
@@ -286,6 +298,121 @@ class CitationOverrideTests(unittest.TestCase):
             "Example v. Example, 1 F.4th 10, 12 (2d Cir. 2021) "
             "(Smith, J., dissenting).",
         )
+
+
+class ReporterAndDecisionDateTests(unittest.TestCase):
+    def test_early_scotus_uses_modern_and_nominative_reporters(self):
+        examples = [
+            ("3 U.S. 199", "3 Dall. 199", "3 U.S. (3 Dall.) 199"),
+            ("10 U.S. 87", "6 Cranch 87", "10 U.S. (6 Cranch) 87"),
+            ("23 U.S. 66", "10 Wheat. 66", "23 U.S. (10 Wheat.) 66"),
+            ("36 U.S. 420", "11 Pet. 420", "36 U.S. (11 Pet.) 420"),
+        ]
+        for modern, nominative, expected in examples:
+            with self.subTest(modern=modern):
+                self.assertEqual(
+                    _nominative_display_cite(modern, [modern, nominative]),
+                    expected,
+                )
+
+    def test_scotus_header_year_beats_rehearing_date(self):
+        win = object.__new__(_ScholarTextWindow)
+        win._item = {
+            "case_name": "Korematsu v. United States",
+            "citation": ["323 U.S. 214"],
+            "court_id": "scotus",
+            "date_filed": "1945-02-26",
+        }
+        win._blocks = [
+            Block("center", [Span("Korematsu v. United States")]),
+            Block("center", [Span("323 U.S. 214 (1944)")]),
+            Block("para", [Span("MR. JUSTICE BLACK delivered the opinion.")]),
+        ]
+
+        bb = win._compute_bluebook_parts()
+
+        self.assertEqual(bb["year"], "1944")
+
+    def test_official_state_reporter_is_source_independent_without_stars(self):
+        win = object.__new__(_ScholarTextWindow)
+        win._item = {
+            "case_name": "People v. Aaron",
+            "citation": ["299 N.W.2d 304"],
+            "court_id": "mich",
+            "date_filed": "1980-11-24",
+        }
+        win._blocks = [
+            Block("center", [Span("People v. Aaron")]),
+            Block("center", [Span("299 N.W.2d 304, 409 Mich. 672")]),
+            Block("para", [Span("The Court holds as follows.")]),
+        ]
+
+        bb = win._compute_bluebook_parts()
+
+        self.assertEqual(bb["display_cite"], "409 Mich. 672")
+
+
+class PublicDomainCitationTests(unittest.TestCase):
+    def test_wisconsin_initial_citation_orders_all_three_sources(self):
+        self.assertEqual(
+            _wisconsin_display_cite([
+                "960 N.W.2d 869", "2021 WI 64", "397 Wis. 2d 719",
+            ]),
+            "2021 WI 64, 397 Wis. 2d 719, 960 N.W.2d 869",
+        )
+
+    def test_paragraph_pin_follows_public_domain_cite(self):
+        win = object.__new__(_ScholarTextWindow)
+        win._base_citation_override = ""
+        win._bb = {
+            "name": "State v. Prado",
+            "cite": "397 Wis. 2d 719",
+            "display_cite": "2021 WI 64, 397 Wis. 2d 719, 960 N.W.2d 869",
+            "court": "Wis.", "year": "2021",
+            "omit_parenthetical": "1", "pin_kind": "paragraph",
+        }
+
+        plain, _rtf = win._bluebook_citation("¶ 12")
+
+        self.assertEqual(
+            plain,
+            "State v. Prado, 2021 WI 64, ¶ 12, 397 Wis. 2d 719, "
+            "960 N.W.2d 869.",
+        )
+
+
+class CombinedOpinionCompletenessTests(unittest.TestCase):
+    def test_lone_unpaginated_combined_record_is_still_a_body_candidate(self):
+        combined = {
+            "type": "010combined",
+            "plain_text": "Lead opinion.\n\nJustice Jones, dissenting.\n\nI dissent.",
+        }
+        self.assertIs(_pick_combined_opinion([combined]), combined)
+
+    def test_truncated_combined_cannot_hide_typed_separate_writings(self):
+        opinions = [
+            {"type": "010combined", "html": "<p>combined</p>"},
+            {"type": "020lead", "html": "<p>lead</p>"},
+            {"type": "035concurrenceinpart", "html": "<p>Ryan</p>"},
+            {"type": "030concurrence", "html": "<p>Williams</p>"},
+        ]
+        combined_parts = [OpinionPart("Opinion", "majority", [])]
+
+        self.assertFalse(_combined_parts_cover_typed(opinions, combined_parts))
+
+    def test_more_complete_combined_document_remains_eligible(self):
+        opinions = [
+            {"type": "010combined", "html": "<p>combined</p>"},
+            {"type": "020lead", "html": "<p>lead</p>"},
+            {"type": "040dissent", "html": "<p>dissent</p>"},
+        ]
+        combined_parts = [
+            SimpleNamespace(kind="majority"),
+            SimpleNamespace(kind="concurrence"),
+            SimpleNamespace(kind="dissent"),
+        ]
+
+        self.assertTrue(_combined_parts_cover_typed(opinions, combined_parts))
 
 
 if __name__ == "__main__":

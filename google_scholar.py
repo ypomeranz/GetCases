@@ -684,7 +684,16 @@ _BARE_SEP_HEADER_RE = re.compile(
     r"^(?:Statement\s+of\s+)?"
     r"(?:(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(?:CHIEF\s+)?JUSTICE\s+"
     r"[A-Z][\w.'’-]+\s*[.:]"
-    r"|[A-Z][\w.'’-]+,\s*(?:C\.\s*)?J\.)$",
+    r"|[A-Z][\w.'’-]+,\s*(?:(?:C\.|Ch\.)\s*)?J\.)$",
+    re.IGNORECASE,
+)
+# OCR from the earliest U.S. Reports often turns the long-s in ``Justice``
+# into strings such as ``Jujtice``, ``Juftke``, or ``7ujh~?~``.  Restrict this
+# deliberately loose recovery rule to a whole short byline so the noisy word
+# cannot create a boundary in running prose.
+_OCR_JUSTICE_BYLINE_RE = re.compile(
+    r"^\W{0,8}[A-Z][A-Za-z.’'~!-]{2,30},\W{0,4}[J7][A-Za-z~?]{3,12}"
+    r"[.\s*t]*$",
     re.IGNORECASE,
 )
 
@@ -719,19 +728,39 @@ _SEP_DELIVERED_RE = re.compile(
 )
 
 
-def _peek_sep_kind(blocks: list, i: int, default: str = "concurrence") -> str:
-    """The role of a separate opinion whose header names none (a bare
-    "TRAYNOR, J.", "…delivered the following separate opinion."): read the
-    opening sentences — "I dissent…" / "I concur…" say which way it went."""
+def _peek_sep_kind_evidence(
+    blocks: list, i: int, default: str = "concurrence"
+) -> tuple[str, bool]:
+    """Return ``(kind, found_role_language)`` for a keyword-less byline."""
     for b in blocks[i + 1: i + 4]:
         t = _content_text(b)
         if not t:
             continue
+        # Role language after another byline belongs to that later judge, not
+        # to the candidate being classified.
+        if (_BARE_SEP_HEADER_RE.match(t)
+                or _JOINED_SEP_HEADER_RE.match(t)
+                or _OCR_JUSTICE_BYLINE_RE.match(t)):
+            break
         m = re.search(r"\b(dissent|concur)", t[:300], re.IGNORECASE)
         if m:
-            return ("dissent" if m.group(1).lower() == "dissent"
-                    else "concurrence")
-    return default
+            return (("dissent" if m.group(1).lower() == "dissent"
+                     else "concurrence"), True)
+        if re.search(
+            r"\b(?:opinion|view)\s+(?:is\s+)?different\b|"
+            r"\bdiffer\s+from\s+(?:the\s+)?(?:court|opinion|judgment)\b",
+            t[:400], re.IGNORECASE,
+        ):
+            return "dissent", True
+        if re.search(r"\bdelivered\s+the\s+opinion(?:\s+of\s+the\s+court)?\b",
+                     t[:300], re.IGNORECASE):
+            return "majority", True
+    return default, False
+
+
+def _peek_sep_kind(blocks: list, i: int, default: str = "concurrence") -> str:
+    """Role of a separate opinion whose byline does not state its role."""
+    return _peek_sep_kind_evidence(blocks, i, default)[0]
 
 # The byline shared with the body of _SEP_HEADER_RE — a justice/judge name
 # followed (within a clause) by "concurring"/"dissenting".
@@ -818,8 +847,43 @@ _MAJ_ATTRIB_RE = re.compile(
 # Lower-court style author line standing alone: "KOZINSKI, Circuit Judge:"
 _AUTHOR_LINE_RE = re.compile(
     r"^\s*[A-Z][\w.'’ -]{0,50},\s*(?:(?:Chief|Senior|Presiding)\s+)?"
-    r"(?:(?:Circuit|District|Bankruptcy)\s+)?(?:Judge|Justice|C\.?\s?J\.|J\.)"
+    r"(?:(?:Circuit|District|Bankruptcy)\s+)?"
+    r"(?:Judge|Justice|C\.?\s?J\.|Ch\.?\s?J\.|J\.)"
     r"\s*[.:;—-]?\s*$"
+)
+# Authorship can share the first numbered paragraph instead of occupying a
+# standalone line (Wisconsin slip opinions commonly use this form).
+_INLINE_AUTHOR_OPEN_RE = re.compile(
+    r"^\s*[A-Z][A-Z.'’ -]{1,60},\s*(?:C\.?\s*J\.?|J\.|"
+    r"(?:Chief\s+)?(?:Circuit\s+)?Judge)\s+(?=\S)",
+    re.IGNORECASE,
+)
+_INLINE_ROLE_OPEN_RE = re.compile(
+    r"^\s*[A-Z][A-Z.'’ -]{1,60},\s*(?:C\.?\s*J\.?|J\.|"
+    r"(?:Chief\s+)?(?:Circuit\s+)?Judge)\s*"
+    r"(?:\((?:concurring|dissenting)[^)]*\)|,\s*(?:concurring|dissenting)[^:]*:)\.?",
+    re.IGNORECASE,
+)
+# PDF-to-text extraction sometimes glues a filing banner to the dissent byline:
+# ``6 FILED ... CLERK R. NELSON, Circuit Judge, dissenting:``.
+_FILED_BANNER_ROLE_RE = re.compile(
+    r"(?:\bFILED\b|\bCLERK\b).{0,400}?"
+    r"(?P<label>[A-Z](?:\.\s*)?[A-Z][A-Z.'’ -]{0,45},\s*"
+    r"(?:(?:Chief|Senior)\s+)?(?:Circuit\s+)?Judge,.{0,160}?"
+    r"(?P<role>concurring|dissenting)[^:]{0,100}:)",
+    re.IGNORECASE | re.DOTALL,
+)
+_PUBLIC_ROLE_BYLINE_RE = re.compile(
+    r"(?:^|¶\s*\d{1,5}\s+)"
+    r"(?P<label>[A-Z][A-Z.'’ -]{1,60},\s*(?:C\.?\s*J\.?|J\.)\s*"
+    r"\((?P<role>concurring|dissenting)[^)]*\)\.?)",
+    re.IGNORECASE,
+)
+_JOINED_ROLE_BYLINE_RE = re.compile(
+    r"^(?P<label>[A-Z](?:\.\s*)?[A-Z][A-Z.'’ -]{0,55},\s*"
+    r"(?:(?:Chief|Senior)\s+)?(?:Circuit\s+)?Judge,.{0,240}?"
+    r"(?P<role>concurring|dissenting)[^:]{0,80}:)",
+    re.IGNORECASE,
 )
 # Caption front matter that belongs in the header even though it isn't
 # centered: how the case arrived and counsel listings (in their several
@@ -853,7 +917,11 @@ def _content_text(b: Block) -> str:
     """Block text without page markers, whitespace-normalized — page
     markers can open a block ("*116 MR. JUSTICE BLACKMUN delivered…") and
     would defeat the start-anchored classification patterns."""
-    return _visible_block_text(b)
+    text = _visible_block_text(b)
+    # Public-domain opinions prefix the authorship line with the first
+    # paragraph number (``¶1 ANN WALSH BRADLEY, J.``).  Keep the marker in the
+    # rendered block, but remove it from the classification view.
+    return re.sub(r"^(?:¶\s*|\[\s*¶\s*)(\d{1,5})\s*\]?\s*", "", text)
 
 
 def _split_footnote_run(blocks: list[Block]) -> tuple[list[Block], list[Block]]:
@@ -953,13 +1021,55 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     if not blocks:
         return []
     blocks = _split_inline_sep_headers(blocks)
+    seriatim = any(
+        re.search(r"\b(?:seriatim|feriatim)\b", _content_text(b), re.IGNORECASE)
+        for b in blocks[:6]
+    )
     boundaries: list[tuple[int, str, str]] = []  # (block index, kind, label)
-    bare_headers: list[tuple[int, str, str]] = []  # keyword-less attributions
+    # (index, kind, label, role language found).  The final flag lets us prune
+    # short runs of vote signatures without discarding substantial old-style
+    # opinions whose bylines omit "concurring" or "dissenting."
+    bare_headers: list[tuple[int, str, str, bool]] = []
     maj_phrase_all: list[int] = []
     maj_author_idx: Optional[int] = None
     for i, b in enumerate(blocks):
         t = _content_text(b)
         if not t:
+            continue
+        joined_text = " ".join(
+            _content_text(nb) for nb in blocks[i:i + 3]
+            if _content_text(nb)
+        )
+        filed_role = (_FILED_BANNER_ROLE_RE.search(joined_text[:4000])
+                      if re.search(r"\b(?:FILED|CLERK)\b", t, re.IGNORECASE)
+                      else None)
+        public_role = _PUBLIC_ROLE_BYLINE_RE.search(t[:4000])
+        inline_role = _INLINE_ROLE_OPEN_RE.match(t[:300])
+        joined_role = _JOINED_ROLE_BYLINE_RE.match(joined_text[:700])
+        if filed_role or public_role or inline_role or joined_role:
+            role_text = (filed_role.group("role") if filed_role else
+                         public_role.group("role") if public_role else
+                         joined_role.group("role") if joined_role else
+                         inline_role.group(0))
+            kind = ("dissent" if re.search(r"dissent", role_text, re.IGNORECASE)
+                    else "concurrence")
+            label = (filed_role.group("label") if filed_role else
+                     public_role.group("label") if public_role else
+                     joined_role.group("label") if joined_role else
+                     inline_role.group(0)).strip()
+            if filed_role:
+                label = re.sub(
+                    r"^(?:(?:U\.S\.|COURT|OF|APPEALS|CLERK)\s+)+",
+                    "", label, flags=re.IGNORECASE,
+                )
+            boundaries.append((i, kind, label[:90]))
+            continue
+        if (boundaries and i - boundaries[-1][0] <= 2
+                and "joined" in boundaries[-1][2].lower()
+                and re.search(r"\bJudges?,\s*(?:concurring|dissenting)\b",
+                              t, re.IGNORECASE)):
+            # Continuation of a wrapped joined-byline already captured from
+            # the filing-banner block, not another opinion.
             continue
         if len(t) <= 300 and _SEP_HEADER_RE.match(t) and not _NOT_SEP_RE.search(t):
             kind = "dissent" if re.search(r"dissent", t, re.IGNORECASE) else "concurrence"
@@ -972,19 +1082,28 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
                     else "concurrence" if m else _peek_sep_kind(blocks, i))
             boundaries.append((i, kind, t if len(t) <= 90 else t[:87] + "…"))
             continue
-        if len(t) <= 60 and _BARE_SEP_HEADER_RE.match(t):
+        if len(t) <= 60 and (
+            _BARE_SEP_HEADER_RE.match(t) or _OCR_JUSTICE_BYLINE_RE.match(t)
+        ):
             if (maj_author_idx is None and not boundaries and not bare_headers
-                    and _AUTHOR_LINE_RE.match(t)):
+                    and (_AUTHOR_LINE_RE.match(t)
+                         or _OCR_JUSTICE_BYLINE_RE.match(t))):
                 # The first bare state-court byline before any separate
                 # opinion opens the majority ("GIBSON, C.J." in Escola),
                 # not a separate opinion.
                 maj_author_idx = i
             else:
-                bare_headers.append((i, _peek_sep_kind(blocks, i), t))
+                kind, evidenced = _peek_sep_kind_evidence(
+                    blocks, i, default="majority" if seriatim else "concurrence"
+                )
+                bare_headers.append((i, kind, t, evidenced))
             continue
         if len(t) <= 260 and _JOINED_SEP_HEADER_RE.match(t):
             label = t if len(t) <= 90 else t[:87] + "…"
-            bare_headers.append((i, _peek_sep_kind(blocks, i), label))
+            kind, _evidenced = _peek_sep_kind_evidence(blocks, i)
+            # A complete "with whom ... joins" byline is itself strong
+            # boundary evidence even when the next sentence omits the role.
+            bare_headers.append((i, kind, label, True))
             continue
         if _MAJ_PHRASE_RE.search(t[:160]) and _MAJ_ATTRIB_RE.match(t):
             # Candidates are collected over the whole document: an attribution
@@ -992,7 +1111,8 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
             # a front-matter announcement (see below).
             maj_phrase_all.append(i)
         elif (maj_author_idx is None and not boundaries
-              and len(t) <= 120 and _AUTHOR_LINE_RE.match(t)):
+              and ((_AUTHOR_LINE_RE.match(t) and len(t) <= 120)
+                   or _INLINE_AUTHOR_OPEN_RE.match(t[:180]))):
             maj_author_idx = i
     first_sep = boundaries[0][0] if boundaries else len(blocks)
     phrase_before = [i for i in maj_phrase_all if i < first_sep]
@@ -1018,7 +1138,20 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     anchor = maj_idx if maj_idx is not None else (
         boundaries[0][0] if boundaries else None)
     if anchor is not None:
-        boundaries += [bd for bd in bare_headers if bd[0] > anchor]
+        candidates = [bd for bd in bare_headers if bd[0] > anchor]
+        all_candidate_indexes = sorted(
+            [bd[0] for bd in boundaries] + [bd[0] for bd in candidates]
+        )
+        for idx, kind, label, evidenced in candidates:
+            next_idx = next(
+                (j for j in all_candidate_indexes if j > idx), len(blocks)
+            )
+            # An unevidenced byline with at most one following block before
+            # another byline (or the document end) is a vote/signature line,
+            # not a separate opinion.  Longer historical writings remain.
+            if not evidenced and next_idx - idx <= 2:
+                continue
+            boundaries.append((idx, kind, label))
         boundaries.sort(key=lambda bd: bd[0])
     first_sep = boundaries[0][0] if boundaries else len(blocks)
 

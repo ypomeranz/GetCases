@@ -113,7 +113,8 @@ def _ensure_dependencies() -> None:
         root.destroy()
 
 
-_ensure_dependencies()
+if not os.environ.get("GETCASES_SKIP_DEPENDENCY_PROMPT"):
+    _ensure_dependencies()
 
 import requests as _requests
 
@@ -1390,6 +1391,50 @@ _NOMINATIVE_CITE_RE = re.compile(
     r"Black|Wall|Wallace)\.?\s+(\d{1,4})\b"
 )
 
+_WI_NEUTRAL_CITE_RE = re.compile(r"^\d{4}\s+WI(?:\s+App)?\s+\d+$")
+_WI_OFFICIAL_CITE_RE = re.compile(r"^\d+\s+Wis\.\s*(?:2d\s+)?\d+$")
+_WI_REGIONAL_CITE_RE = re.compile(r"^\d+\s+N\.W\.(?:2d\s+)?\d+$")
+_REGIONAL_REPORTER_RE = re.compile(
+    r"\s(?:A\.(?:2d|3d)?|P\.(?:2d|3d)?|N\.E\.(?:2d|3d)?|"
+    r"N\.W\.(?:2d)?|S\.E\.(?:2d)?|S\.W\.(?:2d|3d)?|"
+    r"So\.(?:\s*[23]d)?)\s",
+    re.IGNORECASE,
+)
+
+
+def _nominative_display_cite(us_cite: str, citations) -> str:
+    """Bluebook's dual modern/nominative form for early U.S. Reports.
+
+    ``3 U.S. 199`` plus ``3 Dall. 199`` becomes
+    ``3 U.S. (3 Dall.) 199``.  The relationship is verified through the
+    reporter-volume offset table so an unrelated parallel cannot be inserted.
+    """
+    um = re.fullmatch(r"(\d+)\s+U\.S\.\s+(\d+)", us_cite or "")
+    if not um:
+        return ""
+    for raw in citations or []:
+        text = re.sub(r"\s+", " ", str(raw or "")).strip()
+        nm = _NOMINATIVE_CITE_RE.fullmatch(text)
+        if not nm or _us_reports_cite(text) != us_cite:
+            continue
+        reporter = _NOMINATIVE_CANON.get(nm.group(2).lower(), nm.group(2))
+        return f"{um.group(1)} U.S. ({nm.group(1)} {reporter}) {um.group(2)}"
+    return ""
+
+
+def _wisconsin_display_cite(citations) -> str:
+    """Wisconsin SCR 80.02 initial-citation order, when available."""
+    clean = [
+        re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(c or ""))).strip()
+        for c in citations or []
+    ]
+    neutral = next((c for c in clean if _WI_NEUTRAL_CITE_RE.fullmatch(c)), "")
+    if not neutral:
+        return ""
+    official = next((c for c in clean if _WI_OFFICIAL_CITE_RE.fullmatch(c)), "")
+    regional = next((c for c in clean if _WI_REGIONAL_CITE_RE.fullmatch(c)), "")
+    return ", ".join(c for c in (neutral, official, regional) if c)
+
 
 def _us_reports_cite(cite: str) -> str:
     """A nominative early-SCOTUS citation in its modern "U.S." form
@@ -2632,20 +2677,63 @@ def _headmatter_blocks(headmatter: str) -> "tuple[list, list]":
 
 def _pick_combined_opinion(opinions: list[dict]) -> Optional[dict]:
     """The CourtListener "combined" opinion — the whole case as one
-    star-paginated document (structurally a Google Scholar opinion) — when the
-    cluster has one.  Identified by the ``combined`` opinion type carrying
-    reporter page markers; falls back to a lone star-paginated sub-opinion.
-    Returns None when no such nicely-formatted full text is present, so the
-    caller assembles the separate sub-opinions as before."""
+    document — when the cluster has one.  Prefer a combined record carrying
+    reporter page markers; a lone unpaginated combined record is still useful
+    because its plain text may be the cluster's only body.  The caller checks
+    completeness against typed sub-opinions before allowing it to replace
+    them."""
     def starred(op: dict) -> bool:
         return "star-pagination" in (
             op.get("html_with_citations") or op.get("html") or ""
         )
-    for op in opinions:
-        if "combined" in (op.get("type") or "") and starred(op):
+    combined = [op for op in opinions if "combined" in (op.get("type") or "")]
+    for op in combined:
+        if starred(op):
             return op
+    # A number of lawbox/slip-opinion clusters expose only one combined
+    # record, without star-pagination markup.  It is still the only body and
+    # its plain_text can be segmented; the completeness gate below prevents
+    # it from displacing any typed separate writings.
+    if len(combined) == 1:
+        return combined[0]
     hits = [op for op in opinions if starred(op)]
     return hits[0] if len(hits) == 1 else None
+
+
+_STRUCTURAL_CL_TYPES = {
+    "015unamimous", "020lead", "025plurality", "030concurrence",
+    "035concurrenceinpart", "040dissent",
+}
+
+
+def _combined_parts_cover_typed(opinions: list[dict], parts: list) -> bool:
+    """Whether a parsed combined document preserves CourtListener's typed
+    writings.
+
+    A combined, star-paginated document is useful for reporter pages, but it
+    is not necessarily complete.  Some clusters contain a truncated combined
+    record alongside correctly typed lead/concurrence/dissent sub-opinions.
+    Never let that convenience record erase a writing the API explicitly
+    identifies.
+    """
+    expected: dict[str, int] = {"majority": 0, "concurrence": 0, "dissent": 0}
+    for op in opinions:
+        type_code = op.get("type") or ""
+        if type_code not in _STRUCTURAL_CL_TYPES:
+            continue
+        if not any((op.get(k) or "").strip() for k in (
+            "html_with_citations", "html", "plain_text",
+        )):
+            continue
+        expected[_CL_TYPE_KIND.get(type_code, "majority")] += 1
+
+    if not any(expected.values()):
+        return True
+    actual = {"majority": 0, "concurrence": 0, "dissent": 0}
+    for part in parts:
+        if getattr(part, "kind", "") in actual:
+            actual[part.kind] += 1
+    return all(actual[kind] >= count for kind, count in expected.items())
 
 
 def _assemble_case_parts(
@@ -2783,14 +2871,47 @@ def _assemble_case_parts(
         html_text = (
             combined.get("html_with_citations") or combined.get("html") or ""
         )
+        cblocks = []
+        cfootnotes = []
         try:
             cblocks = parse_opinion_blocks(html_text)
+            # ``<pre class="inline">`` CourtListener records are one or two
+            # enormous DOM blocks to the Scholar parser.  The CL parser knows
+            # that blank lines inside those pre chunks are real paragraphs,
+            # which restores the bylines needed by Prado, Duncan, and similar
+            # modern slip opinions.
+            if len(cblocks) <= 2 and len(html_text) > 4000:
+                alt_blocks, cfootnotes = _parse_cl_html(
+                    html_text, fn_prefix="combined_"
+                )
+                if len(alt_blocks) > len(cblocks):
+                    cblocks = alt_blocks
+                if (combined.get("plain_text") or "").strip():
+                    # Some lawbox records expose their real paragraph breaks
+                    # only in ``plain_text``; both HTML parsers see a pair of
+                    # giant centered/pre blocks.  Recover those paragraphs so
+                    # authorship headings remain classifiable.
+                    plain = (combined.get("plain_text") or "").strip()
+                    paras = [p for p in re.split(r"\n\s*\n", plain) if p.strip()]
+                    if len(paras) <= 2:
+                        # Lawbox plain text commonly uses one physical line
+                        # per paragraph and no blank separators.
+                        paras = plain.splitlines()
+                    plain_blocks = [
+                        Block(kind="para", spans=[Span(text=para.strip())])
+                        for para in paras
+                        if para.strip()
+                    ]
+                    if len(plain_blocks) > len(cblocks):
+                        cblocks = plain_blocks
             cparts = segment_blocks(cblocks)
+            if cfootnotes and cparts:
+                cparts[-1].footnotes.extend(cfootnotes)
             link_footnotes_by_marker(cparts)  # make [N] footnotes clickable
         except Exception as exc:
             print(f"[cl-parts] combined-opinion parse failed: {exc}")
             cparts = []
-        if cparts:
+        if cparts and _combined_parts_cover_typed(opinions, cparts):
             # The combined text is the whole printed case *from the opinion
             # on*; the CAP headmatter (headnotes, arguments of counsel) still
             # belongs before the opinion — after the caption header when the
@@ -2804,11 +2925,34 @@ def _assemble_case_parts(
             except Exception:
                 plain = ""
             return cparts, body, plain, cluster
+        if cblocks:
+            # Even when the combined body is incomplete, its printed header
+            # can contain an official reporter omitted from CourtListener's
+            # cluster metadata.  Fuse only short centered/heading fields into
+            # the metadata header; keep the typed sub-opinions as the body.
+            seen_header = {
+                re.sub(r"\s+", " ", b.text()).strip().lower()
+                for b in header_blocks
+            }
+            for b in cblocks[:12]:
+                text = re.sub(r"\s+", " ", b.text()).strip()
+                key = text.lower()
+                if (b.kind in ("center", "heading") and 0 < len(text) <= 300
+                        and key not in seen_header):
+                    header_blocks.append(b)
+                    if parts and parts[0].kind == "header":
+                        parts[0].blocks.append(b)
+                    seen_header.add(key)
 
     all_blocks: list[Block] = list(header_blocks)
 
     for idx, op in enumerate(opinions):
         type_code = op.get("type") or ""
+        if "combined" in type_code:
+            # A combined record was already considered above.  If it failed
+            # the completeness check, the typed sub-opinions are the fallback;
+            # appending the same combined body here would duplicate the case.
+            continue
         label = _OPINION_TYPE_LABELS.get(type_code, type_code or "Opinion")
         kind = _CL_TYPE_KIND.get(type_code, "majority")
 
@@ -7284,6 +7428,13 @@ def _extract_opinion_id(url: str) -> Optional[int]:
 # centered line, e.g. "306 Md. 556 (1986)" / "510 A.2d 562" / "87 F.4th 563 (2023)"
 _HEADER_CITE_RE = re.compile(
     r"^\s*(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})\s*(?:\(|$)"
+)
+# The CourtListener metadata header can put all parallels on one centered
+# comma-separated line.  Scan each field rather than recognizing only its
+# first citation.
+_HEADER_CITE_SCAN_RE = re.compile(
+    r"(?<!\w)(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})"
+    r"(?=\s*(?:[,;(]|$))"
 )
 
 # A line that is *only* a reporter citation (optionally with a year), e.g.
@@ -11873,9 +12024,11 @@ class _ScholarTextWindow:
         """The app-computed citation without a pinpoint or final period."""
         bb = self._bb
         name = bb.get("name", "")
-        cite = bb.get("cite", "")
+        cite = bb.get("display_cite") or bb.get("cite", "")
         value = f"{name}, {cite}" if name and cite else (name or cite)
-        paren = " ".join(p for p in (bb.get("court", ""), bb.get("year", "")) if p)
+        paren = "" if bb.get("omit_parenthetical") else " ".join(
+            p for p in (bb.get("court", ""), bb.get("year", "")) if p
+        )
         return f"{value} ({paren})" if value and paren else value
 
     def _set_base_citation_override(self, value: str) -> None:
@@ -13436,24 +13589,32 @@ class _ScholarTextWindow:
         # stars, prefer a recognized national/regional reporter, the
         # Bluebook default for state cases.
         header = "  ".join(
-            b.text() for b in self._blocks[:8] if b.kind in ("center", "heading")
+            b.text() for b in self._blocks[:16] if b.kind in ("center", "heading")
         )
         cands: list[tuple[str, int]] = []
-        for b in self._blocks[:8]:
+        header_cites: list[str] = []
+        header_cite_seen: set[str] = set()
+        for b in self._blocks[:16]:
             if b.kind not in ("center", "heading"):
                 continue
             t = re.sub(r"\s+", " ", b.text()).strip()
             t = re.sub(r"\bU\.\s+S\.", "U.S.", t)
             t = re.sub(r"\b(\d{1,4})\s+US\s+(\d{1,5})\b", r"\1 U.S. \2", t)
-            m = _HEADER_CITE_RE.match(t)
-            if m:
+            for m in _HEADER_CITE_SCAN_RE.finditer(t):
                 vol, rep, page = m.group(1), m.group(2).strip(" ,"), m.group(3)
-                cands.append((f"{vol} {rep} {page}", int(page)))
+                candidate = f"{vol} {rep} {page}"
+                key = re.sub(r"\s+", "", candidate).lower()
+                if key in header_cite_seen:
+                    continue
+                header_cite_seen.add(key)
+                header_cites.append(candidate)
+                if _is_paginable_cite(candidate):
+                    cands.append((candidate, int(page)))
         # Every parallel reporter cite printed above the case name — Scholar
         # often lists two or three (U.S., S. Ct., L. Ed.).  Kept so the PDF
         # resolver can try them all before giving up (not just the one chosen
         # for the Bluebook citation below).
-        self._header_cites = [c for c, _p in cands]
+        self._header_cites = header_cites
         # The star pagination may follow a reporter that isn't printed in the
         # opinion's own header — CourtListener's combined opinions carry no
         # parallel-cite header at all.  Fold in the cluster's parallel citations
@@ -13517,12 +13678,20 @@ class _ScholarTextWindow:
         if not cite:
             cite = _pick_citation(item.get("citation", []))
 
+        item_cites = _cluster_citations_to_strings(item.get("citation", []))
+        known_cites = list(header_cites)
+        known_seen = {re.sub(r"\s+", "", c).lower() for c in known_cites}
+        for candidate in item_cites:
+            key = re.sub(r"\s+", "", candidate).lower()
+            if key not in known_seen:
+                known_seen.add(key)
+                known_cites.append(candidate)
+
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
         year = date_filed[:4] if len(date_filed) >= 4 else ""
-        if not year:
-            years = re.findall(r"\b(1[6-9]\d{2}|20\d{2})\b", header)
-            if years:
-                year = years[-1]
+        header_years = re.findall(r"\b(1[6-9]\d{2}|20\d{2})\b", header)
+        if not year and header_years:
+            year = header_years[-1]
 
         if not name:
             name = _scholar_caption_name(self._blocks)
@@ -13540,13 +13709,46 @@ class _ScholarTextWindow:
             re.match(r"\d+\s+(U\.S\.|S\.\s?Ct\.|L\.\s?Ed\.)", cite)
         )
         self._is_scotus = is_scotus
+        # CourtListener occasionally supplies the rehearing-denial date as
+        # ``date_filed``.  The year printed in a Supreme Court opinion's own
+        # citation header is the decision year and therefore controls.
+        if is_scotus and header_years:
+            year = header_years[-1]
         court_abbr = ""
         if not is_scotus:
             fallback = str(item.get("court") or court_id).strip() if court_id else ""
             court_abbr = _court_for_paren(cite, court_id, fallback)
         name = abbreviate_case_name(name)
         cite = _respace_reporter_in_cite(cite)
-        return {"name": name, "cite": cite, "court": court_abbr, "year": year}
+        display_cite = cite
+        omit_parenthetical = ""
+        pin_kind = "page"
+        if is_scotus:
+            display_cite = _nominative_display_cite(cite, known_cites) or cite
+        elif first_star is None:
+            # With no page markers there is no pin-pagination reason to prefer
+            # a regional reporter.  A printed official state reporter in the
+            # source header gives a stable citation regardless of whether the
+            # case was opened through Scholar or CourtListener.
+            official = next((c for c in header_cites if (
+                _is_paginable_cite(c)
+                and not _REGIONAL_REPORTER_RE.search(f" {c} ")
+                and not re.search(r"\s(?:U\.S\.|S\. Ct\.|L\. Ed\.|F\.)\s", f" {c} ")
+            )), "")
+            if official:
+                display_cite = _respace_reporter_in_cite(official)
+
+        if court_id in ("wis", "wisctapp") or court_id.startswith("wis"):
+            wi_cite = _wisconsin_display_cite(known_cites)
+            if wi_cite:
+                display_cite = wi_cite
+                omit_parenthetical = "1"
+                pin_kind = "paragraph"
+        return {
+            "name": name, "cite": cite, "display_cite": display_cite,
+            "court": court_abbr, "year": year,
+            "omit_parenthetical": omit_parenthetical, "pin_kind": pin_kind,
+        }
 
     def _writer_parenthetical(self, part) -> str:
         """
@@ -13736,12 +13938,15 @@ class _ScholarTextWindow:
             return edited
         bb = self._bb
         name = bb.get("name", "")
+        display_cite = bb.get("display_cite") or bb.get("cite", "")
         seen: set = set()
         cites: list[str] = []
-        for c in ([bb.get("cite", "")] + list(self._header_cites)
-                  + list((self._item or {}).get("citation", []) or [])):
+        display_key = re.sub(r"\s+", "", display_cite).lower()
+        source_cites = ([display_cite] + list(self._header_cites)
+                        + list((self._item or {}).get("citation", []) or []))
+        for pos, c in enumerate(source_cites):
             c = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(c))).strip()
-            if (not c or not _is_paginable_cite(c)
+            if (not c or (pos and not _is_paginable_cite(c))
                     or _NONSTANDARD_CITE_RE.search(c)):
                 continue
             # Re-space standard reporters ("S.Ct." -> "S. Ct."), but leave a
@@ -13750,6 +13955,8 @@ class _ScholarTextWindow:
             if "(" not in c:
                 c = _respace_reporter_in_cite(c)
             key = re.sub(r"\s+", "", c).lower()
+            if pos and key in display_key:
+                continue
             if key not in seen:
                 seen.add(key)
                 cites.append(c)
@@ -13762,7 +13969,9 @@ class _ScholarTextWindow:
                 len(_TITLE_CITE_RANK),
             ))
             cites = [cites[0]] + tail
-        paren = " ".join(p for p in (bb.get("court", ""), bb.get("year", "")) if p)
+        paren = "" if bb.get("omit_parenthetical") else " ".join(
+            p for p in (bb.get("court", ""), bb.get("year", "")) if p
+        )
         if name and cites:
             title = f"{name}, {', '.join(cites)}"
         elif cites:
@@ -13947,15 +14156,23 @@ class _ScholarTextWindow:
             return plain, rtf
 
         bb = self._bb
-        name, cite, court, year = bb["name"], bb["cite"], bb["court"], bb["year"]
+        name = bb["name"]
+        cite = bb.get("display_cite") or bb["cite"]
+        court, year = bb["court"], bb["year"]
         rest = ""
         if cite:
-            rest = f", {cite}"
-            if pin:
-                m = _CITE_PARSE_RE.match(cite)
-                if not (m and pin == m.group(3)):  # skip pin equal to first page
-                    rest += f", {pin}"
-        paren_inner = " ".join(p for p in (court, year) if p)
+            if pin and bb.get("pin_kind") == "paragraph" and ", " in cite:
+                first, parallels = cite.split(", ", 1)
+                rest = f", {first}, {pin}, {parallels}"
+            else:
+                rest = f", {cite}"
+                if pin:
+                    m = _CITE_PARSE_RE.match(bb.get("cite", ""))
+                    if not (m and pin == m.group(3)):
+                        rest += f", {pin}"
+        paren_inner = "" if bb.get("omit_parenthetical") else " ".join(
+            p for p in (court, year) if p
+        )
         if paren_inner:
             rest += f" ({paren_inner})"
         if writer:
@@ -13992,6 +14209,22 @@ class _ScholarTextWindow:
         """Pinpoint page(s) for the text between *start* and *end*, derived
         from the star-pagination markers (Bluebook-style range, e.g. 120-21)."""
         txt = self._text
+        if self._bb.get("pin_kind") == "paragraph":
+            # Public-domain opinions print paragraph markers in the text.
+            # Use those markers and never silently substitute a reporter page
+            # for a jurisdiction that requires paragraph pinpoints.
+            marker_re = re.compile(r"(?:¶\s*|\[\s*¶\s*)(\d{1,5})\s*\]?")
+            before = txt.get("1.0", start)
+            selected = txt.get(start, end)
+            prior = list(marker_re.finditer(before))
+            through = list(marker_re.finditer(before + selected))
+            if not through:
+                return None
+            first = int((prior[-1] if prior else through[0]).group(1))
+            last = int(through[-1].group(1))
+            if last <= first:
+                return f"¶ {first}"
+            return f"¶¶ {first}–{last}"
         start_page: Optional[int] = None
         prev = txt.tag_prevrange("pagenum", start)
         if prev:
