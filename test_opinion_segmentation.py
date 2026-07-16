@@ -73,6 +73,50 @@ class JoinedSeparateOpinionTests(unittest.TestCase):
         self.assertIn("WHITE concurs", parts[1].blocks[-1].text())
 
 
+class TitleCommaBylineTests(unittest.TestCase):
+    def test_stray_comma_after_justice_still_bounds_opinions(self):
+        # Alleyne v. United States, 570 U.S. 99 (2013): Scholar's text
+        # prints "Justice, BREYER," / "Chief Justice, ROBERTS," — a stray
+        # comma between title and name that must not hide the bylines.
+        parts = segment_blocks([
+            _block("Justice THOMAS announced the judgment of the Court."),
+            _block("Mandatory minimum sentences increase the penalty."),
+            _block("Justice SOTOMAYOR, with whom Justice GINSBURG and "
+                   "Justice KAGAN join, concurring."),
+            _block("I join the opinion of the Court in full."),
+            _block("Justice, BREYER, concurring in part and concurring in "
+                   "the judgment."),
+            _block("I cannot accept the majority's rationale."),
+            _block("Chief Justice, ROBERTS, with whom Justice, SCALIA and "
+                   "Justice, KENNEDY join, dissenting."),
+            _block("I would adhere to our precedent."),
+            _block("Justice, ALITO, dissenting."),
+            _block("The Court overrules a well-entrenched case."),
+        ])
+
+        self.assertEqual(
+            [part.kind for part in parts],
+            ["majority", "concurrence", "concurrence", "dissent", "dissent"],
+        )
+        self.assertIn("BREYER", parts[2].label)
+        self.assertIn("ROBERTS", parts[3].label)
+
+    def test_comma_after_title_in_majority_attribution(self):
+        # Armstrong v. Exceptional Child Ctr.: "Justice, SCALIA, delivered
+        # the opinion of the Court, except as to Part IV."
+        parts = segment_blocks([
+            _block("Justice, SCALIA, delivered the opinion of the Court, "
+                   "except as to Part IV."),
+            _block("Medicaid is a federal-state program."),
+            _block("Justice, SOTOMAYOR, with whom Justice KENNEDY joins, "
+                   "dissenting."),
+            _block("I respectfully dissent from the Court's holding."),
+        ])
+
+        self.assertEqual([part.kind for part in parts],
+                         ["majority", "dissent"])
+
+
 class SpelledOutRoleBylineTests(unittest.TestCase):
     def test_alabama_style_justice_bylines_start_separate_opinions(self):
         # Ex parte Murphy, 886 So. 2d 90 (Ala. 2003): the role is spelled
@@ -105,6 +149,78 @@ class SpelledOutRoleBylineTests(unittest.TestCase):
         self.assertIn("LYONS", parts[2].label)
         # The vote lines stay with the majority opinion.
         self.assertIn("JJ., concur", parts[0].blocks[-3].text())
+
+
+class GluedDispositionBylineTests(unittest.TestCase):
+    def test_disposition_glued_to_byline_without_period(self):
+        # King v. Burwell, 759 F.3d 358 (4th Cir. 2014): Scholar glues the
+        # mandate to the concurrence byline with no period — "AFFIRMED
+        # DAVIS, Senior Circuit Judge, concurring:".
+        parts = segment_blocks([
+            _block("GREGORY, Circuit Judge:"),
+            _block("The plaintiffs challenge the IRS rule."),
+            _block("AFFIRMED DAVIS, Senior Circuit Judge, concurring:"),
+            _block("I write separately because the statute is clear."),
+        ])
+
+        self.assertEqual([p.kind for p in parts], ["majority", "concurrence"])
+        self.assertTrue(
+            parts[1].blocks[0].text().startswith("DAVIS"),
+            parts[1].blocks[0].text(),
+        )
+        # The mandate stays with the majority opinion.
+        self.assertIn("AFFIRMED", parts[0].blocks[-1].text())
+
+    def test_disposition_blocks_do_not_become_phantom_parts(self):
+        # Rothery Storage & Van Co. v. Atlas Van Lines, 792 F.2d 210 (D.C.
+        # Cir. 1986): the disposition sentences precede the byline as their
+        # own blocks; the 3-block joined window must not turn them into
+        # phantom one-line concurrences.
+        parts = segment_blocks([
+            _block("BORK, Circuit Judge:"),
+            _block("The antitrust claims fail as a matter of law."),
+            _block("The judgment of the district court is"),
+            _block("Affirmed."),
+            _block("WALD, Circuit Judge, concurring:"),
+            _block("I concur in the result and in much of the reasoning."),
+        ])
+
+        self.assertEqual([p.kind for p in parts], ["majority", "concurrence"])
+        self.assertTrue(parts[1].blocks[0].text().startswith("WALD"))
+
+    def test_so_ordered_glued_byline_splits(self):
+        # Lorenzo v. SEC, 872 F.3d 578 (D.C. Cir. 2017): "So ordered.
+        # KAVANAUGH, Circuit Judge, dissenting:" shares one block.
+        parts = segment_blocks([
+            _block("SRINIVASAN, Circuit Judge:"),
+            _block("Substantial evidence supports the Commission."),
+            _block("So ordered. KAVANAUGH, Circuit Judge, dissenting:"),
+            _block("The Commission overreached in this case."),
+        ])
+
+        self.assertEqual([p.kind for p in parts], ["majority", "dissent"])
+        self.assertTrue(parts[1].blocks[0].text().startswith("KAVANAUGH"))
+
+    def test_page_break_running_head_is_not_a_byline(self):
+        # Intel Corp. v. AMD, 542 U.S. 241 (2004): the facing-page running
+        # head "BREYER, J., dissenting" rides in on a page marker with no
+        # terminal punctuation; the majority's closing lines must not become
+        # a phantom dissent.
+        blocks = [
+            _block("JUSTICE GINSBURG delivered the opinion of the Court."),
+            _block("Section 1782 authorizes the discovery."),
+            Block(kind="para", spans=[
+                Span(text="*267 ", pagenum=True),
+                Span(text="BREYER, J., dissenting"),
+            ]),
+            _block("For the reasons stated, the judgment is Affirmed."),
+            _block("JUSTICE BREYER, dissenting."),
+            _block("I cannot agree with the Court's reading."),
+        ]
+        parts = segment_blocks(blocks)
+
+        self.assertEqual([p.kind for p in parts], ["majority", "dissent"])
+        self.assertTrue(parts[1].blocks[0].text().startswith("JUSTICE BREYER"))
 
 
 class HistoricalAndSignatureBoundaryTests(unittest.TestCase):

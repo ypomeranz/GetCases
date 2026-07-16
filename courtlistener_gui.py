@@ -601,6 +601,7 @@ from bluebook_names import (
     abbreviate_case_name,
     collapse_personal_all_caps_run,
     courtlistener_case_name,
+    is_recognized_given_name,
     normal_case_caption,
     refine_caption_case,
     strip_related_case_note,
@@ -647,6 +648,7 @@ from court_catalog import (
     STATE_COURTS as _STATE_COURTS,
     all_court_ids as _all_court_ids,
     bluebook_court_from_name as _bluebook_court_from_name,
+    bluebook_federal_trial_court as _bluebook_federal_trial_court,
 )
 
 _CONFIG_PATH = Path.home() / ".config" / "courtlistener" / "config.json"
@@ -3103,6 +3105,7 @@ try:
         bears_citation as _scholar_bears_citation,
         blocks_to_text,
         educate_quotes,
+        fix_title_comma,
         parse_opinion_blocks,
         segment_blocks,
         text_similarity,
@@ -3113,6 +3116,9 @@ except ImportError:
     _SCHOLAR_AVAILABLE = False
 
     def educate_quotes(text: str) -> str:  # graceful degradation
+        return text
+
+    def fix_title_comma(text: str) -> str:  # graceful degradation
         return text
 
 try:
@@ -7768,6 +7774,54 @@ def _scholar_court_id(blocks) -> str:
     return ""
 
 
+# Abbreviations whose period never ends a listed case: honorifics,
+# geography ("St. Paul"), and entity suffixes ("Marine Ins. Co. SAME v. …").
+# "al" is deliberately absent — "…, et al." routinely closes the first case.
+_CUT_STOP_ABBRS = frozenset({
+    "st", "ste", "mt", "ft", "mr", "mrs", "ms", "dr", "hon", "rev",
+    "sgt", "lt", "capt", "col", "gen", "jr", "sr", "co", "cos", "corp",
+    "inc", "ltd", "bros", "ins", "mfg", "ry", "rr", "no", "nos",
+})
+
+
+def _cut_companion_cases(text: str) -> str:
+    """Keep only the first-listed case of a consolidated caption (Bluebook
+    rule 10.2.1(b)).
+
+    Strategy one cuts where a period is followed by a new case — one with
+    its own "v.", a "SAME", or an in-re style caption — never at an entity
+    abbreviation's period ("… v. Acme Co. of America" has no case after
+    it).  Its lookahead cannot span a companion party whose *own name*
+    holds periods ("CLAYTON COUNTY, GEORGIA. Altitude Express, Inc., et
+    al., Petitioners v. Zarda" — Bostock), so when a later separator proves
+    a companion case exists, strategy two cuts at the first sentence period
+    before it, skipping initials and abbreviations.  Either strategy can
+    also fire at a *later* boundary than the true one (Olmstead's "… v.
+    SAME." line defeats one at the first boundary but not the second), so
+    the earliest cut wins."""
+    cuts: list[int] = []
+    cm = re.search(
+        r"\.\s+(?=[^.]*?\s+vs?\.\s+|SAME\b|IN\s+RE\b|EX\s+PARTE\b"
+        r"|(?:IN\s+THE\s+)?MATTER\s+OF\b)",
+        text, re.IGNORECASE,
+    )
+    if cm:
+        cuts.append(cm.start())
+    m2 = re.search(r"\s+(?:vs?\.|(?i:versus|against))\s+", text)
+    if m2:
+        head = text[: m2.start()]
+        for c2 in re.finditer(r"\.(?:\[[^\]]{1,6}\])?\s+(?=[A-Z0-9(])", head):
+            wm = re.search(r"([A-Za-z]+)$", head[: c2.start()])
+            word = (wm.group(1) if wm else "").lower()
+            if len(word) <= 1 or word in _CUT_STOP_ABBRS:
+                continue  # an abbreviation's period, not a case boundary
+            cuts.append(c2.start())
+            break
+    if cuts:
+        return text[: min(cuts) + 1]
+    return text
+
+
 def _scholar_caption_name(blocks) -> str:
     """Bluebook case name derived from the Scholar page's party caption."""
     for b in blocks[:8]:
@@ -7782,38 +7836,64 @@ def _scholar_caption_name(blocks) -> str:
         t = strip_related_case_note(t)
         if not t or _HEADER_CITE_RE.match(t) or t.startswith(("No.", "Nos.")):
             continue
+        # An in-re style caption owns no separator, so any "v." inside it
+        # belongs to a companion case ("In re Nexium Antitrust Litigation.
+        # AstraZeneca AB v. United Food…") — classify it before splitting.
+        # Only a role tail is cut at a comma; a comma can continue the
+        # matter's own title ("In re Title, Ballot Title & Submission
+        # Clause for 2015-2016 #156").
+        if re.match(r"(?:IN\s+RE|EX\s+PARTE|(?:IN\s+THE\s+)?MATTER\s+OF)\b", t, re.IGNORECASE):
+            t2 = _cut_companion_cases(t)
+            t2 = re.sub(
+                r",\s*(?:debtors?|appell\w+|petitioners?|respondents?|"
+                r"relators?|movants?|claimants?|et al\.?)\b.*$",
+                "", t2, flags=re.IGNORECASE)
+            return refine_caption_case(
+                _titlecase_caps(t2.strip()), _scholar_body_text(blocks))
         # Google Scholar renders the party separator in lowercase ("… v. …")
         # even for ALL-CAPS captions ("MERCY HOSPITAL, INC. v. JACKSON"), so
-        # a lowercase "v."/"vs." is the reliable separator and never collides
+        # a lowercase "v."/"vs." — or the earliest reports' spelled-out
+        # "versus"/"against" — is the reliable separator and never collides
         # with an uppercase middle initial like the "V." in "Francis V.
-        # Lorenzo".  Only fall back to a case-insensitive split (for a caption
-        # that happens to capitalize the separator) when no lowercase one is
-        # found.
-        sides = re.split(r"\s+vs?\.\s+", t, maxsplit=1)
+        # Lorenzo" or a party's own "AGAINST".  Only fall back to a
+        # case-insensitive split (for a caption that happens to capitalize
+        # the separator) when no lowercase one is found.
+        sides = re.split(r"\s+(?:vs?\.|versus|against)\s+", t, maxsplit=1)
         if len(sides) != 2:
             sides = re.split(r"\s+[vV]s?\.\s+", t, maxsplit=1)
+        if len(sides) != 2:
+            sides = re.split(
+                r"\s+(?:VERSUS|Versus|AGAINST|Against)\s+", t, maxsplit=1)
         if len(sides) == 2:
-            # A consolidated caption lists the companion cases after the
-            # first, separated by periods ("MUGLER v. KANSAS. SAME v. SAME.
-            # KANSAS v. ZIEBOLD."): only the first listed case is cited
-            # (Bluebook rule 10.2.1(b)).  Cut where a period is followed by
-            # a new case — one with its own "v.", a "SAME", or an in-re
-            # style caption — never at an entity abbreviation's period
-            # ("… v. Acme Co. of America" has no case after it).
-            cm = re.search(
-                r"\.\s+(?=[^.]*?\s+vs?\.\s+|SAME\b|IN\s+RE\b|EX\s+PARTE\b"
-                r"|(?:IN\s+THE\s+)?MATTER\s+OF\b)",
-                sides[1], re.IGNORECASE,
-            )
-            if cm:
-                sides[1] = sides[1][: cm.start() + 1]
+            sides[1] = _cut_companion_cases(sides[1])
             left, right = _caption_party(sides[0]), _caption_party(sides[1])
             if left and right:
                 return refine_caption_case(
                     f"{left} v. {right}", _scholar_body_text(blocks))
-        if re.match(r"(?:IN\s+RE|EX\s+PARTE|(?:IN\s+THE\s+)?MATTER\s+OF)\b", t, re.IGNORECASE):
+        # A single-party caption ("HAYBURN'S CASE.", "THE AMISTAD.") has no
+        # separator to split on; without this branch the cite line would
+        # become the case name downstream.  Court, date, and docket lines
+        # never qualify (cites and "No." lines were filtered above; the
+        # digit guard covers public-domain cites — "2006-Ohio-3799" — that
+        # the volume-reporter-page pattern does not).
+        if (len(t) <= 80
+                and sum(c.isalpha() for c in t) >= 4
+                and not t[0].isdigit()
+                and "court" not in t.lower()
+                and not re.match(
+                    r"(?:Argued|Reargued|Decided|Submitted|Filed|Released|"
+                    r"January|February|March|April|May|June|July|August|"
+                    r"September|October|November|December)\b",
+                    t, re.IGNORECASE)
+                # Procedural notes ride the header as their own centered
+                # lines ("As Modified on Denial of Petition for Rehearing
+                # December 1, 1964.") and are never the caption.
+                and not re.search(
+                    r"\b(?:rehearing|certiorari|en banc|as amended|"
+                    r"as modified|as corrected|petition for)\b",
+                    t, re.IGNORECASE)):
             return refine_caption_case(
-                _titlecase_caps(t.split(",")[0].strip()),
+                _titlecase_caps(_cut_companion_cases(t).split(",")[0].strip()),
                 _scholar_body_text(blocks))
     return ""
 
@@ -13689,7 +13769,38 @@ class _ScholarTextWindow:
 
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
         year = date_filed[:4] if len(date_filed) >= 4 else ""
-        header_years = re.findall(r"\b(1[6-9]\d{2}|20\d{2})\b", header)
+        # Year candidates from the header, most reliable first.  Page markers
+        # are excluded before scanning: a star page ("*2066 Syllabus" in
+        # Cedar Point) or a bare S. Ct. page number is indistinguishable from
+        # a year (S. Ct. pages run 1600–2099 through much of a term), and a
+        # body heading inside the first blocks can carry a stray date ("A.
+        # December 20, 2013 Suppression Hearing").  A year in parentheses
+        # after a citation ("323 U.S. 214 (1944)") is the decision year; a
+        # "Decided June 23, 2021." line is next; a bare year is last.
+        hdr_clean = "  ".join(
+            "".join(s.text for s in b.spans if not s.pagenum)
+            for b in self._blocks[:16] if b.kind in ("center", "heading")
+        )
+        # Lower-court headers date the decision with a bare centered
+        # "February 27, 2026." line (no "Decided" keyword).  Only *center*
+        # blocks count for that form: a body section heading can carry a
+        # full date that is not the decision's ("A. December 20, 2013
+        # Suppression Hearing").
+        hdr_center = "  ".join(
+            "".join(s.text for s in b.spans if not s.pagenum)
+            for b in self._blocks[:16] if b.kind == "center"
+        )
+        header_years = (
+            re.findall(r"\([^()]{0,40}?(1[6-9]\d{2}|20\d{2})\s*\)", hdr_clean)
+            or re.findall(
+                r"\b(?:Decided|Filed|Released|Entered)\b[^0-9]{0,40}?"
+                r"(1[6-9]\d{2}|20\d{2})", hdr_clean, re.IGNORECASE)
+            or re.findall(
+                r"\b(?:January|February|March|April|May|June|July|August|"
+                r"September|October|November|December)\s+\d{1,2},?\s+"
+                r"(1[6-9]\d{2}|20\d{2})\b", hdr_center, re.IGNORECASE)
+            or re.findall(r"\b(1[6-9]\d{2}|20\d{2})\b", hdr_clean)
+        )
         if not year and header_years:
             year = header_years[-1]
 
@@ -13714,10 +13825,42 @@ class _ScholarTextWindow:
         # citation header is the decision year and therefore controls.
         if is_scotus and header_years:
             year = header_years[-1]
+        if not year:
+            # The earliest U.S. Reports volumes print no year in the citation
+            # line (Scholar renders "2 U.S. 409 (____)"); a centered term
+            # line ("February Term, 1803.") carries the decision year.  Only
+            # front-matter blocks are trusted: the reporter's statement of
+            # the case narrates earlier terms ("AT the December term 1801,
+            # William Marbury … moved" — Marbury was decided in 1803), so a
+            # prose scan would print the wrong year, which is worse than
+            # printing none.
+            for b in self._blocks[:16]:
+                if b.kind not in ("center", "heading"):
+                    continue
+                tm = re.search(
+                    r"\b(?:January|February|March|April|May|June|July|August|"
+                    r"September|October|November|December)\s+Term,?\s+"
+                    r"(1[6-9]\d{2}|20\d{2})\b", b.text(), re.IGNORECASE)
+                if tm:
+                    year = tm.group(1)
+                    break
         court_abbr = ""
         if not is_scotus:
             fallback = str(item.get("court") or court_id).strip() if court_id else ""
             court_abbr = _court_for_paren(cite, court_id, fallback)
+            if not court_abbr and not court_id:
+                # A federal district/bankruptcy court read from the Scholar
+                # header — ``_scholar_court_id`` leaves those unmapped, but
+                # an F. Supp. / B.R. date parenthetical requires the court
+                # (rule 10.4(a)): "627 F. Supp. 3d 520 (M.D.N.C. 2022)".
+                for b in self._blocks[:8]:
+                    if b.kind != "center":
+                        continue
+                    abbr = _bluebook_federal_trial_court(
+                        re.sub(r"\s+", " ", b.text()).strip())
+                    if abbr:
+                        court_abbr = abbr
+                        break
         name = abbreviate_case_name(name)
         cite = _respace_reporter_in_cite(cite)
         display_cite = cite
@@ -13758,7 +13901,9 @@ class _ScholarTextWindow:
         Empty for the header and signed majority opinions.
         """
         def block_text(b) -> str:
-            t = re.sub(r"\s+", " ", b.text()).strip()
+            # The title-comma fix mirrors segmentation's classification view
+            # ("Justice, BREYER, concurring." — Alleyne's Scholar text).
+            t = fix_title_comma(re.sub(r"\s+", " ", b.text()).strip())
             return re.sub(r"^(?:\*\d+\s+)+", "", t)  # leading page markers
 
         if part.kind == "majority":
@@ -13809,11 +13954,27 @@ class _ScholarTextWindow:
                 # Headers that never name the role — the role was read from
                 # the opinion's opening lines when the part was segmented, so
                 # part.kind is trustworthy here.  A bare state-court byline
-                # ("TRAYNOR, J.") or an explicit hand-off ("MR. JUSTICE FIELD
+                # ("TRAYNOR, J."), a spelled-out one ("CLINTON, Judge."), a
+                # joinder byline with no role word ("MR. JUSTICE BLACKMUN,
+                # with whom THE CHIEF JUSTICE and MR. JUSTICE BLACK join." in
+                # Cohen), or an explicit hand-off ("MR. JUSTICE FIELD
                 # delivered the following separate opinion.").
                 role = "dissenting" if part.kind == "dissent" else "concurring"
+                wm = re.match(
+                    r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(CHIEF\s+)?JUSTICE\s+"
+                    r"([A-Z][\w.'’-]+)\s*,\s*with\s+whom\b",
+                    fix_title_comma((part.label or "").strip()),
+                    re.IGNORECASE,
+                )
+                if wm:
+                    title = "C.J." if wm.group(1) else "J."
+                    surname = _fix_name_case(wm.group(2).replace("’", "'"))
+                    return f"{surname}, {title}, {role}"
                 bm = re.match(
-                    r"([A-Z][\w.'’-]+),\s*(C\.\s*)?J\.\s*[.:]?\s*$",
+                    r"((?:[A-Z][\w.'’-]*\s+)?[A-Z][\w.'’-]+),\s*"
+                    r"(?:(C\.\s*J\.|Ch\.\s*J\.|Chief\s+(?:Justice|Judge))|"
+                    r"J\.|Justice|(?:(?:Senior\s+|Presiding\s+)?"
+                    r"(?:Circuit\s+|District\s+)?Judge))\s*[.:]?\s*$",
                     (part.label or "").strip(),
                 )
                 if bm:
@@ -13868,6 +14029,12 @@ class _ScholarTextWindow:
             r"^(?:THE\s+)?(?:CHIEF\s+)?JUSTICE\s+", "", author_seg, flags=re.IGNORECASE
         ).strip()
         name = _fix_name_case(name)
+        # A circuit byline may print the judge's full name ("TOBY HEYTENS,
+        # Circuit Judge, …"); the writer parenthetical takes the surname
+        # alone, while disambiguating initials ("R. Nelson") stay.
+        tokens = name.split()
+        if len(tokens) > 1 and is_recognized_given_name(tokens[0]):
+            name = " ".join(tokens[1:])
         if not name:
             return ""
         return f"{name}, {title}, {phrase}"
@@ -13878,12 +14045,12 @@ class _ScholarTextWindow:
         Case-insensitive: Google Scholar renders many opinions' attribution
         lines in mixed case ('Justice Barrett delivered the opinion…')."""
         for b in part.blocks[:3]:
-            t = re.sub(r"\s+", " ", b.text()).strip()
+            t = fix_title_comma(re.sub(r"\s+", " ", b.text()).strip())
             t = re.sub(r"^(?:\*\d+\s+)+", "", t)
             if re.match(r"PER\s+CURIAM\b", t, re.IGNORECASE):
                 return "per curiam"
             m = re.match(
-                r"(?:(?:MR\.|MRS\.|MS\.)\s+)?(CHIEF\s+)?JUSTICE\s+([A-Z][\w.'’-]+)\s+"
+                r"(?:(?:MR\.|MRS\.|MS\.)\s+)?(CHIEF\s+)?JUSTICE\s+([A-Z][\w.'’-]+)\s*,?\s+"
                 r"(?:delivered|announced)",
                 t, re.IGNORECASE,
             )

@@ -455,7 +455,7 @@ _ORG_WORDS = {
     "brewery", "brewing", "builders", "church", "cinemas", "club",
     "dairy", "drug", "drugs", "farms", "foods", "furniture", "gas",
     "grocery", "hardware", "herald", "homes", "jewelers", "journal",
-    "lines", "lodge", "lumber", "media", "mill", "mills", "ministries",
+    "lines", "list", "lodge", "lumber", "media", "mill", "mills", "ministries",
     "motors", "news", "nursery", "oil", "optical", "outfitters", "packing",
     "pictures", "pizza", "post", "press", "realty", "records", "shop",
     "shops", "steel", "store", "stores", "studios", "supply", "temple",
@@ -497,7 +497,7 @@ dale damon dan dana daniel danielle danny daphne darlene darnell darrell
 darren darryl dave david dawn dean deanna debbie deborah debra delbert delia
 della delores delmar denise dennis derek derrick desiree devin devon dewey
 dexter diana diane dianne dolores dominic dominique don donald donna donnie
-dora doreen doris dorothy doug douglas duane dustin dwayne dwight dylan earl
+dora dred doreen doris dorothy doug douglas duane dustin dwayne dwight dylan earl
 earnest ebony ed eddie edgar edith edmund edna eduardo edward edwin eileen
 elaine elbert eleanor elena eli elias elijah elizabeth ella ellen elliot
 elliott elmer eloise elsa elsie elvira elwood emanuel emil emily emma emmett
@@ -510,7 +510,7 @@ george georgia gerald geraldine gerard gerardo gilbert gina ginger gladys
 glen glenda glenn gloria gordon grace graham grant greg gregg gregory
 gretchen grover guadalupe guillermo gus gustavo guy gwen gwendolyn hal hank
 hannah harlan harold harriet harriett harry harvey hattie hazel heather
-hector heidi helen henrietta henry herbert herman hilda hiram holly homer
+hector heidi helen henrietta henry herbert herman hilda hillary hiram holly homer
 hope horace hortense howard hubert hugh hugo ian ida ignacio ike ina inez ira
 irene iris irma irving isaac isabel isadore isaiah ismael israel ivan jack
 jackie jacob jacqueline jaime jake james jamie jan jana jane janet janice
@@ -523,7 +523,7 @@ judith judy julia julian julie julio julius june justin kaitlyn kara karen
 kari karl karla kate katelyn katherine kathleen kathryn kathy katie katrina
 kay kayla keith kelley kelli kellie kelly kelvin ken kendra kenneth kenny
 kent kerry kevin kim kimberly kirk krista kristen kristi kristin kristina
-kristine kristy kurt kyle lamar lance larry latasha latoya laura lauren
+kristine kristopher kristy kurt kyle lamar lance larry latasha latoya laura lauren
 laurie lavern laverne lawrence leah lela leland lemuel lena leo leon
 leonard leopold leroy lesley leslie lester leticia levi lewis lila lillian
 lillie lily linda lindsay lindsey lionel lisa lloyd logan lois lola lonnie
@@ -546,7 +546,7 @@ perry pete peter phil philip phillip phineas phyllis preston priscilla
 prudence rachael rachel rafael ralph ramon ramona randal randall randolph
 randy raquel raul ray raymond rebecca regina reginald rene renee reuben rex
 rhonda ricardo richard rick rickey ricky rita rob robert roberta roberto
-robin robyn rocky rod roderick rodney rodolfo rodrigo roger roland rolando
+robin robyn rocco rocky rod roderick rodney rodolfo rodrigo roger roland rolando
 roman ron ronald ronnie roosevelt rosa rosalie roscoe rose rosemary rosetta
 ross rowena roxanne roy ruben ruby rudolph rudy rufus rupert russell rusty
 ruth ryan sabrina sadie sally salvador salvatore sam samantha sammy samuel
@@ -554,12 +554,12 @@ sandra sandy santos sara sarah saul scott sean sergio seth seymour shane
 shannon shari sharon shaun shawn sheila shelby sheldon shelia shelley shelly
 sheri sherman sherri sherry sheryl shirley sidney silas silvia simon sonia
 sonya sophia spencer stacey stacy stan stanley stefanie stella stephanie
-stephen steve steven stuart sue summer susan susannah susie suzanne sybil
+stephen steve steven stuart sue summer susan susannah susette susie suzanne sybil
 sylvester sylvia tabitha tamara tami tammie tammy tanya tara tasha taylor
 ted terence teresa teri terrance terrell terrence terri terry thaddeus
 thelma theodora theodore theresa thomas tiffany tim timothy tina toby todd
 tom tommie tommy toni tony tonya tracey traci tracy travis trevor tricia
-trisha troy tyler tyrone ulysses ursula valerie vance vanessa velma vera
+trisha troy tyler tyrone ulysses ursula valerie vance vanessa valentino velma vera
 verna vernon veronica vicki vickie vicky victor victoria vincent viola
 violet virgil virginia vivian wade wallace walter wanda warren wayne wendell
 wendy wesley wilbert wilbur wilfred willa willard william willie willis
@@ -696,7 +696,8 @@ def normal_case_caption(text: str) -> str:
     reporter's authoritative metadata.
     """
     out: list[str] = []
-    for i, word in enumerate((text or "").split()):
+    words = (text or "").split()
+    for i, word in enumerate(words):
         letters = [c for c in word if c.isalpha()]
         # Ordinary mixed case passes through, but a mostly-uppercase OCR form
         # such as McFADDEN is still an all-caps word for normalization purposes.
@@ -715,6 +716,18 @@ def normal_case_caption(text: str) -> str:
                 or re.fullmatch(r"(?:[A-Z]\.)+[A-Z]?", stripped)):
             out.append(word)
             continue
+        # A single dotted initial ("SAMUEL A. WORCESTER", "R. A. V.,
+        # PETITIONER", "U. S. A., INC.") collides with the small-word list
+        # ("a", "v") and must keep its capital.  A lone "V." is the versus
+        # separator unless it continues a chain of initials — the article
+        # "A" never prints a period, so the period is the initial's mark.
+        if re.fullmatch(r"[A-Z]", stripped) and "." in word:
+            if stripped != "V" or (
+                i and re.fullmatch(
+                    r"[A-Z]\.[,;]?", words[i - 1].replace("’", "'"))
+            ):
+                out.append(word)
+                continue
         low = word.lower()
         if i and low.strip(".,()'\"") in _CAPTION_SMALL_WORDS:
             out.append(low)
@@ -730,6 +743,9 @@ def normal_case_caption(text: str) -> str:
         )
         if fixed.startswith("Mc") and len(fixed) > 2 and fixed[2].isalpha():
             fixed = "Mc" + fixed[2].upper() + fixed[3:]
+        # A possessive or plural 'S is not an O'Brien-style surname prefix:
+        # WASSERMAN'S → Wasserman's, never Wasserman'S.
+        fixed = re.sub(r"(['’])S(?=[^A-Za-z]*$)", r"\1s", fixed)
         out.append(fixed)
     return " ".join(out)
 
@@ -918,6 +934,7 @@ _PARTY_ROLE_RE = re.compile(
 def _strip_given_names(p: str) -> str | None:
     """Surname-only form of a personal party name (rule 10.2.1(g)), or
     None when the party does not safely read as an individual's name."""
+    suffixed = bool(_NAME_SUFFIX_RE.search(p))
     p = _NAME_SUFFIX_RE.sub("", p)
     if "," in p or "&" in p or re.search(r"\bof\b", p, re.IGNORECASE):
         return None
@@ -938,18 +955,30 @@ def _strip_given_names(p: str) -> str | None:
     if not 2 <= len(tokens) <= 4:
         return None
     low = [t.replace("’", "'").lower().rstrip(".") for t in tokens]
-    if low[0] not in _GIVEN_NAMES:
+    # Structural evidence can stand in for the given-name list: a stripped
+    # Jr./Sr. suffix, or a middle initial ("Okello T. Chatrie", "John
+    # F.A. Sandford") — organizations never reduce a middle word to a
+    # single letter, and the entity/T6 vetoes below still reject firms
+    # named for people.  An honorific is deliberately NOT enough here: it
+    # relaxes only the middle tokens ("Dr. Theresa Swain Emory"), or
+    # "Mrs. Fields Cookies" would truncate to "Cookies".
+    person_shaped = (suffixed or any(
+        re.fullmatch(r"(?:[A-Z]\.)+", t) for t in tokens[1:-1]))
+    if low[0] not in _GIVEN_NAMES and not (
+            person_shaped and re.fullmatch(r"[A-Z][A-Za-z'’-]+", tokens[0])):
         return None
     # Every token must look like a name part: a capitalized word, an
-    # initial, or a surname particle — and none may be an organizational
-    # word ("George Washington University" abbreviates instead) or a
-    # business-entity term ("Katherine Inc." is a firm, not a person).
+    # initial ("W." or "F.A."), or a surname particle — and none may be an
+    # organizational word ("George Washington University" abbreviates
+    # instead) or a business-entity term ("Katherine Inc." is a firm, not
+    # a person).
     for t, tl in zip(tokens, low):
         if (tl in _T6_WORDS or tl in _ORG_WORDS
                 or re.sub(r"[^a-z]", "", tl) in _APPOSITIVE_ENTITY_TERMS
-                or not re.fullmatch(r"[A-Z](?:[A-Za-z'’-]+|\.)?", t)):
+                or not re.fullmatch(
+                    r"(?:[A-Z]\.)+|[A-Z](?:[A-Za-z'’-]+|\.)?", t)):
             return None
-    if re.fullmatch(r"[A-Z]\.?", tokens[-1]):
+    if re.fullmatch(r"(?:[A-Z]\.)+|[A-Z]", tokens[-1]):
         return None  # anonymized party ("Susan B.", "B. J. F.")
     # Surname = last token plus any particles ("Nathan Van Buren")
     i = len(tokens) - 1
@@ -961,8 +990,9 @@ def _strip_given_names(p: str) -> str | None:
     # already establishes a natural person, so under one any name-shaped
     # middle token passes ("Dr. Theresa Swain Emory" -> "Emory").
     for t, tl in zip(tokens[1:i], low[1:i]):
-        if not (titled or tl in _GIVEN_NAMES or tl in _SURNAME_PARTICLES
-                or re.fullmatch(r"[A-Z]\.?", t)):
+        if not (titled or suffixed or tl in _GIVEN_NAMES
+                or tl in _SURNAME_PARTICLES
+                or re.fullmatch(r"(?:[A-Z]\.)+|[A-Z]\.?", t)):
             return None
     return " ".join(tokens[i:])
 
@@ -1338,6 +1368,33 @@ def _strip_trailing_period(name: str) -> str:
     return name[:-1]
 
 
+_SMALL_MIDWORD = frozenset({
+    "of", "the", "and", "in", "for", "at", "by", "to", "on", "or",
+})
+
+
+def _lowercase_small_words(name: str) -> str:
+    """Lowercase a capitalized small word amid mixed-case text ("District
+    Of Columbia", "Tax Comm'n OF N.Y.") — a partially mixed-case caption
+    bypasses ``normal_case_caption``'s all-caps handling, so these survive
+    it.  A party-leading "The" ("v. The Boeing Co.") and words inside an
+    all-caps run ("CITIZENS FOR A BETTER ENVIRONMENT") stay untouched."""
+    tokens = name.split(" ")
+    out: list[str] = []
+    for i, tok in enumerate(tokens):
+        core = re.sub(r"[^A-Za-z'’]", "", tok)
+        prev_core = re.sub(r"[^A-Za-z'’]", "", tokens[i - 1]) if i else ""
+        if (i > 0
+                and core.lower() in _SMALL_MIDWORD
+                and core[:1].isupper()
+                and prev_core.lower() not in ("v", "vs", "re", "parte")
+                and any(c.islower() for c in prev_core)):
+            out.append(tok.replace(core, core.lower(), 1))
+        else:
+            out.append(tok)
+    return " ".join(out)
+
+
 def abbreviate_case_name(name: str) -> str:
     """Abbreviate a case name for use in a citation or filename per
     Bluebook rule 10.2.2 (= Indigo Book R8.3), dropping given names of
@@ -1347,13 +1404,28 @@ def abbreviate_case_name(name: str) -> str:
     # Strip any "(Re <underlying case>)" cross-reference before splitting:
     # its own " v. " would otherwise masquerade as this case's separator.
     name = strip_related_case_note(name)
+    # Descriptive parentheticals are given-name-style baggage, not part of
+    # the party's name: "Coca Cola Bottling Co. of Fresno (a Corporation)",
+    # "Triestina Di Carlo (a Minor)".
+    name = re.sub(r"\s*\(\s*an?\s+[^)]{0,40}\)", "", name, flags=re.IGNORECASE)
+    # Words indicating multiple parties are omitted (rule 10.2.1(a)):
+    # "Calder et Wife", "Troxel et vir", "Brown and Others", "Wayman &
+    # another".  ("et al." itself is handled with the party structure.)
+    name = re.sub(
+        r",?\s+(?:et|and|&)\s+(?:ux(?:or)?|vir|wife|husband|others?|another)"
+        r"\.?(?=[\s,.]|$)",
+        "", name, flags=re.IGNORECASE)
     if not name:
         return name
     parts = _V_SPLIT_RE.split(name, maxsplit=1)
     joined = " v. ".join(
         _drop_redundant_entity(_abbreviate_party(p)) for p in parts
     )
-    return _strip_trailing_period(joined)
+    # A stray capital after a possessive apostrophe ("Sailor'S") is a
+    # title-casing artifact, never a name; all-caps runs (MCDONALD'S USA,
+    # kept caps by design) are left whole.
+    joined = re.sub(r"(?<=[a-z])(['’])S(?=\W|$)", r"\1s", joined)
+    return _strip_trailing_period(_lowercase_small_words(joined))
 
 
 if __name__ == "__main__":

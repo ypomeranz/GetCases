@@ -19,9 +19,11 @@ from citation_overrides import (
     format_edited_citation,
     update_overrides,
 )
+from court_catalog import bluebook_federal_trial_court
 from courtlistener_gui import (
     _ScholarTextWindow,
     _combined_parts_cover_typed,
+    _cut_companion_cases,
     _nominative_display_cite,
     _pick_combined_opinion,
     _wisconsin_display_cite,
@@ -99,6 +101,60 @@ class CaptionCapitalizationTests(unittest.TestCase):
             "The PRESIDENT",
         )
 
+    def test_possessive_s_is_not_a_surname_prefix(self):
+        # The O'BRIEN → O'Brien rule must not capitalize a possessive:
+        # Wasserman's Inc. v. Township of Middletown, 137 N.J. 238 (1994).
+        self.assertEqual(
+            normal_case_caption("WASSERMAN'S INC. v. MIDDLETOWN"),
+            "Wasserman's Inc. v. Middletown",
+        )
+        self.assertEqual(
+            normal_case_caption("JACKSON WOMEN'S HEALTH ORGANIZATION"),
+            "Jackson Women's Health Organization",
+        )
+        self.assertEqual(normal_case_caption("McDONALD'S"), "McDonald's")
+        # An already-stored artifact is repaired at abbreviation time (the
+        # party-leading "The" drops under rule 10.2.1(d) as before).
+        self.assertEqual(
+            abbreviate_case_name("Inglis v. The Sailor'S Snug Harbour"),
+            "Inglis v. Sailor's Snug Harbour",
+        )
+
+    def test_single_letter_initials_keep_their_capitals(self):
+        # R.A.V. v. City of St. Paul, 505 U.S. 377 (1992): the spaced
+        # initials "R. A. V." collide with the small words "a" and "v".
+        self.assertEqual(
+            abbreviate_case_name(normal_case_caption(
+                "R. A. V., PETITIONER v. CITY OF ST. PAUL, MINNESOTA")),
+            "R.A.V. v. City of St. Paul, Minnesota",
+        )
+        self.assertEqual(
+            normal_case_caption("SAMUEL A. WORCESTER v. GEORGIA"),
+            "Samuel A. Worcester v. Georgia",
+        )
+        # A lone "V." stays the separator when no initial precedes it.
+        self.assertEqual(
+            normal_case_caption("SMITH V. JONES"), "Smith v. Jones")
+
+    def test_mixed_case_small_words_are_lowercased(self):
+        # Partially mixed-case captions bypass all-caps normalization, so
+        # "Of"/"OF" survive into the name ("District Of Columbia").
+        self.assertEqual(
+            abbreviate_case_name("District Of Columbia v. Heller"),
+            "District of Columbia v. Heller",
+        )
+        self.assertEqual(
+            abbreviate_case_name("Walz v. Tax Comm'n OF N.Y."),
+            "Walz v. Tax Comm'n of N.Y.",
+        )
+        # Small words inside an all-caps run carry no casing signal and
+        # keep their caps (T6 word abbreviation applies as before).
+        self.assertEqual(
+            abbreviate_case_name(
+                "CITIZENS FOR A BETTER ENVIRONMENT v. Anne Gorsuch"),
+            "CITIZENS FOR A BETTER Env't v. Gorsuch",
+        )
+
     def test_deslandes_caption_keeps_mcdonalds(self):
         self.assertEqual(
             abbreviate_case_name("Leinani Deslandes v. McDonald's USA LLC"),
@@ -116,6 +172,38 @@ class CaptionCapitalizationTests(unittest.TestCase):
         self.assertEqual(
             abbreviate_case_name("Smith v. Sgt. William Brown, Jr."),
             "Smith v. Brown",
+        )
+
+    def test_middle_initial_marks_a_natural_person(self):
+        # Rule 10.2.1(g): organizations never reduce a middle word to a
+        # single letter, so the initial licenses the surname reduction
+        # even for a given name no list covers.
+        self.assertEqual(
+            abbreviate_case_name("Okello T. Chatrie v. United States"),
+            "Chatrie v. United States",
+        )
+        self.assertEqual(
+            abbreviate_case_name("Dred Scott v. John F.A. Sandford"),
+            "Scott v. Sandford",
+        )
+        self.assertEqual(
+            abbreviate_case_name("Moore v. Mahendra J. Shah"),
+            "Moore v. Shah",
+        )
+        # …but a firm named for a person keeps its full name.
+        self.assertEqual(
+            abbreviate_case_name("Susan B. Anthony List v. Driehaus"),
+            "Susan B. Anthony List v. Driehaus",
+        )
+        self.assertEqual(
+            abbreviate_case_name("A. H. Robins Co. v. Piccinin"),
+            "A. H. Robins Co. v. Piccinin",
+        )
+
+    def test_generational_suffix_marks_a_natural_person(self):
+        self.assertEqual(
+            abbreviate_case_name("Valentino Shine, Sr. v. United States"),
+            "Shine v. United States",
         )
 
     def test_title_never_truncates_a_brand_name(self):
@@ -161,6 +249,58 @@ class CaptionCapitalizationTests(unittest.TestCase):
             abbreviate_case_name(
                 "Standard Oil Co., Defendant-Appellant v. United States"),
             "Standard Oil Co. v. United States",
+        )
+
+
+class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
+    def test_multiple_party_words_are_omitted(self):
+        # Rule 10.2.1(a): "et Wife", "et vir", "and Others" drop.
+        self.assertEqual(
+            abbreviate_case_name("Calder et Wife v. Bull et Wife"),
+            "Calder v. Bull",
+        )
+        self.assertEqual(
+            abbreviate_case_name("Troxel et vir v. Granville"),
+            "Troxel v. Granville",
+        )
+        self.assertEqual(
+            abbreviate_case_name("Wayman & another v. Southard & another"),
+            "Wayman v. Southard",
+        )
+
+    def test_descriptive_parenthetical_drops(self):
+        self.assertEqual(
+            abbreviate_case_name(
+                "Escola v. Coca Cola Bottling Co. of Fresno "
+                "(a Corporation)"),
+            "Escola v. Coca Cola Bottling Co. of Fresno",
+        )
+
+    def test_companion_cases_cut_at_the_earliest_boundary(self):
+        # Bostock: the companion party's own periods ("Inc.") defeat the
+        # simple lookahead; the fallback cuts before "Altitude".
+        self.assertEqual(
+            _cut_companion_cases(
+                "CLAYTON COUNTY, GEORGIA. Altitude Express, Inc., et al., "
+                "Petitioners v. Melissa Zarda"),
+            "CLAYTON COUNTY, GEORGIA.",
+        )
+        # Olmstead: "GREEN ET AL. v. SAME." defeats the lookahead at the
+        # first boundary but not the second — the earliest cut wins.
+        self.assertEqual(
+            _cut_companion_cases(
+                "UNITED STATES. GREEN ET AL. v. SAME. McINNIS v. SAME."),
+            "UNITED STATES.",
+        )
+        # An entity abbreviation's period is never a case boundary.
+        self.assertEqual(
+            _cut_companion_cases(
+                "ST. PAUL FIRE & MARINE INS. CO. SAME v. OTHER."),
+            "ST. PAUL FIRE & MARINE INS. CO.",
+        )
+        self.assertEqual(
+            _cut_companion_cases("Acme Co. of America"),
+            "Acme Co. of America",
         )
 
 
@@ -333,6 +473,47 @@ class ReporterAndDecisionDateTests(unittest.TestCase):
 
         self.assertEqual(bb["year"], "1944")
 
+    def test_star_page_and_sct_page_numbers_are_not_years(self):
+        # Cedar Point Nursery v. Hassid, 141 S. Ct. 2063 (2021): the header
+        # ends with the star marker "*2066 Syllabus", and S. Ct. page
+        # numbers (1600-2099) are indistinguishable from years — the
+        # parenthesized year next to the citation controls.
+        win = object.__new__(_ScholarTextWindow)
+        win._item = {}
+        win._blocks = [
+            Block("center", [Span("141 S.Ct. 2063 (2021)")]),
+            Block("center", [Span("594 U.S. 139")]),
+            Block("center", [Span("CEDAR POINT NURSERY v. Victoria HASSID")]),
+            Block("center", [Span("Decided June 23, 2021.")]),
+            Block("heading", [Span("*2066 ", pagenum=True), Span("Syllabus")]),
+            Block("para", [Span("CHIEF JUSTICE ROBERTS delivered the "
+                                "opinion of the Court.")]),
+        ]
+
+        bb = win._compute_bluebook_parts()
+
+        self.assertEqual(bb["year"], "2021")
+
+    def test_body_heading_dates_do_not_supply_the_year(self):
+        # United States v. Thomas, 818 F.3d 1230 (11th Cir. 2016): section
+        # headings ("A. December 20, 2013 Suppression Hearing") fall inside
+        # the first blocks and must not beat the citation's own year.
+        win = object.__new__(_ScholarTextWindow)
+        win._item = {}
+        win._blocks = [
+            Block("center", [Span("818 F.3d 1230 (2016)")]),
+            Block("center", [Span("UNITED STATES v. Eric THOMAS")]),
+            Block("center", [Span("United States Court of Appeals, "
+                                  "Eleventh Circuit.")]),
+            Block("heading", [Span("A. December 20, 2013 Suppression "
+                                   "Hearing")]),
+            Block("para", [Span("WILSON, Circuit Judge:")]),
+        ]
+
+        bb = win._compute_bluebook_parts()
+
+        self.assertEqual(bb["year"], "2016")
+
     def test_official_state_reporter_is_source_independent_without_stars(self):
         win = object.__new__(_ScholarTextWindow)
         win._item = {
@@ -350,6 +531,55 @@ class ReporterAndDecisionDateTests(unittest.TestCase):
         bb = win._compute_bluebook_parts()
 
         self.assertEqual(bb["display_cite"], "409 Mich. 672")
+
+
+class FederalTrialCourtTests(unittest.TestCase):
+    def test_district_captions_reach_bluebook_form(self):
+        cases = [
+            ("United States District Court, M.D. North Carolina.",
+             "M.D.N.C."),
+            ("United States District Court, District of Columbia.",
+             "D.D.C."),
+            ("United States District Court, N.D. Illinois, "
+             "Eastern Division.", "N.D. Ill."),
+            ("District Court, E. D. Pennsylvania.", "E.D. Pa."),
+            # A single-district state's division tail is not a district:
+            # "C. D." after the state means Central Division.
+            ("United States District Court, South Dakota, C. D.",
+             "D.S.D."),
+            ("United States Bankruptcy Court, S.D. Texas, "
+             "Houston Division.", "Bankr. S.D. Tex."),
+            ("United States District Court for the Eastern District "
+             "of Pennsylvania", "E.D. Pa."),
+        ]
+        for name, want in cases:
+            with self.subTest(name=name):
+                self.assertEqual(bluebook_federal_trial_court(name), want)
+
+    def test_state_and_appellate_courts_are_not_federal_districts(self):
+        for name in ("District Court of Appeal of Florida, Third District.",
+                     "District Court, City and County of Denver, Colorado.",
+                     "Supreme Court of Wisconsin.",
+                     "United States Court of Appeals, Fourth Circuit."):
+            with self.subTest(name=name):
+                self.assertEqual(bluebook_federal_trial_court(name), "")
+
+    def test_f_supp_citation_gets_the_district_parenthetical(self):
+        win = object.__new__(_ScholarTextWindow)
+        win._item = {}
+        win._blocks = [
+            Block("center", [Span("627 F.Supp.3d 520 (2022)")]),
+            Block("center", [Span("Lucille BELL v. AMERICAN "
+                                  "INTERNATIONAL INDUSTRIES")]),
+            Block("center", [Span("United States District Court, "
+                                  "M.D. North Carolina.")]),
+            Block("para", [Span("OSTEEN, JR., District Judge.")]),
+        ]
+
+        bb = win._compute_bluebook_parts()
+
+        self.assertEqual(bb["court"], "M.D.N.C.")
+        self.assertEqual(bb["year"], "2022")
 
 
 class PublicDomainCitationTests(unittest.TestCase):
@@ -378,6 +608,67 @@ class PublicDomainCitationTests(unittest.TestCase):
             plain,
             "State v. Prado, 2021 WI 64, ¶ 12, 397 Wis. 2d 719, "
             "960 N.W.2d 869.",
+        )
+
+
+class WriterParentheticalTests(unittest.TestCase):
+    @staticmethod
+    def _win():
+        return object.__new__(_ScholarTextWindow)
+
+    @staticmethod
+    def _part(kind: str, first_line: str, label: str = "") -> OpinionPart:
+        return OpinionPart(
+            label or first_line[:90], kind,
+            [Block("para", [Span(first_line)])],
+        )
+
+    def test_joinder_byline_without_role_uses_part_kind(self):
+        # Cohen v. California, 403 U.S. 15 (1971): Blackmun's byline names
+        # only the joiners; the role was read from his opening lines when
+        # the part was segmented.
+        part = self._part(
+            "dissent",
+            "MR. JUSTICE BLACKMUN, with whom THE CHIEF JUSTICE and "
+            "MR. JUSTICE BLACK join.",
+        )
+        self.assertEqual(
+            self._win()._writer_parenthetical(part),
+            "Blackmun, J., dissenting",
+        )
+
+    def test_spelled_out_bare_judge_byline(self):
+        part = self._part("concurrence", "CLINTON, Judge.")
+        self.assertEqual(
+            self._win()._writer_parenthetical(part),
+            "Clinton, J., concurring",
+        )
+
+    def test_comma_after_justice_in_byline(self):
+        # Alleyne v. United States: Scholar prints "Justice, ALITO,
+        # dissenting."
+        part = self._part("dissent", "Justice, ALITO, dissenting.")
+        self.assertEqual(
+            self._win()._writer_parenthetical(part),
+            "Alito, J., dissenting",
+        )
+
+    def test_full_name_circuit_byline_reduces_to_surname(self):
+        part = self._part(
+            "concurrence",
+            "TOBY HEYTENS, Circuit Judge, with whom Judges HARRIS and "
+            "BENJAMIN join, concurring:",
+        )
+        self.assertEqual(
+            self._win()._writer_parenthetical(part),
+            "Heytens, J., concurring",
+        )
+        # Disambiguating initials survive (two Nelsons on the CA9 bench).
+        part = self._part(
+            "dissent", "R. NELSON, Circuit Judge, dissenting:")
+        self.assertEqual(
+            self._win()._writer_parenthetical(part),
+            "R. Nelson, J., dissenting",
         )
 
 

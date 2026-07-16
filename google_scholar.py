@@ -775,16 +775,17 @@ _SEP_BYLINE = (
 # Scholar sometimes tucks a separate opinion's byline onto the end of the
 # disposition blockquote instead of giving it its own paragraph, e.g.
 #   "Affirmed.  Justice Thomas, concurring."
+#   "AFFIRMED DAVIS, Senior Circuit Judge, concurring:"   [no period at all]
 # Anchored to a standalone disposition sentence and requiring the byline to
 # end the block, so it never fires on a mid-sentence parenthetical such as
 # "(Kennedy, J., dissenting)".  Group 1 is the byline to split onto its own
 # block/line.
 _INLINE_SEP_HEADER_RE = re.compile(
     r"(?:^|\.\s+)"                                  # disposition starts block/sentence
-    r"(?:it\s+is\s+so\s+ordered"
+    r"(?:(?:it\s+is\s+)?so\s+ordered"
     r"|(?:the\s+(?:judgments?|orders?)\s+(?:is|are)\s+)?"
     r"(?:affirmed|reversed|vacated|remanded|dismissed|modified|reinstated)"
-    r"[^.]{0,60})\.\s+"                             # ...a short disposition sentence
+    r"[^.]{0,60}?)\.?\s+"                           # ...a short disposition sentence
     r"(" + _SEP_BYLINE + r")\s*$",                  # ...then the inlined byline
     re.IGNORECASE | re.DOTALL,
 )
@@ -814,14 +815,20 @@ def _split_block_at(block: Block, offset: int) -> tuple[Block, Block]:
 def _split_inline_sep_headers(blocks: list[Block]) -> list[Block]:
     """Give a separate-opinion byline its own block when Scholar appended it
     to the disposition block (e.g. "Affirmed.  Justice Thomas, concurring.")
-    so segmentation — and the rendered opinion — start it on a new line."""
+    so segmentation — and the rendered opinion — start it on a new line.
+
+    The split runs even when the glued whole happens to satisfy
+    ``_SEP_HEADER_RE`` ("AFFIRMED. DIAZ, Chief Judge, concurring:" does,
+    because the pattern's name run tolerates embedded periods) — otherwise
+    the disposition sentence would open the separate opinion and pollute
+    its label and writer parenthetical."""
     out: list[Block] = []
     for b in blocks:
         m = _INLINE_SEP_HEADER_RE.search(b.text())
         if (
             m
-            and not _SEP_HEADER_RE.match(_content_text(b))  # not already its own header
-            and not _NOT_SEP_RE.search(m.group(1))          # not a syllabus disposition
+            and m.start(1) > 0                      # a disposition really precedes
+            and not _NOT_SEP_RE.search(m.group(1))  # not a syllabus disposition
         ):
             head, tail = _split_block_at(b, m.start(1))
             if head.text().strip():
@@ -879,12 +886,38 @@ _PUBLIC_ROLE_BYLINE_RE = re.compile(
     r"\((?P<role>concurring|dissenting)[^)]*\)\.?)",
     re.IGNORECASE,
 )
+# Case-sensitive on the name run: with IGNORECASE the caps-name prefix
+# would match ordinary prose ("The judgment of the district court is
+# Affirmed. WALD, Circuit Judge, concurring:" from the block before the
+# byline), stacking phantom boundaries on the disposition sentences.
 _JOINED_ROLE_BYLINE_RE = re.compile(
     r"^(?P<label>[A-Z](?:\.\s*)?[A-Z][A-Z.'’ -]{0,55},\s*"
     r"(?:(?:Chief|Senior)\s+)?(?:Circuit\s+)?Judge,.{0,240}?"
-    r"(?P<role>concurring|dissenting)[^:]{0,80}:)",
+    r"(?P<role>(?i:concurring|dissenting))[^:]{0,80}:)",
+)
+
+# A disposition fragment Scholar sometimes glues ahead of a circuit
+# separate-opinion byline ("AFFIRMED DAVIS, Senior Circuit Judge,
+# concurring:").  Stripped from boundary labels; when everything a block
+# contributes to a joined-window match is disposition text, the boundary
+# belongs to the later block that actually holds the byline.
+_GLUED_DISPOSITION_RE = re.compile(
+    r"^(?:(?:it\s+is\s+)?so\s+ordered[.;:]?|"
+    r"(?:the\s+)?(?:judgments?|orders?)(?:\s+of\s+[^.;:]{0,60}?)?\s+(?:is|are)|"
+    r"(?:affirmed|reversed|vacated|remanded|dismissed|modified|reinstated)"
+    r"[.;,:]?|and|in\s+part[.;,:]?|with\s+instructions[.;,:]?)\s+",
     re.IGNORECASE,
 )
+
+
+def _strip_glued_disposition(text: str) -> str:
+    out = text
+    while True:
+        m = _GLUED_DISPOSITION_RE.match(out)
+        if not m:
+            break
+        out = out[m.end():]
+    return out if out and out != text and out[0].isupper() else text
 # Caption front matter that belongs in the header even though it isn't
 # centered: how the case arrived and counsel listings (in their several
 # house styles: "argued the cause" (SCOTUS), "on brief" (4th Cir.),
@@ -913,11 +946,24 @@ _FN_MARK_RE = re.compile(r"^(?:\[([^\]\s]{1,6})\]|(\*{1,3}|†|‡))(?=\s|$)")
 _FN_REF_RE = re.compile(r"^\[?([^\[\]\s]{1,6})\]?$")
 
 
+# West/Scholar text sometimes prints a spurious comma between the title and
+# the name in a byline — "Justice, BREYER, concurring in part…", "Chief
+# Justice, ROBERTS, with whom Justice, SCALIA … join, dissenting." (Alleyne,
+# Armstrong v. Exceptional Child, Hollingsworth).  Normalized in the
+# classification view only; the rendered text stays as the source prints it.
+_TITLE_COMMA_RE = re.compile(r"\b(JUSTICE)\s*,\s+(?=[A-Z])", re.IGNORECASE)
+
+
+def fix_title_comma(text: str) -> str:
+    """Drop the stray comma Scholar inserts after "Justice" in bylines."""
+    return _TITLE_COMMA_RE.sub(r"\1 ", text)
+
+
 def _content_text(b: Block) -> str:
     """Block text without page markers, whitespace-normalized — page
     markers can open a block ("*116 MR. JUSTICE BLACKMUN delivered…") and
     would defeat the start-anchored classification patterns."""
-    text = _visible_block_text(b)
+    text = fix_title_comma(_visible_block_text(b))
     # Public-domain opinions prefix the authorship line with the first
     # paragraph number (``¶1 ANN WALSH BRADLEY, J.``).  Keep the marker in the
     # rendered block, but remove it from the classification view.
@@ -1046,6 +1092,13 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
         public_role = _PUBLIC_ROLE_BYLINE_RE.search(t[:4000])
         inline_role = _INLINE_ROLE_OPEN_RE.match(t[:300])
         joined_role = _JOINED_ROLE_BYLINE_RE.match(joined_text[:700])
+        if joined_role and not (filed_role or public_role or inline_role):
+            lbl = joined_role.group("label")
+            if len(lbl) - len(_strip_glued_disposition(lbl)) >= len(t):
+                # Everything this block contributes to the joined window is
+                # disposition text ("AFFIRMED"); the byline opens a later
+                # block, which will claim the boundary itself.
+                joined_role = None
         if filed_role or public_role or inline_role or joined_role:
             role_text = (filed_role.group("role") if filed_role else
                          public_role.group("role") if public_role else
@@ -1062,6 +1115,7 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
                     r"^(?:(?:U\.S\.|COURT|OF|APPEALS|CLERK)\s+)+",
                     "", label, flags=re.IGNORECASE,
                 )
+            label = _strip_glued_disposition(label)
             boundaries.append((i, kind, label[:90]))
             continue
         if (boundaries and i - boundaries[-1][0] <= 2
@@ -1071,7 +1125,14 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
             # Continuation of a wrapped joined-byline already captured from
             # the filing-banner block, not another opinion.
             continue
-        if len(t) <= 300 and _SEP_HEADER_RE.match(t) and not _NOT_SEP_RE.search(t):
+        if (len(t) <= 300 and _SEP_HEADER_RE.match(t) and not _NOT_SEP_RE.search(t)
+                # "*267 BREYER, J., dissenting" opening on a page marker and
+                # ending with no punctuation is a reporter running head swept
+                # into the text at a page break, not a byline (Intel v. AMD's
+                # majority tail became a phantom dissent).  Real bylines end
+                # with "." or ":".
+                and not (b.spans and b.spans[0].pagenum
+                         and not re.search(r"[.:]$", t.rstrip()))):
             kind = "dissent" if re.search(r"dissent", t, re.IGNORECASE) else "concurrence"
             label = t if len(t) <= 90 else t[:87] + "…"
             boundaries.append((i, kind, label))
