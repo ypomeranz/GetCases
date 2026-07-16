@@ -45,7 +45,12 @@ from pathlib import Path
 from typing import Optional
 
 import citations
-from bluebook_names import abbreviate_case_name, normal_case_caption
+from bluebook_names import (
+    abbreviate_case_name,
+    normal_case_caption,
+    refine_caption_case,
+    strip_related_case_note,
+)
 
 _SCHEMA_VERSION = 2
 
@@ -89,6 +94,27 @@ def _blocks_text(blocks: list) -> str:
         return blocks_to_text(blocks)
     except Exception:
         return ""
+
+
+def _prose_text(blocks: list, cap: int = 40000) -> str:
+    """The opinion's prose paragraphs, joined — the mixed-case evidence
+    :func:`refine_caption_case` reads party-name capitalization from.
+    Caption/header lines are excluded: Scholar's caption styles (all-caps
+    and surname-caps) are exactly the guesswork being corrected.  Capped:
+    the parties are named within the first pages."""
+    out: list[str] = []
+    total = 0
+    for b in blocks:
+        if getattr(b, "kind", None) in ("center", "heading"):
+            continue
+        t = re.sub(r"\s+", " ", b.text()).strip()
+        if not t:
+            continue
+        out.append(t)
+        total += len(t)
+        if total > cap:
+            break
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +205,9 @@ def _caption_name(blocks: list) -> str:
         if getattr(b, "kind", None) not in ("center", "heading"):
             continue
         t = re.sub(r"\s+", " ", b.text()).strip()
+        # An Alabama-style "(Re <underlying case>)" cross-reference carries
+        # its own " v. " and would masquerade as this case's caption.
+        t = strip_related_case_note(t)
         if not t or t.startswith(("No.", "Nos.")):
             continue
         if citations.TEXT_CITE_RE.match(t):
@@ -264,6 +293,9 @@ def extract_record(
         raw_name = _caption_name(blocks)
         if raw_name:
             raw_name = _smart_titlecase(raw_name)  # caption is often ALL CAPS
+            # The body's mixed-case prose corrects ambiguous title-casing
+            # guesses ("Us Dominion" -> "US Dominion").
+            raw_name = refine_caption_case(raw_name, _prose_text(blocks))
     name = abbreviate_case_name(raw_name) if raw_name else ""
 
     cites = _header_cites(blocks)
@@ -276,11 +308,37 @@ def extract_record(
     date_filed = item.get("dateFiled") or item.get("date_filed") or ""
     year = date_filed[:4] if len(str(date_filed)) >= 4 else ""
     if not year:
-        head = " ".join(
-            b.text() for b in blocks[:10]
+        # Same ladder as the viewer's Bluebook year: page markers are
+        # stripped first (a star page or S. Ct. page number, 1600–2099,
+        # is indistinguishable from a year), then a parenthesized year
+        # next to a citation wins, then a "Decided …" line, then a bare
+        # centered date, then any bare year.
+        def _no_markers(b) -> str:
+            spans = getattr(b, "spans", None)
+            if spans is None:
+                return b.text()
+            return "".join(
+                s.text for s in spans if not getattr(s, "pagenum", False))
+
+        hdr = " ".join(
+            _no_markers(b) for b in blocks[:16]
             if getattr(b, "kind", None) in ("center", "heading")
         )
-        years = re.findall(r"\b(1[6-9]\d{2}|20\d{2})\b", head)
+        hdr_center = " ".join(
+            _no_markers(b) for b in blocks[:16]
+            if getattr(b, "kind", None) == "center"
+        )
+        years = (
+            re.findall(r"\([^()]{0,40}?(1[6-9]\d{2}|20\d{2})\s*\)", hdr)
+            or re.findall(
+                r"\b(?:Decided|Filed|Released|Entered)\b[^0-9]{0,40}?"
+                r"(1[6-9]\d{2}|20\d{2})", hdr, re.IGNORECASE)
+            or re.findall(
+                r"\b(?:January|February|March|April|May|June|July|August|"
+                r"September|October|November|December)\s+\d{1,2},?\s+"
+                r"(1[6-9]\d{2}|20\d{2})\b", hdr_center, re.IGNORECASE)
+            or re.findall(r"\b(1[6-9]\d{2}|20\d{2})\b", hdr)
+        )
         if years:
             year = years[-1]
 

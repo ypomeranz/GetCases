@@ -644,12 +644,13 @@ def text_similarity(a: str, b: str, n: int = 4) -> float:
 #   MR. JUSTICE STEWART, concurring.
 #   Justice O'CONNOR, with whom Justice BRENNAN joins, dissenting.
 #   KOZINSKI, Circuit Judge, dissenting:
+#   LYONS, Justice (dissenting).          [Alabama-style spelled-out role]
 _SEP_HEADER_RE = re.compile(
     r"^\s*(?:MR\.\s+|MRS\.\s+|MS\.\s+)?"
     r"(?:(?:CHIEF\s+)?JUSTICE\s+\S+|"
     r"[A-Z][\w.'’-]*(?:\s+[A-Z][\w.'’-]*){0,3}\s*,\s*"
     r"(?:C\.\s*J\.|JJ?\.|(?:Chief\s+|Senior\s+|Presiding\s+)?"
-    r"(?:Circuit\s+|District\s+|Bankruptcy\s+)?Judge))"
+    r"(?:Circuit\s+|District\s+|Bankruptcy\s+)?(?:Judge|Justice)))"
     r".{0,200}?\b(?:concurring|dissenting)"
     # A real header ends right after the role phrase (allowing "in part…"
     # tails and trailing footnote markers).  Prose that merely *mentions*
@@ -683,7 +684,16 @@ _BARE_SEP_HEADER_RE = re.compile(
     r"^(?:Statement\s+of\s+)?"
     r"(?:(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(?:CHIEF\s+)?JUSTICE\s+"
     r"[A-Z][\w.'’-]+\s*[.:]"
-    r"|[A-Z][\w.'’-]+,\s*(?:C\.\s*)?J\.)$",
+    r"|[A-Z][\w.'’-]+,\s*(?:(?:C\.|Ch\.)\s*)?J\.)$",
+    re.IGNORECASE,
+)
+# OCR from the earliest U.S. Reports often turns the long-s in ``Justice``
+# into strings such as ``Jujtice``, ``Juftke``, or ``7ujh~?~``.  Restrict this
+# deliberately loose recovery rule to a whole short byline so the noisy word
+# cannot create a boundary in running prose.
+_OCR_JUSTICE_BYLINE_RE = re.compile(
+    r"^\W{0,8}[A-Z][A-Za-z.’'~!-]{2,30},\W{0,4}[J7][A-Za-z~?]{3,12}"
+    r"[.\s*t]*$",
     re.IGNORECASE,
 )
 
@@ -717,20 +727,151 @@ _SEP_DELIVERED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Another role-less historical U.S. Reports form reverses the usual byline:
+#
+#   Separate opinion of MR. JUSTICE McREYNOLDS.
+#
+# It is a definite opinion boundary, but "separate" alone does not establish
+# whether the writing concurs or dissents.  The role is resolved after all
+# boundaries are known, using the disposition and neighboring writings.
+_SEP_OF_RE = re.compile(
+    r"^\s*Separate\s+opinion\s+of\s+"
+    r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(?:CHIEF\s+)?JUSTICE\s+"
+    r"[A-Z][\w.'â€™-]+\s*[.:]?\s*$",
+    re.IGNORECASE,
+)
 
-def _peek_sep_kind(blocks: list, i: int, default: str = "concurrence") -> str:
-    """The role of a separate opinion whose header names none (a bare
-    "TRAYNOR, J.", "…delivered the following separate opinion."): read the
-    opening sentences — "I dissent…" / "I concur…" say which way it went."""
+
+def _peek_sep_kind_evidence(
+    blocks: list, i: int, default: str = "concurrence"
+) -> tuple[str, bool]:
+    """Return ``(kind, found_role_language)`` for a keyword-less byline."""
     for b in blocks[i + 1: i + 4]:
         t = _content_text(b)
         if not t:
             continue
+        # Role language after another byline belongs to that later judge, not
+        # to the candidate being classified.
+        if (_BARE_SEP_HEADER_RE.match(t)
+                or _JOINED_SEP_HEADER_RE.match(t)
+                or _SEP_OF_RE.match(t)
+                or _OCR_JUSTICE_BYLINE_RE.match(t)):
+            break
         m = re.search(r"\b(dissent|concur)", t[:300], re.IGNORECASE)
         if m:
-            return ("dissent" if m.group(1).lower() == "dissent"
-                    else "concurrence")
-    return default
+            return (("dissent" if m.group(1).lower() == "dissent"
+                     else "concurrence"), True)
+        if re.search(
+            r"\b(?:opinion|view)\s+(?:is\s+)?different\b|"
+            r"\bdiffer\s+from\s+(?:the\s+)?(?:court|opinion|judgment)\b",
+            t[:400], re.IGNORECASE,
+        ):
+            return "dissent", True
+        if re.search(r"\bdelivered\s+the\s+opinion(?:\s+of\s+the\s+court)?\b",
+                     t[:300], re.IGNORECASE):
+            return "majority", True
+    return default, False
+
+
+def _peek_sep_kind(blocks: list, i: int, default: str = "concurrence") -> str:
+    """Role of a separate opinion whose byline does not state its role."""
+    return _peek_sep_kind_evidence(blocks, i, default)[0]
+
+
+_FIRST_PERSON_DISPOSITION_RE = re.compile(
+    r"\bI\s+(?:(?:therefore|accordingly)\s+)?"
+    r"(?:think|believe|am\s+of\s+opinion)\b[^.]{0,240}?"
+    r"\b(?:judgment|decree|order)\b[^.]{0,100}?"
+    r"\b(affirmed|reversed|vacated|dismissed)\b",
+    re.IGNORECASE,
+)
+_STANDALONE_DISPOSITION_RE = re.compile(
+    r"^\s*(?:(?:the\s+)?(?:judgment|decree|order)(?:\s+below)?\s+"
+    r"(?:is|should\s+be|must\s+be)\s+)?"
+    r"(affirmed|reversed|vacated|dismissed)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+_AGREES_WITH_PRECEDING_OPINION_RE = re.compile(
+    r"\b(?:opinion|views?)\s+(?:just\s+handed\s+down|immediately\s+"
+    r"preceding)\b[^.]{0,100}\bI\s+concur\b",
+    re.IGNORECASE,
+)
+
+
+def _majority_disposition_before(blocks: list, first_sep: int) -> str:
+    """The lead writing's short disposition immediately before a separate
+    opinion, such as Scholar's standalone ``Affirmed.`` block."""
+    for b in reversed(blocks[max(0, first_sep - 10):first_sep]):
+        t = re.sub(r"^(?:\*\d+\s+)+", "", _content_text(b)).strip()
+        m = _STANDALONE_DISPOSITION_RE.fullmatch(t)
+        if m:
+            return m.group(1).lower()
+    return ""
+
+
+def _neutral_sep_direct_kind(
+    blocks: list, start: int, end: int, majority_disposition: str,
+) -> str:
+    """Role proved within one role-less separate-opinion section."""
+    if majority_disposition:
+        stance = ""
+        for b in blocks[start + 1:end]:
+            m = _FIRST_PERSON_DISPOSITION_RE.search(_content_text(b))
+            if m:
+                stance = m.group(1).lower()
+        if stance:
+            return ("concurrence" if stance == majority_disposition
+                    else "dissent")
+
+    # Opening role language remains useful when no contrary disposition is
+    # stated.  Keep its existing short look-ahead and boundary safeguards.
+    kind, evidenced = _peek_sep_kind_evidence(blocks, start)
+    return kind if evidenced else ""
+
+
+def _resolve_neutral_sep_boundaries(
+    blocks: list, boundaries: list[tuple[int, str, str]],
+) -> list[tuple[int, str, str]]:
+    """Resolve temporary ``separate`` boundaries without guessing too soon.
+
+    A section's express disposition controls.  A later writing that says it
+    concurs with the immediately preceding opinion transfers its resolved role
+    backward (the Sutherland/McReynolds sequence in Steward Machine).  Truly
+    ambiguous historical writings retain the pre-existing concurrence
+    fallback, but are still detected as separate opinions.
+    """
+    if not any(kind == "separate" for _i, kind, _label in boundaries):
+        return boundaries
+    resolved = [list(bd) for bd in boundaries]
+    lead_disposition = _majority_disposition_before(blocks, boundaries[0][0])
+
+    for k, (start, kind, _label) in enumerate(boundaries):
+        if kind != "separate":
+            continue
+        end = boundaries[k + 1][0] if k + 1 < len(boundaries) else len(blocks)
+        direct = _neutral_sep_direct_kind(
+            blocks, start, end, lead_disposition)
+        if direct:
+            resolved[k][1] = direct
+
+    # Work backward so an already-resolved later writing can establish the
+    # role of the separate opinion with which it expressly agrees.
+    for k in range(len(resolved) - 2, -1, -1):
+        if resolved[k][1] != "separate" or resolved[k + 1][1] == "separate":
+            continue
+        next_start = int(resolved[k + 1][0])
+        next_end = (int(resolved[k + 2][0])
+                    if k + 2 < len(resolved) else len(blocks))
+        opening = " ".join(
+            _content_text(b) for b in blocks[next_start + 1:min(next_end, next_start + 4)]
+        )
+        if _AGREES_WITH_PRECEDING_OPINION_RE.search(opening):
+            resolved[k][1] = resolved[k + 1][1]
+
+    for bd in resolved:
+        if bd[1] == "separate":
+            bd[1] = "concurrence"
+    return [(int(i), str(kind), str(label)) for i, kind, label in resolved]
 
 # The byline shared with the body of _SEP_HEADER_RE — a justice/judge name
 # followed (within a clause) by "concurring"/"dissenting".
@@ -739,22 +880,23 @@ _SEP_BYLINE = (
     r"(?:(?:CHIEF\s+)?JUSTICE\s+\S+|"
     r"[A-Z][\w.'’-]*(?:\s+[A-Z][\w.'’-]*){0,3}\s*,\s*"
     r"(?:C\.\s*J\.|JJ?\.|(?:Chief\s+|Senior\s+|Presiding\s+)?"
-    r"(?:Circuit\s+|District\s+|Bankruptcy\s+)?Judge))"
+    r"(?:Circuit\s+|District\s+|Bankruptcy\s+)?(?:Judge|Justice)))"
     r".{0,200}?\b(?:concurring|dissenting)\b[^.:]*[.:]"
 )
 # Scholar sometimes tucks a separate opinion's byline onto the end of the
 # disposition blockquote instead of giving it its own paragraph, e.g.
 #   "Affirmed.  Justice Thomas, concurring."
+#   "AFFIRMED DAVIS, Senior Circuit Judge, concurring:"   [no period at all]
 # Anchored to a standalone disposition sentence and requiring the byline to
 # end the block, so it never fires on a mid-sentence parenthetical such as
 # "(Kennedy, J., dissenting)".  Group 1 is the byline to split onto its own
 # block/line.
 _INLINE_SEP_HEADER_RE = re.compile(
     r"(?:^|\.\s+)"                                  # disposition starts block/sentence
-    r"(?:it\s+is\s+so\s+ordered"
+    r"(?:(?:it\s+is\s+)?so\s+ordered"
     r"|(?:the\s+(?:judgments?|orders?)\s+(?:is|are)\s+)?"
     r"(?:affirmed|reversed|vacated|remanded|dismissed|modified|reinstated)"
-    r"[^.]{0,60})\.\s+"                             # ...a short disposition sentence
+    r"[^.]{0,60}?)\.?\s+"                           # ...a short disposition sentence
     r"(" + _SEP_BYLINE + r")\s*$",                  # ...then the inlined byline
     re.IGNORECASE | re.DOTALL,
 )
@@ -784,14 +926,20 @@ def _split_block_at(block: Block, offset: int) -> tuple[Block, Block]:
 def _split_inline_sep_headers(blocks: list[Block]) -> list[Block]:
     """Give a separate-opinion byline its own block when Scholar appended it
     to the disposition block (e.g. "Affirmed.  Justice Thomas, concurring.")
-    so segmentation — and the rendered opinion — start it on a new line."""
+    so segmentation — and the rendered opinion — start it on a new line.
+
+    The split runs even when the glued whole happens to satisfy
+    ``_SEP_HEADER_RE`` ("AFFIRMED. DIAZ, Chief Judge, concurring:" does,
+    because the pattern's name run tolerates embedded periods) — otherwise
+    the disposition sentence would open the separate opinion and pollute
+    its label and writer parenthetical."""
     out: list[Block] = []
     for b in blocks:
         m = _INLINE_SEP_HEADER_RE.search(b.text())
         if (
             m
-            and not _SEP_HEADER_RE.match(_content_text(b))  # not already its own header
-            and not _NOT_SEP_RE.search(m.group(1))          # not a syllabus disposition
+            and m.start(1) > 0                      # a disposition really precedes
+            and not _NOT_SEP_RE.search(m.group(1))  # not a syllabus disposition
         ):
             head, tail = _split_block_at(b, m.start(1))
             if head.text().strip():
@@ -817,9 +965,70 @@ _MAJ_ATTRIB_RE = re.compile(
 # Lower-court style author line standing alone: "KOZINSKI, Circuit Judge:"
 _AUTHOR_LINE_RE = re.compile(
     r"^\s*[A-Z][\w.'’ -]{0,50},\s*(?:(?:Chief|Senior|Presiding)\s+)?"
-    r"(?:(?:Circuit|District|Bankruptcy)\s+)?(?:Judge|Justice|C\.?\s?J\.|J\.)"
+    r"(?:(?:Circuit|District|Bankruptcy)\s+)?"
+    r"(?:Judge|Justice|C\.?\s?J\.|Ch\.?\s?J\.|J\.)"
     r"\s*[.:;—-]?\s*$"
 )
+# Authorship can share the first numbered paragraph instead of occupying a
+# standalone line (Wisconsin slip opinions commonly use this form).
+_INLINE_AUTHOR_OPEN_RE = re.compile(
+    r"^\s*[A-Z][A-Z.'’ -]{1,60},\s*(?:C\.?\s*J\.?|J\.|"
+    r"(?:Chief\s+)?(?:Circuit\s+)?Judge)\s+(?=\S)",
+    re.IGNORECASE,
+)
+_INLINE_ROLE_OPEN_RE = re.compile(
+    r"^\s*[A-Z][A-Z.'’ -]{1,60},\s*(?:C\.?\s*J\.?|J\.|"
+    r"(?:Chief\s+)?(?:Circuit\s+)?Judge)\s*"
+    r"(?:\((?:concurring|dissenting)[^)]*\)|,\s*(?:concurring|dissenting)[^:]*:)\.?",
+    re.IGNORECASE,
+)
+# PDF-to-text extraction sometimes glues a filing banner to the dissent byline:
+# ``6 FILED ... CLERK R. NELSON, Circuit Judge, dissenting:``.
+_FILED_BANNER_ROLE_RE = re.compile(
+    r"(?:\bFILED\b|\bCLERK\b).{0,400}?"
+    r"(?P<label>[A-Z](?:\.\s*)?[A-Z][A-Z.'’ -]{0,45},\s*"
+    r"(?:(?:Chief|Senior)\s+)?(?:Circuit\s+)?Judge,.{0,160}?"
+    r"(?P<role>concurring|dissenting)[^:]{0,100}:)",
+    re.IGNORECASE | re.DOTALL,
+)
+_PUBLIC_ROLE_BYLINE_RE = re.compile(
+    r"(?:^|¶\s*\d{1,5}\s+)"
+    r"(?P<label>[A-Z][A-Z.'’ -]{1,60},\s*(?:C\.?\s*J\.?|J\.)\s*"
+    r"\((?P<role>concurring|dissenting)[^)]*\)\.?)",
+    re.IGNORECASE,
+)
+# Case-sensitive on the name run: with IGNORECASE the caps-name prefix
+# would match ordinary prose ("The judgment of the district court is
+# Affirmed. WALD, Circuit Judge, concurring:" from the block before the
+# byline), stacking phantom boundaries on the disposition sentences.
+_JOINED_ROLE_BYLINE_RE = re.compile(
+    r"^(?P<label>[A-Z](?:\.\s*)?[A-Z][A-Z.'’ -]{0,55},\s*"
+    r"(?:(?:Chief|Senior)\s+)?(?:Circuit\s+)?Judge,.{0,240}?"
+    r"(?P<role>(?i:concurring|dissenting))[^:]{0,80}:)",
+)
+
+# A disposition fragment Scholar sometimes glues ahead of a circuit
+# separate-opinion byline ("AFFIRMED DAVIS, Senior Circuit Judge,
+# concurring:").  Stripped from boundary labels; when everything a block
+# contributes to a joined-window match is disposition text, the boundary
+# belongs to the later block that actually holds the byline.
+_GLUED_DISPOSITION_RE = re.compile(
+    r"^(?:(?:it\s+is\s+)?so\s+ordered[.;:]?|"
+    r"(?:the\s+)?(?:judgments?|orders?)(?:\s+of\s+[^.;:]{0,60}?)?\s+(?:is|are)|"
+    r"(?:affirmed|reversed|vacated|remanded|dismissed|modified|reinstated)"
+    r"[.;,:]?|and|in\s+part[.;,:]?|with\s+instructions[.;,:]?)\s+",
+    re.IGNORECASE,
+)
+
+
+def _strip_glued_disposition(text: str) -> str:
+    out = text
+    while True:
+        m = _GLUED_DISPOSITION_RE.match(out)
+        if not m:
+            break
+        out = out[m.end():]
+    return out if out and out != text and out[0].isupper() else text
 # Caption front matter that belongs in the header even though it isn't
 # centered: how the case arrived and counsel listings (in their several
 # house styles: "argued the cause" (SCOTUS), "on brief" (4th Cir.),
@@ -848,11 +1057,28 @@ _FN_MARK_RE = re.compile(r"^(?:\[([^\]\s]{1,6})\]|(\*{1,3}|†|‡))(?=\s|$)")
 _FN_REF_RE = re.compile(r"^\[?([^\[\]\s]{1,6})\]?$")
 
 
+# West/Scholar text sometimes prints a spurious comma between the title and
+# the name in a byline — "Justice, BREYER, concurring in part…", "Chief
+# Justice, ROBERTS, with whom Justice, SCALIA … join, dissenting." (Alleyne,
+# Armstrong v. Exceptional Child, Hollingsworth).  Normalized in the
+# classification view only; the rendered text stays as the source prints it.
+_TITLE_COMMA_RE = re.compile(r"\b(JUSTICE)\s*,\s+(?=[A-Z])", re.IGNORECASE)
+
+
+def fix_title_comma(text: str) -> str:
+    """Drop the stray comma Scholar inserts after "Justice" in bylines."""
+    return _TITLE_COMMA_RE.sub(r"\1 ", text)
+
+
 def _content_text(b: Block) -> str:
     """Block text without page markers, whitespace-normalized — page
     markers can open a block ("*116 MR. JUSTICE BLACKMUN delivered…") and
     would defeat the start-anchored classification patterns."""
-    return _visible_block_text(b)
+    text = fix_title_comma(_visible_block_text(b))
+    # Public-domain opinions prefix the authorship line with the first
+    # paragraph number (``¶1 ANN WALSH BRADLEY, J.``).  Keep the marker in the
+    # rendered block, but remove it from the classification view.
+    return re.sub(r"^(?:¶\s*|\[\s*¶\s*)(\d{1,5})\s*\]?\s*", "", text)
 
 
 def _split_footnote_run(blocks: list[Block]) -> tuple[list[Block], list[Block]]:
@@ -952,15 +1178,72 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     if not blocks:
         return []
     blocks = _split_inline_sep_headers(blocks)
+    seriatim = any(
+        re.search(r"\b(?:seriatim|feriatim)\b", _content_text(b), re.IGNORECASE)
+        for b in blocks[:6]
+    )
     boundaries: list[tuple[int, str, str]] = []  # (block index, kind, label)
-    bare_headers: list[tuple[int, str, str]] = []  # keyword-less attributions
+    # (index, kind, label, role language found).  The final flag lets us prune
+    # short runs of vote signatures without discarding substantial old-style
+    # opinions whose bylines omit "concurring" or "dissenting."
+    bare_headers: list[tuple[int, str, str, bool]] = []
     maj_phrase_all: list[int] = []
     maj_author_idx: Optional[int] = None
     for i, b in enumerate(blocks):
         t = _content_text(b)
         if not t:
             continue
-        if len(t) <= 300 and _SEP_HEADER_RE.match(t) and not _NOT_SEP_RE.search(t):
+        joined_text = " ".join(
+            _content_text(nb) for nb in blocks[i:i + 3]
+            if _content_text(nb)
+        )
+        filed_role = (_FILED_BANNER_ROLE_RE.search(joined_text[:4000])
+                      if re.search(r"\b(?:FILED|CLERK)\b", t, re.IGNORECASE)
+                      else None)
+        public_role = _PUBLIC_ROLE_BYLINE_RE.search(t[:4000])
+        inline_role = _INLINE_ROLE_OPEN_RE.match(t[:300])
+        joined_role = _JOINED_ROLE_BYLINE_RE.match(joined_text[:700])
+        if joined_role and not (filed_role or public_role or inline_role):
+            lbl = joined_role.group("label")
+            if len(lbl) - len(_strip_glued_disposition(lbl)) >= len(t):
+                # Everything this block contributes to the joined window is
+                # disposition text ("AFFIRMED"); the byline opens a later
+                # block, which will claim the boundary itself.
+                joined_role = None
+        if filed_role or public_role or inline_role or joined_role:
+            role_text = (filed_role.group("role") if filed_role else
+                         public_role.group("role") if public_role else
+                         joined_role.group("role") if joined_role else
+                         inline_role.group(0))
+            kind = ("dissent" if re.search(r"dissent", role_text, re.IGNORECASE)
+                    else "concurrence")
+            label = (filed_role.group("label") if filed_role else
+                     public_role.group("label") if public_role else
+                     joined_role.group("label") if joined_role else
+                     inline_role.group(0)).strip()
+            if filed_role:
+                label = re.sub(
+                    r"^(?:(?:U\.S\.|COURT|OF|APPEALS|CLERK)\s+)+",
+                    "", label, flags=re.IGNORECASE,
+                )
+            label = _strip_glued_disposition(label)
+            boundaries.append((i, kind, label[:90]))
+            continue
+        if (boundaries and i - boundaries[-1][0] <= 2
+                and "joined" in boundaries[-1][2].lower()
+                and re.search(r"\bJudges?,\s*(?:concurring|dissenting)\b",
+                              t, re.IGNORECASE)):
+            # Continuation of a wrapped joined-byline already captured from
+            # the filing-banner block, not another opinion.
+            continue
+        if (len(t) <= 300 and _SEP_HEADER_RE.match(t) and not _NOT_SEP_RE.search(t)
+                # "*267 BREYER, J., dissenting" opening on a page marker and
+                # ending with no punctuation is a reporter running head swept
+                # into the text at a page break, not a byline (Intel v. AMD's
+                # majority tail became a phantom dissent).  Real bylines end
+                # with "." or ":".
+                and not (b.spans and b.spans[0].pagenum
+                         and not re.search(r"[.:]$", t.rstrip()))):
             kind = "dissent" if re.search(r"dissent", t, re.IGNORECASE) else "concurrence"
             label = t if len(t) <= 90 else t[:87] + "…"
             boundaries.append((i, kind, label))
@@ -971,19 +1254,34 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
                     else "concurrence" if m else _peek_sep_kind(blocks, i))
             boundaries.append((i, kind, t if len(t) <= 90 else t[:87] + "…"))
             continue
-        if len(t) <= 60 and _BARE_SEP_HEADER_RE.match(t):
+        if len(t) <= 160 and _SEP_OF_RE.match(t):
+            # The heading proves a boundary but not a vote.  Delay the role
+            # decision until neighboring sections and the lead disposition
+            # are available.
+            boundaries.append((i, "separate", t))
+            continue
+        if len(t) <= 60 and (
+            _BARE_SEP_HEADER_RE.match(t) or _OCR_JUSTICE_BYLINE_RE.match(t)
+        ):
             if (maj_author_idx is None and not boundaries and not bare_headers
-                    and _AUTHOR_LINE_RE.match(t)):
+                    and (_AUTHOR_LINE_RE.match(t)
+                         or _OCR_JUSTICE_BYLINE_RE.match(t))):
                 # The first bare state-court byline before any separate
                 # opinion opens the majority ("GIBSON, C.J." in Escola),
                 # not a separate opinion.
                 maj_author_idx = i
             else:
-                bare_headers.append((i, _peek_sep_kind(blocks, i), t))
+                kind, evidenced = _peek_sep_kind_evidence(
+                    blocks, i, default="majority" if seriatim else "concurrence"
+                )
+                bare_headers.append((i, kind, t, evidenced))
             continue
         if len(t) <= 260 and _JOINED_SEP_HEADER_RE.match(t):
             label = t if len(t) <= 90 else t[:87] + "…"
-            bare_headers.append((i, _peek_sep_kind(blocks, i), label))
+            kind, _evidenced = _peek_sep_kind_evidence(blocks, i)
+            # A complete "with whom ... joins" byline is itself strong
+            # boundary evidence even when the next sentence omits the role.
+            bare_headers.append((i, kind, label, True))
             continue
         if _MAJ_PHRASE_RE.search(t[:160]) and _MAJ_ATTRIB_RE.match(t):
             # Candidates are collected over the whole document: an attribution
@@ -991,7 +1289,8 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
             # a front-matter announcement (see below).
             maj_phrase_all.append(i)
         elif (maj_author_idx is None and not boundaries
-              and len(t) <= 120 and _AUTHOR_LINE_RE.match(t)):
+              and ((_AUTHOR_LINE_RE.match(t) and len(t) <= 120)
+                   or _INLINE_AUTHOR_OPEN_RE.match(t[:180]))):
             maj_author_idx = i
     first_sep = boundaries[0][0] if boundaries else len(blocks)
     phrase_before = [i for i in maj_phrase_all if i < first_sep]
@@ -1017,8 +1316,22 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
     anchor = maj_idx if maj_idx is not None else (
         boundaries[0][0] if boundaries else None)
     if anchor is not None:
-        boundaries += [bd for bd in bare_headers if bd[0] > anchor]
+        candidates = [bd for bd in bare_headers if bd[0] > anchor]
+        all_candidate_indexes = sorted(
+            [bd[0] for bd in boundaries] + [bd[0] for bd in candidates]
+        )
+        for idx, kind, label, evidenced in candidates:
+            next_idx = next(
+                (j for j in all_candidate_indexes if j > idx), len(blocks)
+            )
+            # An unevidenced byline with at most one following block before
+            # another byline (or the document end) is a vote/signature line,
+            # not a separate opinion.  Longer historical writings remain.
+            if not evidenced and next_idx - idx <= 2:
+                continue
+            boundaries.append((idx, kind, label))
         boundaries.sort(key=lambda bd: bd[0])
+    boundaries = _resolve_neutral_sep_boundaries(blocks, boundaries)
     first_sep = boundaries[0][0] if boundaries else len(blocks)
 
     parts: list[OpinionPart] = []

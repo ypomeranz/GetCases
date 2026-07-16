@@ -399,6 +399,17 @@ _MUNICIPAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The same unit expressions in mid-name position are omitted (rule
+# 10.2.1(f)): "Board of Education of the Borough of Hawthorne" -> "Board of
+# Education of Hawthorne", "Mayor of the City of New York" -> "Mayor of New
+# York".  The lookbehind confines the omission to mid-name — a party that
+# *begins* with the expression ("City of New York") is untouched.
+_MID_GEO_UNIT_RE = re.compile(
+    r"(?<=\w)(\s+of)\s+(?:the\s+)?"
+    r"(?:City|Town|Township|Village|Borough|County|Parish)\s+of\b",
+    re.IGNORECASE,
+)
+
 # The suffix mirror of the same rule: "Cook County", "Jefferson Parish", "New
 # York City" name a unit whose words together are the place's proper name, so
 # the whole party stays unabbreviated ("Soldal v. Cook County", never "Cook
@@ -444,7 +455,7 @@ _ORG_WORDS = {
     "brewery", "brewing", "builders", "church", "cinemas", "club",
     "dairy", "drug", "drugs", "farms", "foods", "furniture", "gas",
     "grocery", "hardware", "herald", "homes", "jewelers", "journal",
-    "lines", "lodge", "lumber", "media", "mill", "mills", "ministries",
+    "lines", "list", "lodge", "lumber", "media", "mill", "mills", "ministries",
     "motors", "news", "nursery", "oil", "optical", "outfitters", "packing",
     "pictures", "pizza", "post", "press", "realty", "records", "shop",
     "shops", "steel", "store", "stores", "studios", "supply", "temple",
@@ -486,7 +497,7 @@ dale damon dan dana daniel danielle danny daphne darlene darnell darrell
 darren darryl dave david dawn dean deanna debbie deborah debra delbert delia
 della delores delmar denise dennis derek derrick desiree devin devon dewey
 dexter diana diane dianne dolores dominic dominique don donald donna donnie
-dora doreen doris dorothy doug douglas duane dustin dwayne dwight dylan earl
+dora dred doreen doris dorothy doug douglas duane dustin dwayne dwight dylan earl
 earnest ebony ed eddie edgar edith edmund edna eduardo edward edwin eileen
 elaine elbert eleanor elena eli elias elijah elizabeth ella ellen elliot
 elliott elmer eloise elsa elsie elvira elwood emanuel emil emily emma emmett
@@ -499,7 +510,7 @@ george georgia gerald geraldine gerard gerardo gilbert gina ginger gladys
 glen glenda glenn gloria gordon grace graham grant greg gregg gregory
 gretchen grover guadalupe guillermo gus gustavo guy gwen gwendolyn hal hank
 hannah harlan harold harriet harriett harry harvey hattie hazel heather
-hector heidi helen henrietta henry herbert herman hilda hiram holly homer
+hector heidi helen henrietta henry herbert herman hilda hillary hiram holly homer
 hope horace hortense howard hubert hugh hugo ian ida ignacio ike ina inez ira
 irene iris irma irving isaac isabel isadore isaiah ismael israel ivan jack
 jackie jacob jacqueline jaime jake james jamie jan jana jane janet janice
@@ -512,7 +523,7 @@ judith judy julia julian julie julio julius june justin kaitlyn kara karen
 kari karl karla kate katelyn katherine kathleen kathryn kathy katie katrina
 kay kayla keith kelley kelli kellie kelly kelvin ken kendra kenneth kenny
 kent kerry kevin kim kimberly kirk krista kristen kristi kristin kristina
-kristine kristy kurt kyle lamar lance larry latasha latoya laura lauren
+kristine kristopher kristy kurt kyle lamar lance larry latasha latoya laura lauren
 laurie lavern laverne lawrence leah lela leland lemuel lena leo leon
 leonard leopold leroy lesley leslie lester leticia levi lewis lila lillian
 lillie lily linda lindsay lindsey lionel lisa lloyd logan lois lola lonnie
@@ -535,7 +546,7 @@ perry pete peter phil philip phillip phineas phyllis preston priscilla
 prudence rachael rachel rafael ralph ramon ramona randal randall randolph
 randy raquel raul ray raymond rebecca regina reginald rene renee reuben rex
 rhonda ricardo richard rick rickey ricky rita rob robert roberta roberto
-robin robyn rocky rod roderick rodney rodolfo rodrigo roger roland rolando
+robin robyn rocco rocky rod roderick rodney rodolfo rodrigo roger roland rolando
 roman ron ronald ronnie roosevelt rosa rosalie roscoe rose rosemary rosetta
 ross rowena roxanne roy ruben ruby rudolph rudy rufus rupert russell rusty
 ruth ryan sabrina sadie sally salvador salvatore sam samantha sammy samuel
@@ -543,15 +554,15 @@ sandra sandy santos sara sarah saul scott sean sergio seth seymour shane
 shannon shari sharon shaun shawn sheila shelby sheldon shelia shelley shelly
 sheri sherman sherri sherry sheryl shirley sidney silas silvia simon sonia
 sonya sophia spencer stacey stacy stan stanley stefanie stella stephanie
-stephen steve steven stuart sue summer susan susannah susie suzanne sybil
+stephen steve steven stuart sue summer susan susannah susette susie suzanne sybil
 sylvester sylvia tabitha tamara tami tammie tammy tanya tara tasha taylor
 ted terence teresa teri terrance terrell terrence terri terry thaddeus
 thelma theodora theodore theresa thomas tiffany tim timothy tina toby todd
 tom tommie tommy toni tony tonya tracey traci tracy travis trevor tricia
-trisha troy tyler tyrone ulysses ursula valerie vance vanessa velma vera
+trisha troy tyler tyrone ulysses ursula valerie vance vanessa valentino velma vera
 verna vernon veronica vicki vickie vicky victor victoria vincent viola
 violet virgil virginia vivian wade wallace walter wanda warren wayne wendell
-wendy wesley wilbert wilbur wilfred willa willard william willie willis
+wendy wesley wilbert xavier wilbur wilfred willa willard william willie willis
 wilma winfield winifred winston woodrow yesenia yolanda yvette yvonne
 zachary zelda
 """.split()) | frozenset("""
@@ -670,7 +681,7 @@ _CAPTION_SMALL_WORDS = frozenset({
 _CAPTION_KEEP_CAPS = frozenset({
     "LLC", "LLP", "LLLP", "PLLC", "PLC", "LP", "PC", "PA", "N.A.",
     "U.S.", "USA", "FBI", "SEC", "IRS", "EPA", "NLRB", "FCC", "FTC",
-    "II", "III", "IV",
+    "NAACP", "II", "III", "IV",
 })
 
 
@@ -684,8 +695,13 @@ def normal_case_caption(text: str) -> str:
     ``McFadden``; truly unusual brand casing is later recoverable from the
     reporter's authoritative metadata.
     """
+    # The earliest reports print the apostrophe as a turned comma, which
+    # OCR renders U+2018 ("M‘INTOSH"): normalize it to the plain apostrophe
+    # every downstream pattern understands.
+    text = (text or "").replace("‘", "'")
     out: list[str] = []
-    for i, word in enumerate((text or "").split()):
+    words = text.split()
+    for i, word in enumerate(words):
         letters = [c for c in word if c.isalpha()]
         # Ordinary mixed case passes through, but a mostly-uppercase OCR form
         # such as McFADDEN is still an all-caps word for normalization purposes.
@@ -695,10 +711,27 @@ def normal_case_caption(text: str) -> str:
             out.append(word)
             continue
         stripped = word.replace("’", "'").strip(".,()'\"")
+        # An all-caps word containing "&" is a firm's initialism (AT&T,
+        # A&M, S&P, H&R) — English words never carry one, so caps are safe.
+        # The dotted-initialism check tolerates a final letter left bare by
+        # the strip above ("L.L.C." arrives here as "L.L.C").
         if (stripped in _CAPTION_KEEP_CAPS
-                or re.fullmatch(r"(?:[A-Z]\.)+", stripped)):
+                or "&" in stripped
+                or re.fullmatch(r"(?:[A-Z]\.)+[A-Z]?", stripped)):
             out.append(word)
             continue
+        # A single dotted initial ("SAMUEL A. WORCESTER", "R. A. V.,
+        # PETITIONER", "U. S. A., INC.") collides with the small-word list
+        # ("a", "v") and must keep its capital.  A lone "V." is the versus
+        # separator unless it continues a chain of initials — the article
+        # "A" never prints a period, so the period is the initial's mark.
+        if re.fullmatch(r"[A-Z]", stripped) and "." in word:
+            if stripped != "V" or (
+                i and re.fullmatch(
+                    r"[A-Z]\.[,;]?", words[i - 1].replace("’", "'"))
+            ):
+                out.append(word)
+                continue
         low = word.lower()
         if i and low.strip(".,()'\"") in _CAPTION_SMALL_WORDS:
             out.append(low)
@@ -714,8 +747,231 @@ def normal_case_caption(text: str) -> str:
         )
         if fixed.startswith("Mc") and len(fixed) > 2 and fixed[2].isalpha():
             fixed = "Mc" + fixed[2].upper() + fixed[3:]
+        # A possessive or plural 'S is not an O'Brien-style surname prefix:
+        # WASSERMAN'S → Wasserman's, never Wasserman'S.
+        fixed = re.sub(r"(['’])S(?=[^A-Za-z]*$)", r"\1s", fixed)
         out.append(fixed)
     return " ".join(out)
+
+
+def _caption_token_case_votes(
+    tokens: list[str], cores: list[str], i: int, body_text: str,
+) -> tuple[dict[str, int], bool]:
+    """Return prose spellings for one caption token and whether they are
+    unanchored.
+
+    Keeping this evidence collection separate lets both local refinement and
+    the external-fallback gate apply exactly the same reliability rules.
+    """
+    core = cores[i]
+    votes: dict[str, int] = {}
+    for j in (i - 1, i + 1):
+        if not 0 <= j < len(tokens):
+            continue
+        nb = cores[j]
+        if len(nb) < 2 or nb.lower() in ("v", "vs"):
+            continue
+        # The caption may abbreviate what the prose spells out
+        # ("Corp." / "Corporation"): let the anchor run on in lowercase.
+        nb_pat = re.escape(nb) + r"[a-z]*"
+        if j < i:
+            pat = re.compile(
+                r"\b(%s)[\W_]{1,3}(%s)\b" % (nb_pat, re.escape(core)),
+                re.IGNORECASE)
+            g_tok, g_nb = 2, 1
+        else:
+            pat = re.compile(
+                r"\b(%s)[\W_]{1,3}(%s)\b" % (re.escape(core), nb_pat),
+                re.IGNORECASE)
+            g_tok, g_nb = 1, 2
+        for m in pat.finditer(body_text):
+            if not re.search(r"[a-z]", m.group(g_nb)):
+                continue  # all-caps context: no casing signal
+            spelling = m.group(g_tok)
+            if not spelling.islower():
+                votes[spelling] = votes.get(spelling, 0) + 1
+    unanchored = not votes
+    if unanchored:
+        for m in re.finditer(r"\b%s\b" % re.escape(core), body_text,
+                             re.IGNORECASE):
+            spelling = m.group(0)
+            if not spelling.islower():
+                votes[spelling] = votes.get(spelling, 0) + 1
+    return votes, unanchored
+
+
+def _reliable_caption_spelling(
+    core: str, votes: dict[str, int], unanchored: bool,
+) -> str:
+    """The spelling supported strongly enough to use, or an empty string."""
+    if not votes:
+        return ""
+    best = max(votes, key=lambda s: votes[s])
+    cur = votes.get(core, 0)
+    if best != core and votes[best] <= cur:
+        best = core
+    if best.isupper():
+        if len(core) > 4:
+            return ""  # long caps are typography, not acronym spelling
+        if unanchored and (votes[best] < 3 or votes[best] <= 2 * cur):
+            return ""
+        # One occurrence is enough when an adjacent caption word anchors it
+        # in ordinary mixed-case prose ("GMAC Mortgage").  The stricter
+        # repeated-evidence rule remains for bare occurrences, where an
+        # opinion's small-caps treatment of a surname could look identical.
+    elif unanchored and votes[best] < 2:
+        return ""
+    return best
+
+
+def refine_caption_case(name: str, body_text: str) -> str:
+    """Correct title-casing guesses for an all-caps caption by consulting
+    the opinion's own mixed-case prose.
+
+    An all-caps caption destroys the case information: "US DOMINION, INC.
+    v. BYRNE" title-cases to "Us Dominion…" because nothing in the caption
+    says whether US is the word (Toys R Us) or an initialism (US Dominion).
+    The body settles it — the parties are named in ordinary prose
+    ("Plaintiffs US Dominion, Inc. …").  Each purely alphabetic caption
+    token is searched in *body_text*, preferably anchored to an adjacent
+    caption token (so the lookup finds this party, not a stray "us"
+    elsewhere); the anchor may continue in lowercase, so the caption's
+    "Corp." still matches the body's "Corporation".  A token with no
+    anchored evidence — a single-word party such as "IBM v. …" — falls
+    back to unanchored occurrences under stricter thresholds.  A body
+    spelling that outvotes the guess is adopted.  Guards:
+
+      * a match whose anchoring neighbor has no lowercase letter (an
+        all-caps heading, or the caption itself) carries no casing signal
+        and is ignored;
+      * an all-lowercase spelling is never adopted — prose legitimately
+        lowercases articles ("the Boeing Company") that a caption keeps;
+      * an ALL-CAPS spelling is adopted only for initialism-length tokens.
+        One occurrence suffices when a mixed-case adjacent party-name word
+        anchors it; otherwise repeated evidence is required because opinions
+        may set party surnames in caps.
+    """
+    if not name or not body_text:
+        return name
+    tokens = name.split()
+    if len(tokens) < 2:
+        return name
+    cores = [re.sub(r"[^A-Za-z]", "", t) for t in tokens]
+    for i, tok in enumerate(tokens):
+        core = cores[i]
+        if (len(core) < 2 or core.lower() in ("v", "vs")
+                or not tok.strip(".,;:()'\"").isalpha()):
+            continue
+        votes, unanchored = _caption_token_case_votes(
+            tokens, cores, i, body_text)
+        best = _reliable_caption_spelling(core, votes, unanchored)
+        if best and best != core:
+            tokens[i] = tok.replace(core, best)
+    return " ".join(tokens)
+
+
+_CAPTION_ENTITY_MARKERS = frozenset({
+    "association", "associates", "authority", "bank", "board", "company",
+    "co", "communications", "corp", "corporation", "enterprises",
+    "foundation", "group", "holdings", "hospital", "inc", "industries",
+    "insurance", "limited", "llc", "llp", "lp", "media", "mortgage",
+    "network", "partners", "plc", "products", "services", "systems",
+    "technologies", "technology", "trust", "university",
+})
+_CAPTION_ORDINARY_ENTITY_WORDS = _CAPTION_ENTITY_MARKERS | frozenset({
+    "american", "central", "city", "county", "department", "east",
+    "eastern", "federal", "first", "general", "health", "international",
+    "medical", "mutual", "national", "new", "north", "northeast",
+    "northern", "northwest", "public", "resources", "school", "south",
+    "southeast", "southern", "southwest", "state", "states", "the",
+    "united", "west", "western",
+})
+
+
+def caption_case_reference_tokens(name: str, body_text: str) -> tuple[str, ...]:
+    """Return entity-name tokens whose capitalization remains unresolved.
+
+    The fallback is intentionally narrow: a token must have been reduced to
+    ordinary title case, look like an organization-specific word, and lack
+    reliable mixed-case evidence in the opinion itself.  Ordinary party names
+    therefore do not cause an external lookup merely because the caption was
+    printed in capitals.
+    """
+    tokens = name.split()
+    cores = [re.sub(r"[^A-Za-z]", "", t) for t in tokens]
+    result: list[str] = []
+    start = 0
+    parties: list[range] = []
+    for i, core in enumerate(cores):
+        if core.lower() in ("v", "vs"):
+            parties.append(range(start, i))
+            start = i + 1
+    parties.append(range(start, len(tokens)))
+
+    for party in parties:
+        party_words = {cores[i].lower() for i in party if cores[i]}
+        entity_context = bool(party_words & _CAPTION_ENTITY_MARKERS)
+        for i in party:
+            core = cores[i]
+            low = core.lower()
+            if (len(core) < 5 or not core[:1].isupper()
+                    or not core[1:].islower()
+                    or not tokens[i].strip(".,;:()'\"").isalpha()
+                    or low in _CAPTION_ORDINARY_ENTITY_WORDS):
+                continue
+            # A long apparent compound containing an organization word (as
+            # in Nbcuniversal) is entity-like even when no suffix survived.
+            compound_entity = len(core) >= 8 and any(
+                marker in low[2:] for marker in (
+                    "media", "network", "systems", "tech", "universal",
+                    "global", "communications", "entertainment",
+                )
+            )
+            if not (entity_context or compound_entity):
+                continue
+            votes, unanchored = _caption_token_case_votes(
+                tokens, cores, i, body_text or "")
+            if _reliable_caption_spelling(core, votes, unanchored):
+                continue
+            if low not in result:
+                result.append(low)
+    return tuple(result)
+
+
+def apply_caption_case_reference(
+    name: str, reference_name: str, unresolved: tuple[str, ...],
+) -> str:
+    """Copy casing for unresolved *existing* words from a reference caption.
+
+    This cannot substitute a case name: only case-insensitively identical
+    tokens are changed, so words, punctuation, party order, and caption length
+    remain those derived from the opinion.
+    """
+    wanted = set(unresolved)
+    if not name or not reference_name or not wanted:
+        return name
+    spellings: dict[str, set[str]] = {}
+    for m in re.finditer(r"[A-Za-z]+", reference_name):
+        spelling = m.group(0)
+        key = spelling.lower()
+        if key not in wanted or spelling.islower():
+            continue
+        # Long ALL-CAPS words in metadata may be display typography rather
+        # than an entity's spelling.  Mixed case is the useful brand signal.
+        if spelling.isupper() and len(spelling) > 4:
+            continue
+        spellings.setdefault(key, set()).add(spelling)
+    donors = {
+        key: next(iter(values)) for key, values in spellings.items()
+        if len(values) == 1
+    }
+    if not donors:
+        return name
+    return re.sub(
+        r"[A-Za-z]+",
+        lambda m: donors.get(m.group(0).lower(), m.group(0)),
+        name,
+    )
 
 
 def courtlistener_case_name(record: dict) -> str:
@@ -723,8 +979,9 @@ def courtlistener_case_name(record: dict) -> str:
 
     API endpoints use different key styles.  The abbreviated name is preferred
     because it is closest to the form needed for a citation; the full caption
-    remains a fallback.  Preserving the API's casing lets names such as
-    ``NBCUniversal`` repair title-casing guesses when CAP metadata is absent.
+    remains a fallback.  Callers that use this metadata for matching need the
+    source spelling preserved even though it must not replace an opened
+    opinion's own caption.
     """
     if not isinstance(record, dict):
         return ""
@@ -782,6 +1039,19 @@ _PHRASE_MAP = {p: a for p, a in _PHRASES}
 _ET_AL_RE = re.compile(r",?\s+et\s+als?\.?\s*$", re.IGNORECASE)
 _V_SPLIT_RE = re.compile(r"\s+vs?\.\s+")
 
+# A parenthesized cross-reference to the underlying case — Alabama-style
+# certiorari captions read "Ex parte MURPHY. (Re Murphy v. State)." — names
+# a different case and is no part of this one's name.
+_RELATED_CASE_NOTE_RE = re.compile(
+    r"\s*\(\s*(?:in\s+)?re[:.\s][^()]*\)[.,;]?", re.IGNORECASE)
+
+
+def strip_related_case_note(text: str) -> str:
+    """Remove a "(Re <underlying case>)" caption cross-reference, leaving
+    the case's own name: "Ex parte MURPHY. (Re Murphy v. State)." ->
+    "Ex parte MURPHY.".  Captions without one pass through unchanged."""
+    return _RELATED_CASE_NOTE_RE.sub("", text or "").strip()
+
 # Procedural party designations from a reporter caption — "…, Plaintiff,"
 # "…, et al., Defendants.", "…, Defendant-Appellant" — describe the party's
 # role and are no part of the name (rule 10.2.1).  Stripped from the right,
@@ -802,6 +1072,7 @@ _PARTY_ROLE_RE = re.compile(
 def _strip_given_names(p: str) -> str | None:
     """Surname-only form of a personal party name (rule 10.2.1(g)), or
     None when the party does not safely read as an individual's name."""
+    suffixed = bool(_NAME_SUFFIX_RE.search(p))
     p = _NAME_SUFFIX_RE.sub("", p)
     if "," in p or "&" in p or re.search(r"\bof\b", p, re.IGNORECASE):
         return None
@@ -813,19 +1084,39 @@ def _strip_given_names(p: str) -> str | None:
         p = p[m.end():]
         titled = True
     tokens = p.split()
+    # A caption's sentence period ("Ex parte Anthony P. MURPHY.") is
+    # punctuation, not part of the surname; an initial's own period stays
+    # ("Susan B."), as does an internal-dot abbreviation ("U.S.").
+    if (tokens and len(tokens[-1]) > 2 and tokens[-1].endswith(".")
+            and "." not in tokens[-1][:-1]):
+        tokens[-1] = tokens[-1][:-1]
     if not 2 <= len(tokens) <= 4:
         return None
     low = [t.replace("’", "'").lower().rstrip(".") for t in tokens]
-    if low[0] not in _GIVEN_NAMES:
+    # Structural evidence can stand in for the given-name list: a stripped
+    # Jr./Sr. suffix, or a middle initial ("Okello T. Chatrie", "John
+    # F.A. Sandford") — organizations never reduce a middle word to a
+    # single letter, and the entity/T6 vetoes below still reject firms
+    # named for people.  An honorific is deliberately NOT enough here: it
+    # relaxes only the middle tokens ("Dr. Theresa Swain Emory"), or
+    # "Mrs. Fields Cookies" would truncate to "Cookies".
+    person_shaped = (suffixed or any(
+        re.fullmatch(r"(?:[A-Z]\.)+", t) for t in tokens[1:-1]))
+    if low[0] not in _GIVEN_NAMES and not (
+            person_shaped and re.fullmatch(r"[A-Z][A-Za-z'’-]+", tokens[0])):
         return None
     # Every token must look like a name part: a capitalized word, an
-    # initial, or a surname particle — and none may be an organizational
-    # word ("George Washington University" abbreviates instead).
+    # initial ("W." or "F.A."), or a surname particle — and none may be an
+    # organizational word ("George Washington University" abbreviates
+    # instead) or a business-entity term ("Katherine Inc." is a firm, not
+    # a person).
     for t, tl in zip(tokens, low):
         if (tl in _T6_WORDS or tl in _ORG_WORDS
-                or not re.fullmatch(r"[A-Z](?:[A-Za-z'’-]+|\.)?", t)):
+                or re.sub(r"[^a-z]", "", tl) in _APPOSITIVE_ENTITY_TERMS
+                or not re.fullmatch(
+                    r"(?:[A-Z]\.)+|[A-Z](?:[A-Za-z'’-]+|\.)?", t)):
             return None
-    if re.fullmatch(r"[A-Z]\.?", tokens[-1]):
+    if re.fullmatch(r"(?:[A-Z]\.)+|[A-Z]", tokens[-1]):
         return None  # anonymized party ("Susan B.", "B. J. F.")
     # Surname = last token plus any particles ("Nathan Van Buren")
     i = len(tokens) - 1
@@ -837,8 +1128,9 @@ def _strip_given_names(p: str) -> str | None:
     # already establishes a natural person, so under one any name-shaped
     # middle token passes ("Dr. Theresa Swain Emory" -> "Emory").
     for t, tl in zip(tokens[1:i], low[1:i]):
-        if not (titled or tl in _GIVEN_NAMES or tl in _SURNAME_PARTICLES
-                or re.fullmatch(r"[A-Z]\.?", t)):
+        if not (titled or suffixed or tl in _GIVEN_NAMES
+                or tl in _SURNAME_PARTICLES
+                or re.fullmatch(r"(?:[A-Z]\.)+|[A-Z]\.?", t)):
             return None
     return " ".join(tokens[i:])
 
@@ -1044,6 +1336,11 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     p = re.sub(r"\bUnited States of America\b", "United States", p,
                flags=re.IGNORECASE)
     p = _STATE_OF_RE.sub("", p)  # "State of Washington" -> "Washington"
+    # Rule 10.2.1(f): "city of," "county of," and like expressions are
+    # omitted unless they begin the party name — "Bd. of Educ. of the
+    # Borough of Hawthorne" -> "Bd. of Educ. of Hawthorne", while "City of
+    # New York" as the whole party keeps its prefix (handled below).
+    p = _MID_GEO_UNIT_RE.sub(r"\1", p)
 
     # Relator construction (rule 10.2.1(b)): split "<party> ex rel. <relator>".
     # The named party keeps its full geographic name (rule 10.2.2) — restored
@@ -1093,6 +1390,17 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     # institutional pairing stays intact.
     segs = re.split(r"\s+(?:&|and)\s+", p, flags=re.IGNORECASE)
     if len(segs) > 1:
+        # A complete geographic party at the head of a joined caption list is
+        # necessarily the first listed party, not the opening words of the
+        # following institution.  Keep it whole under rule 10.2.2 and omit
+        # the later parties under rule 10.2.1(a): "United States and Federal
+        # Communications Commission" -> "United States".  Expanding first
+        # also repairs sources that print "U.S. and FCC".  A business name
+        # such as "Jones & Laughlin Steel Corp." does not have a bare
+        # geographic first segment and therefore continues through unchanged.
+        first = _expand_geo_party(segs[0].strip(" ,;"))
+        if first.strip(" ,.").lower() in _GEO_PARTIES:
+            return first
         surnames = [_strip_given_names(s) for s in segs]
         if all(surnames):
             return surnames[0]
@@ -1209,19 +1517,79 @@ def _strip_trailing_period(name: str) -> str:
     return name[:-1]
 
 
+_SMALL_MIDWORD = frozenset({
+    "of", "the", "and", "in", "for", "at", "by", "to", "on", "or",
+})
+
+
+def _lowercase_small_words(name: str) -> str:
+    """Lowercase a capitalized small word amid mixed-case text ("District
+    Of Columbia", "Tax Comm'n OF N.Y.") — a partially mixed-case caption
+    bypasses ``normal_case_caption``'s all-caps handling, so these survive
+    it.  A party-leading "The" ("v. The Boeing Co.") and words inside an
+    all-caps run ("CITIZENS FOR A BETTER ENVIRONMENT") stay untouched."""
+    tokens = name.split(" ")
+    out: list[str] = []
+    for i, tok in enumerate(tokens):
+        core = re.sub(r"[^A-Za-z'’]", "", tok)
+        prev_core = re.sub(r"[^A-Za-z'’]", "", tokens[i - 1]) if i else ""
+        if (i > 0
+                and core.lower() in _SMALL_MIDWORD
+                and core[:1].isupper()
+                and prev_core.lower() not in ("v", "vs", "re", "parte")
+                and any(c.islower() for c in prev_core)):
+            out.append(tok.replace(core, core.lower(), 1))
+        else:
+            out.append(tok)
+    return " ".join(out)
+
+
 def abbreviate_case_name(name: str) -> str:
     """Abbreviate a case name for use in a citation or filename per
     Bluebook rule 10.2.2 (= Indigo Book R8.3), dropping given names of
     individuals (rule 10.2.1(g)) and "State of" prefixes (10.2.1(f)).
     Safe to call twice."""
-    name = re.sub(r"\s+", " ", name or "").strip()
+    # OCR renders the early reports' turned-comma apostrophe as U+2018
+    # ("M‘Intosh"); normalize so name patterns and casing rules see it.
+    name = re.sub(r"\s+", " ", (name or "").replace("‘", "'")).strip()
+    # Strip any "(Re <underlying case>)" cross-reference before splitting:
+    # its own " v. " would otherwise masquerade as this case's separator.
+    name = strip_related_case_note(name)
+    # Descriptive parentheticals are given-name-style baggage, not part of
+    # the party's name: "Coca Cola Bottling Co. of Fresno (a Corporation)",
+    # "Triestina Di Carlo (a Minor)".
+    name = re.sub(r"\s*\(\s*an?\s+[^)]{0,40}\)", "", name, flags=re.IGNORECASE)
+    # Words indicating multiple parties are omitted (rule 10.2.1(a)):
+    # "Calder et Wife", "Troxel et vir", "Brown and Others", "Wayman &
+    # another".  ("et al." itself is handled with the party structure.)
+    name = re.sub(
+        r",?\s+(?:et|and|&)\s+(?:ux(?:or)?|vir|wife|husband|others?|another)"
+        r"\.?(?=[\s,.]|$)",
+        "", name, flags=re.IGNORECASE)
+    # A d/b/a or a/k/a clause names an alias, not the party; when the alias
+    # is the citation name it replaced the party upstream, so a surviving
+    # clause drops: "…Life Advocates, dba NIFLA, et al." / "Robertson
+    # a/k/a Mitchell Robinson a/k/a …".  Once an alias marker begins, the
+    # remainder of that party is alias/designation matter; consuming it as a
+    # unit avoids leaving corporate-suffix debris from a chain of aliases.
+    # Bare "aka" is left alone — it is a real surname (Aka v. Wash. Hosp.
+    # Ctr.).
+    name = re.sub(
+        r",?\s+(?:d/b/a|d\.b\.a\.|dba|a/k/a|a\.k\.a\.|f/k/a|f\.k\.a\.|"
+        r"doing\s+business\s+as|also\s+known\s+as|formerly\s+known\s+as)\s+"
+        r".*?(?=\s+vs?\.\s+|$)",
+        "", name, flags=re.IGNORECASE)
     if not name:
         return name
     parts = _V_SPLIT_RE.split(name, maxsplit=1)
     joined = " v. ".join(
         _drop_redundant_entity(_abbreviate_party(p)) for p in parts
     )
-    return _strip_trailing_period(joined)
+    # A stray capital after a possessive apostrophe ("Sailor'S") is a
+    # title-casing artifact, never a name; all-caps runs (MCDONALD'S USA,
+    # kept caps by design) are left whole.
+    joined = re.sub(r"(?<=[a-z])(['’])S(?=\W|$)", r"\1s", joined)
+    return _strip_trailing_period(_lowercase_small_words(joined))
 
 
 if __name__ == "__main__":
@@ -1307,6 +1675,16 @@ if __name__ == "__main__":
         ("Township of Willingboro v. Doe", "Township of Willingboro v. Doe"),
         ("Parish of Jefferson v. Doe", "Parish of Jefferson v. Doe"),
         ("Town of Greece v. Susan Galloway", "Town of Greece v. Galloway"),
+        # Mid-name "city of"/"borough of" expressions are omitted (rule
+        # 10.2.1(f)); the same expression *beginning* a party name is kept
+        # (see the City/Village/Township cases above).
+        ("Doremus v. Board of Education of the Borough of Hawthorne",
+         "Doremus v. Bd. of Educ. of Hawthorne"),
+        ("Board of Education of Township of Piscataway v. Taxman",
+         "Bd. of Educ. of Piscataway v. Taxman"),
+        ("Board of Education of Kiryas Joel Village School District "
+         "v. Grumet",
+         "Bd. of Educ. of Kiryas Joel Vill. Sch. Dist. v. Grumet"),
         ("Soldal v. Cook County", "Soldal v. Cook County"),
         ("Los Angeles County v. Humphries", "Los Angeles County v. Humphries"),
         ("Washington County v. Gunther", "Washington County v. Gunther"),
@@ -1397,6 +1775,14 @@ if __name__ == "__main__":
         ("In Re Winship", "In re Winship"),
         ("Ex Parte Merryman.", "Ex parte Merryman"),
         ("In Re Gerald Gault", "In re Gault"),
+        # Alabama-style certiorari caption: the "(Re <underlying case>)"
+        # cross-reference drops, the sentence period is not part of the
+        # surname, and the given names reduce (rule 10.2.1(g)).
+        ("Ex parte Anthony P. Murphy. (Re Anthony Paul Murphy v. State).",
+         "Ex parte Murphy"),
+        ("Ex parte Anthony P. Murphy.", "Ex parte Murphy"),
+        # A firm led by a given name is not a person (entity-term guard).
+        ("Katherine Inc. v. Smith", "Katherine Inc. v. Smith"),
         ("Matter of Standard Jury Instructions",
          "In re Standard Jury Instructions"),
         # Widely recognized initials (rule 10.2.1(c))

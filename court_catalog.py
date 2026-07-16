@@ -481,6 +481,68 @@ _COURT_TYPE_BLUEBOOK: list[tuple[str, str]] = [
 ]
 
 
+# Spelled-out federal district prefixes ("for the Eastern District of
+# Pennsylvania") beside the abbreviated caption forms ("E.D. Pennsylvania").
+_FED_DISTRICT_WORD = {
+    "northern": "N.D.", "southern": "S.D.", "eastern": "E.D.",
+    "western": "W.D.", "middle": "M.D.", "central": "C.D.",
+}
+
+
+def bluebook_federal_trial_court(name: str) -> str:
+    """Bluebook abbreviation for a federal district or bankruptcy court from
+    its caption name — "United States District Court, M.D. North Carolina,
+    Greensboro Division" → "M.D.N.C.", "United States Bankruptcy Court,
+    S.D. Texas, Houston Division" → "Bankr. S.D. Tex.", "District Court,
+    E. D. Pennsylvania" → "E.D. Pa." — or "" when the name isn't one (a
+    "District Court of Appeal", a state trial "district court").
+
+    Adjacent single-capital abbreviations close up (rule 6.1(b)):
+    "S.D.N.Y.", "D.D.C.", but "E.D. Pa.", "D. Mass.".
+    """
+    import re
+
+    t = re.sub(r"\s+", " ", (name or "")).strip()
+    low = t.lower()
+    is_bankr = "bankruptcy court" in low
+    if not is_bankr and "district court" not in low:
+        return ""
+    if "court of appeal" in low:
+        return ""
+    state = ""
+    spos = -1
+    for sname in sorted(STATE_BLUEBOOK, key=len, reverse=True):
+        m = re.search(r"\b" + re.escape(sname) + r"\b", low)
+        if m:
+            state = STATE_BLUEBOOK[sname]
+            spos = m.start()
+            break
+    if not state:
+        return ""
+    # Only text before the state can carry the district ("N.D. Illinois,
+    # Eastern Division" — the division tail after the state never matters,
+    # and old single-district captions put a division there: "United States
+    # District Court, South Dakota, C. D." is D.S.D., not C.D.S.D.).
+    head = low[:spos]
+    dm = (re.search(r"\b([nsewmc])\.?\s?d\.(?=\s|$)", head)
+          or re.search(r"\b(northern|southern|eastern|western|middle|central)"
+                       r"\s+district\b", head))
+    # A bare state "district court" line without a federal marker is a state
+    # trial court ("District Court, City and County of Denver, Colorado").
+    if not (is_bankr or "united states" in low or "u.s." in low
+            or "u. s." in low or dm or re.search(r"\bdistrict of\b", head)):
+        return ""
+    prefix = "D."
+    if dm:
+        g = dm.group(1)
+        prefix = g.upper() + ".D." if len(g) == 1 else _FED_DISTRICT_WORD[g]
+    if re.fullmatch(r"(?:[A-Z]\.)+", state):
+        abbr = prefix + state       # S.D.N.Y., M.D.N.C., D.D.C., D.P.R.
+    else:
+        abbr = f"{prefix} {state}"  # E.D. Pa., D. Mass., S.D. W. Va.
+    return f"Bankr. {abbr}" if is_bankr else abbr
+
+
 def bluebook_court_from_name(name: str) -> str:
     """Bluebook abbreviation for a state court from its full name
     ("Court of Appeals of Ohio" → "Ohio Ct. App.", "Supreme Court of
