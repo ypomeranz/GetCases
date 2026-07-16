@@ -73,5 +73,39 @@ class JoinedSeparateOpinionTests(unittest.TestCase):
         self.assertIn("WHITE concurs", parts[1].blocks[-1].text())
 
 
+class SpelledOutRoleBylineTests(unittest.TestCase):
+    def test_alabama_style_justice_bylines_start_separate_opinions(self):
+        # Ex parte Murphy, 886 So. 2d 90 (Ala. 2003): the role is spelled
+        # out after the name and the vote is a parenthetical — "LYONS,
+        # Justice (dissenting)." — while the vote lines above it ("LYONS,
+        # J., dissents.") are not boundaries.
+        parts = segment_blocks([
+            _block("STUART, Justice."),
+            _block("James R. Murphy and Mary J. Murphy Benvenuto divorced."),
+            _block("HOUSTON, SEE, BROWN, and WOODALL, JJ., concur."),
+            _block(
+                "HARWOOD, J., concurs in the rationale in part and concurs "
+                "in the result."
+            ),
+            _block("LYONS, J., dissents."),
+            _block(
+                "HARWOOD, Justice (concurring in the rationale in part and "
+                "concurring in the result)."
+            ),
+            _block("I concur in all aspects of the opinion except one."),
+            _block("LYONS, Justice (dissenting)."),
+            _block("I must respectfully dissent."),
+        ])
+
+        self.assertEqual(
+            [part.kind for part in parts],
+            ["majority", "concurrence", "dissent"],
+        )
+        self.assertIn("HARWOOD", parts[1].label)
+        self.assertIn("LYONS", parts[2].label)
+        # The vote lines stay with the majority opinion.
+        self.assertIn("JJ., concur", parts[0].blocks[-3].text())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -644,12 +644,13 @@ def text_similarity(a: str, b: str, n: int = 4) -> float:
 #   MR. JUSTICE STEWART, concurring.
 #   Justice O'CONNOR, with whom Justice BRENNAN joins, dissenting.
 #   KOZINSKI, Circuit Judge, dissenting:
+#   LYONS, Justice (dissenting).          [Alabama-style spelled-out role]
 _SEP_HEADER_RE = re.compile(
     r"^\s*(?:MR\.\s+|MRS\.\s+|MS\.\s+)?"
     r"(?:(?:CHIEF\s+)?JUSTICE\s+\S+|"
     r"[A-Z][\w.'’-]*(?:\s+[A-Z][\w.'’-]*){0,3}\s*,\s*"
     r"(?:C\.\s*J\.|JJ?\.|(?:Chief\s+|Senior\s+|Presiding\s+)?"
-    r"(?:Circuit\s+|District\s+|Bankruptcy\s+)?Judge))"
+    r"(?:Circuit\s+|District\s+|Bankruptcy\s+)?(?:Judge|Justice)))"
     r".{0,200}?\b(?:concurring|dissenting)"
     # A real header ends right after the role phrase (allowing "in part…"
     # tails and trailing footnote markers).  Prose that merely *mentions*
@@ -739,7 +740,7 @@ _SEP_BYLINE = (
     r"(?:(?:CHIEF\s+)?JUSTICE\s+\S+|"
     r"[A-Z][\w.'’-]*(?:\s+[A-Z][\w.'’-]*){0,3}\s*,\s*"
     r"(?:C\.\s*J\.|JJ?\.|(?:Chief\s+|Senior\s+|Presiding\s+)?"
-    r"(?:Circuit\s+|District\s+|Bankruptcy\s+)?Judge))"
+    r"(?:Circuit\s+|District\s+|Bankruptcy\s+)?(?:Judge|Justice)))"
     r".{0,200}?\b(?:concurring|dissenting)\b[^.:]*[.:]"
 )
 # Scholar sometimes tucks a separate opinion's byline onto the end of the
