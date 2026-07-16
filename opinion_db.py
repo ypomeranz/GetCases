@@ -45,7 +45,11 @@ from pathlib import Path
 from typing import Optional
 
 import citations
-from bluebook_names import abbreviate_case_name, normal_case_caption
+from bluebook_names import (
+    abbreviate_case_name,
+    normal_case_caption,
+    strip_related_case_note,
+)
 
 _SCHEMA_VERSION = 2
 
@@ -179,6 +183,9 @@ def _caption_name(blocks: list) -> str:
         if getattr(b, "kind", None) not in ("center", "heading"):
             continue
         t = re.sub(r"\s+", " ", b.text()).strip()
+        # An Alabama-style "(Re <underlying case>)" cross-reference carries
+        # its own " v. " and would masquerade as this case's caption.
+        t = strip_related_case_note(t)
         if not t or t.startswith(("No.", "Nos.")):
             continue
         if citations.TEXT_CITE_RE.match(t):

@@ -793,6 +793,19 @@ _PHRASE_MAP = {p: a for p, a in _PHRASES}
 _ET_AL_RE = re.compile(r",?\s+et\s+als?\.?\s*$", re.IGNORECASE)
 _V_SPLIT_RE = re.compile(r"\s+vs?\.\s+")
 
+# A parenthesized cross-reference to the underlying case — Alabama-style
+# certiorari captions read "Ex parte MURPHY. (Re Murphy v. State)." — names
+# a different case and is no part of this one's name.
+_RELATED_CASE_NOTE_RE = re.compile(
+    r"\s*\(\s*(?:in\s+)?re[:.\s][^()]*\)[.,;]?", re.IGNORECASE)
+
+
+def strip_related_case_note(text: str) -> str:
+    """Remove a "(Re <underlying case>)" caption cross-reference, leaving
+    the case's own name: "Ex parte MURPHY. (Re Murphy v. State)." ->
+    "Ex parte MURPHY.".  Captions without one pass through unchanged."""
+    return _RELATED_CASE_NOTE_RE.sub("", text or "").strip()
+
 # Procedural party designations from a reporter caption — "…, Plaintiff,"
 # "…, et al., Defendants.", "…, Defendant-Appellant" — describe the party's
 # role and are no part of the name (rule 10.2.1).  Stripped from the right,
@@ -824,6 +837,12 @@ def _strip_given_names(p: str) -> str | None:
         p = p[m.end():]
         titled = True
     tokens = p.split()
+    # A caption's sentence period ("Ex parte Anthony P. MURPHY.") is
+    # punctuation, not part of the surname; an initial's own period stays
+    # ("Susan B."), as does an internal-dot abbreviation ("U.S.").
+    if (tokens and len(tokens[-1]) > 2 and tokens[-1].endswith(".")
+            and "." not in tokens[-1][:-1]):
+        tokens[-1] = tokens[-1][:-1]
     if not 2 <= len(tokens) <= 4:
         return None
     low = [t.replace("’", "'").lower().rstrip(".") for t in tokens]
@@ -831,9 +850,11 @@ def _strip_given_names(p: str) -> str | None:
         return None
     # Every token must look like a name part: a capitalized word, an
     # initial, or a surname particle — and none may be an organizational
-    # word ("George Washington University" abbreviates instead).
+    # word ("George Washington University" abbreviates instead) or a
+    # business-entity term ("Katherine Inc." is a firm, not a person).
     for t, tl in zip(tokens, low):
         if (tl in _T6_WORDS or tl in _ORG_WORDS
+                or re.sub(r"[^a-z]", "", tl) in _APPOSITIVE_ENTITY_TERMS
                 or not re.fullmatch(r"[A-Z](?:[A-Za-z'’-]+|\.)?", t)):
             return None
     if re.fullmatch(r"[A-Z]\.?", tokens[-1]):
@@ -1231,6 +1252,9 @@ def abbreviate_case_name(name: str) -> str:
     individuals (rule 10.2.1(g)) and "State of" prefixes (10.2.1(f)).
     Safe to call twice."""
     name = re.sub(r"\s+", " ", name or "").strip()
+    # Strip any "(Re <underlying case>)" cross-reference before splitting:
+    # its own " v. " would otherwise masquerade as this case's separator.
+    name = strip_related_case_note(name)
     if not name:
         return name
     parts = _V_SPLIT_RE.split(name, maxsplit=1)
@@ -1423,6 +1447,14 @@ if __name__ == "__main__":
         ("In Re Winship", "In re Winship"),
         ("Ex Parte Merryman.", "Ex parte Merryman"),
         ("In Re Gerald Gault", "In re Gault"),
+        # Alabama-style certiorari caption: the "(Re <underlying case>)"
+        # cross-reference drops, the sentence period is not part of the
+        # surname, and the given names reduce (rule 10.2.1(g)).
+        ("Ex parte Anthony P. Murphy. (Re Anthony Paul Murphy v. State).",
+         "Ex parte Murphy"),
+        ("Ex parte Anthony P. Murphy.", "Ex parte Murphy"),
+        # A firm led by a given name is not a person (entity-term guard).
+        ("Katherine Inc. v. Smith", "Katherine Inc. v. Smith"),
         ("Matter of Standard Jury Instructions",
          "In re Standard Jury Instructions"),
         # Widely recognized initials (rule 10.2.1(c))

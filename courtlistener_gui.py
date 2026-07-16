@@ -601,6 +601,7 @@ from bluebook_names import (
     collapse_personal_all_caps_run,
     courtlistener_case_name,
     normal_case_caption,
+    strip_related_case_note,
 )
 from citation_overrides import (
     citation_identity_keys,
@@ -7624,6 +7625,9 @@ def _scholar_caption_name(blocks) -> str:
         # ending the caption ("… v. Acme Co."); _caption_party drops only a
         # stray one.
         t = re.sub(r"\s+", " ", b.text()).strip()
+        # An Alabama-style "(Re <underlying case>)" cross-reference carries
+        # its own " v. " and would masquerade as this case's caption.
+        t = strip_related_case_note(t)
         if not t or _HEADER_CITE_RE.match(t) or t.startswith(("No.", "Nos.")):
             continue
         # Google Scholar renders the party separator in lowercase ("… v. …")

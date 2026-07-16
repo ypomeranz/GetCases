@@ -126,6 +126,17 @@ class CaptionCapitalizationTests(unittest.TestCase):
             "City of New York v. Doe",
         )
 
+    def test_ex_parte_caption_with_related_case_note(self):
+        # Ex parte Murphy, 596 So. 2d 45 (Ala. 1992): the "(Re Murphy v.
+        # State)" cross-reference to the underlying case drops, and the
+        # petitioner reduces to the surname.
+        self.assertEqual(
+            abbreviate_case_name(normal_case_caption(
+                "Ex parte Anthony P. MURPHY. "
+                "(Re Anthony Paul Murphy v. State).")),
+            "Ex parte Murphy",
+        )
+
     def test_caption_role_designations_are_stripped(self):
         self.assertEqual(
             abbreviate_case_name(
