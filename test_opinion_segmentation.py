@@ -224,6 +224,39 @@ class GluedDispositionBylineTests(unittest.TestCase):
 
 
 class HistoricalAndSignatureBoundaryTests(unittest.TestCase):
+    def test_roleless_separate_opinion_of_headings_use_disposition_structure(self):
+        # Steward Machine Co. v. Davis, 301 U.S. 548 (1937), gives
+        # McReynolds and Sutherland noun-first headings with no role.  The
+        # Court affirms; Sutherland would reverse and says he concurs with
+        # McReynolds's immediately preceding writing.
+        parts = segment_blocks([
+            _block("MR. JUSTICE CARDOZO delivered the opinion of the Court."),
+            _block("The judgment is"),
+            _block("Affirmed."),
+            _block("Separate opinion of MR. JUSTICE McREYNOLDS."),
+            _block("The legislation, I think, exceeds the power of Congress."),
+            _block("The federal plan imperils the independence of the States."),
+            _block("Separate opinion of MR. JUSTICE SUTHERLAND."),
+            _block(
+                "With most of what is said in the opinion just handed down, "
+                "I concur."
+            ),
+            _block("The administrative provisions invade reserved powers."),
+            _block(
+                "For the foregoing reasons, I think the judgment below "
+                "should be reversed."
+            ),
+            _block("MR. JUSTICE BUTLER, dissenting."),
+            _block("The objections in both separate opinions are well taken."),
+        ])
+
+        self.assertEqual(
+            [part.kind for part in parts],
+            ["majority", "dissent", "dissent", "dissent"],
+        )
+        self.assertIn("McREYNOLDS", parts[1].label)
+        self.assertIn("SUTHERLAND", parts[2].label)
+
     def test_chief_justice_old_style_byline_opens_majority(self):
         # Fletcher v. Peck, 10 U.S. (6 Cranch) 87 (1810), uses the older
         # "Ch. J." title and gives Johnson's disagreement a bare byline.

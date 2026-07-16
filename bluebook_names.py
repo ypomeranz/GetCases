@@ -881,8 +881,9 @@ _CAPTION_ENTITY_MARKERS = frozenset({
 _CAPTION_ORDINARY_ENTITY_WORDS = _CAPTION_ENTITY_MARKERS | frozenset({
     "american", "central", "city", "county", "department", "east",
     "eastern", "federal", "first", "general", "health", "international",
-    "medical", "mutual", "national", "new", "north", "northern", "public",
-    "resources", "school", "south", "southern", "state", "states", "the",
+    "medical", "mutual", "national", "new", "north", "northeast",
+    "northern", "northwest", "public", "resources", "school", "south",
+    "southeast", "southern", "southwest", "state", "states", "the",
     "united", "west", "western",
 })
 
@@ -1389,6 +1390,17 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     # institutional pairing stays intact.
     segs = re.split(r"\s+(?:&|and)\s+", p, flags=re.IGNORECASE)
     if len(segs) > 1:
+        # A complete geographic party at the head of a joined caption list is
+        # necessarily the first listed party, not the opening words of the
+        # following institution.  Keep it whole under rule 10.2.2 and omit
+        # the later parties under rule 10.2.1(a): "United States and Federal
+        # Communications Commission" -> "United States".  Expanding first
+        # also repairs sources that print "U.S. and FCC".  A business name
+        # such as "Jones & Laughlin Steel Corp." does not have a bare
+        # geographic first segment and therefore continues through unchanged.
+        first = _expand_geo_party(segs[0].strip(" ,;"))
+        if first.strip(" ,.").lower() in _GEO_PARTIES:
+            return first
         surnames = [_strip_given_names(s) for s in segs]
         if all(surnames):
             return surnames[0]

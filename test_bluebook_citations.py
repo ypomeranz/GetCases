@@ -266,6 +266,37 @@ class CaptionCapitalizationTests(unittest.TestCase):
 
 
 class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
+    def test_geographic_party_starts_joined_respondent_list(self):
+        # General Telephone Co. of the Southwest v. United States,
+        # 449 F.2d 846 (5th Cir. 1971): United States and the FCC are two
+        # respondents, not one institutional name.  Only the first is kept,
+        # and a geographic party is never shortened to "U.S.".
+        blocks = [Block("center", [Span(
+            "GENERAL TELEPHONE COMPANY OF the SOUTHWEST et al., Petitioners, "
+            "v. UNITED STATES of America and Federal Communications "
+            "Commission, Respondents, National Cable Television Association, "
+            "Inc., et al., Intervenors."
+        )])]
+
+        self.assertEqual(
+            abbreviate_case_name(_scholar_caption_name(blocks)),
+            "Gen. Tel. Co. of the Sw. v. United States",
+        )
+        self.assertNotIn(
+            "southwest",
+            caption_case_reference_tokens(
+                "General Telephone Company of the Southwest v. United States",
+                "",
+            ),
+        )
+        self.assertEqual(
+            abbreviate_case_name(
+                "National Labor Relations Board v. "
+                "Jones and Laughlin Steel Corporation"
+            ),
+            "NLRB v. Jones & Laughlin Steel Corp.",
+        )
+
     def test_in_re_caption_uses_alias_role_and_page_markers_as_boundaries(self):
         blocks = [
             Block("center", [
@@ -1027,6 +1058,15 @@ class WriterParentheticalTests(unittest.TestCase):
         self.assertEqual(
             self._win()._writer_parenthetical(part),
             "Blackmun, J., dissenting",
+        )
+
+    def test_separate_opinion_of_heading_uses_resolved_role(self):
+        part = self._part(
+            "dissent", "Separate opinion of MR. JUSTICE McREYNOLDS."
+        )
+        self.assertEqual(
+            self._win()._writer_parenthetical(part),
+            "McReynolds, J., dissenting",
         )
 
     def test_spelled_out_bare_judge_byline(self):

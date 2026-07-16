@@ -727,6 +727,20 @@ _SEP_DELIVERED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Another role-less historical U.S. Reports form reverses the usual byline:
+#
+#   Separate opinion of MR. JUSTICE McREYNOLDS.
+#
+# It is a definite opinion boundary, but "separate" alone does not establish
+# whether the writing concurs or dissents.  The role is resolved after all
+# boundaries are known, using the disposition and neighboring writings.
+_SEP_OF_RE = re.compile(
+    r"^\s*Separate\s+opinion\s+of\s+"
+    r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(?:CHIEF\s+)?JUSTICE\s+"
+    r"[A-Z][\w.'â€™-]+\s*[.:]?\s*$",
+    re.IGNORECASE,
+)
+
 
 def _peek_sep_kind_evidence(
     blocks: list, i: int, default: str = "concurrence"
@@ -740,6 +754,7 @@ def _peek_sep_kind_evidence(
         # to the candidate being classified.
         if (_BARE_SEP_HEADER_RE.match(t)
                 or _JOINED_SEP_HEADER_RE.match(t)
+                or _SEP_OF_RE.match(t)
                 or _OCR_JUSTICE_BYLINE_RE.match(t)):
             break
         m = re.search(r"\b(dissent|concur)", t[:300], re.IGNORECASE)
@@ -761,6 +776,102 @@ def _peek_sep_kind_evidence(
 def _peek_sep_kind(blocks: list, i: int, default: str = "concurrence") -> str:
     """Role of a separate opinion whose byline does not state its role."""
     return _peek_sep_kind_evidence(blocks, i, default)[0]
+
+
+_FIRST_PERSON_DISPOSITION_RE = re.compile(
+    r"\bI\s+(?:(?:therefore|accordingly)\s+)?"
+    r"(?:think|believe|am\s+of\s+opinion)\b[^.]{0,240}?"
+    r"\b(?:judgment|decree|order)\b[^.]{0,100}?"
+    r"\b(affirmed|reversed|vacated|dismissed)\b",
+    re.IGNORECASE,
+)
+_STANDALONE_DISPOSITION_RE = re.compile(
+    r"^\s*(?:(?:the\s+)?(?:judgment|decree|order)(?:\s+below)?\s+"
+    r"(?:is|should\s+be|must\s+be)\s+)?"
+    r"(affirmed|reversed|vacated|dismissed)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+_AGREES_WITH_PRECEDING_OPINION_RE = re.compile(
+    r"\b(?:opinion|views?)\s+(?:just\s+handed\s+down|immediately\s+"
+    r"preceding)\b[^.]{0,100}\bI\s+concur\b",
+    re.IGNORECASE,
+)
+
+
+def _majority_disposition_before(blocks: list, first_sep: int) -> str:
+    """The lead writing's short disposition immediately before a separate
+    opinion, such as Scholar's standalone ``Affirmed.`` block."""
+    for b in reversed(blocks[max(0, first_sep - 10):first_sep]):
+        t = re.sub(r"^(?:\*\d+\s+)+", "", _content_text(b)).strip()
+        m = _STANDALONE_DISPOSITION_RE.fullmatch(t)
+        if m:
+            return m.group(1).lower()
+    return ""
+
+
+def _neutral_sep_direct_kind(
+    blocks: list, start: int, end: int, majority_disposition: str,
+) -> str:
+    """Role proved within one role-less separate-opinion section."""
+    if majority_disposition:
+        stance = ""
+        for b in blocks[start + 1:end]:
+            m = _FIRST_PERSON_DISPOSITION_RE.search(_content_text(b))
+            if m:
+                stance = m.group(1).lower()
+        if stance:
+            return ("concurrence" if stance == majority_disposition
+                    else "dissent")
+
+    # Opening role language remains useful when no contrary disposition is
+    # stated.  Keep its existing short look-ahead and boundary safeguards.
+    kind, evidenced = _peek_sep_kind_evidence(blocks, start)
+    return kind if evidenced else ""
+
+
+def _resolve_neutral_sep_boundaries(
+    blocks: list, boundaries: list[tuple[int, str, str]],
+) -> list[tuple[int, str, str]]:
+    """Resolve temporary ``separate`` boundaries without guessing too soon.
+
+    A section's express disposition controls.  A later writing that says it
+    concurs with the immediately preceding opinion transfers its resolved role
+    backward (the Sutherland/McReynolds sequence in Steward Machine).  Truly
+    ambiguous historical writings retain the pre-existing concurrence
+    fallback, but are still detected as separate opinions.
+    """
+    if not any(kind == "separate" for _i, kind, _label in boundaries):
+        return boundaries
+    resolved = [list(bd) for bd in boundaries]
+    lead_disposition = _majority_disposition_before(blocks, boundaries[0][0])
+
+    for k, (start, kind, _label) in enumerate(boundaries):
+        if kind != "separate":
+            continue
+        end = boundaries[k + 1][0] if k + 1 < len(boundaries) else len(blocks)
+        direct = _neutral_sep_direct_kind(
+            blocks, start, end, lead_disposition)
+        if direct:
+            resolved[k][1] = direct
+
+    # Work backward so an already-resolved later writing can establish the
+    # role of the separate opinion with which it expressly agrees.
+    for k in range(len(resolved) - 2, -1, -1):
+        if resolved[k][1] != "separate" or resolved[k + 1][1] == "separate":
+            continue
+        next_start = int(resolved[k + 1][0])
+        next_end = (int(resolved[k + 2][0])
+                    if k + 2 < len(resolved) else len(blocks))
+        opening = " ".join(
+            _content_text(b) for b in blocks[next_start + 1:min(next_end, next_start + 4)]
+        )
+        if _AGREES_WITH_PRECEDING_OPINION_RE.search(opening):
+            resolved[k][1] = resolved[k + 1][1]
+
+    for bd in resolved:
+        if bd[1] == "separate":
+            bd[1] = "concurrence"
+    return [(int(i), str(kind), str(label)) for i, kind, label in resolved]
 
 # The byline shared with the body of _SEP_HEADER_RE — a justice/judge name
 # followed (within a clause) by "concurring"/"dissenting".
@@ -1143,6 +1254,12 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
                     else "concurrence" if m else _peek_sep_kind(blocks, i))
             boundaries.append((i, kind, t if len(t) <= 90 else t[:87] + "…"))
             continue
+        if len(t) <= 160 and _SEP_OF_RE.match(t):
+            # The heading proves a boundary but not a vote.  Delay the role
+            # decision until neighboring sections and the lead disposition
+            # are available.
+            boundaries.append((i, "separate", t))
+            continue
         if len(t) <= 60 and (
             _BARE_SEP_HEADER_RE.match(t) or _OCR_JUSTICE_BYLINE_RE.match(t)
         ):
@@ -1214,6 +1331,7 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
                 continue
             boundaries.append((idx, kind, label))
         boundaries.sort(key=lambda bd: bd[0])
+    boundaries = _resolve_neutral_sep_boundaries(blocks, boundaries)
     first_sep = boundaries[0][0] if boundaries else len(blocks)
 
     parts: list[OpinionPart] = []

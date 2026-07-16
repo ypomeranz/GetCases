@@ -14071,6 +14071,20 @@ class _ScholarTextWindow:
                 part.label or "",
             )
             if not lm:
+                sm = re.match(
+                    r"Separate\s+opinion\s+of\s+"
+                    r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(CHIEF\s+)?JUSTICE\s+"
+                    r"([A-Z][\w.'’-]+)\s*[.:]?\s*$",
+                    part.label or "", re.IGNORECASE,
+                )
+                if sm:
+                    role = ("dissenting" if part.kind == "dissent"
+                            else "concurring")
+                    title = "C.J." if sm.group(1) else "J."
+                    surname = _fix_name_case(
+                        sm.group(2).replace("’", "'").rstrip(".:")
+                    )
+                    return f"{surname}, {title}, {role}"
                 # A bare attribution heading ("MR. JUSTICE HOLMES:",
                 # "Statement of Justice Souter.") never says which way the
                 # author voted, so guessing "concurring"/"dissenting" could
