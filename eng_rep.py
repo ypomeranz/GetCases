@@ -226,12 +226,42 @@ def lookup_nearest(vol: int, page: int) -> list[ERCase]:
 
 _NOM_INDEX: "dict[tuple[str, int, int], list[tuple[int, int]]] | None" = None
 _NOM_RE: "re.Pattern | None" = None
+# First pages per (reporter key, volume) — pin-cite resolution.
+_NOM_PAGES: "dict[tuple[str, int], list[int]] | None" = None
+# Normalized alias key -> canonical reporter keys present in the index.
+_NOM_ALIAS_KEYS: "dict[str, tuple[str, ...]]" = {}
 
 # Reporter keys never matched in text, because in a U.S. document the bare
 # abbreviation means something else: "Curt." is Curtis' Circuit Court reports
-# (English Curteis is cited "Curt. Ecc."), and a capitalized "And" is prose
-# ("... 2 And 45 ..." in a title-case heading), not Anderson's Common Pleas.
-_NOMINATE_DENY = frozenset({"curt", "and"})
+# (English Curteis is cited "Curt. Ecc."), a capitalized "And" is prose
+# ("... 2 And 45 ..." in a title-case heading), not Anderson's Common Pleas,
+# "West" is geography ("the arid lands of the West 11 years later" in
+# California v. United States), not West's Chancery Reports, and "Lit." is
+# a journal ("54 J. Econ. Lit. 3" in SFFA v. Harvard), not Littleton —
+# Littleton reaches U.S. opinions as the treatise "Co. Litt.", not by page.
+_NOMINATE_DENY = frozenset({"curt", "and", "west", "lit"})
+
+# American opinions cite several nominate reporters by shorter forms than
+# the English Reports index uses — Dartmouth College alone has "1 Ves. 462"
+# (Vesey Senior), "13 Ves. 519" (Vesey Junior), "10 Co. 23" (Coke),
+# "1 Show. 360" (Shower), and Johnson v. M'Intosh has "1 Bl. Rep. 665"
+# (Wm. Blackstone).  Each alias is detected like a native form and resolved
+# against its canonical key(s); volume/page gating keeps ambiguous aliases
+# honest ("13 Ves." exists only in Vesey Junior; a company's "Co. 45" has
+# no volume and resolves nowhere).  U.S. Black (66-67 U.S., cited "Black.")
+# is deliberately NOT aliased: its two volumes collide with Wm. Blackstone's.
+_NOM_ALIASES: "dict[str, tuple[str, ...]]" = {
+    "Ves": ("Ves Sen", "Ves Jun"),
+    "Co": ("Co Rep",),
+    "Show": ("Show KB",),
+    "Wils": ("Wils KB",),
+    "Bl": ("Black W",),
+    "Bl Rep": ("Black W",),
+    "W Bl": ("Black W",),
+    "Stra": ("Str",),
+    "Term Rep": ("TR",),
+    "Dougl": ("Doug",),
+}
 
 
 def _nom_key(rep: str) -> str:
@@ -269,7 +299,7 @@ def _load_nominate() -> None:
     failure leaves them empty so the app still runs; nominate citations just
     won't resolve.  Loads the main index first (case records join by neutral
     cite)."""
-    global _NOM_INDEX, _NOM_RE
+    global _NOM_INDEX, _NOM_RE, _NOM_PAGES, _NOM_ALIAS_KEYS
     if _NOM_INDEX is not None:
         return
     _load()  # outside _LOCK -- it takes the same (non-reentrant) lock
@@ -303,6 +333,22 @@ def _load_nominate() -> None:
             print(f"[eng_rep] failed to load nominate index: {exc}")
         for targets in idx.values():
             targets.sort()
+        # First pages per (reporter, volume), sorted — a pin cite ("3 Burr.
+        # 1663" into Rex v. Vice-Chancellor at 3 Burr. 1656) resolves to the
+        # case beginning at the nearest preceding indexed page.
+        pages: dict[tuple[str, int], list[int]] = {}
+        for (key, vol, page) in idx:
+            pages.setdefault((key, vol), []).append(page)
+        for plist in pages.values():
+            plist.sort()
+        present = {key for (key, _v, _p) in idx}
+        alias_keys = {}
+        for form, canon in _NOM_ALIASES.items():
+            targets_present = tuple(
+                _nom_key(c) for c in canon if _nom_key(c) in present)
+            if targets_present:
+                forms.add(form)
+                alias_keys[_nom_key(form)] = targets_present
         if forms:
             # Longest form first, so 'Ves Jun Supp' outranks 'Ves Jun' and
             # 'CB NS' outranks 'CB' (regex alternation is first-match).
@@ -310,14 +356,55 @@ def _load_nominate() -> None:
                            for f in sorted(forms, key=len, reverse=True))
             _NOM_RE = re.compile(
                 r"\b(?:(\d{1,3})\s+)?(" + alt + r")\s+(\d{1,5})(?:\s*[ab])?\b")
+        _NOM_PAGES = pages
+        _NOM_ALIAS_KEYS = alias_keys
         _NOM_INDEX = idx
+
+
+# A pin page further than this from the case's first page is treated as an
+# index gap, not a pin: "Holt 715" is Philips v. Bury (not indexed), and
+# pinning it 58 pages back into Hardman v. Clegg would mislink.  The longest
+# genuine pins seen run ~40 pages ("1 Burr. 200" into Rex v. St John's
+# College at 158).
+_NOM_PIN_SPAN = 50
+
+
+def _nom_resolve(key: str, vol: int, page: int) -> "tuple[str, int, list] | None":
+    """``(canonical_key, start_page, targets)`` for a matched nominate cite,
+    or None.  Tries the matched reporter and its aliases at the exact page
+    first; a miss then resolves as a pin cite — the case beginning at the
+    nearest preceding indexed page of the same reporter volume ("3 Burr.
+    1663" pins into Rex v. Vice-Chancellor, 3 Burr. 1647)."""
+    keys = (key,) + _NOM_ALIAS_KEYS.get(key, ())
+    for k in keys:
+        targets = _NOM_INDEX.get((k, vol, page))
+        if targets:
+            return k, page, targets
+    if not vol:
+        # Volumeless single-volume reporters carry word-like names ("Holt",
+        # "Style"); a bare "Word NN" is also the shape of prose ("the West
+        # 11 years later"), so only an exact first page is trusted.
+        return None
+    from bisect import bisect_right
+    for k in keys:
+        pages = (_NOM_PAGES or {}).get((k, vol))
+        if pages:
+            i = bisect_right(pages, page) - 1
+            if i >= 0 and page - pages[i] <= _NOM_PIN_SPAN:
+                start = pages[i]
+                targets = _NOM_INDEX.get((k, vol, start))
+                if targets:
+                    return k, start, targets
+    return None
 
 
 def iter_nominate_cites(text: str) -> "list[tuple[int, int, str, list[ERCase]]]":
     """Nominate-report citations in *text* that resolve to indexed cases, as
     ``(start, end, spec, cases)`` in document order.  ``spec`` ('n:exch:9:341')
-    round-trips through :func:`resolve`.  Unresolvable look-alikes (a U.S. "5
-    Johns. 37", prose) are simply not reported."""
+    round-trips through :func:`resolve` — for an alias or pin-cite match it
+    carries the canonical reporter key and the case's first page.
+    Unresolvable look-alikes (a U.S. "5 Johns. 37", prose) are simply not
+    reported."""
     if not text:
         return []
     _load_nominate()
@@ -329,13 +416,14 @@ def iter_nominate_cites(text: str) -> "list[tuple[int, int, str, list[ERCase]]]"
         vol = int(m.group(1) or 0)
         key = _nom_key(m.group(2))
         page = int(m.group(3))
-        targets = _NOM_INDEX.get((key, vol, page))
-        if not targets:
+        hit = _nom_resolve(key, vol, page)
+        if hit is None:
             continue
+        ckey, start, targets = hit
         cases = [c for c in (_BY_NEUTRAL.get(t) for t in targets)
                  if c is not None]
         if cases:
-            out.append((m.start(), m.end(), f"n:{key}:{vol}:{page}", cases))
+            out.append((m.start(), m.end(), f"n:{ckey}:{vol}:{start}", cases))
     return out
 
 
@@ -595,6 +683,30 @@ if __name__ == "__main__":
     # nominate specs round-trip through resolve()
     check(any("Hadley" in c.name for c in resolve("n:exch:9:341")),
           "resolve('n:exch:9:341') -> Hadley")
+    # American alias forms (Dartmouth College's citations): bare "Ves."
+    # resolves against Vesey Senior or Junior by volume; "Co." is Coke;
+    # "Show." is Shower; "Bl. Rep."/"W. Bl." is Wm. Blackstone.
+    nom_one("Green v. Rutherforth, 1 Ves. 462", "n:vessen:1:462", "Green")
+    nom_one("Attorney-General v. Clarendon, 17 Ves. 491",
+            "n:vesjun:17:491", "Clarendon")
+    nom_one("Philips v. Bury, 1 Show. 360", "n:showkb:1:360", "Philips")
+    nom_one("Sutton v. Bishop, 1 Bl. Rep. 665", "n:blackw:1:665", "Sutton")
+    # A pin cite resolves to the case beginning at the nearest preceding
+    # indexed page ("10 Co. 33" pins into Sutton's Hospital at 10 Co. 23) —
+    # never across more than _NOM_PIN_SPAN pages, and never for a
+    # volumeless cite (the "Holt 715" trap: Philips v. Bury is unindexed
+    # there and must stay unlinked, not mislink to its neighbor).
+    nom_one("The Case of Sutton's Hospital, 10 Co. 33", "n:corep:10:23",
+            "Sutton")
+    nom_one("Rex v. Vice-Chancellor of Cambridge, 3 Burr. 1656",
+            "n:burr:3:1647", "Vice-Chancellor")
+    check(iter_nominate_cites("Philips v. Bury, Holt 715") == [],
+          "volumeless pin ('Holt 715') stays unlinked")
+    check(iter_nominate_cites("the arid lands of the West 11 years") == [],
+          "prose 'West 11' is never West's Chancery Reports")
+    # A company's volumeless "Co. <number>" must never be claimed for Coke.
+    check(iter_nominate_cites("the Insurance Co. 45 filing") == [],
+          "no nominate claim on 'Insurance Co. 45'")
     # U.S. citations sharing an abbreviation must never be claimed: New York's
     # volumed Johnson ("5 Johns. 37") vs the volumeless English Johnson, a U.S.
     # reporter cite, and the denied "Curt." (Curtis' U.S. circuit reports).
