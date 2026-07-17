@@ -2,7 +2,7 @@ import json
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 os.environ["GETCASES_SKIP_DEPENDENCY_PROMPT"] = "1"
 
@@ -25,7 +25,10 @@ from citation_overrides import (
 )
 from court_catalog import bluebook_federal_trial_court
 from courtlistener_gui import (
+    CourtListenerGUI,
     _ScholarTextWindow,
+    _citation_search_variants,
+    _cl_item_for_citation,
     _combined_parts_cover_typed,
     _cut_companion_cases,
     _nominative_display_cite,
@@ -830,6 +833,83 @@ class ReporterAndDecisionDateTests(unittest.TestCase):
         bb = win._compute_bluebook_parts()
 
         self.assertEqual(bb["display_cite"], "409 Mich. 672")
+
+
+class NominativeCitationSearchTests(unittest.TestCase):
+    def test_search_variants_preserve_caption_and_pincite(self):
+        self.assertEqual(
+            _citation_search_variants(
+                "Stuart v. Laird, 1 Cranch 299, 301"
+            ),
+            (
+                "Stuart v. Laird, 1 Cranch 299, 301",
+                "Stuart v. Laird, 5 U.S. 299, 301",
+            ),
+        )
+        self.assertEqual(
+            _citation_search_variants("8 Wall 168"),
+            ("8 Wall 168", "75 U.S. 168"),
+        )
+
+    def test_ordinary_citation_does_not_gain_an_alias(self):
+        self.assertEqual(
+            _citation_search_variants("410 U.S. 113"),
+            ("410 U.S. 113",),
+        )
+
+    def test_courtlistener_retries_us_reports_alias_only_after_miss(self):
+        client = Mock()
+        client.lookup_citation.side_effect = [
+            [],
+            [{
+                "status": 200,
+                "clusters": [{
+                    "id": 75,
+                    "case_name": "The Case",
+                    "citations": ["75 U.S. 168"],
+                    "court_id": "scotus",
+                }],
+            }],
+        ]
+
+        item = _cl_item_for_citation(client, "8 Wall 168")
+
+        self.assertEqual(item["cluster_id"], 75)
+        self.assertEqual(
+            client.lookup_citation.call_args_list,
+            [call("8 Wall 168"), call("75 U.S. 168")],
+        )
+
+    def test_courtlistener_keeps_successful_typed_citation_authoritative(self):
+        client = Mock()
+        client.lookup_citation.return_value = [{
+            "status": 200,
+            "clusters": [{
+                "id": 8,
+                "case_name": "Different Cranch Case",
+                "citations": ["1 Cranch 299"],
+                "court_id": "cadc",
+            }],
+        }]
+
+        item = _cl_item_for_citation(client, "1 Cranch 299")
+
+        self.assertEqual(item["cluster_id"], 8)
+        client.lookup_citation.assert_called_once_with("1 Cranch 299")
+
+    def test_direct_lookup_retries_us_reports_alias_after_scholar_miss(self):
+        win = object.__new__(CourtListenerGUI)
+        win._post_root = Mock()
+        fetcher = Mock()
+        fetcher.fetch_by_citation.side_effect = [None, ("url", "html")]
+
+        self.assertTrue(
+            win._try_open_citation("", "8 Wall 168", "", fetcher, None)
+        )
+        self.assertEqual(
+            fetcher.fetch_by_citation.call_args_list,
+            [call("8 Wall 168"), call("75 U.S. 168")],
+        )
 
 
 class CitationEnrichmentTriggerTests(unittest.TestCase):
