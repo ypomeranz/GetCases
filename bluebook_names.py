@@ -1461,6 +1461,16 @@ def _is_bare_place(place: str) -> bool:
     return True
 
 
+# Rule 10.2.1(d)'s in rem exception can also reach a party inside an
+# adversary caption ("United States v. The Amistad", 40 U.S. 518).  A vessel
+# in that position cannot be told from an ordinary entity's article ("v. The
+# Boeing Co."), so the known ships are listed by name, mapped to their
+# canonical citation form.
+_IN_REM_ADVERSARY_PARTIES = {
+    "the amistad": "The Amistad",
+}
+
+
 def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     p = _strip_party_designations(re.sub(r"\s+", " ", party).strip())
     # Rule 10.2.1(d): a party's leading "The" is omitted — except when "The
@@ -1470,6 +1480,9 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
     crown = re.fullmatch(r"the\s+(king|queen)", p, flags=re.IGNORECASE)
     if crown:
         return "The " + crown.group(1).capitalize()
+    vessel = _IN_REM_ADVERSARY_PARTIES.get(p.strip(" ,.").lower())
+    if vessel:
+        return vessel
     p = re.sub(r"^the\s+", "", p, flags=re.IGNORECASE)  # rule 10.2.1(d)
     p = re.sub(r"\bUnited States of America\b", "United States", p,
                flags=re.IGNORECASE)
@@ -1959,6 +1972,10 @@ if __name__ == "__main__":
         # "The King" / "The Queen" as a party also keeps the article.
         ("The King v. Joyce", "The King v. Joyce"),
         ("The Queen v. Dudley", "The Queen v. Dudley"),
+        # A listed in rem object keeps its "The" even inside an adversary
+        # caption; an unlisted entity's article still drops there.
+        ("United States v. The Amistad", "United States v. The Amistad"),
+        ("United States v. The Amistad.", "United States v. The Amistad"),
         # A grouped-litigation popular name is not an in rem object, nor is
         # a bare business name: their leading article still drops.
         ("The Prize Cases", "Prize Cases"),
