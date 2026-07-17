@@ -224,6 +224,40 @@ class GluedDispositionBylineTests(unittest.TestCase):
 
 
 class HistoricalAndSignatureBoundaryTests(unittest.TestCase):
+    def test_unresolved_roleless_opinion_remains_neutral(self):
+        parts = segment_blocks([
+            _block("MR. JUSTICE MARSHALL delivered the opinion of the Court."),
+            _block("The Court resolves the question presented."),
+            _block("Separate opinion of MR. JUSTICE STORY."),
+            _block("The historical materials point in several directions."),
+            _block("The statutory language supplies another consideration."),
+            _block("That is sufficient to resolve the issue before us."),
+        ])
+
+        self.assertEqual([part.kind for part in parts], ["majority", "separate"])
+
+    def test_long_roleless_opinion_uses_explicit_closing_dissent(self):
+        # Osborn v. Bank of the United States, 22 U.S. (9 Wheat.) 738
+        # (1824): Johnson's neutral heading does not identify his vote; his
+        # conclusion does.
+        parts = segment_blocks([
+            _block("Mr. Chief Justice MARSHALL delivered the opinion of the Court."),
+            _block("The decree of the Circuit Court is affirmed."),
+            _block("Mr. Justice JOHNSON."),
+            _block("The argument in this cause presents three questions."),
+            _block("The first question concerns the statutory grant."),
+            _block("The second concerns the constitutional power."),
+            _block("The final question concerns the exercise of jurisdiction."),
+            _block(
+                "Upon the whole, I feel compelled to dissent from the Court, "
+                "on the point of jurisdiction."
+            ),
+            _block("Decree affirmed."),
+        ])
+
+        self.assertEqual([part.kind for part in parts], ["majority", "dissent"])
+        self.assertIn("JOHNSON", parts[1].label.upper())
+
     def test_roleless_separate_opinion_of_headings_use_disposition_structure(self):
         # Steward Machine Co. v. Davis, 301 U.S. 548 (1937), gives
         # McReynolds and Sutherland noun-first headings with no role.  The

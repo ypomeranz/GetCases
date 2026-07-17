@@ -603,9 +603,11 @@ from bluebook_names import (
     caption_case_reference_tokens,
     collapse_personal_all_caps_run,
     courtlistener_case_name,
+    cut_companion_cases,
     is_recognized_given_name,
     normal_case_caption,
     refine_caption_case,
+    simplify_historical_entity_caption,
     strip_related_case_note,
 )
 from citation_overrides import (
@@ -7706,6 +7708,22 @@ def _caption_party(s: str) -> str:
     raw = [clean_seg(p) for p in re.split(r"[,;]", s)]
     segs = [p for p in raw if p]
     if segs:
+        # A charter-era bank's formal corporate style contains structural
+        # commas that do not separate parties: "The President, Directors,
+        # and Company of the Bank of ...".  Reassemble that fixed title
+        # before the ordinary co-party logic examines comma segments.  The
+        # opinion-evidence refinement later decides whether the embedded
+        # "Bank of ..." may stand alone as the working party name.
+        if (len(segs) >= 3
+                and re.fullmatch(r"(?:the\s+)?(?:president|governor)",
+                                 segs[0], re.IGNORECASE)
+                and re.fullmatch(r"(?:directors?|dirs?\.?|trustees?)",
+                                 segs[1], re.IGNORECASE)
+                and re.match(
+                    r"(?:and|&)\s+(?:company|co\.?|corporation)\s+of\s+"
+                    r"(?:the\s+)?bank\s+of\b",
+                    segs[2], re.IGNORECASE)):
+            segs = [", ".join(segs[:3])] + segs[3:]
         # 1. Consolidation cut: a later segment that re-names the first party
         # (same final token), contains its own " v. ", or introduces another
         # party ("and Ace Garage" — unless it ends the entity's own name,
@@ -7865,52 +7883,10 @@ def _scholar_court_id(blocks) -> str:
     return ""
 
 
-# Abbreviations whose period never ends a listed case: honorifics,
-# geography ("St. Paul"), and entity suffixes ("Marine Ins. Co. SAME v. …").
-# "al" is deliberately absent — "…, et al." routinely closes the first case.
-_CUT_STOP_ABBRS = frozenset({
-    "st", "ste", "mt", "ft", "mr", "mrs", "ms", "dr", "hon", "rev",
-    "sgt", "lt", "capt", "col", "gen", "jr", "sr", "co", "cos", "corp",
-    "inc", "ltd", "bros", "ins", "mfg", "ry", "rr", "no", "nos",
-})
-
-
-def _cut_companion_cases(text: str) -> str:
-    """Keep only the first-listed case of a consolidated caption (Bluebook
-    rule 10.2.1(b)).
-
-    Strategy one cuts where a period is followed by a new case — one with
-    its own "v.", a "SAME", or an in-re style caption — never at an entity
-    abbreviation's period ("… v. Acme Co. of America" has no case after
-    it).  Its lookahead cannot span a companion party whose *own name*
-    holds periods ("CLAYTON COUNTY, GEORGIA. Altitude Express, Inc., et
-    al., Petitioners v. Zarda" — Bostock), so when a later separator proves
-    a companion case exists, strategy two cuts at the first sentence period
-    before it, skipping initials and abbreviations.  Either strategy can
-    also fire at a *later* boundary than the true one (Olmstead's "… v.
-    SAME." line defeats one at the first boundary but not the second), so
-    the earliest cut wins."""
-    cuts: list[int] = []
-    cm = re.search(
-        r"\.\s+(?=[^.]*?\s+vs?\.\s+|SAME\b|IN\s+RE\b|EX\s+PARTE\b"
-        r"|(?:IN\s+THE\s+)?MATTER\s+OF\b)",
-        text, re.IGNORECASE,
-    )
-    if cm:
-        cuts.append(cm.start())
-    m2 = re.search(r"\s+(?:vs?\.|(?i:versus|against))\s+", text)
-    if m2:
-        head = text[: m2.start()]
-        for c2 in re.finditer(r"\.(?:\[[^\]]{1,6}\])?\s+(?=[A-Z0-9(])", head):
-            wm = re.search(r"([A-Za-z]+)$", head[: c2.start()])
-            word = (wm.group(1) if wm else "").lower()
-            if len(word) <= 1 or word in _CUT_STOP_ABBRS:
-                continue  # an abbreviation's period, not a case boundary
-            cuts.append(c2.start())
-            break
-    if cuts:
-        return text[: min(cuts) + 1]
-    return text
+# Shared with opinion_db's caption extraction; the implementation lives in
+# bluebook_names.cut_companion_cases (tkinter-free).  The private alias keeps
+# this module's call sites and tests stable.
+_cut_companion_cases = cut_companion_cases
 
 
 _PROCEDURAL_ALIAS_RE = re.compile(
@@ -7943,6 +7919,12 @@ def _trim_procedural_caption(text: str) -> str:
 
 def _scholar_caption_name(blocks) -> str:
     """Bluebook case name derived from the Scholar page's party caption."""
+
+    def refine(name: str) -> str:
+        body = _scholar_body_text(blocks)
+        return simplify_historical_entity_caption(
+            refine_caption_case(name, body), body)
+
     for b in blocks[:8]:
         if b.kind != "center":
             continue
@@ -7965,11 +7947,13 @@ def _scholar_caption_name(blocks) -> str:
         # AstraZeneca AB v. United Food…") — classify it before splitting.
         # Only a role tail is cut at a comma; a comma can continue the
         # matter's own title ("In re Title, Ballot Title & Submission
-        # Clause for 2015-2016 #156").
+        # Clause for 2015-2016 #156").  Companions are cut BEFORE the role
+        # trim: trimming first would delete the companion's ", et al.,
+        # Defendants-Appellants, v. …" tail — the very " v. " that proves
+        # a companion case follows.
         if re.match(r"(?:IN\s+RE|EX\s+PARTE|(?:IN\s+THE\s+)?MATTER\s+OF)\b", t, re.IGNORECASE):
-            t2 = _cut_companion_cases(_trim_procedural_caption(t))
-            return refine_caption_case(
-                _titlecase_caps(t2.strip()), _scholar_body_text(blocks))
+            t2 = _trim_procedural_caption(_cut_companion_cases(t))
+            return refine(_titlecase_caps(t2.strip()))
         # Google Scholar renders the party separator in lowercase ("… v. …")
         # even for ALL-CAPS captions ("MERCY HOSPITAL, INC. v. JACKSON"), so
         # a lowercase "v."/"vs." — or the earliest reports' spelled-out
@@ -7988,8 +7972,7 @@ def _scholar_caption_name(blocks) -> str:
             sides[1] = _cut_companion_cases(sides[1])
             left, right = _caption_party(sides[0]), _caption_party(sides[1])
             if left and right:
-                return refine_caption_case(
-                    f"{left} v. {right}", _scholar_body_text(blocks))
+                return refine(f"{left} v. {right}")
         # A single-party caption ("HAYBURN'S CASE.", "THE AMISTAD.") has no
         # separator to split on; without this branch the cite line would
         # become the case name downstream.  Court, date, and docket lines
@@ -8012,9 +7995,8 @@ def _scholar_caption_name(blocks) -> str:
                     r"\b(?:rehearing|certiorari|en banc|as amended|"
                     r"as modified|as corrected|petition for)\b",
                     t, re.IGNORECASE)):
-            return refine_caption_case(
-                _titlecase_caps(_cut_companion_cases(t).split(",")[0].strip()),
-                _scholar_body_text(blocks))
+            return refine(
+                _titlecase_caps(_cut_companion_cases(t).split(",")[0].strip()))
     return ""
 
 
@@ -8167,7 +8149,8 @@ def _rtf_escape(s: str) -> str:
 
 
 # Color table: 1 = star-pagination marker (purple), 2 = dissent (dark red),
-# 3 = concurrence (dark green).  Citation links stay black in copied and
+# 3 = concurrence (dark green), 4 = unclassified separate opinion (slate).
+# Citation links stay black in copied and
 # exported text; the blue is only an on-screen affordance.  The dissent/
 # concurrence colors are used only on the running heading of a section in the
 # RTF export — opinion body text is always black.
@@ -8175,7 +8158,8 @@ _RTF_HEADER = (
     "{\\rtf1\\ansi\\deff0"
     "{\\fonttbl{\\f0\\froman Times New Roman;}}"
     "{\\colortbl ;\\red142\\green68\\blue173;"
-    "\\red163\\green21\\blue21;\\red26\\green122\\blue60;}"
+    "\\red163\\green21\\blue21;\\red26\\green122\\blue60;"
+    "\\red89\\green99\\blue111;}"
     "\\f0\\fs22\n"
 )
 
@@ -8209,6 +8193,8 @@ def _run_to_rtf(seg: str, active: set[str], part_colors: bool = False) -> str:
         codes.append("\\cf2")
     elif part_colors and "part-concurrence" in active:
         codes.append("\\cf3")
+    elif part_colors and "part-separate" in active:
+        codes.append("\\cf4")
     esc = _rtf_escape(seg)
     return "{" + "".join(codes) + " " + esc + "}" if codes else esc
 
@@ -11750,15 +11736,25 @@ class _ScholarTextWindow:
     _CONCUR_COLOR = "#1a7a3c"    # dark green
     _DISSENT_BG = "#fbeeee"      # very light red — full-view box behind a dissent
     _CONCUR_BG = "#eef7f0"       # very light green — box behind a concurrence
+    _SEPARATE_COLOR = "#59636f"  # neutral slate: role is not reliably known
+    _SEPARATE_BG = "#f1f3f5"     # neutral gray: neither assent nor disagreement
     # In the full-opinion view the region behind a concurrence/dissent gets a
     # light background tint; the body text itself stays black and the active
     # part is named, in color, at the top of the window.
     _MAJORITY_COLOR = "#1a3e72"  # dark blue — the main opinion on the part map
-    _PART_BOX_TAGS = {"dissent": "box-dissent", "concurrence": "box-concurrence"}
-    _PART_LABEL_COLORS = {"dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR}
+    _PART_BOX_TAGS = {
+        "dissent": "box-dissent", "concurrence": "box-concurrence",
+        "separate": "box-separate",
+    }
+    _PART_LABEL_COLORS = {
+        "dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR,
+        "separate": _SEPARATE_COLOR,
+    }
     # The part map (right strip) also points to the main opinion.
-    _PARTMAP_COLORS = {"dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR,
-                       "majority": _MAJORITY_COLOR}
+    _PARTMAP_COLORS = {
+        "dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR,
+        "separate": _SEPARATE_COLOR, "majority": _MAJORITY_COLOR,
+    }
     _PAGECOL_W = 48     # left gutter: reporter page numbers (px)
     _PARTMAP_W = 104    # right strip: map of the opinion's parts (px)
     # Approx. on-screen width of the right "Case details" panel (a 38-char Text
@@ -12094,8 +12090,10 @@ class _ScholarTextWindow:
         # this subtle box and the top-of-window label distinguish the parts.
         txt.tag_configure("box-dissent", background=self._DISSENT_BG)
         txt.tag_configure("box-concurrence", background=self._CONCUR_BG)
+        txt.tag_configure("box-separate", background=self._SEPARATE_BG)
         txt.tag_lower("box-dissent")
         txt.tag_lower("box-concurrence")
+        txt.tag_lower("box-separate")
         fnhead_font = tkfont.Font(
             family=self._family, size=max(self._base_size - 2, 8), weight="bold"
         )
@@ -13164,7 +13162,7 @@ class _ScholarTextWindow:
             return
         self._scroll_part = pi
         kind = parts[pi].kind
-        if kind in ("concurrence", "dissent"):
+        if kind in ("concurrence", "dissent", "separate"):
             self._view_label_var.set(parts[pi].label)
             self._set_view_color(
                 self._PART_LABEL_COLORS.get(kind, "black"))
@@ -13551,7 +13549,7 @@ class _ScholarTextWindow:
 
     def _draw_part_map(self) -> None:
         """Draw a colour-coded strip on the right marking where each
-        concurrence/dissent begins, with its label.  Shown only in the
+        majority or separate writing begins, with its label.  Shown only in the
         full-opinion text view; clicking a marker jumps to that part."""
         canvas = getattr(self, "_partmap", None)
         if canvas is None:
@@ -13567,7 +13565,7 @@ class _ScholarTextWindow:
         marks = [
             (rs, parts[p].kind, parts[p].label)
             for rs, _re, p in regions
-            if parts[p].kind in ("majority", "concurrence", "dissent")
+            if parts[p].kind in ("majority", "concurrence", "dissent", "separate")
         ]
         if not marks:
             canvas.config(width=0)
@@ -13617,8 +13615,8 @@ class _ScholarTextWindow:
     @staticmethod
     def _partmap_short_label(label: str, kind: str) -> str:
         """A compact label for the narrow part-map strip.  For separate
-        opinions just the author's surname (the colour already says whether
-        it's a dissent or concurrence); for the main opinion 'Opinion
+        opinions just the author's surname (the colour conveys its known or
+        neutral role); for the main opinion 'Opinion
         (Author)'."""
         text = re.sub(r"\s+", " ", label or "").strip()
         # Per curiam opinions: the parenthetical should read "(per curiam)", not
@@ -13643,7 +13641,11 @@ class _ScholarTextWindow:
                 name = m2.group(1)
                 if name.isupper():
                     name = name[:1] + name[1:].lower()
-        return name or ("Dissent" if kind == "dissent" else "Concurrence")
+        fallback = {
+            "dissent": "Dissent", "concurrence": "Concurrence",
+            "separate": "Separate opinion",
+        }
+        return name or fallback.get(kind, "Opinion")
 
     def _on_partmap_click(self, event) -> None:
         for y1, y2, rs in getattr(self, "_partmap_rows", []):
@@ -13943,6 +13945,7 @@ class _ScholarTextWindow:
             name = re.split(r",\s*\d{1,4}\s", first)[0].strip().rstrip(",")[:120]
         opinion_body = _scholar_body_text(self._blocks)
         name = refine_caption_case(normal_case_caption(name), opinion_body)
+        name = simplify_historical_entity_caption(name, opinion_body)
         unresolved_caption_case = caption_case_reference_tokens(
             name, opinion_body)
 
@@ -14030,8 +14033,8 @@ class _ScholarTextWindow:
     def _writer_parenthetical(self, part) -> str:
         """
         Bluebook writer parenthetical for a separate opinion (rule 10.6.1):
-        "Rehnquist, J., dissenting", "Wood, J., dissenting from the denial
-        of rehearing en banc", or "per curiam" for unsigned opinions.
+        "Rehnquist, J., dissenting", "Story, J., separate opinion" when the
+        role is unresolved, or "per curiam" for unsigned opinions.
         Empty for the header and signed majority opinions.
         """
         def block_text(b) -> str:
@@ -14055,8 +14058,10 @@ class _ScholarTextWindow:
             if re.search(r"\(per\s+curiam\)", part.label or "", re.IGNORECASE):
                 return "per curiam"
             return ""
-        if part.kind not in ("concurrence", "dissent") or not part.blocks:
+        if part.kind not in ("concurrence", "dissent", "separate") or not part.blocks:
             return ""
+        neutral_role = "separate opinion" if part.kind == "separate" else (
+            "dissenting" if part.kind == "dissent" else "concurring")
         t = block_text(part.blocks[0])
         m = re.search(r"\b(?:concurring|dissenting)\b", t, re.IGNORECASE)
         if not m:
@@ -14078,18 +14083,16 @@ class _ScholarTextWindow:
                     part.label or "", re.IGNORECASE,
                 )
                 if sm:
-                    role = ("dissenting" if part.kind == "dissent"
-                            else "concurring")
                     title = "C.J." if sm.group(1) else "J."
                     surname = _fix_name_case(
                         sm.group(2).replace("’", "'").rstrip(".:")
                     )
-                    return f"{surname}, {title}, {role}"
+                    return f"{surname}, {title}, {neutral_role}"
                 # A bare attribution heading ("MR. JUSTICE HOLMES:",
                 # "Statement of Justice Souter.") never says which way the
                 # author voted, so guessing "concurring"/"dissenting" could
-                # misdescribe it — Bluebook's neutral forms are "(opinion of
-                # Holmes, J.)" and "(statement of Souter, J.)".
+                # misdescribe it.  Keep a statement labeled as a statement;
+                # otherwise use the neutral "separate opinion" parenthetical.
                 jm = re.match(
                     r"(Statement\s+of\s+)?(?:MR\.\s+|MRS\.\s+|MS\.\s+)?"
                     r"(?:CHIEF\s+)?JUSTICE\s+([A-Z][\w.'’-]+?)\s*[.:]?\s*$",
@@ -14097,8 +14100,11 @@ class _ScholarTextWindow:
                 )
                 if jm:
                     surname = _fix_name_case(jm.group(2).replace("’", "'"))
-                    form = "statement of" if jm.group(1) else "opinion of"
-                    return f"{form} {surname}, J."
+                    if jm.group(1):
+                        return f"statement of {surname}, J."
+                    return (f"{surname}, J., {neutral_role}"
+                            if part.kind == "separate"
+                            else f"opinion of {surname}, J.")
                 # Headers that never name the role — the role was read from
                 # the opinion's opening lines when the part was segmented, so
                 # part.kind is trustworthy here.  A bare state-court byline
@@ -14107,7 +14113,6 @@ class _ScholarTextWindow:
                 # with whom THE CHIEF JUSTICE and MR. JUSTICE BLACK join." in
                 # Cohen), or an explicit hand-off ("MR. JUSTICE FIELD
                 # delivered the following separate opinion.").
-                role = "dissenting" if part.kind == "dissent" else "concurring"
                 wm = re.match(
                     r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(CHIEF\s+)?JUSTICE\s+"
                     r"([A-Z][\w.'’-]+)\s*,\s*with\s+whom\b",
@@ -14117,7 +14122,7 @@ class _ScholarTextWindow:
                 if wm:
                     title = "C.J." if wm.group(1) else "J."
                     surname = _fix_name_case(wm.group(2).replace("’", "'"))
-                    return f"{surname}, {title}, {role}"
+                    return f"{surname}, {title}, {neutral_role}"
                 bm = re.match(
                     r"((?:[A-Z][\w.'’-]*\s+)?[A-Z][\w.'’-]+),\s*"
                     r"(?:(C\.\s*J\.|Ch\.\s*J\.|Chief\s+(?:Justice|Judge))|"
@@ -14128,7 +14133,7 @@ class _ScholarTextWindow:
                 if bm:
                     title = "C.J." if bm.group(2) else "J."
                     surname = _fix_name_case(bm.group(1).replace("’", "'"))
-                    return f"{surname}, {title}, {role}"
+                    return f"{surname}, {title}, {neutral_role}"
                 dm = re.match(
                     r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(CHIEF\s+)?JUSTICE\s+"
                     r"([A-Z][\w.'’-]+)\s+delivered\s+(?:the\s+following|a)\s+"
@@ -14138,8 +14143,8 @@ class _ScholarTextWindow:
                 if dm:
                     title = "C.J." if dm.group(1) else "J."
                     surname = _fix_name_case(dm.group(2).replace("’", "'"))
-                    return f"{surname}, {title}, {role}"
-                return ""
+                    return f"{surname}, {title}, {neutral_role}"
+                return "separate opinion" if part.kind == "separate" else ""
             phrase = {
                 "concurrence": "concurring",
                 "concurrence in part": "concurring in part",
@@ -14229,10 +14234,11 @@ class _ScholarTextWindow:
             return
         has_dissent = any(p.kind == "dissent" for p in parts)
         has_concurrence = any(p.kind == "concurrence" for p in parts)
+        has_separate = any(p.kind == "separate" for p in parts)
         signal = self._writer_parenthetical(maj)  # "" | per curiam | plurality
         if signal == "plurality opinion" and self._is_scotus:
             base = "Plurality Opinion"
-        elif not has_dissent and not has_concurrence:
+        elif not has_dissent and not has_concurrence and not has_separate:
             base = "Opinion"
         else:
             base = "Majority Opinion"
@@ -14813,8 +14819,12 @@ class _ScholarTextWindow:
         sections = self._export_section_list()
 
         # Colour only the running heading by opinion kind (dissent red,
-        # concurrence green); the body text of every opinion stays black.
-        head_cf = {"dissent": "\\cf2 ", "concurrence": "\\cf3 "}
+        # concurrence green, unresolved separate opinion neutral slate); the
+        # body text of every opinion stays black.
+        head_cf = {
+            "dissent": "\\cf2 ", "concurrence": "\\cf3 ",
+            "separate": "\\cf4 ",
+        }
         out: list[str] = []
         for i, (label, rs, rend, kind) in enumerate(sections):
             out.append(
@@ -17884,7 +17894,7 @@ _PDF_PART_COLORS = {
     "majority": _ScholarTextWindow._MAJORITY_COLOR,
     "concurrence": _ScholarTextWindow._CONCUR_COLOR,
     "dissent": _ScholarTextWindow._DISSENT_COLOR,
-    "separate": "#6a4d9f",
+    "separate": _ScholarTextWindow._SEPARATE_COLOR,
 }
 
 

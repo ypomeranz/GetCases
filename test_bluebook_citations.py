@@ -266,6 +266,32 @@ class CaptionCapitalizationTests(unittest.TestCase):
 
 
 class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
+    def test_historical_bank_wrapper_uses_opinions_own_entity_name(self):
+        # Osborn v. Bank of the United States, 22 U.S. (9 Wheat.) 738
+        # (1824): the reporter caption gives the bank's formal charter style,
+        # while Marshall and Johnson repeatedly call the party the Bank of
+        # the United States in their opinions.
+        blocks = [
+            Block("center", [Span(
+                "OSBORN and others, Appellants, v. The PRESIDENT, "
+                "DIRECTORS, AND COMPANY OF THE BANK OF THE UNITED STATES, "
+                "Respondents."
+            )]),
+            Block("para", [Span(
+                "The Bank of the United States is an instrument of the "
+                "national government."
+            )]),
+            Block("para", [Span(
+                "The charter permits the Bank of the United States to sue."
+            )]),
+        ]
+
+        name = _scholar_caption_name(blocks)
+        self.assertEqual(
+            name, "Osborn and others v. Bank of the United States")
+        self.assertEqual(
+            abbreviate_case_name(name), "Osborn v. Bank of the U.S.")
+
     def test_geographic_party_starts_joined_respondent_list(self):
         # General Telephone Co. of the Southwest v. United States,
         # 449 F.2d 846 (5th Cir. 1971): United States and the FCC are two
@@ -404,6 +430,42 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
             "Johnson & Graham's Lessee v. M'intosh",
         )
 
+    def test_zf_automotive_consolidated_caption(self):
+        # ZF Automotive US, Inc. v. Luxshare, Ltd., 596 U.S. 619 (2022):
+        # the consolidated AlixPartners case follows the first respondent's
+        # "LTD." and is omitted (rule 10.2.1(b)).
+        right = _cut_companion_cases(
+            "LUXSHARE, LTD. AlixPartners, LLP, et al., Petitioners v. The "
+            "Fund for Protection of Investors' Rights in Foreign States.")
+        self.assertEqual(right, "LUXSHARE, LTD.")
+        self.assertEqual(
+            abbreviate_case_name(
+                "ZF Automotive US, Inc., et al., Petitioners, v. "
+                "Luxshare, Ltd."),
+            "ZF Auto. US, Inc. v. Luxshare, Ltd.",
+        )
+
+    def test_geographic_first_party_is_not_cut_from_a_firm_name(self):
+        # "New York & Cuba Mail Steamship Co." is one business that merely
+        # opens with a place — nothing is omitted; a true government
+        # co-party list still reduces to its first party.
+        self.assertEqual(
+            abbreviate_case_name(
+                "New York & Cuba Mail Steamship Company v. The Barge Sadie"),
+            "N.Y. & Cuba Mail S.S. Co. v. Barge Sadie",
+        )
+        self.assertEqual(
+            abbreviate_case_name(
+                "Texas & Pacific Railway Company v. Behymer"),
+            "Tex. & Pac. Ry. Co. v. Behymer",
+        )
+        self.assertEqual(
+            abbreviate_case_name(
+                "United States and Federal Communications Commission "
+                "v. Acme Corp."),
+            "United States v. Acme Corp.",
+        )
+
     def test_companion_cases_cut_at_the_earliest_boundary(self):
         # Bostock: the companion party's own periods ("Inc.") defeat the
         # simple lookahead; the fallback cuts before "Altitude".
@@ -420,7 +482,8 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
                 "UNITED STATES. GREEN ET AL. v. SAME. McINNIS v. SAME."),
             "UNITED STATES.",
         )
-        # An entity abbreviation's period is never a case boundary.
+        # An entity abbreviation's period is a boundary only when the name
+        # does not continue past it.
         self.assertEqual(
             _cut_companion_cases(
                 "ST. PAUL FIRE & MARINE INS. CO. SAME v. OTHER."),
@@ -429,6 +492,23 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
         self.assertEqual(
             _cut_companion_cases("Acme Co. of America"),
             "Acme Co. of America",
+        )
+        # ZF Automotive US, Inc. v. Luxshare, Ltd., 596 U.S. 619 (2022):
+        # the first respondent's own "Ltd." closes the case, and the
+        # consolidated AlixPartners case follows.
+        self.assertEqual(
+            _cut_companion_cases(
+                "LUXSHARE, LTD. AlixPartners, LLP, et al., Petitioners v. "
+                "The Fund for Protection of Investors' Rights in Foreign "
+                "States."),
+            "LUXSHARE, LTD.",
+        )
+        # …but a continuing name keeps its entity abbreviation mid-name.
+        self.assertEqual(
+            _cut_companion_cases(
+                "TRAVELERS INS. CO. OF HARTFORD. Acme Widgets, Inc., "
+                "Petitioners v. Doe"),
+            "TRAVELERS INS. CO. OF HARTFORD.",
         )
 
 
@@ -1068,6 +1148,32 @@ class WriterParentheticalTests(unittest.TestCase):
             self._win()._writer_parenthetical(part),
             "McReynolds, J., dissenting",
         )
+
+    def test_unresolved_separate_opinion_uses_neutral_parenthetical(self):
+        part = self._part(
+            "separate", "Separate opinion of MR. JUSTICE STORY."
+        )
+        win = self._win()
+        self.assertEqual(
+            win._writer_parenthetical(part),
+            "Story, J., separate opinion",
+        )
+        win._base_citation_override = ""
+        win._bb = {
+            "name": "Example v. Example", "cite": "1 U.S. 10",
+            "display_cite": "1 U.S. 10", "court": "", "year": "1800",
+            "omit_parenthetical": "", "pin_kind": "page",
+        }
+        plain, _rtf = win._bluebook_citation(
+            None, win._writer_parenthetical(part))
+        self.assertEqual(
+            plain,
+            "Example v. Example, 1 U.S. 10 (1800) "
+            "(Story, J., separate opinion).",
+        )
+        self.assertEqual(win._PART_BOX_TAGS["separate"], "box-separate")
+        self.assertEqual(win._PART_LABEL_COLORS["separate"], "#59636f")
+        self.assertEqual(win._SEPARATE_BG, "#f1f3f5")
 
     def test_spelled_out_bare_judge_byline(self):
         part = self._part("concurrence", "CLINTON, Judge.")

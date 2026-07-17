@@ -870,6 +870,60 @@ def refine_caption_case(name: str, body_text: str) -> str:
     return " ".join(tokens)
 
 
+_HISTORICAL_BANK_WRAPPER_RE = re.compile(
+    r"^(?:the\s+)?(?:president|governor)\s*,?\s+"
+    r"(?:directors?|dirs?\.?|trustees?)\s*,?\s+"
+    r"(?:and|&)\s+(?:company|co\.?|corporation)\s+of\s+"
+    r"(?P<entity>(?:the\s+)?bank\s+of\s+.+?)"
+    r"(?:,\s*(?:appellants?|appellees?|petitioners?|respondents?|"
+    r"plaintiffs?|defendants?)\.?)?$",
+    re.IGNORECASE,
+)
+
+
+def simplify_historical_entity_caption(name: str, body_text: str) -> str:
+    """Remove a charter-era corporate wrapper when the opinion proves the
+    embedded institution is the party's working name.
+
+    Early reports sometimes style a bank as ``President, Directors, and
+    Company of the Bank of ...`` even though the opinion itself repeatedly
+    calls the litigant ``Bank of ...``.  This is not a metadata substitution:
+    the shorter entity must occur inside the caption and must also appear at
+    least twice in the opinion's own mixed-case prose.  Other formal names
+    (for example, ``President and Fellows of Harvard College``) and a wrapper
+    lacking that internal evidence pass through unchanged.
+    """
+    if not name or not body_text:
+        return name
+
+    sides = _V_SPLIT_RE.split(name, maxsplit=1)
+    changed = False
+    for i, side in enumerate(sides):
+        m = _HISTORICAL_BANK_WRAPPER_RE.fullmatch(side.strip(" ,.;"))
+        if not m:
+            continue
+        entity = re.sub(r"^the\s+", "", m.group("entity"),
+                        flags=re.IGNORECASE).strip(" ,.;")
+        if not entity:
+            continue
+        pattern = re.compile(
+            r"\b" + r"\s+".join(re.escape(w) for w in entity.split()) + r"\b",
+            re.IGNORECASE,
+        )
+        evidence = [match.group(0) for match in pattern.finditer(body_text)]
+        evidence = [text for text in evidence
+                    if any(c.islower() for c in text)
+                    and text[:1].isupper()]
+        if len(evidence) < 2:
+            continue
+        # Retain the caption's words and punctuation; the opinion supplies
+        # only confirmation that the embedded entity is independently used.
+        entity = _lowercase_small_words(entity[:1].upper() + entity[1:])
+        sides[i] = entity
+        changed = True
+    return " v. ".join(sides) if changed else name
+
+
 _CAPTION_ENTITY_MARKERS = frozenset({
     "association", "associates", "authority", "bank", "board", "company",
     "co", "communications", "corp", "corporation", "enterprises",
@@ -1051,6 +1105,78 @@ def strip_related_case_note(text: str) -> str:
     the case's own name: "Ex parte MURPHY. (Re Murphy v. State)." ->
     "Ex parte MURPHY.".  Captions without one pass through unchanged."""
     return _RELATED_CASE_NOTE_RE.sub("", text or "").strip()
+
+
+# Abbreviations whose period never ends a listed case: honorifics,
+# geography ("St. Paul"), and mid-name business words ("Marine Ins. Co.").
+# "al" is deliberately absent — "…, et al." routinely closes the first case.
+_CUT_NEVER_ENDS = frozenset({
+    "st", "ste", "mt", "ft", "mr", "mrs", "ms", "dr", "hon", "rev",
+    "sgt", "lt", "capt", "col", "gen", "jr", "sr", "ins", "mfg",
+    "no", "nos",
+})
+# Entity designators that usually *close* a party name — the period after
+# one is a case boundary ("… v. LUXSHARE, LTD. AlixPartners, LLP, et al.,
+# Petitioners v. …" in ZF Automotive) unless the name visibly continues
+# ("Acme Co. of America", "INS. CO. OF HARTFORD").
+_CUT_ENTITY_ENDS = frozenset({
+    "co", "cos", "corp", "inc", "ltd", "bros", "llc", "llp", "lp",
+    "lllp", "plc", "pllc", "pc", "na", "sa", "ag", "nv", "ry", "rr",
+})
+_NAME_CONTINUATIONS = frozenset({
+    "of", "the", "and", "for", "in", "de", "la", "du", "von", "van",
+    "a", "an", "d",
+})
+
+# Firm-name tail words beyond _APPOSITIVE_ENTITY_TERMS: a conjoined name
+# ending in one of these is a single business, not a party list ("New York
+# & Cuba Mail Steamship Co.", "Baltimore & Ohio Railroad").
+_FIRM_TAIL_WORDS = frozenset({
+    "ry", "rr", "railroad", "railway", "steamship", "ss", "insurance",
+    "ins", "telegraph", "telephone", "tel",
+})
+
+
+def cut_companion_cases(text: str) -> str:
+    """Keep only the first-listed case of a consolidated caption (Bluebook
+    rule 10.2.1(b)).
+
+    Strategy one cuts where a period is followed by a new case — one with
+    its own "v.", a "SAME", or an in-re style caption — never at an entity
+    abbreviation's period ("… v. Acme Co. of America" has no case after
+    it).  Its lookahead cannot span a companion party whose *own name*
+    holds periods ("CLAYTON COUNTY, GEORGIA. Altitude Express, Inc., et
+    al., Petitioners v. Zarda" — Bostock), so when a later separator proves
+    a companion case exists, strategy two cuts at the first sentence period
+    before it, skipping initials and abbreviations.  Either strategy can
+    also fire at a *later* boundary than the true one (Olmstead's "… v.
+    SAME." line defeats one at the first boundary but not the second), so
+    the earliest cut wins."""
+    cuts: list[int] = []
+    cm = re.search(
+        r"\.\s+(?=[^.]*?\s+vs?\.\s+|SAME\b|IN\s+RE\b|EX\s+PARTE\b"
+        r"|(?:IN\s+THE\s+)?MATTER\s+OF\b)",
+        text, re.IGNORECASE,
+    )
+    if cm:
+        cuts.append(cm.start())
+    m2 = re.search(r"\s+(?:vs?\.|(?i:versus|against))\s+", text)
+    if m2:
+        head = text[: m2.start()]
+        for c2 in re.finditer(r"\.(?:\[[^\]]{1,6}\])?\s+(?=[A-Z0-9(])", head):
+            wm = re.search(r"([A-Za-z]+)$", head[: c2.start()])
+            word = (wm.group(1) if wm else "").lower()
+            if len(word) <= 1 or word in _CUT_NEVER_ENDS:
+                continue  # an abbreviation's period, not a case boundary
+            if word in _CUT_ENTITY_ENDS:
+                nxt = re.match(r"[A-Za-z]+", head[c2.end():])
+                if nxt and nxt.group(0).lower() in _NAME_CONTINUATIONS:
+                    continue  # "Acme Co. of America" — same party's name
+            cuts.append(c2.start())
+            break
+    if cuts:
+        return text[: min(cuts) + 1]
+    return text
 
 # Procedural party designations from a reporter caption — "…, Plaintiff,"
 # "…, et al., Defendants.", "…, Defendant-Appellant" — describe the party's
@@ -1397,9 +1523,17 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
         # Communications Commission" -> "United States".  Expanding first
         # also repairs sources that print "U.S. and FCC".  A business name
         # such as "Jones & Laughlin Steel Corp." does not have a bare
-        # geographic first segment and therefore continues through unchanged.
+        # geographic first segment and therefore continues through unchanged
+        # — but a firm can also merely *open* with a place ("New York &
+        # Cuba Mail Steamship Co.", "Texas & Pacific Ry. Co."), recognized
+        # by the trailing entity designator: then the conjunction is inside
+        # one name and nothing is omitted.
+        tail = segs[-1].split()
+        tail_word = re.sub(r"[^a-z]", "", tail[-1].lower()) if tail else ""
         first = _expand_geo_party(segs[0].strip(" ,;"))
-        if first.strip(" ,.").lower() in _GEO_PARTIES:
+        if (first.strip(" ,.").lower() in _GEO_PARTIES
+                and tail_word not in _APPOSITIVE_ENTITY_TERMS
+                and tail_word not in _FIRM_TAIL_WORDS):
             return first
         surnames = [_strip_given_names(s) for s in segs]
         if all(surnames):

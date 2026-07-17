@@ -47,8 +47,10 @@ from typing import Optional
 import citations
 from bluebook_names import (
     abbreviate_case_name,
+    cut_companion_cases,
     normal_case_caption,
     refine_caption_case,
+    simplify_historical_entity_caption,
     strip_related_case_note,
 )
 
@@ -216,11 +218,17 @@ def _caption_name(blocks: list) -> str:
         if len(sides) != 2:
             sides = re.split(r"\s+[vV]s?\.\s+", t, maxsplit=1)
         if len(sides) == 2 and sides[0].strip() and sides[1].strip():
+            # Only the first-listed case of a consolidated caption is cited
+            # (rule 10.2.1(b)): "… v. LUXSHARE, LTD. AlixPartners, LLP, et
+            # al., Petitioners v. The Fund …" ends at "LTD."
+            right = cut_companion_cases(sides[1])
+            if right != sides[1]:
+                return f"{sides[0]} v. {right}".strip()
             return t
         if re.match(
             r"(?:IN\s+RE|EX\s+PARTE|(?:IN\s+THE\s+)?MATTER\s+OF)\b", t, re.IGNORECASE
         ):
-            return t.split(",")[0].strip()
+            return cut_companion_cases(t).split(",")[0].strip()
     return ""
 
 
@@ -295,7 +303,9 @@ def extract_record(
             raw_name = _smart_titlecase(raw_name)  # caption is often ALL CAPS
             # The body's mixed-case prose corrects ambiguous title-casing
             # guesses ("Us Dominion" -> "US Dominion").
-            raw_name = refine_caption_case(raw_name, _prose_text(blocks))
+            prose = _prose_text(blocks)
+            raw_name = refine_caption_case(raw_name, prose)
+            raw_name = simplify_historical_entity_caption(raw_name, prose)
     name = abbreviate_case_name(raw_name) if raw_name else ""
 
     cites = _header_cites(blocks)
