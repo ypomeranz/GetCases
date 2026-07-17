@@ -1136,10 +1136,19 @@ def _court_for_paren(citation: str, court_id: str, fallback: str = "") -> str:
     abbr = _COURT_BLUEBOOK.get(court_id, "")
     if not abbr:
         # An id outside the catalog: bluebook the court *name* CourtListener
-        # supplied ("Court of Appeals of Ohio" → "Ohio Ct. App.") rather
-        # than printing it raw; keep the raw fallback only when the name
-        # isn't recognizable.
-        abbr = _bluebook_court_from_name(fallback) or (fallback or "").strip()
+        # supplied ("Court of Appeals of Ohio" → "Ohio Ct. App.",
+        # "United States Bankruptcy Court, S.D. Texas" → "Bankr. S.D.
+        # Tex.") rather than printing it raw; keep the raw fallback only
+        # when the name isn't recognizable.  A fallback that is just the
+        # court id ("circtsdny") is never printed — "(circtsdny 1904)" is
+        # worse than no court at all.
+        name = (fallback or "").strip()
+        abbr = (_bluebook_court_from_name(name)
+                or _bluebook_federal_trial_court(name)
+                or name)
+        if abbr and (abbr == court_id
+                     or re.fullmatch(r"[a-z0-9]{2,}", abbr)):
+            return ""
     if not abbr or not reporter:
         return abbr
     rep_tokens = [t for t in _REPORTER_SERIES_RE.sub(" ", reporter).split() if t]
