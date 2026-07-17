@@ -1493,6 +1493,30 @@ def _us_reports_cite(cite: str) -> str:
     return f"{int(m.group(1)) + off} U.S. {m.group(3)}" if off is not None else ""
 
 
+def _citation_search_variants(query: str) -> tuple[str, ...]:
+    """The query as entered, plus its U.S.-Reports equivalent when it
+    contains an early-SCOTUS nominative citation.
+
+    Search services do not agree on which side of a dual citation they index:
+    a user may type ``8 Wall. 168`` while CourtListener or Google Scholar only
+    recognizes ``75 U.S. 168``.  Preserve surrounding case-name and pincite
+    text so a full query remains just as specific, and retain the typed form as
+    a fallback for sources that do index the old reporter.
+    """
+    query = re.sub(r"\s+", " ", query or "").strip()
+    if not query:
+        return ()
+    variants = [query]
+    m = _NOMINATIVE_CITE_RE.search(query)
+    if m:
+        us_cite = _us_reports_cite(m.group(0))
+        if us_cite:
+            expanded = query[:m.start()] + us_cite + query[m.end():]
+            if expanded not in variants:
+                variants.append(expanded)
+    return tuple(variants)
+
+
 def _link_cite(text: str, short_cite_index) -> tuple[str, str]:
     """(reporter cite, pincite) for a cited-case hyperlink's text, recognizing
     the old nominative SCOTUS reporters the standard parser misses ("Calder v.
@@ -1908,7 +1932,11 @@ def _cl_item_for_citation(client, cite: str, name: str = "") -> Optional[dict]:
     cite = (cite or "").split("@", 1)[0].strip()
     if not cite:
         return None
-    want = re.sub(r"\s+", "", cite).lower()
+    lookup_cites = _citation_search_variants(cite)
+    want_keys = {
+        re.sub(r"\s+", "", variant).lower()
+        for variant in lookup_cites
+    }
     alt = _us_reports_cite(cite)
     altkey = re.sub(r"\s+", "", alt).lower() if alt else ""
 
@@ -1934,35 +1962,47 @@ def _cl_item_for_citation(client, cite: str, name: str = "") -> Optional[dict]:
         return s
 
     # 1) Resolution via the citation-lookup endpoint (exact; 300 = ambiguous).
-    try:
-        clusters = []
-        for entry in client.lookup_citation(cite):
-            if entry.get("status") in (200, 300):
-                clusters.extend(entry.get("clusters") or [])
-        if clusters:
-            best = max(
-                clusters,
-                key=lambda cl: score(
-                    cl.get("case_name") or cl.get("case_name_full") or "",
-                    norm_cites(cl.get("citations")),
-                    str(cl.get("court_id") or cl.get("court") or ""),
-                ),
-            )
-            item = _item_from_cluster(best)
-            if item.get("cluster_id"):
-                return item
-    except Exception as exc:
-        print(f"[cl-cite] citation-lookup failed for {cite!r}: {exc}")
+    # Try the form the user entered first.  A Cranch citation can also denote a
+    # D.C. Circuit reporter, so consulting its U.S.-Reports counterpart is a
+    # fallback rather than an unconditional preference.
+    for lookup_cite in lookup_cites:
+        try:
+            clusters = []
+            for entry in client.lookup_citation(lookup_cite):
+                if entry.get("status") in (200, 300):
+                    clusters.extend(entry.get("clusters") or [])
+            if clusters:
+                best = max(
+                    clusters,
+                    key=lambda cl: score(
+                        cl.get("case_name") or cl.get("case_name_full") or "",
+                        norm_cites(cl.get("citations")),
+                        str(cl.get("court_id") or cl.get("court") or ""),
+                    ),
+                )
+                item = _item_from_cluster(best)
+                if item.get("cluster_id"):
+                    return item
+        except Exception as exc:
+            print(f"[cl-cite] citation-lookup failed for {lookup_cite!r}: {exc}")
 
     # 2) Fall back to full-text search, trusting only a real citation match
     # (and preferring the same disambiguation signals when several match).
-    for q in (f"citation:({cite})", f'"{cite}"'):
-        try:
-            results = client.search(q, type="o", page_size=5).get("results") or []
-        except Exception:
-            continue
-        matched = [it for it in results
-                   if want in norm_cites(it.get("citation"))]
+    for lookup_cite in lookup_cites:
+        matched = []
+        seen_items: set[str] = set()
+        for q in (f"citation:({lookup_cite})", f'"{lookup_cite}"'):
+            try:
+                results = client.search(q, type="o", page_size=5).get("results") or []
+            except Exception:
+                continue
+            for item in results:
+                if not (want_keys & norm_cites(item.get("citation"))):
+                    continue
+                key = str(item.get("cluster_id") or item.get("id") or id(item))
+                if key not in seen_items:
+                    seen_items.add(key)
+                    matched.append(item)
         if matched:
             return max(
                 matched,
@@ -4590,6 +4630,14 @@ class CourtListenerGUI:
         # F. App'x citation, skip those searches and offer the static.case.law
         # PDF built straight from the citation the user typed.
         cite_m = _LINE_CITE_RE.search(query)
+        is_reporter_cite = bool(cite_m)
+        # A nominative early-SCOTUS cite gets a modern U.S. Reports fallback.
+        # Keep the full query for Scholar, but give CL's exact endpoint just
+        # the citation token it expects.
+        case_search_queries = _citation_search_variants(query)
+        lookup_cites = _citation_search_variants(
+            cite_m.group(0) if cite_m else query
+        )
         appx_url = (_static_case_law_url(cite_m.group(0))
                     if cite_m and _FED_APPX_RE.search(cite_m.group(0)) else None)
         if appx_url:
@@ -4618,11 +4666,18 @@ class CourtListenerGUI:
                 search_done[0] += 1
                 self.root.after(0, _update_status)
                 return
-            try:
-                results = fetcher.search_cases(query, limit=10)
-            except Exception:
-                results = []
-            if _LINE_CITE_RE.search(query):
+            results = []
+            for search_query in case_search_queries:
+                try:
+                    candidate_results = fetcher.search_cases(
+                        search_query, limit=10,
+                    )
+                except Exception:
+                    candidate_results = []
+                if candidate_results:
+                    results = candidate_results
+                    break
+            if is_reporter_cite:
                 # A reporter citation in the query pins the case, so keep
                 # Google Scholar's own relevance order (top few).
                 results = results[:3]
@@ -4707,29 +4762,42 @@ class CourtListenerGUI:
                 self.root.after(0, _update_status)
                 return
 
-            if _LINE_CITE_RE.search(query):
+            if is_reporter_cite:
                 # A reporter citation ("514 F. App'x 210"): resolve it precisely
                 # via citation-lookup first — full-text search often mismatches
                 # a bare citation — and fall back to a plain search only if that
                 # finds nothing, dropping SCOTUS "order" entries as the main
                 # search does.
                 results: list[dict] = []
-                try:
-                    for entry in client.lookup_citation(query):
-                        if entry.get("status") != 200:
-                            continue
-                        for cl in entry.get("clusters") or []:
-                            results.append(_item_from_cluster(cl))
-                except Exception:
-                    pass
-                if not results:
+                for lookup_cite in lookup_cites:
                     try:
-                        data = client.search(query, type="o", page_size=10)
-                        results = data.get("results") or []
+                        candidate_results = []
+                        for entry in client.lookup_citation(lookup_cite):
+                            if entry.get("status") != 200:
+                                continue
+                            for cl in entry.get("clusters") or []:
+                                candidate_results.append(_item_from_cluster(cl))
                     except Exception:
-                        results = []
-                    results = [it for it in results
-                               if not _is_scotus_order_item(it)][:3]
+                        candidate_results = []
+                    if candidate_results:
+                        results = candidate_results
+                        break
+                if not results:
+                    for search_query in case_search_queries:
+                        try:
+                            data = client.search(
+                                search_query, type="o", page_size=10,
+                            )
+                            candidate_results = [
+                                it for it in (data.get("results") or [])
+                                if not _is_scotus_order_item(it)
+                            ]
+                        except Exception:
+                            candidate_results = []
+                        if candidate_results:
+                            results = candidate_results
+                            break
+                    results = results[:3]
                 tagged = [("cl", it) for it in results]
             else:
                 # Just words (a case name): CourtListener gives the name no
@@ -4980,6 +5048,24 @@ class CourtListenerGUI:
                         ):
                             result = fetcher.fetch_by_url(hit.url)
                             break
+                # Scholar sometimes indexes early Supreme Court opinions only
+                # under the modern U.S. Reports citation.  Keep the literal
+                # cite first (it can be a different reporter), then retry its
+                # verified counterpart only when that lookup found nothing.
+                alt_cite = _us_reports_cite(cite)
+                if not result and alt_cite:
+                    result = fetcher.fetch_by_citation(alt_cite)
+                    if not result and name:
+                        hits = fetcher.search_cases(
+                            f"{name} {alt_cite}", limit=3,
+                        )
+                        for hit in hits:
+                            if _scholar_bears_citation(hit, alt_cite) or (
+                                _name_match_score(name, hit.title or "")
+                                >= _NAME_MATCH_MIN
+                            ):
+                                result = fetcher.fetch_by_url(hit.url)
+                                break
             except Exception as exc:
                 print(f"[citelist] scholar {cite!r}: {exc}")
             if result:
