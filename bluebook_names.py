@@ -1711,6 +1711,13 @@ def abbreviate_case_name(name: str) -> str:
     # OCR renders the early reports' turned-comma apostrophe as U+2018
     # ("M‘Intosh"); normalize so name patterns and casing rules see it.
     name = re.sub(r"\s+", " ", (name or "").replace("‘", "'")).strip()
+    # A reporter caption's footnote marker clings to the end of the name —
+    # a reference symbol ("THE EUGENE F. MORAN.*"), or a superscript digit
+    # that OCR sets as a plain digit right after the sentence period ("THE
+    # EUGENE F. MORAN.1").  A digit reached through a space ("Apollo 13",
+    # "No. 12") is part of the name and stays.
+    name = re.sub(r"\s*[*†‡§¶#¹²³⁴⁵⁶⁷⁸⁹⁰]+$", "", name)
+    name = re.sub(r"(?<=\.)\d{1,2}$", "", name)
     # Strip any "(Re <underlying case>)" cross-reference before splitting:
     # its own " v. " would otherwise masquerade as this case's separator.
     name = strip_related_case_note(name)
@@ -1969,6 +1976,14 @@ if __name__ == "__main__":
         ("The Thomas Jefferson", "The Thomas Jefferson"),
         ("The Silvia.", "The Silvia"),
         ("The Western Maid, et al.", "The Western Maid"),
+        # A footnote marker at the end of a reporter caption — a reference
+        # symbol or an OCR-flattened superscript digit — is no part of the
+        # name; a digit reached through a space is ("Apollo 13").
+        ("The Eugene F. Moran.*", "The Eugene F. Moran"),
+        ("The Eugene F. Moran.†", "The Eugene F. Moran"),
+        ("The Eugene F. Moran.1", "The Eugene F. Moran"),
+        ("Youngstown Sheet & Tube Co. v. Sawyer.*",
+         "Youngstown Sheet & Tube Co. v. Sawyer"),
         # "The King" / "The Queen" as a party also keeps the article.
         ("The King v. Joyce", "The King v. Joyce"),
         ("The Queen v. Dudley", "The Queen v. Dudley"),
