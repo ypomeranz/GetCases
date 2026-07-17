@@ -1195,6 +1195,17 @@ _PARTY_ROLE_RE = re.compile(
 )
 
 
+def _strip_party_designations(p: str) -> str:
+    """Peel role designations and "et al." off the right in turn (rules
+    10.2.1, 10.2.1(a)) until neither remains."""
+    while True:
+        q = _ET_AL_RE.sub("", p.rstrip(" ,;")).rstrip(" ,;")
+        q = _PARTY_ROLE_RE.sub("", q)
+        if q == p:
+            return p
+        p = q
+
+
 def _strip_given_names(p: str) -> str | None:
     """Surname-only form of a personal party name (rule 10.2.1(g)), or
     None when the party does not safely read as an individual's name."""
@@ -1451,13 +1462,14 @@ def _is_bare_place(place: str) -> bool:
 
 
 def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
-    p = re.sub(r"\s+", " ", party).strip()
-    while True:  # designations and "et al." peel off the right in turn
-        q = _ET_AL_RE.sub("", p.rstrip(" ,;")).rstrip(" ,;")
-        q = _PARTY_ROLE_RE.sub("", q)
-        if q == p:
-            break
-        p = q
+    p = _strip_party_designations(re.sub(r"\s+", " ", party).strip())
+    # Rule 10.2.1(d): a party's leading "The" is omitted — except when "The
+    # King" or "The Queen" is the party, where the article is part of the
+    # name.  (The rule's other exception, the object of an in rem action,
+    # is an adversary-less caption and is handled in abbreviate_case_name.)
+    crown = re.fullmatch(r"the\s+(king|queen)", p, flags=re.IGNORECASE)
+    if crown:
+        return "The " + crown.group(1).capitalize()
     p = re.sub(r"^the\s+", "", p, flags=re.IGNORECASE)  # rule 10.2.1(d)
     p = re.sub(r"\bUnited States of America\b", "United States", p,
                flags=re.IGNORECASE)
@@ -1716,6 +1728,23 @@ def abbreviate_case_name(name: str) -> str:
     if not name:
         return name
     parts = _V_SPLIT_RE.split(name, maxsplit=1)
+    # Rule 10.2.1(d) keeps "The" when it is part of the name of the object of
+    # an in rem action: an adversary-less caption opening with "The" names
+    # the res itself — an admiralty vessel ("The Silvia", "The Paquete
+    # Habana") — and the ship's proper name survives whole, since party
+    # rules would misread it as a litigant ("The Daniel Ball" is not
+    # Mr. Ball).  Grouped-litigation popular names ("The Prize Cases") and a
+    # bare business name ("The Boeing Company") are not in rem objects and
+    # still shed the article through the ordinary party path.
+    if len(parts) == 1:
+        res = _strip_party_designations(parts[0])
+        art = re.match(r"the\s+(?=\S)", res, flags=re.IGNORECASE)
+        if art:
+            last = re.sub(r"[^a-z]", "", res.split()[-1].lower())
+            if (last not in _APPOSITIVE_ENTITY_TERMS
+                    and not re.fullmatch(r"cases?", last)):
+                return _strip_trailing_period(
+                    _lowercase_small_words("The " + res[art.end():]))
     joined = " v. ".join(
         _drop_redundant_entity(_abbreviate_party(p)) for p in parts
     )
@@ -1919,6 +1948,22 @@ if __name__ == "__main__":
         ("Katherine Inc. v. Smith", "Katherine Inc. v. Smith"),
         ("Matter of Standard Jury Instructions",
          "In re Standard Jury Instructions"),
+        # Rule 10.2.1(d): the object of an in rem action keeps its "The",
+        # and the vessel's proper name is never reduced or abbreviated.
+        ("The Silvia", "The Silvia"),
+        ("The Paquete Habana", "The Paquete Habana"),
+        ("The Western Maid", "The Western Maid"),
+        ("The Thomas Jefferson", "The Thomas Jefferson"),
+        ("The Silvia.", "The Silvia"),
+        ("The Western Maid, et al.", "The Western Maid"),
+        # "The King" / "The Queen" as a party also keeps the article.
+        ("The King v. Joyce", "The King v. Joyce"),
+        ("The Queen v. Dudley", "The Queen v. Dudley"),
+        # A grouped-litigation popular name is not an in rem object, nor is
+        # a bare business name: their leading article still drops.
+        ("The Prize Cases", "Prize Cases"),
+        ("The Pocket Veto Case", "Pocket Veto Case"),
+        ("The Boeing Company", "Boeing Co."),
         # Widely recognized initials (rule 10.2.1(c))
         ("Lorenzo v. Securities and Exchange Commission", "Lorenzo v. SEC"),
         ("Securities & Exchange Commission v. Edwards", "SEC v. Edwards"),
