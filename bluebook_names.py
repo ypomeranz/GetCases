@@ -870,6 +870,60 @@ def refine_caption_case(name: str, body_text: str) -> str:
     return " ".join(tokens)
 
 
+_HISTORICAL_BANK_WRAPPER_RE = re.compile(
+    r"^(?:the\s+)?(?:president|governor)\s*,?\s+"
+    r"(?:directors?|dirs?\.?|trustees?)\s*,?\s+"
+    r"(?:and|&)\s+(?:company|co\.?|corporation)\s+of\s+"
+    r"(?P<entity>(?:the\s+)?bank\s+of\s+.+?)"
+    r"(?:,\s*(?:appellants?|appellees?|petitioners?|respondents?|"
+    r"plaintiffs?|defendants?)\.?)?$",
+    re.IGNORECASE,
+)
+
+
+def simplify_historical_entity_caption(name: str, body_text: str) -> str:
+    """Remove a charter-era corporate wrapper when the opinion proves the
+    embedded institution is the party's working name.
+
+    Early reports sometimes style a bank as ``President, Directors, and
+    Company of the Bank of ...`` even though the opinion itself repeatedly
+    calls the litigant ``Bank of ...``.  This is not a metadata substitution:
+    the shorter entity must occur inside the caption and must also appear at
+    least twice in the opinion's own mixed-case prose.  Other formal names
+    (for example, ``President and Fellows of Harvard College``) and a wrapper
+    lacking that internal evidence pass through unchanged.
+    """
+    if not name or not body_text:
+        return name
+
+    sides = _V_SPLIT_RE.split(name, maxsplit=1)
+    changed = False
+    for i, side in enumerate(sides):
+        m = _HISTORICAL_BANK_WRAPPER_RE.fullmatch(side.strip(" ,.;"))
+        if not m:
+            continue
+        entity = re.sub(r"^the\s+", "", m.group("entity"),
+                        flags=re.IGNORECASE).strip(" ,.;")
+        if not entity:
+            continue
+        pattern = re.compile(
+            r"\b" + r"\s+".join(re.escape(w) for w in entity.split()) + r"\b",
+            re.IGNORECASE,
+        )
+        evidence = [match.group(0) for match in pattern.finditer(body_text)]
+        evidence = [text for text in evidence
+                    if any(c.islower() for c in text)
+                    and text[:1].isupper()]
+        if len(evidence) < 2:
+            continue
+        # Retain the caption's words and punctuation; the opinion supplies
+        # only confirmation that the embedded entity is independently used.
+        entity = _lowercase_small_words(entity[:1].upper() + entity[1:])
+        sides[i] = entity
+        changed = True
+    return " v. ".join(sides) if changed else name
+
+
 _CAPTION_ENTITY_MARKERS = frozenset({
     "association", "associates", "authority", "bank", "board", "company",
     "co", "communications", "corp", "corporation", "enterprises",

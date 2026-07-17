@@ -49,6 +49,7 @@ from bluebook_names import (
     abbreviate_case_name,
     normal_case_caption,
     refine_caption_case,
+    simplify_historical_entity_caption,
     strip_related_case_note,
 )
 
@@ -295,7 +296,9 @@ def extract_record(
             raw_name = _smart_titlecase(raw_name)  # caption is often ALL CAPS
             # The body's mixed-case prose corrects ambiguous title-casing
             # guesses ("Us Dominion" -> "US Dominion").
-            raw_name = refine_caption_case(raw_name, _prose_text(blocks))
+            prose = _prose_text(blocks)
+            raw_name = refine_caption_case(raw_name, prose)
+            raw_name = simplify_historical_entity_caption(raw_name, prose)
     name = abbreviate_case_name(raw_name) if raw_name else ""
 
     cites = _header_cites(blocks)

@@ -826,7 +826,33 @@ def _neutral_sep_direct_kind(
     # Opening role language remains useful when no contrary disposition is
     # stated.  Keep its existing short look-ahead and boundary safeguards.
     kind, evidenced = _peek_sep_kind_evidence(blocks, start)
-    return kind if evidenced else ""
+    if evidenced:
+        return kind
+
+    # A long old-style opinion may reserve its only explicit statement of
+    # position for the conclusion.  Read the tail as well as the opening:
+    # Osborn's Johnson opinion runs more than thirty paragraphs under the
+    # neutral heading "Mr. Justice JOHNSON." and only then says "I feel
+    # compelled to dissent from the Court."  These first-person forms prove
+    # the role; merely discussing another judge's dissent does not.
+    tail = " ".join(
+        _content_text(b) for b in blocks[max(start + 1, end - 10):end]
+    )
+    if re.search(
+        r"\bI\s+(?:(?:respectfully|therefore|accordingly|also|must)\s+)*"
+        r"(?:(?:feel\s+compelled|am\s+(?:compelled|constrained))\s+to\s+)?"
+        r"dissent\b|\bI\s+(?:cannot|can\s+not|do\s+not)\s+concur\b",
+        tail, re.IGNORECASE,
+    ):
+        return "dissent"
+    if re.search(
+        r"\bI\s+(?:(?:respectfully|therefore|accordingly|also|must)\s+)*"
+        r"(?:(?:feel\s+compelled|am\s+(?:compelled|constrained))\s+to\s+)?"
+        r"concur\b",
+        tail, re.IGNORECASE,
+    ):
+        return "concurrence"
+    return ""
 
 
 def _resolve_neutral_sep_boundaries(
@@ -1274,6 +1300,8 @@ def segment_blocks(blocks: list[Block]) -> list[OpinionPart]:
                 kind, evidenced = _peek_sep_kind_evidence(
                     blocks, i, default="majority" if seriatim else "concurrence"
                 )
+                if not evidenced and not seriatim:
+                    kind = "separate"
                 bare_headers.append((i, kind, t, evidenced))
             continue
         if len(t) <= 260 and _JOINED_SEP_HEADER_RE.match(t):

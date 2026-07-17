@@ -266,6 +266,32 @@ class CaptionCapitalizationTests(unittest.TestCase):
 
 
 class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
+    def test_historical_bank_wrapper_uses_opinions_own_entity_name(self):
+        # Osborn v. Bank of the United States, 22 U.S. (9 Wheat.) 738
+        # (1824): the reporter caption gives the bank's formal charter style,
+        # while Marshall and Johnson repeatedly call the party the Bank of
+        # the United States in their opinions.
+        blocks = [
+            Block("center", [Span(
+                "OSBORN and others, Appellants, v. The PRESIDENT, "
+                "DIRECTORS, AND COMPANY OF THE BANK OF THE UNITED STATES, "
+                "Respondents."
+            )]),
+            Block("para", [Span(
+                "The Bank of the United States is an instrument of the "
+                "national government."
+            )]),
+            Block("para", [Span(
+                "The charter permits the Bank of the United States to sue."
+            )]),
+        ]
+
+        name = _scholar_caption_name(blocks)
+        self.assertEqual(
+            name, "Osborn and others v. Bank of the United States")
+        self.assertEqual(
+            abbreviate_case_name(name), "Osborn v. Bank of the U.S.")
+
     def test_geographic_party_starts_joined_respondent_list(self):
         # General Telephone Co. of the Southwest v. United States,
         # 449 F.2d 846 (5th Cir. 1971): United States and the FCC are two

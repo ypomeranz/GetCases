@@ -606,6 +606,7 @@ from bluebook_names import (
     is_recognized_given_name,
     normal_case_caption,
     refine_caption_case,
+    simplify_historical_entity_caption,
     strip_related_case_note,
 )
 from citation_overrides import (
@@ -7706,6 +7707,22 @@ def _caption_party(s: str) -> str:
     raw = [clean_seg(p) for p in re.split(r"[,;]", s)]
     segs = [p for p in raw if p]
     if segs:
+        # A charter-era bank's formal corporate style contains structural
+        # commas that do not separate parties: "The President, Directors,
+        # and Company of the Bank of ...".  Reassemble that fixed title
+        # before the ordinary co-party logic examines comma segments.  The
+        # opinion-evidence refinement later decides whether the embedded
+        # "Bank of ..." may stand alone as the working party name.
+        if (len(segs) >= 3
+                and re.fullmatch(r"(?:the\s+)?(?:president|governor)",
+                                 segs[0], re.IGNORECASE)
+                and re.fullmatch(r"(?:directors?|dirs?\.?|trustees?)",
+                                 segs[1], re.IGNORECASE)
+                and re.match(
+                    r"(?:and|&)\s+(?:company|co\.?|corporation)\s+of\s+"
+                    r"(?:the\s+)?bank\s+of\b",
+                    segs[2], re.IGNORECASE)):
+            segs = [", ".join(segs[:3])] + segs[3:]
         # 1. Consolidation cut: a later segment that re-names the first party
         # (same final token), contains its own " v. ", or introduces another
         # party ("and Ace Garage" — unless it ends the entity's own name,
@@ -7943,6 +7960,12 @@ def _trim_procedural_caption(text: str) -> str:
 
 def _scholar_caption_name(blocks) -> str:
     """Bluebook case name derived from the Scholar page's party caption."""
+
+    def refine(name: str) -> str:
+        body = _scholar_body_text(blocks)
+        return simplify_historical_entity_caption(
+            refine_caption_case(name, body), body)
+
     for b in blocks[:8]:
         if b.kind != "center":
             continue
@@ -7968,8 +7991,7 @@ def _scholar_caption_name(blocks) -> str:
         # Clause for 2015-2016 #156").
         if re.match(r"(?:IN\s+RE|EX\s+PARTE|(?:IN\s+THE\s+)?MATTER\s+OF)\b", t, re.IGNORECASE):
             t2 = _cut_companion_cases(_trim_procedural_caption(t))
-            return refine_caption_case(
-                _titlecase_caps(t2.strip()), _scholar_body_text(blocks))
+            return refine(_titlecase_caps(t2.strip()))
         # Google Scholar renders the party separator in lowercase ("… v. …")
         # even for ALL-CAPS captions ("MERCY HOSPITAL, INC. v. JACKSON"), so
         # a lowercase "v."/"vs." — or the earliest reports' spelled-out
@@ -7988,8 +8010,7 @@ def _scholar_caption_name(blocks) -> str:
             sides[1] = _cut_companion_cases(sides[1])
             left, right = _caption_party(sides[0]), _caption_party(sides[1])
             if left and right:
-                return refine_caption_case(
-                    f"{left} v. {right}", _scholar_body_text(blocks))
+                return refine(f"{left} v. {right}")
         # A single-party caption ("HAYBURN'S CASE.", "THE AMISTAD.") has no
         # separator to split on; without this branch the cite line would
         # become the case name downstream.  Court, date, and docket lines
@@ -8012,9 +8033,8 @@ def _scholar_caption_name(blocks) -> str:
                     r"\b(?:rehearing|certiorari|en banc|as amended|"
                     r"as modified|as corrected|petition for)\b",
                     t, re.IGNORECASE)):
-            return refine_caption_case(
-                _titlecase_caps(_cut_companion_cases(t).split(",")[0].strip()),
-                _scholar_body_text(blocks))
+            return refine(
+                _titlecase_caps(_cut_companion_cases(t).split(",")[0].strip()))
     return ""
 
 
@@ -13943,6 +13963,7 @@ class _ScholarTextWindow:
             name = re.split(r",\s*\d{1,4}\s", first)[0].strip().rstrip(",")[:120]
         opinion_body = _scholar_body_text(self._blocks)
         name = refine_caption_case(normal_case_caption(name), opinion_body)
+        name = simplify_historical_entity_caption(name, opinion_body)
         unresolved_caption_case = caption_case_reference_tokens(
             name, opinion_body)
 
