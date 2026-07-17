@@ -1036,6 +1036,62 @@ class OpinionUnpublishedCaseLinkTests(unittest.TestCase):
             win._app, win._win, spec, win._status_var.set)
 
 
+class HistoricalFederalCourtTests(unittest.TestCase):
+    def test_old_circuit_court_id_reaches_bluebook_form(self):
+        # United States v. Cohn, 128 F. 615 (C.C.S.D.N.Y. 1904):
+        # CourtListener's id for the old circuit court (abolished 1912) is
+        # "circtsdny" — previously printed raw in the parenthetical.
+        win = object.__new__(_ScholarTextWindow)
+        win._item = {
+            "case_name": "United States v. Cohn",
+            "citation": ["128 F. 615"],
+            "court_id": "circtsdny",
+            "date_filed": "1904-02-15",
+        }
+        win._blocks = [
+            Block("center", [Span("128 F. 615 (1904)")]),
+            Block("center", [Span("UNITED STATES v. COHN.")]),
+            Block("center", [Span("Circuit Court, S. D. New York.")]),
+            Block("para", [Span("HOLT, District Judge.")]),
+        ]
+
+        bb = win._compute_bluebook_parts()
+
+        self.assertEqual(bb["court"], "C.C.S.D.N.Y.")
+        self.assertEqual(bb["year"], "1904")
+
+    def test_historical_and_bankruptcy_ids_are_mapped(self):
+        from court_catalog import COURT_BLUEBOOK
+        self.assertEqual(COURT_BLUEBOOK["circtsdny"], "C.C.S.D.N.Y.")
+        self.assertEqual(COURT_BLUEBOOK["circtdal"], "C.C.D. Ala.")
+        self.assertEqual(COURT_BLUEBOOK["ald"], "D. Ala.")
+        self.assertEqual(COURT_BLUEBOOK["nysb"], "Bankr. S.D.N.Y.")
+        # CL's "arb" is Arizona (not Arkansas — those are areb/arwb): the
+        # table is generated from court *names*, immune to the id scheme.
+        self.assertEqual(COURT_BLUEBOOK["arb"], "Bankr. D. Ariz.")
+
+    def test_unknown_court_id_is_never_printed_raw(self):
+        from courtlistener_gui import _court_for_paren
+        self.assertEqual(
+            _court_for_paren("100 F. 1", "someunknownid", "someunknownid"),
+            "",
+        )
+
+    def test_old_circuit_header_line_parses(self):
+        self.assertEqual(
+            bluebook_federal_trial_court("Circuit Court, S. D. New York."),
+            "C.C.S.D.N.Y.",
+        )
+        self.assertEqual(
+            bluebook_federal_trial_court("Circuit Court, D. Massachusetts."),
+            "C.C.D. Mass.",
+        )
+        # County circuit courts are state trial courts, never C.C.
+        for name in ("Circuit Court for Baltimore County, Maryland",
+                     "Circuit Court of Cook County, Illinois"):
+            self.assertEqual(bluebook_federal_trial_court(name), "")
+
+
 class FederalTrialCourtTests(unittest.TestCase):
     def test_district_captions_reach_bluebook_form(self):
         cases = [

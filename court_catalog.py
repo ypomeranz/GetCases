@@ -351,6 +351,258 @@ EXTRA_BLUEBOOK: dict[str, str] = {
     "tennsuperct": "Tenn. Super. Ct.",
 }
 
+# Historical and low-traffic federal courts, generated from CourtListener's
+# own court names via bluebook_federal_trial_court (plus hand entries for
+# specials and two CL misspellings): the old circuit courts abolished in
+# 1912 ("circtsdny" -> "C.C.S.D.N.Y." for United States v. Cohn, 128 F.
+# 615), the pre-split single-district courts ("ald" -> "D. Ala."), every
+# bankruptcy court, and the familiar boards.  Without these a case loaded
+# from CourtListener printed the raw id in its parenthetical.
+HISTORICAL_FEDERAL_BLUEBOOK: dict[str, str] = {
+    "akb": "Bankr. D. Alaska",
+    "ald": "D. Ala.",
+    "almb": "Bankr. M.D. Ala.",
+    "alnb": "Bankr. N.D. Ala.",
+    "alsb": "Bankr. S.D. Ala.",
+    "arb": "Bankr. D. Ariz.",
+    "ard": "D. Ark.",
+    "areb": "Bankr. E.D. Ark.",
+    "arwb": "Bankr. W.D. Ark.",
+    "asbca": "A.S.B.C.A.",
+    "bia": "B.I.A.",
+    "bpai": "B.P.A.I.",
+    "bta": "B.T.A.",
+    "cacb": "Bankr. C.D. Cal.",
+    "caeb": "Bankr. E.D. Cal.",
+    "californiad": "D. Cal.",
+    "canalzoned": "D.C.Z.",
+    "canb": "Bankr. N.D. Cal.",
+    "casb": "Bankr. S.D. Cal.",
+    "cc": "Ct. Cl.",
+    "ccpa": "C.C.P.A.",
+    "circtcapefearnc": "C.C.D.N.C.",
+    "circtdal": "C.C.D. Ala.",
+    "circtdalb": "C.C.D.N.C.",
+    "circtdalbanyny": "C.C.D.N.Y.",
+    "circtdar": "C.C.D. Ark.",
+    "circtdca": "C.C.D. Cal.",
+    "circtdco": "C.C.D. Colo.",
+    "circtdct": "C.C.D. Conn.",
+    "circtddc": "C.C.D.D.C.",
+    "circtdedenton": "C.C.D.N.C.",
+    "circtdel": "C.C.D. Del.",
+    "circtdga": "C.C.D. Ga.",
+    "circtdia": "C.C.D. Iowa",
+    "circtdid": "C.C.D. Idaho",
+    "circtdil": "C.C.D. Ill.",
+    "circtdin": "C.C.D. Ind.",
+    "circtdks": "C.C.D. Kan.",
+    "circtdky": "C.C.D. Ky.",
+    "circtdla": "C.C.D. La.",
+    "circtdma": "C.C.D. Mass.",
+    "circtdmd": "C.C.D. Md.",
+    "circtdme": "C.C.D. Me.",
+    "circtdmi": "C.C.D. Mich.",
+    "circtdmn": "C.C.D. Minn.",
+    "circtdmo": "C.C.D. Mo.",
+    "circtdms": "C.C.D. Miss.",
+    "circtdmt": "C.C.D. Mont.",
+    "circtdnd": "C.C.D.N.D.",
+    "circtdne": "C.C.D. Neb.",
+    "circtdnewbern": "C.C.D.N.C.",
+    "circtdnh": "C.C.D.N.H.",
+    "circtdnj": "C.C.D.N.J.",
+    "circtdnv": "C.C.D. Nev.",
+    "circtdoh": "C.C.D. Ohio",
+    "circtdor": "C.C.D. Or.",
+    "circtdpa": "C.C.D. Pa.",
+    "circtdpamptico": "C.C.D.N.C.",
+    "circtdri": "C.C.D.R.I.",
+    "circtdsc": "C.C.D.S.C.",
+    "circtdsd": "C.C.D.S.D.",
+    "circtdtx": "C.C.D. Tex.",
+    "circtdut": "C.C.D. Utah",
+    "circtdva": "C.C.D. Va.",
+    "circtdvt": "C.C.D. Vt.",
+    "circtdwa": "C.C.D. Wash.",
+    "circtdwi": "C.C.D. Wis.",
+    "circtdwilm": "C.C.D.N.C.",
+    "circtdwv": "C.C.D. W. Va.",
+    "circtdwy": "C.C.D. Wyo.",
+    "circtedar": "C.C.E.D. Ark.",
+    "circtedil": "C.C.E.D. Ill.",
+    "circtedky": "C.C.E.D. Ky.",
+    "circtedla": "C.C.E.D. La.",
+    "circtedmi": "C.C.E.D. Mich.",
+    "circtedmo": "C.C.E.D. Mo.",
+    "circtednc": "C.C.E.D.N.C.",
+    "circtedny": "C.C.E.D.N.Y.",
+    "circtedok": "C.C.E.D. Okla.",
+    "circtedpa": "C.C.E.D. Pa.",
+    "circtedsc": "C.C.E.D.S.C.",
+    "circtedtn": "C.C.E.D. Tenn.",
+    "circtedtx": "C.C.E.D. Tex.",
+    "circtedva": "C.C.E.D. Va.",
+    "circtedwa": "C.C.E.D. Wash.",
+    "circtedwi": "C.C.E.D. Wis.",
+    "circtmdal": "C.C.M.D. Ala.",
+    "circtmdpa": "C.C.M.D. Pa.",
+    "circtmdtn": "C.C.M.D. Tenn.",
+    "circtnc": "C.C.D.N.C.",
+    "circtndal": "C.C.N.D. Ala.",
+    "circtndca": "C.C.N.D. Cal.",
+    "circtndfl": "C.C.N.D. Fla.",
+    "circtndga": "C.C.N.D. Ga.",
+    "circtndil": "C.C.N.D. Ill.",
+    "circtndms": "C.C.N.D. Miss.",
+    "circtndny": "C.C.N.D.N.Y.",
+    "circtndoh": "C.C.N.D. Ohio",
+    "circtndtx": "C.C.N.D. Tex.",
+    "circtndwv": "C.C.N.D. W. Va.",
+    "circtnia": "C.C.N.D. Iowa",
+    "circtny": "C.C.D.N.Y.",
+    "circtsdal": "C.C.S.D. Ala.",
+    "circtsdca": "C.C.S.D. Cal.",
+    "circtsdfl": "C.C.S.D. Fla.",
+    "circtsdga": "C.C.S.D. Ga.",
+    "circtsdia": "C.C.S.D. Iowa",
+    "circtsdil": "C.C.S.D. Ill.",
+    "circtsdms": "C.C.S.D. Miss.",
+    "circtsdny": "C.C.S.D.N.Y.",
+    "circtsdoh": "C.C.S.D. Ohio",
+    "circtsdtex": "C.C.S.D. Tex.",
+    "circtsdwv": "C.C.S.D. W. Va.",
+    "circttenn": "C.C.D. Tenn.",
+    "circtwdar": "C.C.W.D. Ark.",
+    "circtwdky": "C.C.W.D. Ky.",
+    "circtwdla": "C.C.W.D. La.",
+    "circtwdmi": "C.C.W.D. Mich.",
+    "circtwdmo": "C.C.W.D. Mo.",
+    "circtwdnc": "C.C.W.D.N.C.",
+    "circtwdny": "C.C.W.D.N.Y.",
+    "circtwdok": "C.C.W.D. Okla.",
+    "circtwdpa": "C.C.W.D. Pa.",
+    "circtwdtex": "C.C.W.D. Tex.",
+    "circtwdtn": "C.C.W.D. Tenn.",
+    "circtwdva": "C.C.W.D. Va.",
+    "circtwdwa": "C.C.W.D. Wash.",
+    "circtwdwi": "C.C.W.D. Wis.",
+    "cob": "Bankr. D. Colo.",
+    "com": "Comm. Ct.",
+    "ctb": "Bankr. D. Conn.",
+    "cusc": "Cust. Ct.",
+    "dcb": "Bankr. D.D.C.",
+    "deb": "Bankr. D. Del.",
+    "fld": "D. Fla.",
+    "flmb": "Bankr. M.D. Fla.",
+    "flnb": "Bankr. N.D. Fla.",
+    "flsb": "Bankr. S.D. Fla.",
+    "gad": "D. Ga.",
+    "gamb": "Bankr. M.D. Ga.",
+    "ganb": "Bankr. N.D. Ga.",
+    "gasb": "Bankr. S.D. Ga.",
+    "gub": "Bankr. D. Guam",
+    "hib": "Bankr. D. Haw.",
+    "iad": "D. Iowa",
+    "ianb": "Bankr. N.D. Iowa",
+    "iasb": "Bankr. S.D. Iowa",
+    "idb": "Bankr. D. Idaho",
+    "ilcb": "Bankr. C.D. Ill.",
+    "illinoisd": "D. Ill.",
+    "illinoised": "E.D. Ill.",
+    "ilnb": "Bankr. N.D. Ill.",
+    "ilsb": "Bankr. S.D. Ill.",
+    "indianad": "D. Ind.",
+    "innb": "Bankr. N.D. Ind.",
+    "insb": "Bankr. S.D. Ind.",
+    "ksb": "Bankr. D. Kan.",
+    "kyd": "D. Ky.",
+    "kyeb": "Bankr. E.D. Ky.",
+    "kywb": "Bankr. W.D. Ky.",
+    "lad": "D. La.",
+    "laeb": "Bankr. E.D. La.",
+    "lamb": "Bankr. M.D. La.",
+    "lawb": "Bankr. W.D. La.",
+    "mab": "Bankr. D. Mass.",
+    "mdb": "Bankr. D. Md.",
+    "meb": "Bankr. D. Me.",
+    "michd": "D. Mich.",
+    "mieb": "Bankr. E.D. Mich.",
+    "missd": "D. Miss.",
+    "miwb": "Bankr. W.D. Mich.",
+    "mnb": "Bankr. D. Minn.",
+    "mod": "D. Mo.",
+    "moeb": "Bankr. E.D. Mo.",
+    "mowb": "Bankr. W.D. Mo.",
+    "msnb": "Bankr. N.D. Miss.",
+    "mspb": "M.S.P.B.",
+    "mssb": "Bankr. S.D. Miss.",
+    "mtb": "Bankr. D. Mont.",
+    "ncd": "D.N.C.",
+    "nceb": "Bankr. E.D.N.C.",
+    "ncmb": "Bankr. M.D.N.C.",
+    "ncwb": "Bankr. W.D.N.C.",
+    "ndb": "Bankr. D.N.D.",
+    "nebraskab": "Bankr. D. Neb.",
+    "nhb": "Bankr. D.N.H.",
+    "njb": "Bankr. D.N.J.",
+    "nmb": "Bankr. D.N.M.",
+    "nmib": "Bankr. D. N. Mar. I.",
+    "nvb": "Bankr. D. Nev.",
+    "nyd": "D.N.Y.",
+    "nyeb": "Bankr. E.D.N.Y.",
+    "nynb": "Bankr. N.D.N.Y.",
+    "nysb": "Bankr. S.D.N.Y.",
+    "nywb": "Bankr. W.D.N.Y.",
+    "ohiod": "D. Ohio",
+    "ohnb": "Bankr. N.D. Ohio",
+    "ohsb": "Bankr. S.D. Ohio",
+    "okd": "D. Okla.",
+    "okeb": "Bankr. E.D. Okla.",
+    "oknb": "Bankr. N.D. Okla.",
+    "okwb": "Bankr. W.D. Okla.",
+    "orb": "Bankr. D. Or.",
+    "paeb": "Bankr. E.D. Pa.",
+    "pamb": "Bankr. M.D. Pa.",
+    "pawb": "Bankr. W.D. Pa.",
+    "pennsylvaniad": "D. Pa.",
+    "prb": "Bankr. D.P.R.",
+    "ptab": "P.T.A.B.",
+    "rib": "Bankr. D.R.I.",
+    "scb": "Bankr. D.S.C.",
+    "sdb": "Bankr. D.S.D.",
+    "southcarolinaed": "E.D.S.C.",
+    "southcarolinawd": "W.D.S.C.",
+    "tennessed": "D. Tenn.",
+    "tennesseeb": "Bankr. D. Tenn.",
+    "texd": "D. Tex.",
+    "tneb": "Bankr. E.D. Tenn.",
+    "tnmb": "Bankr. M.D. Tenn.",
+    "tnwb": "Bankr. W.D. Tenn.",
+    "ttab": "T.T.A.B.",
+    "txeb": "Bankr. E.D. Tex.",
+    "txnb": "Bankr. N.D. Tex.",
+    "txsb": "Bankr. S.D. Tex.",
+    "txwb": "Bankr. W.D. Tex.",
+    "utb": "Bankr. D. Utah",
+    "vad": "D. Va.",
+    "vaeb": "Bankr. E.D. Va.",
+    "vawb": "Bankr. W.D. Va.",
+    "vib": "Bankr. D.V.I.",
+    "vtb": "Bankr. D. Vt.",
+    "waeb": "Bankr. E.D. Wash.",
+    "washd": "D. Wash.",
+    "wawb": "Bankr. W.D. Wash.",
+    "wieb": "Bankr. E.D. Wis.",
+    "wisd": "D. Wis.",
+    "wiwb": "Bankr. W.D. Wis.",
+    "wvad": "D. W. Va.",
+    "wvnb": "Bankr. N.D. W. Va.",
+    "wvsb": "Bankr. S.D. W. Va.",
+    "wyb": "Bankr. D. Wyo.",
+}
+
+
 # --- Merged Bluebook map (same content the GUI used previously) ---------------
 
 COURT_BLUEBOOK: dict[str, str] = {}
@@ -358,6 +610,7 @@ COURT_BLUEBOOK.update(CIRCUIT_COURTS)
 COURT_BLUEBOOK.update(DISTRICT_COURTS)
 COURT_BLUEBOOK.update(SPECIAL_COURTS)
 COURT_BLUEBOOK.update(EXTRA_BLUEBOOK)
+COURT_BLUEBOOK.update(HISTORICAL_FEDERAL_BLUEBOOK)
 for _state, _courts in STATE_COURTS:
     for _cid, _abbr, _label in _courts:
         COURT_BLUEBOOK[_cid] = _abbr
@@ -490,24 +743,27 @@ _FED_DISTRICT_WORD = {
 
 
 def bluebook_federal_trial_court(name: str) -> str:
-    """Bluebook abbreviation for a federal district or bankruptcy court from
-    its caption name — "United States District Court, M.D. North Carolina,
-    Greensboro Division" → "M.D.N.C.", "United States Bankruptcy Court,
-    S.D. Texas, Houston Division" → "Bankr. S.D. Tex.", "District Court,
-    E. D. Pennsylvania" → "E.D. Pa." — or "" when the name isn't one (a
-    "District Court of Appeal", a state trial "district court").
+    """Bluebook abbreviation for a federal trial court from its caption
+    name — "United States District Court, M.D. North Carolina, Greensboro
+    Division" → "M.D.N.C.", "United States Bankruptcy Court, S.D. Texas,
+    Houston Division" → "Bankr. S.D. Tex.", "District Court, E. D.
+    Pennsylvania" → "E.D. Pa.", and the old federal circuit courts
+    (abolished 1912): "Circuit Court, S. D. New York" → "C.C.S.D.N.Y." —
+    or "" when the name isn't one (a "District Court of Appeal", a state
+    trial "district court", a county "Circuit Court").
 
     Adjacent single-capital abbreviations close up (rule 6.1(b)):
-    "S.D.N.Y.", "D.D.C.", but "E.D. Pa.", "D. Mass.".
+    "S.D.N.Y.", "D.D.C.", "C.C.S.D.N.Y.", but "E.D. Pa.", "C.C.D. Mass.".
     """
     import re
 
     t = re.sub(r"\s+", " ", (name or "")).strip()
     low = t.lower()
-    is_bankr = "bankruptcy court" in low
-    if not is_bankr and "district court" not in low:
-        return ""
     if "court of appeal" in low:
+        return ""
+    is_bankr = "bankruptcy court" in low
+    is_circt = not is_bankr and "circuit court" in low
+    if not (is_bankr or is_circt or "district court" in low):
         return ""
     state = ""
     spos = -1
@@ -523,14 +779,24 @@ def bluebook_federal_trial_court(name: str) -> str:
     # Eastern Division" — the division tail after the state never matters,
     # and old single-district captions put a division there: "United States
     # District Court, South Dakota, C. D." is D.S.D., not C.D.S.D.).
+    # CourtListener inverts some historical names ("U.S. Circuit Court for
+    # the District of Southern New York"), hence the third alternative.
     head = low[:spos]
     dm = (re.search(r"\b([nsewmc])\.?\s?d\.(?=\s|$)", head)
           or re.search(r"\b(northern|southern|eastern|western|middle|central)"
-                       r"\s+district\b", head))
-    # A bare state "district court" line without a federal marker is a state
-    # trial court ("District Court, City and County of Denver, Colorado").
+                       r"\s+district\b", head)
+          or re.search(r"\bdistrict\s+of\s+"
+                       r"(northern|southern|eastern|western|middle|central)\b",
+                       head))
+    # A bare state "district court" or "circuit court" without a federal
+    # marker is a state trial court ("District Court, City and County of
+    # Denver, Colorado"; "Circuit Court for Baltimore County, Maryland").
+    # A bare "D." immediately before the state is the federal single-
+    # district form ("District Court, D. Alabama") — no state court
+    # writes its name that way.
     if not (is_bankr or "united states" in low or "u.s." in low
-            or "u. s." in low or dm or re.search(r"\bdistrict of\b", head)):
+            or "u. s." in low or dm or re.search(r"\bdistrict of\b", head)
+            or re.search(r"\bd\.\s*$", head)):
         return ""
     prefix = "D."
     if dm:
@@ -540,7 +806,12 @@ def bluebook_federal_trial_court(name: str) -> str:
         abbr = prefix + state       # S.D.N.Y., M.D.N.C., D.D.C., D.P.R.
     else:
         abbr = f"{prefix} {state}"  # E.D. Pa., D. Mass., S.D. W. Va.
-    return f"Bankr. {abbr}" if is_bankr else abbr
+    if is_bankr:
+        return f"Bankr. {abbr}"
+    if is_circt:
+        # "C.C." closes against the district group: C.C.S.D.N.Y., C.C.D. Mass.
+        return f"C.C.{abbr}"
+    return abbr
 
 
 def bluebook_court_from_name(name: str) -> str:
