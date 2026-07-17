@@ -1095,6 +1095,32 @@ class WriterParentheticalTests(unittest.TestCase):
             "McReynolds, J., dissenting",
         )
 
+    def test_unresolved_separate_opinion_uses_neutral_parenthetical(self):
+        part = self._part(
+            "separate", "Separate opinion of MR. JUSTICE STORY."
+        )
+        win = self._win()
+        self.assertEqual(
+            win._writer_parenthetical(part),
+            "Story, J., separate opinion",
+        )
+        win._base_citation_override = ""
+        win._bb = {
+            "name": "Example v. Example", "cite": "1 U.S. 10",
+            "display_cite": "1 U.S. 10", "court": "", "year": "1800",
+            "omit_parenthetical": "", "pin_kind": "page",
+        }
+        plain, _rtf = win._bluebook_citation(
+            None, win._writer_parenthetical(part))
+        self.assertEqual(
+            plain,
+            "Example v. Example, 1 U.S. 10 (1800) "
+            "(Story, J., separate opinion).",
+        )
+        self.assertEqual(win._PART_BOX_TAGS["separate"], "box-separate")
+        self.assertEqual(win._PART_LABEL_COLORS["separate"], "#59636f")
+        self.assertEqual(win._SEPARATE_BG, "#f1f3f5")
+
     def test_spelled_out_bare_judge_byline(self):
         part = self._part("concurrence", "CLINTON, Judge.")
         self.assertEqual(

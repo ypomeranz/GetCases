@@ -863,8 +863,8 @@ def _resolve_neutral_sep_boundaries(
     A section's express disposition controls.  A later writing that says it
     concurs with the immediately preceding opinion transfers its resolved role
     backward (the Sutherland/McReynolds sequence in Steward Machine).  Truly
-    ambiguous historical writings retain the pre-existing concurrence
-    fallback, but are still detected as separate opinions.
+    ambiguous historical writings remain ``separate``: callers can identify
+    the writing without falsely claiming that it concurs or dissents.
     """
     if not any(kind == "separate" for _i, kind, _label in boundaries):
         return boundaries
@@ -894,9 +894,6 @@ def _resolve_neutral_sep_boundaries(
         if _AGREES_WITH_PRECEDING_OPINION_RE.search(opening):
             resolved[k][1] = resolved[k + 1][1]
 
-    for bd in resolved:
-        if bd[1] == "separate":
-            bd[1] = "concurrence"
     return [(int(i), str(kind), str(label)) for i, kind, label in resolved]
 
 # The byline shared with the body of _SEP_HEADER_RE — a justice/judge name

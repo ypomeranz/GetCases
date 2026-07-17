@@ -8187,7 +8187,8 @@ def _rtf_escape(s: str) -> str:
 
 
 # Color table: 1 = star-pagination marker (purple), 2 = dissent (dark red),
-# 3 = concurrence (dark green).  Citation links stay black in copied and
+# 3 = concurrence (dark green), 4 = unclassified separate opinion (slate).
+# Citation links stay black in copied and
 # exported text; the blue is only an on-screen affordance.  The dissent/
 # concurrence colors are used only on the running heading of a section in the
 # RTF export — opinion body text is always black.
@@ -8195,7 +8196,8 @@ _RTF_HEADER = (
     "{\\rtf1\\ansi\\deff0"
     "{\\fonttbl{\\f0\\froman Times New Roman;}}"
     "{\\colortbl ;\\red142\\green68\\blue173;"
-    "\\red163\\green21\\blue21;\\red26\\green122\\blue60;}"
+    "\\red163\\green21\\blue21;\\red26\\green122\\blue60;"
+    "\\red89\\green99\\blue111;}"
     "\\f0\\fs22\n"
 )
 
@@ -8229,6 +8231,8 @@ def _run_to_rtf(seg: str, active: set[str], part_colors: bool = False) -> str:
         codes.append("\\cf2")
     elif part_colors and "part-concurrence" in active:
         codes.append("\\cf3")
+    elif part_colors and "part-separate" in active:
+        codes.append("\\cf4")
     esc = _rtf_escape(seg)
     return "{" + "".join(codes) + " " + esc + "}" if codes else esc
 
@@ -11770,15 +11774,25 @@ class _ScholarTextWindow:
     _CONCUR_COLOR = "#1a7a3c"    # dark green
     _DISSENT_BG = "#fbeeee"      # very light red — full-view box behind a dissent
     _CONCUR_BG = "#eef7f0"       # very light green — box behind a concurrence
+    _SEPARATE_COLOR = "#59636f"  # neutral slate: role is not reliably known
+    _SEPARATE_BG = "#f1f3f5"     # neutral gray: neither assent nor disagreement
     # In the full-opinion view the region behind a concurrence/dissent gets a
     # light background tint; the body text itself stays black and the active
     # part is named, in color, at the top of the window.
     _MAJORITY_COLOR = "#1a3e72"  # dark blue — the main opinion on the part map
-    _PART_BOX_TAGS = {"dissent": "box-dissent", "concurrence": "box-concurrence"}
-    _PART_LABEL_COLORS = {"dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR}
+    _PART_BOX_TAGS = {
+        "dissent": "box-dissent", "concurrence": "box-concurrence",
+        "separate": "box-separate",
+    }
+    _PART_LABEL_COLORS = {
+        "dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR,
+        "separate": _SEPARATE_COLOR,
+    }
     # The part map (right strip) also points to the main opinion.
-    _PARTMAP_COLORS = {"dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR,
-                       "majority": _MAJORITY_COLOR}
+    _PARTMAP_COLORS = {
+        "dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR,
+        "separate": _SEPARATE_COLOR, "majority": _MAJORITY_COLOR,
+    }
     _PAGECOL_W = 48     # left gutter: reporter page numbers (px)
     _PARTMAP_W = 104    # right strip: map of the opinion's parts (px)
     # Approx. on-screen width of the right "Case details" panel (a 38-char Text
@@ -12114,8 +12128,10 @@ class _ScholarTextWindow:
         # this subtle box and the top-of-window label distinguish the parts.
         txt.tag_configure("box-dissent", background=self._DISSENT_BG)
         txt.tag_configure("box-concurrence", background=self._CONCUR_BG)
+        txt.tag_configure("box-separate", background=self._SEPARATE_BG)
         txt.tag_lower("box-dissent")
         txt.tag_lower("box-concurrence")
+        txt.tag_lower("box-separate")
         fnhead_font = tkfont.Font(
             family=self._family, size=max(self._base_size - 2, 8), weight="bold"
         )
@@ -13184,7 +13200,7 @@ class _ScholarTextWindow:
             return
         self._scroll_part = pi
         kind = parts[pi].kind
-        if kind in ("concurrence", "dissent"):
+        if kind in ("concurrence", "dissent", "separate"):
             self._view_label_var.set(parts[pi].label)
             self._set_view_color(
                 self._PART_LABEL_COLORS.get(kind, "black"))
@@ -13571,7 +13587,7 @@ class _ScholarTextWindow:
 
     def _draw_part_map(self) -> None:
         """Draw a colour-coded strip on the right marking where each
-        concurrence/dissent begins, with its label.  Shown only in the
+        majority or separate writing begins, with its label.  Shown only in the
         full-opinion text view; clicking a marker jumps to that part."""
         canvas = getattr(self, "_partmap", None)
         if canvas is None:
@@ -13587,7 +13603,7 @@ class _ScholarTextWindow:
         marks = [
             (rs, parts[p].kind, parts[p].label)
             for rs, _re, p in regions
-            if parts[p].kind in ("majority", "concurrence", "dissent")
+            if parts[p].kind in ("majority", "concurrence", "dissent", "separate")
         ]
         if not marks:
             canvas.config(width=0)
@@ -13637,8 +13653,8 @@ class _ScholarTextWindow:
     @staticmethod
     def _partmap_short_label(label: str, kind: str) -> str:
         """A compact label for the narrow part-map strip.  For separate
-        opinions just the author's surname (the colour already says whether
-        it's a dissent or concurrence); for the main opinion 'Opinion
+        opinions just the author's surname (the colour conveys its known or
+        neutral role); for the main opinion 'Opinion
         (Author)'."""
         text = re.sub(r"\s+", " ", label or "").strip()
         # Per curiam opinions: the parenthetical should read "(per curiam)", not
@@ -13663,7 +13679,11 @@ class _ScholarTextWindow:
                 name = m2.group(1)
                 if name.isupper():
                     name = name[:1] + name[1:].lower()
-        return name or ("Dissent" if kind == "dissent" else "Concurrence")
+        fallback = {
+            "dissent": "Dissent", "concurrence": "Concurrence",
+            "separate": "Separate opinion",
+        }
+        return name or fallback.get(kind, "Opinion")
 
     def _on_partmap_click(self, event) -> None:
         for y1, y2, rs in getattr(self, "_partmap_rows", []):
@@ -14051,8 +14071,8 @@ class _ScholarTextWindow:
     def _writer_parenthetical(self, part) -> str:
         """
         Bluebook writer parenthetical for a separate opinion (rule 10.6.1):
-        "Rehnquist, J., dissenting", "Wood, J., dissenting from the denial
-        of rehearing en banc", or "per curiam" for unsigned opinions.
+        "Rehnquist, J., dissenting", "Story, J., separate opinion" when the
+        role is unresolved, or "per curiam" for unsigned opinions.
         Empty for the header and signed majority opinions.
         """
         def block_text(b) -> str:
@@ -14076,8 +14096,10 @@ class _ScholarTextWindow:
             if re.search(r"\(per\s+curiam\)", part.label or "", re.IGNORECASE):
                 return "per curiam"
             return ""
-        if part.kind not in ("concurrence", "dissent") or not part.blocks:
+        if part.kind not in ("concurrence", "dissent", "separate") or not part.blocks:
             return ""
+        neutral_role = "separate opinion" if part.kind == "separate" else (
+            "dissenting" if part.kind == "dissent" else "concurring")
         t = block_text(part.blocks[0])
         m = re.search(r"\b(?:concurring|dissenting)\b", t, re.IGNORECASE)
         if not m:
@@ -14099,18 +14121,16 @@ class _ScholarTextWindow:
                     part.label or "", re.IGNORECASE,
                 )
                 if sm:
-                    role = ("dissenting" if part.kind == "dissent"
-                            else "concurring")
                     title = "C.J." if sm.group(1) else "J."
                     surname = _fix_name_case(
                         sm.group(2).replace("’", "'").rstrip(".:")
                     )
-                    return f"{surname}, {title}, {role}"
+                    return f"{surname}, {title}, {neutral_role}"
                 # A bare attribution heading ("MR. JUSTICE HOLMES:",
                 # "Statement of Justice Souter.") never says which way the
                 # author voted, so guessing "concurring"/"dissenting" could
-                # misdescribe it — Bluebook's neutral forms are "(opinion of
-                # Holmes, J.)" and "(statement of Souter, J.)".
+                # misdescribe it.  Keep a statement labeled as a statement;
+                # otherwise use the neutral "separate opinion" parenthetical.
                 jm = re.match(
                     r"(Statement\s+of\s+)?(?:MR\.\s+|MRS\.\s+|MS\.\s+)?"
                     r"(?:CHIEF\s+)?JUSTICE\s+([A-Z][\w.'’-]+?)\s*[.:]?\s*$",
@@ -14118,8 +14138,11 @@ class _ScholarTextWindow:
                 )
                 if jm:
                     surname = _fix_name_case(jm.group(2).replace("’", "'"))
-                    form = "statement of" if jm.group(1) else "opinion of"
-                    return f"{form} {surname}, J."
+                    if jm.group(1):
+                        return f"statement of {surname}, J."
+                    return (f"{surname}, J., {neutral_role}"
+                            if part.kind == "separate"
+                            else f"opinion of {surname}, J.")
                 # Headers that never name the role — the role was read from
                 # the opinion's opening lines when the part was segmented, so
                 # part.kind is trustworthy here.  A bare state-court byline
@@ -14128,7 +14151,6 @@ class _ScholarTextWindow:
                 # with whom THE CHIEF JUSTICE and MR. JUSTICE BLACK join." in
                 # Cohen), or an explicit hand-off ("MR. JUSTICE FIELD
                 # delivered the following separate opinion.").
-                role = "dissenting" if part.kind == "dissent" else "concurring"
                 wm = re.match(
                     r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(CHIEF\s+)?JUSTICE\s+"
                     r"([A-Z][\w.'’-]+)\s*,\s*with\s+whom\b",
@@ -14138,7 +14160,7 @@ class _ScholarTextWindow:
                 if wm:
                     title = "C.J." if wm.group(1) else "J."
                     surname = _fix_name_case(wm.group(2).replace("’", "'"))
-                    return f"{surname}, {title}, {role}"
+                    return f"{surname}, {title}, {neutral_role}"
                 bm = re.match(
                     r"((?:[A-Z][\w.'’-]*\s+)?[A-Z][\w.'’-]+),\s*"
                     r"(?:(C\.\s*J\.|Ch\.\s*J\.|Chief\s+(?:Justice|Judge))|"
@@ -14149,7 +14171,7 @@ class _ScholarTextWindow:
                 if bm:
                     title = "C.J." if bm.group(2) else "J."
                     surname = _fix_name_case(bm.group(1).replace("’", "'"))
-                    return f"{surname}, {title}, {role}"
+                    return f"{surname}, {title}, {neutral_role}"
                 dm = re.match(
                     r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(CHIEF\s+)?JUSTICE\s+"
                     r"([A-Z][\w.'’-]+)\s+delivered\s+(?:the\s+following|a)\s+"
@@ -14159,8 +14181,8 @@ class _ScholarTextWindow:
                 if dm:
                     title = "C.J." if dm.group(1) else "J."
                     surname = _fix_name_case(dm.group(2).replace("’", "'"))
-                    return f"{surname}, {title}, {role}"
-                return ""
+                    return f"{surname}, {title}, {neutral_role}"
+                return "separate opinion" if part.kind == "separate" else ""
             phrase = {
                 "concurrence": "concurring",
                 "concurrence in part": "concurring in part",
@@ -14250,10 +14272,11 @@ class _ScholarTextWindow:
             return
         has_dissent = any(p.kind == "dissent" for p in parts)
         has_concurrence = any(p.kind == "concurrence" for p in parts)
+        has_separate = any(p.kind == "separate" for p in parts)
         signal = self._writer_parenthetical(maj)  # "" | per curiam | plurality
         if signal == "plurality opinion" and self._is_scotus:
             base = "Plurality Opinion"
-        elif not has_dissent and not has_concurrence:
+        elif not has_dissent and not has_concurrence and not has_separate:
             base = "Opinion"
         else:
             base = "Majority Opinion"
@@ -14834,8 +14857,12 @@ class _ScholarTextWindow:
         sections = self._export_section_list()
 
         # Colour only the running heading by opinion kind (dissent red,
-        # concurrence green); the body text of every opinion stays black.
-        head_cf = {"dissent": "\\cf2 ", "concurrence": "\\cf3 "}
+        # concurrence green, unresolved separate opinion neutral slate); the
+        # body text of every opinion stays black.
+        head_cf = {
+            "dissent": "\\cf2 ", "concurrence": "\\cf3 ",
+            "separate": "\\cf4 ",
+        }
         out: list[str] = []
         for i, (label, rs, rend, kind) in enumerate(sections):
             out.append(
@@ -17905,7 +17932,7 @@ _PDF_PART_COLORS = {
     "majority": _ScholarTextWindow._MAJORITY_COLOR,
     "concurrence": _ScholarTextWindow._CONCUR_COLOR,
     "dissent": _ScholarTextWindow._DISSENT_COLOR,
-    "separate": "#6a4d9f",
+    "separate": _ScholarTextWindow._SEPARATE_COLOR,
 }
 
 
