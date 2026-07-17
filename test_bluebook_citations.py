@@ -430,6 +430,42 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
             "Johnson & Graham's Lessee v. M'intosh",
         )
 
+    def test_zf_automotive_consolidated_caption(self):
+        # ZF Automotive US, Inc. v. Luxshare, Ltd., 596 U.S. 619 (2022):
+        # the consolidated AlixPartners case follows the first respondent's
+        # "LTD." and is omitted (rule 10.2.1(b)).
+        right = _cut_companion_cases(
+            "LUXSHARE, LTD. AlixPartners, LLP, et al., Petitioners v. The "
+            "Fund for Protection of Investors' Rights in Foreign States.")
+        self.assertEqual(right, "LUXSHARE, LTD.")
+        self.assertEqual(
+            abbreviate_case_name(
+                "ZF Automotive US, Inc., et al., Petitioners, v. "
+                "Luxshare, Ltd."),
+            "ZF Auto. US, Inc. v. Luxshare, Ltd.",
+        )
+
+    def test_geographic_first_party_is_not_cut_from_a_firm_name(self):
+        # "New York & Cuba Mail Steamship Co." is one business that merely
+        # opens with a place — nothing is omitted; a true government
+        # co-party list still reduces to its first party.
+        self.assertEqual(
+            abbreviate_case_name(
+                "New York & Cuba Mail Steamship Company v. The Barge Sadie"),
+            "N.Y. & Cuba Mail S.S. Co. v. Barge Sadie",
+        )
+        self.assertEqual(
+            abbreviate_case_name(
+                "Texas & Pacific Railway Company v. Behymer"),
+            "Tex. & Pac. Ry. Co. v. Behymer",
+        )
+        self.assertEqual(
+            abbreviate_case_name(
+                "United States and Federal Communications Commission "
+                "v. Acme Corp."),
+            "United States v. Acme Corp.",
+        )
+
     def test_companion_cases_cut_at_the_earliest_boundary(self):
         # Bostock: the companion party's own periods ("Inc.") defeat the
         # simple lookahead; the fallback cuts before "Altitude".
@@ -446,7 +482,8 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
                 "UNITED STATES. GREEN ET AL. v. SAME. McINNIS v. SAME."),
             "UNITED STATES.",
         )
-        # An entity abbreviation's period is never a case boundary.
+        # An entity abbreviation's period is a boundary only when the name
+        # does not continue past it.
         self.assertEqual(
             _cut_companion_cases(
                 "ST. PAUL FIRE & MARINE INS. CO. SAME v. OTHER."),
@@ -455,6 +492,23 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
         self.assertEqual(
             _cut_companion_cases("Acme Co. of America"),
             "Acme Co. of America",
+        )
+        # ZF Automotive US, Inc. v. Luxshare, Ltd., 596 U.S. 619 (2022):
+        # the first respondent's own "Ltd." closes the case, and the
+        # consolidated AlixPartners case follows.
+        self.assertEqual(
+            _cut_companion_cases(
+                "LUXSHARE, LTD. AlixPartners, LLP, et al., Petitioners v. "
+                "The Fund for Protection of Investors' Rights in Foreign "
+                "States."),
+            "LUXSHARE, LTD.",
+        )
+        # …but a continuing name keeps its entity abbreviation mid-name.
+        self.assertEqual(
+            _cut_companion_cases(
+                "TRAVELERS INS. CO. OF HARTFORD. Acme Widgets, Inc., "
+                "Petitioners v. Doe"),
+            "TRAVELERS INS. CO. OF HARTFORD.",
         )
 
 

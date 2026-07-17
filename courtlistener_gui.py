@@ -603,6 +603,7 @@ from bluebook_names import (
     caption_case_reference_tokens,
     collapse_personal_all_caps_run,
     courtlistener_case_name,
+    cut_companion_cases,
     is_recognized_given_name,
     normal_case_caption,
     refine_caption_case,
@@ -7882,52 +7883,10 @@ def _scholar_court_id(blocks) -> str:
     return ""
 
 
-# Abbreviations whose period never ends a listed case: honorifics,
-# geography ("St. Paul"), and entity suffixes ("Marine Ins. Co. SAME v. …").
-# "al" is deliberately absent — "…, et al." routinely closes the first case.
-_CUT_STOP_ABBRS = frozenset({
-    "st", "ste", "mt", "ft", "mr", "mrs", "ms", "dr", "hon", "rev",
-    "sgt", "lt", "capt", "col", "gen", "jr", "sr", "co", "cos", "corp",
-    "inc", "ltd", "bros", "ins", "mfg", "ry", "rr", "no", "nos",
-})
-
-
-def _cut_companion_cases(text: str) -> str:
-    """Keep only the first-listed case of a consolidated caption (Bluebook
-    rule 10.2.1(b)).
-
-    Strategy one cuts where a period is followed by a new case — one with
-    its own "v.", a "SAME", or an in-re style caption — never at an entity
-    abbreviation's period ("… v. Acme Co. of America" has no case after
-    it).  Its lookahead cannot span a companion party whose *own name*
-    holds periods ("CLAYTON COUNTY, GEORGIA. Altitude Express, Inc., et
-    al., Petitioners v. Zarda" — Bostock), so when a later separator proves
-    a companion case exists, strategy two cuts at the first sentence period
-    before it, skipping initials and abbreviations.  Either strategy can
-    also fire at a *later* boundary than the true one (Olmstead's "… v.
-    SAME." line defeats one at the first boundary but not the second), so
-    the earliest cut wins."""
-    cuts: list[int] = []
-    cm = re.search(
-        r"\.\s+(?=[^.]*?\s+vs?\.\s+|SAME\b|IN\s+RE\b|EX\s+PARTE\b"
-        r"|(?:IN\s+THE\s+)?MATTER\s+OF\b)",
-        text, re.IGNORECASE,
-    )
-    if cm:
-        cuts.append(cm.start())
-    m2 = re.search(r"\s+(?:vs?\.|(?i:versus|against))\s+", text)
-    if m2:
-        head = text[: m2.start()]
-        for c2 in re.finditer(r"\.(?:\[[^\]]{1,6}\])?\s+(?=[A-Z0-9(])", head):
-            wm = re.search(r"([A-Za-z]+)$", head[: c2.start()])
-            word = (wm.group(1) if wm else "").lower()
-            if len(word) <= 1 or word in _CUT_STOP_ABBRS:
-                continue  # an abbreviation's period, not a case boundary
-            cuts.append(c2.start())
-            break
-    if cuts:
-        return text[: min(cuts) + 1]
-    return text
+# Shared with opinion_db's caption extraction; the implementation lives in
+# bluebook_names.cut_companion_cases (tkinter-free).  The private alias keeps
+# this module's call sites and tests stable.
+_cut_companion_cases = cut_companion_cases
 
 
 _PROCEDURAL_ALIAS_RE = re.compile(
@@ -7988,9 +7947,12 @@ def _scholar_caption_name(blocks) -> str:
         # AstraZeneca AB v. United Food…") — classify it before splitting.
         # Only a role tail is cut at a comma; a comma can continue the
         # matter's own title ("In re Title, Ballot Title & Submission
-        # Clause for 2015-2016 #156").
+        # Clause for 2015-2016 #156").  Companions are cut BEFORE the role
+        # trim: trimming first would delete the companion's ", et al.,
+        # Defendants-Appellants, v. …" tail — the very " v. " that proves
+        # a companion case follows.
         if re.match(r"(?:IN\s+RE|EX\s+PARTE|(?:IN\s+THE\s+)?MATTER\s+OF)\b", t, re.IGNORECASE):
-            t2 = _cut_companion_cases(_trim_procedural_caption(t))
+            t2 = _trim_procedural_caption(_cut_companion_cases(t))
             return refine(_titlecase_caps(t2.strip()))
         # Google Scholar renders the party separator in lowercase ("… v. …")
         # even for ALL-CAPS captions ("MERCY HOSPITAL, INC. v. JACKSON"), so

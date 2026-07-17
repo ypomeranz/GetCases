@@ -47,6 +47,7 @@ from typing import Optional
 import citations
 from bluebook_names import (
     abbreviate_case_name,
+    cut_companion_cases,
     normal_case_caption,
     refine_caption_case,
     simplify_historical_entity_caption,
@@ -217,11 +218,17 @@ def _caption_name(blocks: list) -> str:
         if len(sides) != 2:
             sides = re.split(r"\s+[vV]s?\.\s+", t, maxsplit=1)
         if len(sides) == 2 and sides[0].strip() and sides[1].strip():
+            # Only the first-listed case of a consolidated caption is cited
+            # (rule 10.2.1(b)): "… v. LUXSHARE, LTD. AlixPartners, LLP, et
+            # al., Petitioners v. The Fund …" ends at "LTD."
+            right = cut_companion_cases(sides[1])
+            if right != sides[1]:
+                return f"{sides[0]} v. {right}".strip()
             return t
         if re.match(
             r"(?:IN\s+RE|EX\s+PARTE|(?:IN\s+THE\s+)?MATTER\s+OF)\b", t, re.IGNORECASE
         ):
-            return t.split(",")[0].strip()
+            return cut_companion_cases(t).split(",")[0].strip()
     return ""
 
 

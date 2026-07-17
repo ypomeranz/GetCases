@@ -1106,6 +1106,78 @@ def strip_related_case_note(text: str) -> str:
     "Ex parte MURPHY.".  Captions without one pass through unchanged."""
     return _RELATED_CASE_NOTE_RE.sub("", text or "").strip()
 
+
+# Abbreviations whose period never ends a listed case: honorifics,
+# geography ("St. Paul"), and mid-name business words ("Marine Ins. Co.").
+# "al" is deliberately absent — "…, et al." routinely closes the first case.
+_CUT_NEVER_ENDS = frozenset({
+    "st", "ste", "mt", "ft", "mr", "mrs", "ms", "dr", "hon", "rev",
+    "sgt", "lt", "capt", "col", "gen", "jr", "sr", "ins", "mfg",
+    "no", "nos",
+})
+# Entity designators that usually *close* a party name — the period after
+# one is a case boundary ("… v. LUXSHARE, LTD. AlixPartners, LLP, et al.,
+# Petitioners v. …" in ZF Automotive) unless the name visibly continues
+# ("Acme Co. of America", "INS. CO. OF HARTFORD").
+_CUT_ENTITY_ENDS = frozenset({
+    "co", "cos", "corp", "inc", "ltd", "bros", "llc", "llp", "lp",
+    "lllp", "plc", "pllc", "pc", "na", "sa", "ag", "nv", "ry", "rr",
+})
+_NAME_CONTINUATIONS = frozenset({
+    "of", "the", "and", "for", "in", "de", "la", "du", "von", "van",
+    "a", "an", "d",
+})
+
+# Firm-name tail words beyond _APPOSITIVE_ENTITY_TERMS: a conjoined name
+# ending in one of these is a single business, not a party list ("New York
+# & Cuba Mail Steamship Co.", "Baltimore & Ohio Railroad").
+_FIRM_TAIL_WORDS = frozenset({
+    "ry", "rr", "railroad", "railway", "steamship", "ss", "insurance",
+    "ins", "telegraph", "telephone", "tel",
+})
+
+
+def cut_companion_cases(text: str) -> str:
+    """Keep only the first-listed case of a consolidated caption (Bluebook
+    rule 10.2.1(b)).
+
+    Strategy one cuts where a period is followed by a new case — one with
+    its own "v.", a "SAME", or an in-re style caption — never at an entity
+    abbreviation's period ("… v. Acme Co. of America" has no case after
+    it).  Its lookahead cannot span a companion party whose *own name*
+    holds periods ("CLAYTON COUNTY, GEORGIA. Altitude Express, Inc., et
+    al., Petitioners v. Zarda" — Bostock), so when a later separator proves
+    a companion case exists, strategy two cuts at the first sentence period
+    before it, skipping initials and abbreviations.  Either strategy can
+    also fire at a *later* boundary than the true one (Olmstead's "… v.
+    SAME." line defeats one at the first boundary but not the second), so
+    the earliest cut wins."""
+    cuts: list[int] = []
+    cm = re.search(
+        r"\.\s+(?=[^.]*?\s+vs?\.\s+|SAME\b|IN\s+RE\b|EX\s+PARTE\b"
+        r"|(?:IN\s+THE\s+)?MATTER\s+OF\b)",
+        text, re.IGNORECASE,
+    )
+    if cm:
+        cuts.append(cm.start())
+    m2 = re.search(r"\s+(?:vs?\.|(?i:versus|against))\s+", text)
+    if m2:
+        head = text[: m2.start()]
+        for c2 in re.finditer(r"\.(?:\[[^\]]{1,6}\])?\s+(?=[A-Z0-9(])", head):
+            wm = re.search(r"([A-Za-z]+)$", head[: c2.start()])
+            word = (wm.group(1) if wm else "").lower()
+            if len(word) <= 1 or word in _CUT_NEVER_ENDS:
+                continue  # an abbreviation's period, not a case boundary
+            if word in _CUT_ENTITY_ENDS:
+                nxt = re.match(r"[A-Za-z]+", head[c2.end():])
+                if nxt and nxt.group(0).lower() in _NAME_CONTINUATIONS:
+                    continue  # "Acme Co. of America" — same party's name
+            cuts.append(c2.start())
+            break
+    if cuts:
+        return text[: min(cuts) + 1]
+    return text
+
 # Procedural party designations from a reporter caption — "…, Plaintiff,"
 # "…, et al., Defendants.", "…, Defendant-Appellant" — describe the party's
 # role and are no part of the name (rule 10.2.1).  Stripped from the right,
@@ -1451,9 +1523,17 @@ def _abbreviate_party(party: str, *, recognize_initials: bool = True) -> str:
         # Communications Commission" -> "United States".  Expanding first
         # also repairs sources that print "U.S. and FCC".  A business name
         # such as "Jones & Laughlin Steel Corp." does not have a bare
-        # geographic first segment and therefore continues through unchanged.
+        # geographic first segment and therefore continues through unchanged
+        # — but a firm can also merely *open* with a place ("New York &
+        # Cuba Mail Steamship Co.", "Texas & Pacific Ry. Co."), recognized
+        # by the trailing entity designator: then the conjunction is inside
+        # one name and nothing is omitted.
+        tail = segs[-1].split()
+        tail_word = re.sub(r"[^a-z]", "", tail[-1].lower()) if tail else ""
         first = _expand_geo_party(segs[0].strip(" ,;"))
-        if first.strip(" ,.").lower() in _GEO_PARTIES:
+        if (first.strip(" ,.").lower() in _GEO_PARTIES
+                and tail_word not in _APPOSITIVE_ENTITY_TERMS
+                and tail_word not in _FIRM_TAIL_WORDS):
             return first
         surnames = [_strip_given_names(s) for s in segs]
         if all(surnames):
