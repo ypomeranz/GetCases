@@ -263,8 +263,11 @@ _NOMINATE_DENY = frozenset({"curt", "and", "west", "lit"})
 # The admiralty forms are the ones the limitation-of-liability line of
 # SCOTUS cases uses (The Scotland, 105 U.S. 24: "1 Dod. 290", "1 Hagg.
 # Adm. 109", "1 Swa. 96", "4 Kay & J. 367", "1 John. & H. 180").  Bare
-# "Hagg." is NOT aliased: Haggard reported three courts (Adm/Ecc/Con)
-# whose volume/page ranges overlap, so an unqualified cite can't be placed.
+# "Hagg." (The Nestor's "The William Money, 2 Hagg. 136") is aliased to
+# every court Haggard reported (Adm/Ecc/Con and the Ecc appendix); their
+# volume/page ranges overlap, so resolution collects the hits across all
+# four — a page indexed in only one series places the cite outright, and
+# a genuine collision surfaces every candidate for the same-page chooser.
 _NOM_ALIASES: "dict[str, tuple[str, ...]]" = {
     "Ves": ("Ves Sen", "Ves Jun"),
     "Co": ("Co Rep",),
@@ -277,6 +280,7 @@ _NOM_ALIASES: "dict[str, tuple[str, ...]]" = {
     "Term Rep": ("TR",),
     "Dougl": ("Doug",),
     "Dod": ("Dods",),
+    "Hagg": ("Hag Adm", "Hag Ecc", "Hag Con", "Hag Ecc App"),
     "Hagg Adm": ("Hag Adm",),
     "Hagg Ecc": ("Hag Ecc",),
     "Hagg Con": ("Hag Con",),
@@ -416,17 +420,33 @@ def _nom_resolve(key: str, vol: int, page: int
     of the same reporter volume ("3 Burr. 1663" pins into Rex v.
     Vice-Chancellor, 3 Burr. 1647)."""
     keys = (key,) + _NOM_ALIAS_KEYS.get(key, ())
+    hits: "list[tuple[str, int, list]]" = []
     for k in keys:
         for v in _vols_for(k, vol):
             targets = _NOM_INDEX.get((k, v, page))
             if targets:
-                return k, v, page, targets
+                hits.append((k, v, targets))
+    if hits:
+        if len(hits) == 1:
+            k, v, targets = hits[0]
+            return k, v, page, targets
+        # Several reporters share this exact start page — an ambiguous alias
+        # (bare "Hagg." can be any court Haggard reported).  Keep the matched
+        # alias key in the spec and merge the candidates, so resolve() finds
+        # the same union and the viewer can offer a chooser.
+        merged: list = []
+        for _k, _v, targets in hits:
+            for t in targets:
+                if t not in merged:
+                    merged.append(t)
+        return key, vol, page, merged
     if not vol:
         # Volumeless single-volume reporters carry word-like names ("Holt",
         # "Style"); a bare "Word NN" is also the shape of prose ("the West
         # 11 years later"), so only an exact first page is trusted.
         return None
     from bisect import bisect_right
+    pin_hits: "list[tuple[str, int, int, list]]" = []
     for k in keys:
         for v in _vols_for(k, vol):
             pages = (_NOM_PAGES or {}).get((k, v))
@@ -436,7 +456,13 @@ def _nom_resolve(key: str, vol: int, page: int
                     start = pages[i]
                     targets = _NOM_INDEX.get((k, v, start))
                     if targets:
-                        return k, v, start, targets
+                        pin_hits.append((k, v, start, targets))
+    # A pin cite must place uniquely: when an ambiguous alias (bare "Hagg.")
+    # pins into reports in more than one of its reporters, the candidates
+    # start at *different* pages, so no one spec can carry them — leave the
+    # cite unlinked rather than guess.
+    if len({k for k, _v, _s, _t in pin_hits}) == 1:
+        return pin_hits[0]
     return None
 
 
@@ -655,8 +681,16 @@ def resolve(spec: str) -> list[ERCase]:
         _load_nominate()
         if not _NOM_INDEX or _BY_NEUTRAL is None:
             return []
-        targets = _NOM_INDEX.get(
-            (nm.group(1), int(nm.group(2)), int(nm.group(3)))) or []
+        key, vol, page = nm.group(1), int(nm.group(2)), int(nm.group(3))
+        # An ambiguous alias spec ("n:hagg:2:136") carries the alias key
+        # itself; collect the union across its canonical reporters, exactly
+        # as _nom_resolve matched it.  Canonical specs hit the index direct.
+        targets: list = []
+        for k in (key,) + _NOM_ALIAS_KEYS.get(key, ()):
+            for v in _vols_for(k, vol):
+                for t in _NOM_INDEX.get((k, v, page)) or []:
+                    if t not in targets:
+                        targets.append(t)
         return [c for c in (_BY_NEUTRAL.get(t) for t in targets)
                 if c is not None]
     vp = parse_spec(s)
@@ -807,6 +841,17 @@ if __name__ == "__main__":
                 "Cope v. Doherty, 4 Kay & J. 367; S.C. 2 De G. & J. 614; "
                 "The General Iron Screw Collier Co. v. Schurmanns, "
                 "1 John. & H. 180; The Wild Ranger, 1 Lush. 553.")
+    # Bare "Hagg." (any of Haggard's courts) is placed by resolution: The
+    # Nestor's "The William Money, 2 Hagg. 136" exists only in Haggard's
+    # Admiralty, so it resolves there outright; a page shared by two series
+    # ("1 Hagg. 22" is in both Adm and Ecc) keeps the alias key and yields
+    # every candidate, for the same-page chooser.
+    nom_one("The William Money, 2 Hagg. 136", "n:hagadm:2:136",
+            "William Money")
+    check(len(resolve("n:hagg:1:22")) >= 2
+          and any(spec == "n:hagg:1:22"
+                  for _s, _e, spec, _c in iter_nominate_cites("1 Hagg. 22")),
+          "colliding bare 'Hagg.' page yields every candidate")
     nom_one(scotland, "n:dods:1:290", "Nostra Signora")
     nom_one(scotland, "n:hagadm:1:109", "Dundee")
     nom_one(scotland, "n:hagadm:3:169", "Girolamo")

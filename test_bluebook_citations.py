@@ -1472,5 +1472,67 @@ class CombinedOpinionCompletenessTests(unittest.TestCase):
         self.assertTrue(_combined_parts_cover_typed(opinions, combined_parts))
 
 
+class FederalCasesLookupTests(unittest.TestCase):
+    """Offline pieces of the Federal Cases case-number resolution: the name
+    query builder's OCR forgiveness, the headnote-number verifier, and the
+    F. Cas. volume extraction (courtlistener.find_fedcas_case's helpers)."""
+
+    def test_name_queries_tightest_first_with_ocr_variants(self):
+        from courtlistener import _fedcas_name_queries
+
+        qs = _fedcas_name_queries("Har-ney v. The Sydney L. Wright")
+        # The name as printed, then de-hyphenated, then ANDed tokens, then
+        # the one-edit fuzzy tokens.
+        self.assertEqual(qs[0], 'caseName:"Har-ney v. The Sydney L. Wright"')
+        self.assertIn('caseName:"Harney v. The Sydney L. Wright"', qs)
+        self.assertTrue(any("~1" in q for q in qs))
+
+    def test_name_queries_join_surname_particles(self):
+        from courtlistener import _fedcas_name_queries
+
+        # CourtListener titles the case "Macy v. DeWolf" — the joined
+        # spelling must be searched as its own variant.
+        qs = _fedcas_name_queries("Macy v. De Wolf")
+        self.assertIn('caseName:"Macy v. DeWolf"', qs)
+
+    def test_headnote_number_reads_only_the_head(self):
+        from courtlistener import _fedcas_headnote_number
+
+        self.assertEqual(
+            _fedcas_headnote_number(
+                "<p>Case No. 2,717. Lien on Foreign Vessel.</p>"),
+            "2717")
+        self.assertEqual(
+            _fedcas_headnote_number("[Case No. 6,082a.]"), "6082a")
+        # A number later in the headnotes is a cross-reference, not the
+        # case's own number.
+        self.assertIsNone(
+            _fedcas_headnote_number(
+                "Approving The Nestor, Case No. 10,126."))
+        self.assertIsNone(_fedcas_headnote_number(""))
+
+    def test_fcas_volume_from_citation_strings_and_dicts(self):
+        from courtlistener import _fcas_volume
+
+        self.assertEqual(_fcas_volume(["18 F. Cas. 9", "1 Sumn. 73"]), 18)
+        self.assertEqual(
+            _fcas_volume([{"volume": 5, "reporter": "F. Cas.", "page": 680}]),
+            5)
+        self.assertIsNone(_fcas_volume(["410 U.S. 113"]))
+
+    def test_detect_links_routes_fedcas_and_nominative_parallels(self):
+        from citations import detect_links
+
+        links = detect_links(
+            "See The General Smith, 4 Wheat. [17 U. S.] 438; Cole v. The "
+            "Atlantic, Case No. 2,976; The Chusan, Id. 2,717.")
+        actions = [a for _s, _e, a in links]
+        self.assertIn(("cite", "4 Wheat. 438"), actions)
+        fedcas = [json.loads(v) for k, v in actions if k == "fedcas"]
+        self.assertEqual(
+            [(f["no"], f.get("name")) for f in fedcas],
+            [("2976", "Cole v. The Atlantic"), ("2717", "The Chusan")])
+
+
 if __name__ == "__main__":
     unittest.main()

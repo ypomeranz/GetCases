@@ -624,6 +624,7 @@ import constitution
 import ecfr
 import eng_rep
 import eng_rep_pdf
+import fed_cas
 import fed_rules
 import state_statutes
 import statutes_at_large
@@ -636,8 +637,12 @@ import slip_opinion
 from citations import (
     PINCITE_AFTER_RE as _PINCITE_AFTER_RE,
     TEXT_CITE_RE as _TEXT_CITE_RE,
+    NOMINATIVE_PARALLEL_RE as _NOMINATIVE_PARALLEL_RE,
+    US_NOMINATIVE_PARALLEL_RE as _US_NOMINATIVE_PARALLEL_RE,
+    NOMINATIVE_CITE_RE as _NOMINATIVE_TEXT_CITE_RE,
     SHORT_CITE_RE as _SHORT_CITE_RE,
     ID_CITE_RE as _ID_CITE_RE,
+    case_match_text as _case_match_text,
     norm_reporter as _norm_reporter,
     build_short_cite_index as _build_short_cite_index,
     cite_target_from_text as _cite_target_from_text,
@@ -1393,24 +1398,25 @@ def _case_law_pdf_choices_for_cites(cites: list[str]) -> list[_CaseLawPdfChoice]
 _NOMINATIVE_US_OFFSET = {
     "dall": 0, "dallas": 0, "cranch": 4, "wheat": 13, "wheaton": 13,
     "pet": 25, "peters": 25, "how": 41, "howard": 41, "black": 65,
-    "wall": 67, "wallace": 67,
+    "wall": 67, "wallace": 67, "otto": 90,
 }
 _NOMINATIVE_CANON = {
     "dall": "Dall.", "dallas": "Dall.", "cranch": "Cranch", "wheat": "Wheat.",
     "wheaton": "Wheat.", "pet": "Pet.", "peters": "Pet.", "how": "How.",
     "howard": "How.", "black": "Black", "wall": "Wall.", "wallace": "Wall.",
+    "otto": "Otto",
 }
 # Case-sensitive on purpose: a reporter abbreviation is capitalized in a real
 # cite, so the digits-around requirement plus the capital keeps common words
 # ("how", "black", "wall") in prose from being mistaken for a citation.
 _NOMINATIVE_CITE_RE = re.compile(
     r"\b(\d{1,2})\s+(Dall|Dallas|Cranch|Wheat|Wheaton|Pet|Peters|How|Howard|"
-    r"Black|Wall|Wallace)\.?\s+(\d{1,4})\b"
+    r"Black|Wall|Wallace|Otto)\.?\s+(\d{1,4})\b"
 )
 _NOMINATIVE_DISPLAY_RE = re.compile(
     r"^\s*(\d+)\s+U\.S\.\s+\((\d+)\s+"
     r"(Dall|Dallas|Cranch|Wheat|Wheaton|Pet|Peters|How|Howard|"
-    r"Black|Wall|Wallace)\.?\)\s+(\d+)\s*$",
+    r"Black|Wall|Wallace|Otto)\.?\)\s+(\d+)\s*$",
     re.IGNORECASE,
 )
 
@@ -12877,6 +12883,20 @@ class _ScholarTextWindow:
             matches.append((start, end, "recap", action[1]))
         for m in _TEXT_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "cite", m))
+        # Early-SCOTUS nominative cites, with or without the interpolated
+        # parallel U.S. volume ("4 Wheat. [17 U. S.] 438", "9 Wall. (76
+        # U. S.) 136", "76 U.S. (9 Wall.) 136", bare "1 Cranch 137") —
+        # pre-normalized to the two-part cite the resolvers know
+        # ("4 Wheat. 438"), whose modern U.S. volume the lookup paths
+        # already try via _citation_search_variants.
+        for pat in (_NOMINATIVE_PARALLEL_RE, _US_NOMINATIVE_PARALLEL_RE,
+                    _NOMINATIVE_TEXT_CITE_RE):
+            for m in pat.finditer(text):
+                if any(m.start() < e and s < m.end()
+                       for s, e, _k, _v in matches):
+                    continue
+                matches.append((m.start(), m.end(), "cite",
+                                _case_match_text(m)))
         for m in us_code.USC_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "usc", m))
         for m in ecfr.CFR_CITE_RE.finditer(text):
@@ -12914,6 +12934,12 @@ class _ScholarTextWindow:
             matches.append((m.start(), m.end(), "engrep", m))
         for s, e, spec, _cases in eng_rep.iter_nominate_cites(text):
             matches.append((s, e, "engrepn", spec))
+        # Federal Cases cited by case number ("Cole v. The Atlantic, Case
+        # No. 2,976"; chained "The Chusan, Id. 2,717") — resolved at click
+        # time via the CourtListener API from the printed name and number.
+        # The span outranks the bare "Id." match at the same start.
+        for s, e, spec in fed_cas.iter_cites(text):
+            matches.append((s, e, "fedcas", spec))
         matches.sort(key=lambda t: (t[0], -t[1]))
         pos = 0
         for start, end, kind, m in matches:
@@ -12923,8 +12949,13 @@ class _ScholarTextWindow:
                 txt.insert("end", text[pos:start], tags)
             cite_base = ""  # set for case cites, to track the last citation
             if kind == "cite":
-                cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
-                cite = cite.replace("’", "'")  # straight apostrophe for the search query
+                # m is a regex match, or a pre-normalized string for the
+                # nominative-SCOTUS pass above.
+                if isinstance(m, str):
+                    cite = m
+                else:
+                    cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
+                    cite = cite.replace("’", "'")  # straight apostrophe for the search query
                 cite_base = cite  # base for a following "Id. at N"
                 # A pincite right after ("365 U.S. 167, 171") rides along
                 # so the opened case can jump to that page.  A number that
@@ -12977,6 +13008,10 @@ class _ScholarTextWindow:
                 # Nominate-report cite ("9 Exch. 341") → same viewer; m is the
                 # pre-built, resolution-gated spec ("n:exch:9:341").
                 action = ("engrep", m)
+            elif kind == "fedcas":
+                # Federal Cases case number → CourtListener lookup at click
+                # time; m is the pre-built JSON spec ({"no", "name"}).
+                action = ("fedcas", m)
             else:
                 action = ("cfr", ecfr.cite_spec(m))
             if action is None:
@@ -16227,6 +16262,10 @@ class _ScholarTextWindow:
             _open_recap_citation(
                 self._app, self._win, value, self._status_var.set)
             return
+        if kind == "fedcas":
+            _open_fedcas_citation(
+                self._app, self._win, value, self._status_var.set)
+            return
         # A Scholar case URL may carry a pincite, a reporter cite, and the case
         # name ("<url>\tpin=565\tcite=…\tname=…") so a failed/blocked fetch can
         # still be located on CourtListener.
@@ -18443,8 +18482,8 @@ def _open_eng_rep_case(parent: tk.Misc, case: "eng_rep.ERCase",
 
 #: Categories used to colour-code highlights by what the citation points at.
 def _brief_action_category(kind: str) -> str:
-    if kind in ("cite", "url", "engrep", "recap"):
-        return "case"  # English Reports and RECAP documents are cases too
+    if kind in ("cite", "url", "engrep", "recap", "fedcas"):
+        return "case"  # English Reports, RECAP and Federal Cases too
     if kind == "const":
         return "const"
     return "statute"
@@ -18481,6 +18520,20 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
         cite = value.split("@")[0]
         url = ("https://scholar.google.com/scholar?q="
                + urllib.parse.quote(f'"{cite}"'))
+    elif kind == "fedcas":
+        # Federal Cases number → the CourtListener search the in-app lookup
+        # would run, pre-filtered to the era: by printed case name when the
+        # citation gives one, else by the "Case No. N" phrase.
+        try:
+            spec = json.loads(value)
+        except Exception:
+            spec = {}
+        name = spec.get("name") or ""
+        q = (f'caseName:"{name}"' if name
+             else f'"Case No. {fed_cas.pretty_number(spec.get("no") or "")}"')
+        url = ("https://www.courtlistener.com/?"
+               + urllib.parse.urlencode(
+                   {"q": q, "type": "o", "filed_before": "1882-12-31"}))
     elif kind == "engrep":
         # English Reports → the CommonLII case page (first case at that page),
         # not the .pdf directly: the origin hotlink-blocks the scan unless you
@@ -18592,6 +18645,99 @@ def _open_recap_citation(app: "CourtListenerGUI", parent: tk.Misc,
     threading.Thread(target=run, daemon=True).start()
 
 
+def _open_fedcas_citation(app: "CourtListenerGUI", parent: tk.Misc,
+                          spec_json: str, status=lambda _s: None) -> None:
+    """Open a Federal Cases citation given by case number ("Cole v. The
+    Atlantic, Case No. 2,976").  No public index maps the numbers to
+    reporter pages, so the case is found live on CourtListener
+    (:func:`courtlistener.find_fedcas_case`): searched by the printed case
+    name — forgivingly, the sources being OCR — with the winner confirmed
+    by the number at the head of its headnotes or, failing that, by the
+    F. Cas. volume the number's alphabetical position dictates.  When
+    CourtListener doesn't hold the case at all, falls back to a Google
+    Scholar name search before giving up."""
+    try:
+        spec = json.loads(spec_json)
+    except Exception:
+        status("Couldn't read that citation.")
+        return
+    no = str(spec.get("no") or "")
+    name = spec.get("name") or ""
+    pretty = fed_cas.pretty_number(no)
+    label = (f"{name}, Case No. {pretty}" if name else f"Case No. {pretty}")
+
+    def safe_status(s: str) -> None:
+        try:
+            status(s)
+        except tk.TclError:
+            pass
+
+    safe_status(f"Looking up {label} on CourtListener…")
+    # Resolve these on the calling (main) thread — they touch tk variables.
+    client = app._get_client() if app._token_var.get().strip() else None
+    fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
+
+    def run() -> None:
+        item = None
+        try:
+            item = cl_api.find_fedcas_case(
+                no, name or None,
+                session=(client._session if client is not None else None),
+            )
+        except Exception as exc:
+            print(f"[fedcas] lookup failed for {label!r}: {exc}")
+        if item and client is not None:
+            try:
+                parts, blocks, plain, _cluster = _assemble_case_parts(
+                    client, item)
+            except Exception as exc:
+                print(f"[fedcas] assemble failed for {label!r}: {exc}")
+                parts, plain = [], ""
+            if parts or plain:
+                how = ("confirmed by its headnote number"
+                       if item.get("matched_by") == "headnote"
+                       else "matched by name and F. Cas. volume")
+                cite = "; ".join(item.get("citation") or [])
+
+                def open_cl(it=item) -> None:
+                    try:
+                        _ScholarTextWindow(
+                            app.root, app, "", "", item=it, cl_text=plain,
+                            cl_parts=parts, cl_blocks=blocks,
+                        )
+                    except tk.TclError:
+                        pass
+
+                app._post_root(open_cl)
+                app._post_root(lambda: safe_status(
+                    f"Opened {label}" + (f" — {cite}" if cite else "")
+                    + f" ({how})."))
+                return
+        # CourtListener doesn't hold the case (or no API token): try a
+        # Google Scholar search by the printed name, era-scoped.
+        if name and fetcher is not None:
+            result = None
+            try:
+                result = fetcher.fetch_by_name(name, None)
+            except Exception as exc:
+                print(f"[fedcas] scholar name lookup failed for {label!r}: {exc}")
+            if result:
+                def open_scholar(u=result[0], h=result[1]) -> None:
+                    try:
+                        _ScholarTextWindow(app.root, app, u, h, item=None,
+                                           prefetch_pdf=False)
+                    except tk.TclError:
+                        pass
+                app._post_root(open_scholar)
+                app._post_root(lambda: safe_status(
+                    f"CourtListener hasn't {label} — opened a Google "
+                    "Scholar name match (verify it yourself)."))
+                return
+        app._post_root(lambda: safe_status(f"Not found: {label}"))
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
                          action: tuple[str, str],
                          status=lambda _s: None,
@@ -18615,6 +18761,9 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
         return
     if kind == "recap":
         _open_recap_citation(app, parent, value, status)
+        return
+    if kind == "fedcas":
+        _open_fedcas_citation(app, parent, value, status)
         return
     if kind != "cite":
         status("Don't know how to open that citation.")
