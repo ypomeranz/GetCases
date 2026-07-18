@@ -56,6 +56,18 @@ class CaptionCapitalizationTests(unittest.TestCase):
             "NBCUniversal Media, LLC",
         )
 
+    def test_quoted_all_caps_word_capitalizes_inside_the_quotes(self):
+        # THE "SCOTLAND.", 105 U.S. 24: the capital must reach the first
+        # letter through the reporter's quotation mark, in either style.
+        self.assertEqual(
+            normal_case_caption("THE “SCOTLAND.”"), "The “Scotland.”")
+        self.assertEqual(
+            normal_case_caption('THE "SCOTLAND."'), 'The "Scotland."')
+        # A digit-led token is an ordinal, not a name: its tail stays lower.
+        self.assertEqual(
+            normal_case_caption("42ND STREET CO. v. SMITH"),
+            "42nd Street Co. v. Smith")
+
     def test_naacp_survives_all_caps_caption_normalization(self):
         name = normal_case_caption("NAACP v. ALABAMA")
         self.assertEqual(name, "NAACP v. Alabama")
@@ -349,6 +361,29 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
             abbreviate_case_name(name),
             "In re Imerys Talc Am., Inc.",
         )
+
+    def test_quoted_in_rem_vessel_caption_drops_the_quotes(self):
+        # The Scotland, 105 U.S. 24 (1882): the reporter prints the vessel's
+        # name in quotation marks ("THE “SCOTLAND.”").  The quotes are the
+        # reporter's typography — the citation name is "The Scotland", with
+        # the ship's capital and its rule-10.2.1(d) "The" intact.
+        blocks = [
+            Block("center", [Span("105 U.S. 24 (____)")]),
+            Block("center", [Span("THE “SCOTLAND.”")]),
+            Block("center", [Span("Supreme Court of United States.")]),
+            Block("para", [Span(
+                "The case was argued by Mr. William Allen Butler, with "
+                "whom was Mr. Thomas E. Stillman and Mr. John Chetwood, "
+                "for the “Scotland,” and by Mr. James C. Carter and Mr. "
+                "Robert D. Benedict, with whom was Mr. Joseph H. Choate, "
+                "for the libellants."
+            )]),
+        ]
+
+        name = _scholar_caption_name(blocks)
+
+        self.assertEqual(name, "The “Scotland.”")
+        self.assertEqual(abbreviate_case_name(name), "The Scotland")
 
     def test_lowercase_words_do_not_end_a_procedural_case_name(self):
         blocks = [Block("center", [Span(

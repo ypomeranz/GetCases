@@ -685,6 +685,20 @@ _CAPTION_KEEP_CAPS = frozenset({
 })
 
 
+def _capitalize_component(piece: str) -> str:
+    """Capitalize a lowercased caption-word component, reaching the first
+    letter through any opening quote or bracket — the old reports set an in
+    rem vessel's name in quotation marks ('THE “SCOTLAND.”', 105 U.S. 24),
+    and capitalizing the quote character itself would leave '“scotland.”'.
+    A digit-led component ("42nd", "3rd") is an ordinal, not a name, and
+    keeps its lowercased tail."""
+    m = re.search(r"[0-9A-Za-z]", piece)
+    if m and piece[m.start()].isalpha():
+        i = m.start()
+        return piece[:i] + piece[i].upper() + piece[i + 1:]
+    return piece
+
+
 def normal_case_caption(text: str) -> str:
     """Normal-case the all-caps words in a case caption without damaging
     apostrophe or ``Mc`` surnames.
@@ -710,7 +724,7 @@ def normal_case_caption(text: str) -> str:
                     and sum(c.isupper() for c in letters) <= len(letters) // 2)):
             out.append(word)
             continue
-        stripped = word.replace("’", "'").strip(".,()'\"")
+        stripped = word.replace("’", "'").strip(".,()'\"“”")
         # An all-caps word containing "&" is a firm's initialism (AT&T,
         # A&M, S&P, H&R) — English words never carry one, so caps are safe.
         # The dotted-initialism check tolerates a final letter left bare by
@@ -733,7 +747,7 @@ def normal_case_caption(text: str) -> str:
                 out.append(word)
                 continue
         low = word.lower()
-        if i and low.strip(".,()'\"") in _CAPTION_SMALL_WORDS:
+        if i and low.strip(".,()'\"“”") in _CAPTION_SMALL_WORDS:
             out.append(low)
             continue
 
@@ -742,7 +756,7 @@ def normal_case_caption(text: str) -> str:
         # conventional internal capital after Mc.
         pieces = re.split(r"(['’-])", low)
         fixed = "".join(
-            piece[:1].upper() + piece[1:] if j % 2 == 0 and piece else piece
+            _capitalize_component(piece) if j % 2 == 0 and piece else piece
             for j, piece in enumerate(pieces)
         )
         if fixed.startswith("Mc") and len(fixed) > 2 and fixed[2].isalpha():
@@ -860,7 +874,7 @@ def refine_caption_case(name: str, body_text: str) -> str:
     for i, tok in enumerate(tokens):
         core = cores[i]
         if (len(core) < 2 or core.lower() in ("v", "vs")
-                or not tok.strip(".,;:()'\"").isalpha()):
+                or not tok.strip(".,;:()'\"“”").isalpha()):
             continue
         votes, unanchored = _caption_token_case_votes(
             tokens, cores, i, body_text)
@@ -970,7 +984,7 @@ def caption_case_reference_tokens(name: str, body_text: str) -> tuple[str, ...]:
             low = core.lower()
             if (len(core) < 5 or not core[:1].isupper()
                     or not core[1:].islower()
-                    or not tokens[i].strip(".,;:()'\"").isalpha()
+                    or not tokens[i].strip(".,;:()'\"“”").isalpha()
                     or low in _CAPTION_ORDINARY_ENTITY_WORDS):
                 continue
             # A long apparent compound containing an organization word (as
@@ -1711,6 +1725,10 @@ def abbreviate_case_name(name: str) -> str:
     # OCR renders the early reports' turned-comma apostrophe as U+2018
     # ("M‘Intosh"); normalize so name patterns and casing rules see it.
     name = re.sub(r"\s+", " ", (name or "").replace("‘", "'")).strip()
+    # The old reports set an in rem vessel's name in quotation marks
+    # (THE "SCOTLAND.", 105 U.S. 24) — the quotes are the reporter's
+    # typography, never part of the Bluebook name.
+    name = re.sub(r"[“”\"]", "", name)
     # A caption's footnote marker clings to the end of the name — a
     # reference symbol ("THE EUGENE F. MORAN.*"), Scholar's bracketed form
     # ("The Eugene F. Moran.[1]", same token shape google_scholar's
@@ -1979,6 +1997,10 @@ if __name__ == "__main__":
         ("The Thomas Jefferson", "The Thomas Jefferson"),
         ("The Silvia.", "The Silvia"),
         ("The Western Maid, et al.", "The Western Maid"),
+        # The reporter may set the vessel's name in quotation marks
+        # (THE "SCOTLAND.", 105 U.S. 24): the quotes are typography only.
+        ("The “Scotland.”", "The Scotland"),
+        ('The "Scotland."', "The Scotland"),
         # A footnote marker at the end of a reporter caption — a reference
         # symbol or an OCR-flattened superscript digit — is no part of the
         # name; a digit reached through a space is ("Apollo 13").
