@@ -640,6 +640,8 @@ from citations import (
     NOMINATIVE_PARALLEL_RE as _NOMINATIVE_PARALLEL_RE,
     US_NOMINATIVE_PARALLEL_RE as _US_NOMINATIVE_PARALLEL_RE,
     NOMINATIVE_CITE_RE as _NOMINATIVE_TEXT_CITE_RE,
+    EARLY_FED_CITE_RE as _EARLY_FED_CITE_RE,
+    early_fed_cite_text as _early_fed_cite_text,
     SHORT_CITE_RE as _SHORT_CITE_RE,
     ID_CITE_RE as _ID_CITE_RE,
     case_match_text as _case_match_text,
@@ -10170,10 +10172,7 @@ def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
             doc.close()
 
 
-def _citation_links_from_pages(
-    pages: list,
-    link_pages: Optional[set[int]] = None,
-) -> dict:
+def _citation_links_from_pages(pages: list) -> dict:
     """Build the per-page clickable-citation rectangles from extracted page char
     data (see :func:`_extract_pdf_text_pages`).  Pure — no PDFium, no tk — so it
     is cheap to run on the worker right after extraction:
@@ -10205,8 +10204,6 @@ def _citation_links_from_pages(
             pi, li = gmap[g]
             if pi is None:
                 continue
-            if link_pages is not None and pi not in link_pages:
-                continue
             bx = pages[pi][li][1]
             if bx is not None:
                 per_page.setdefault(pi, []).append(bx)
@@ -10223,15 +10220,20 @@ def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
     return _citation_links_from_pages(_extract_pdf_text_pages(pdf_bytes))
 
 
-def _citation_links_from_visible_pdf_text(pdf_bytes: bytes, pages: list) -> dict:
-    """Citation rectangles only for born-digital text, not OCR-over-scan text."""
+def _citation_links_from_visible_pdf_text(
+    pdf_bytes: bytes, pages: list,
+) -> "tuple[dict, set[int]]":
+    """Citation rectangles for the whole document, plus the page indexes
+    whose text layer is OCR over a scan.  OCR glyph boxes land imprecisely,
+    so the pane renders those pages' links *quietly* — no tint, no
+    recoloring — while keeping them clickable (see
+    :meth:`_PdfPane.set_citation_links`)."""
     try:
         ocr_pages = _pdf_ocr_scan_pages(pdf_bytes)
     except Exception as exc:
         print(f"[pdf-links] OCR scan check failed: {exc}")
         ocr_pages = set()
-    link_pages = set(range(len(pages))) - ocr_pages
-    return _citation_links_from_pages(pages, link_pages=link_pages)
+    return _citation_links_from_pages(pages), ocr_pages
 
 
 # ---------------------------------------------------------------------------
@@ -10488,6 +10490,9 @@ class _PdfPane(ttk.Frame):
         self._overlay_ids: dict[int, list] = {}  # page → [canvas rectangle ids]
         self._cite_on_left = None
         self._cite_on_right = None
+        # Pages whose links are *quiet*: clickable but drawn with no tint and
+        # no recoloring (OCR-over-scan text, whose glyph boxes are imprecise).
+        self._quiet_pages: set[int] = set()
         # Optional text find (enabled via enable_find): per-page char data, the
         # current match list, and the page→highlight-ids map.
         self._search_pages: Optional[list] = None
@@ -10809,17 +10814,22 @@ class _PdfPane(ttk.Frame):
     # ------------------------------------------------------------------
 
     def set_citation_links(self, page_links: dict,
-                           on_left=None, on_right=None) -> None:
+                           on_left=None, on_right=None,
+                           quiet_pages: "Optional[set[int]]" = None) -> None:
         """Attach clickable citation overlays.  ``page_links`` maps a page index
         to ``[(rect_pts, action, snippet), …]`` (see
         :func:`_detect_pdf_citation_links`).  ``on_left(action, snippet)`` fires
-        on a left click, ``on_right(action, snippet)`` on a right click.  Redraws
-        the overlays on every page currently on screen (in recolor mode the
-        pages themselves are re-rendered, since the link color is baked into
-        the page image)."""
+        on a left click, ``on_right(action, snippet)`` on a right click.
+        Links on a page in ``quiet_pages`` (OCR-over-scan text, whose glyph
+        boxes are imprecise) are drawn with no tint or recoloring at all but
+        stay clickable, dispatched at the canvas level.  Redraws the overlays
+        on every page currently on screen (in recolor mode the pages
+        themselves are re-rendered, since the link color is baked into the
+        page image)."""
         self._cite_links = page_links or {}
         self._cite_on_left = on_left
         self._cite_on_right = on_right
+        self._quiet_pages = set(quiet_pages or ())
         if self._link_style == "recolor":
             self._bind_recolor_events()
             c = self._canvas
@@ -10828,6 +10838,8 @@ class _PdfPane(ttk.Frame):
                 _dispose_photo(self._photos.pop(i, None))
             self._render_visible()
             return
+        if self._quiet_pages:
+            self._bind_recolor_events()   # canvas-level clicks for quiet links
         for i in list(self._img_ids):
             self._draw_overlays(i)
 
@@ -10838,6 +10850,8 @@ class _PdfPane(ttk.Frame):
         rectangle are recolored, so the shapes stay crisp and the paper stays
         white — the text simply *is* blue, with no highlight box."""
         from PIL import Image
+        if i in self._quiet_pages:
+            return content   # OCR page: leave the scan untouched (quiet links)
         _w_pt, h_pt, _frac = self._meta[i]
         if content.mode != "RGB":
             content = content.convert("RGB")
@@ -10874,20 +10888,34 @@ class _PdfPane(ttk.Frame):
                add="+")
 
     def _link_at(self, event) -> "Optional[tuple]":
-        """The (action, snippet) under a mouse event, or None."""
+        """The (action, snippet) under a mouse event, or None.  In tint mode
+        only the *quiet* pages' links are canvas-dispatched — the tinted
+        rectangles have their own item bindings."""
         try:
             x = self._canvas.canvasx(event.x)
             y = self._canvas.canvasy(event.y)
         except tk.TclError:
             return None
         for i in list(self._img_ids):
+            if self._link_style != "recolor" and i not in self._quiet_pages:
+                continue
             for rect, action, snippet in self._cite_links.get(i, ()):
                 x0, y0, x1, y1 = self._rect_to_canvas(i, rect)
                 if x0 - 1 <= x <= x1 + 1 and y0 - 1 <= y <= y1 + 1:
                     return action, snippet
         return None
 
+    def _over_overlay_item(self) -> bool:
+        """True when the pointer sits on a tinted overlay rectangle (whose
+        own item bindings handle the cursor and the click)."""
+        try:
+            return "cite_ov" in self._canvas.gettags("current")
+        except tk.TclError:
+            return False
+
     def _on_recolor_motion(self, event) -> None:
+        if self._over_overlay_item():
+            return
         try:
             self._canvas.config(
                 cursor="hand2" if self._link_at(event) else "")
@@ -10895,6 +10923,8 @@ class _PdfPane(ttk.Frame):
             pass
 
     def _on_recolor_click(self, event, left: bool):
+        if self._over_overlay_item():
+            return None
         hit = self._link_at(event)
         if not hit:
             return None
@@ -10938,6 +10968,8 @@ class _PdfPane(ttk.Frame):
         links = self._cite_links.get(i)
         if not links or i >= len(self._slots):
             return
+        if i in self._quiet_pages:
+            return   # quiet page: no tint; clicks are canvas-dispatched
         ids: list = []
         for rect, action, snippet in links:
             x0, y0, x1, y1 = self._rect_to_canvas(i, rect)
@@ -12897,6 +12929,14 @@ class _ScholarTextWindow:
                     continue
                 matches.append((m.start(), m.end(), "cite",
                                 _case_match_text(m)))
+        # Early lower-federal reporters ("1 Sumner, 73" -> "1 Sumn. 73",
+        # "35 Fed. Rep. 665" -> "35 F. 665"), the forms CourtListener knows.
+        for m in _EARLY_FED_CITE_RE.finditer(text):
+            if any(m.start() < e and s < m.end()
+                   for s, e, _k, _v in matches):
+                continue
+            matches.append((m.start(), m.end(), "cite",
+                            _early_fed_cite_text(m)))
         for m in us_code.USC_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "usc", m))
         for m in ecfr.CFR_CITE_RE.finditer(text):
@@ -17198,11 +17238,12 @@ class _ScholarTextWindow:
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
                 return
-            links = {}
+            links: dict = {}
+            quiet: set = set()
             if not any(pages or []):
                 return  # scan-only PDF: no text layer to select
             try:
-                links = _citation_links_from_visible_pdf_text(d, pages)
+                links, quiet = _citation_links_from_visible_pdf_text(d, pages)
             except Exception as exc:
                 print(f"[pdf-links] citation scan failed: {exc}")
             # The separate opinions (Syllabus, Opinion of the Court, each
@@ -17222,6 +17263,7 @@ class _ScholarTextWindow:
                                 links,
                                 self._open_pdf_cite,
                                 self._open_pdf_cite_browser,
+                                quiet_pages=quiet,
                             )
                         p.enable_find(pages, bind_keys=False)
                         if len(sections) > 1:
@@ -17230,10 +17272,13 @@ class _ScholarTextWindow:
                             nav.pack(side="right", fill="y", padx=(4, 0))
                         bits = []
                         n = sum(len(v) for v in links.values())
+                        nq = sum(len(v) for pg, v in links.items()
+                                 if pg in quiet)
                         if n:
                             bits.append(
                                 f"{n} citation link{'s' if n != 1 else ''} "
-                                "shown in blue"
+                                + ("clickable (not colored on scanned pages)"
+                                   if nq else "shown in blue")
                             )
                         if len(sections) > 1:
                             bits.append(f"{len(sections)} opinion parts "
@@ -17715,12 +17760,14 @@ class _PdfWindow:
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
                 return
-            links = {}
+            links: dict = {}
+            quiet: set = set()
             if not any(pages or []):
                 return
             if self._is_case:
                 try:
-                    links = _citation_links_from_visible_pdf_text(d, pages)
+                    links, quiet = _citation_links_from_visible_pdf_text(
+                        d, pages)
                 except Exception as exc:
                     print(f"[pdf-links] citation scan failed: {exc}")
 
@@ -17732,14 +17779,18 @@ class _PdfWindow:
                                 links,
                                 self._open_cite,
                                 self._open_cite_browser,
+                                quiet_pages=quiet,
                             )
                         p.enable_find(pages)
                         n = sum(len(v) for v in links.values())
+                        nq = sum(len(v) for pg, v in links.items()
+                                 if pg in quiet)
                         if n:
                             self._status_var.set(
-                                f"{n} citation link"
-                                f"{'' if n == 1 else 's'} shown in blue; "
-                                "drag to select text."
+                                f"{n} citation link{'' if n == 1 else 's'} "
+                                + ("clickable (not colored on scanned "
+                                   "pages); " if nq else "shown in blue; ")
+                                + "drag to select text."
                             )
                 except tk.TclError:
                     pass
@@ -18349,26 +18400,30 @@ class _SlipOpinionWindow:
             print(f"[slip] text extraction failed: {exc}")
             pages = []
         links: dict = {}
+        quiet: set = set()
         sections: list = []
         if pages:
             try:
-                links = _citation_links_from_visible_pdf_text(data, pages)
+                links, quiet = _citation_links_from_visible_pdf_text(
+                    data, pages)
             except Exception as exc:
                 print(f"[slip] citation scan failed: {exc}")
             try:
                 sections = slip_opinion.detect_sections(pages)
             except Exception as exc:
                 print(f"[slip] section detection failed: {exc}")
-        self._post(self._analyzed, pages, links, sections)
+        self._post(self._analyzed, pages, links, sections, quiet)
 
-    def _analyzed(self, pages: list, links: dict, sections: list) -> None:
+    def _analyzed(self, pages: list, links: dict, sections: list,
+                  quiet: "set[int] | None" = None) -> None:
         if self._pane is None:
             return
         self._pages = pages
         self._pane.enable_find(pages)
         if links:
             self._pane.set_citation_links(
-                links, self._open_cite, self._open_cite_browser)
+                links, self._open_cite, self._open_cite_browser,
+                quiet_pages=quiet)
         self._build_nav(sections)
         n = sum(len(v) for v in links.values())
         bits = []
@@ -19448,25 +19503,32 @@ class _LinkedPdfWindow:
     def _scan(self) -> None:
         try:
             pages = _extract_pdf_text_pages(self._bytes)   # one extraction pass
-            links = _citation_links_from_visible_pdf_text(self._bytes, pages)
+            links, quiet = _citation_links_from_visible_pdf_text(
+                self._bytes, pages)
         except Exception as exc:
             self._post(self._scan_failed, str(exc))
             return
-        self._post(self._scan_done, links, pages)
+        self._post(self._scan_done, links, pages, quiet)
 
     def _scan_failed(self, msg: str) -> None:
         self._legend_lbl.configure(text="Citation scan failed:")
         self._status_var.set(msg)
 
-    def _scan_done(self, links: dict, pages: list) -> None:
+    def _scan_done(self, links: dict, pages: list,
+                   quiet: "set[int] | None" = None) -> None:
         if self._closed or self._pane is None:
             return
-        self._pane.set_citation_links(links, self._open_cite, self._open_cite_browser)
+        self._pane.set_citation_links(links, self._open_cite,
+                                      self._open_cite_browser,
+                                      quiet_pages=quiet)
         self._pane.enable_find(pages)   # Ctrl-F searches the text layer
         n = sum(len(v) for v in links.values())
+        n_quiet = sum(len(v) for pg, v in links.items() if pg in (quiet or ()))
         has_text = any(pages)
         self._legend_lbl.configure(
-            text=("Citations are shown in blue and clickable." if n
+            text=("Citations are clickable (not colored on scanned pages)."
+                  if n and n_quiet
+                  else "Citations are shown in blue and clickable." if n
                   else "No citations detected."))
         msg = (f"{n} citation link{'' if n == 1 else 's'} — left-click to open, "
                "right-click for the browser." if n

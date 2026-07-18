@@ -77,14 +77,45 @@ CITE_CAPTURE_RE = re.compile(
 # "wall" from matching.
 _NOM_SCOTUS_ALT = (r"(?:Dall(?:as)?|Cranch|Wheat(?:on)?|Pet(?:ers)?|"
                    r"How(?:ard)?|Black|Wall(?:ace)?|Otto)")
+# The possessive guard keeps "1 Peters' Rep. 233" — Peters' *District Court*
+# reports — from reading as 1 Pet. 233; the optional "Rep." absorbs the old
+# spelled-out style "10 Wheat. Rep. 472" (case_match_text drops it).
 NOMINATIVE_CITE_RE = re.compile(
-    r"\b(\d{1,2})\s+(" + _NOM_SCOTUS_ALT + r"\.?)\s+(\d{1,4})\b")
+    r"\b(\d{1,2})\s+(" + _NOM_SCOTUS_ALT
+    + r"\.?)(?!['’])(?:\s+Rep\.)?\s+(\d{1,4})\b")
 NOMINATIVE_PARALLEL_RE = re.compile(
     r"\b(\d{1,2})\s+(" + _NOM_SCOTUS_ALT + r"\.?)\s*"
     r"[\[(]\s*\d{1,3}\s+U\.\s?S\.\s*[\])]\s*[-–—]?\s*(\d{1,5})\b")
 US_NOMINATIVE_PARALLEL_RE = re.compile(
     r"\b(\d{1,3})\s+(U\.\s?S\.)\s*[\[(]\s*\d{1,2}\s+" + _NOM_SCOTUS_ALT +
     r"\.?\s*[\])]\s*[-–—]?\s*(\d{1,5})\b")
+
+# Early lower-federal reporters, cited by the reporter's name in 19th-century
+# opinions — "The Nestor, 1 Sumner, 73", "The Young Mechanic, 2 Curtis, 404",
+# "The Amos D. Carver, 35 Fed. Rep. 665" — normalized to the abbreviation
+# CourtListener indexes ("1 Sumn. 73", "2 Curt. 404", "35 F. 665"), which the
+# ordinary citation-resolution path then opens.  Case-sensitive, digits on
+# both sides, and "Fed." must be followed by the page (or "Rep." then the
+# page), so "Fed. R. Civ. P. 56", "Fed. Reg." and "Fed. Cl." never match.
+_EARLY_FED_CANON = {
+    "sumner": "Sumn.", "sumn": "Sumn.", "curtis": "Curt.", "curt": "Curt.",
+    "benedict": "Ben.", "ben": "Ben.", "lowell": "Low.", "low": "Low.",
+    "gallison": "Gall.", "gallis": "Gall.", "gall": "Gall.",
+    "sprague": "Sprague",
+    "story": "Story", "brock": "Brock.", "walljr": "Wall. Jr.",
+    "fed": "F.", "fedrep": "F.",
+}
+EARLY_FED_CITE_RE = re.compile(
+    r"\b(\d{1,3})\s+(Sumner|Sumn\.|Curtis|Curt\.|Benedict|Ben\.|Lowell|"
+    r"Low\.|Gallison|Gallis\.|Gall\.|Sprague|Story|Brock\.|Wall\.\s?Jr\.|"
+    r"Fed\.(?:\s?Rep\.)?),?\s+(\d{1,5})\b")
+
+
+def early_fed_cite_text(m: re.Match) -> str:
+    """Normalized cite for an EARLY_FED_CITE_RE match ("2 Curtis, 72" ->
+    "2 Curt. 72", "35 Fed. Rep. 665" -> "35 F. 665")."""
+    rep = _EARLY_FED_CANON[re.sub(r"[^a-z]", "", m.group(2).lower())]
+    return f"{m.group(1)} {rep} {m.group(3)}"
 
 # Briefs often cite official state reporters that are too numerous to list in
 # REPORTER_ALT ("306 Md. 556", "100 Cal. 400", "515 Pa. 1").  This guarded
@@ -172,6 +203,7 @@ def case_match_text(m: re.Match) -> str:
     s = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.").replace("’", "'")
     s = re.sub(r"\s*[\[(][^\])]*[\])]\s*", " ", s)
     s = re.sub(r"\s[-–—]\s*(?=\d)", " ", s)
+    s = re.sub(r"(?<=\.)\s+Rep\.(?=\s+\d)", "", s)  # "10 Wheat. Rep. 472"
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -548,7 +580,17 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
             continue
         fedcas_spans.append((start, end))
         matches.append((start, end, "fedcas", spec))
-    claimed_spans = engrep_spans + recap_spans + fedcas_spans
+    # Early lower-federal reporters ("1 Sumner, 73", "35 Fed. Rep. 665"),
+    # pre-normalized to the abbreviations CourtListener indexes — claimed
+    # ahead of the broad reporter fallback so the normalized form wins.
+    efed_spans: list[tuple[int, int]] = []
+    for m in EARLY_FED_CITE_RE.finditer(text):
+        if any(m.start() < e and s < m.end()
+               for s, e in engrep_spans + recap_spans + fedcas_spans):
+            continue
+        efed_spans.append((m.start(), m.end()))
+        matches.append((m.start(), m.end(), "cite", early_fed_cite_text(m)))
+    claimed_spans = engrep_spans + recap_spans + fedcas_spans + efed_spans
     for m in _iter_case_cites(text):
         if any(m.start() < e and s < m.end() for s, e in claimed_spans):
             continue
@@ -821,6 +863,29 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
         if not any(a == want for _, _, a in nomsc):
             print("nominative SCOTUS cite failed:", want, nomsc)
             sys.exit(1)
+
+    # Early lower-federal reporters normalize to CourtListener's forms; the
+    # spelled-out "Wheat. Rep." folds to "Wheat."; the possessive "Peters'
+    # Rep." (Peters' District Court reports) must NOT become "Pet." (26
+    # U.S.); and "Fed. R. Civ. P." stays a rule.
+    efed = detect_links(
+        "The Nestor, 1 Sumner, 73; The Young Mechanic, 2 Curtis, 404; "
+        "The Amos D. Carver, 35 Fed. Rep. 665; The Orient, 10 Benedict, 620; "
+        "The Creole, 2 Wall. Jr. 485, 518; Manro v. Almeida, 10 Wheat. Rep. "
+        "472; Stevens v. The Sandwich, 1 Peters' Rep. 233; Fed. R. Civ. P. 56."
+    )
+    for want in (("cite", "1 Sumn. 73"), ("cite", "2 Curt. 404"),
+                 ("cite", "35 F. 665"), ("cite", "10 Ben. 620"),
+                 ("cite", "2 Wall. Jr. 485@518"), ("cite", "10 Wheat. 472")):
+        if not any(a == want for _, _, a in efed):
+            print("early-federal reporter failed:", want, efed)
+            sys.exit(1)
+    if any(a == ("cite", "1 Pet. 233") for _, _, a in efed):
+        print("possessive Peters' Rep. must not become Pet.:", efed)
+        sys.exit(1)
+    if not any(a[0] == "rule" for _, _, a in efed):
+        print("Fed. R. Civ. P. lost to the Fed. reporter pass:", efed)
+        sys.exit(1)
 
     # Unpublished opinions: a federal WL cite with docket + court/date routes
     # to RECAP — with the docket carried from the first occurrence to later

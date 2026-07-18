@@ -231,6 +231,8 @@ _NOM_INDEX: "dict[tuple[str, int, int], list[tuple[int, int]]] | None" = None
 _NOM_RE: "re.Pattern | None" = None
 # First pages per (reporter key, volume) — pin-cite resolution.
 _NOM_PAGES: "dict[tuple[str, int], list[int]] | None" = None
+# Volumes each reporter key appears with — the volumeless-cite fallback.
+_NOM_VOLS: "dict[str, tuple[int, ...]]" = {}
 # Normalized alias key -> canonical reporter keys present in the index.
 _NOM_ALIAS_KEYS: "dict[str, tuple[str, ...]]" = {}
 # Reporters the index knows only volumeless (every row has volume 0) — the
@@ -281,6 +283,23 @@ _NOM_ALIASES: "dict[str, tuple[str, ...]]" = {
     "Dougl": ("Doug",),
     "Dod": ("Dods",),
     "Hagg": ("Hag Adm", "Hag Ecc", "Hag Con", "Hag Ecc App"),
+    # Late-19th-century U.S. opinions (The John G. Stevens, 170 U.S. 113;
+    # Ramsay v. Allegre, 25 U.S. 611) spell several reporters out or use
+    # older short forms: "7 Moore P.C. 267" (The Bold Buccleugh), "1 Dodson,
+    # 37", "The Europa, Brown. & Lush. 89" — which must never fall through
+    # to volumeless "Lush." (a different case) — "2 Lord Raym. 805",
+    # "3 Levinz. 353", "1 Vesey, 155".  Bare "Rob." (The John, 3 Rob. 288)
+    # can be Christopher or William Robinson's admiralty reports, so like
+    # bare "Hagg." it aliases to both and resolution decides.
+    "Moore PC": ("Moo PC",),
+    "Dodson": ("Dods",),
+    "Brown & Lush": ("Br & Lush",),
+    "Lord Raym": ("Ld Raym",),
+    "Levinz": ("Lev",),
+    "Vesey": ("Ves Sen", "Ves Jun"),
+    "Cro Ch": ("Cro Car",),
+    "Cro Charles": ("Cro Car",),
+    "Rob": ("C Rob", "W Rob"),
     "Hagg Adm": ("Hag Adm",),
     "Hagg Ecc": ("Hag Ecc",),
     "Hagg Con": ("Hag Con",),
@@ -327,6 +346,7 @@ def _load_nominate() -> None:
     won't resolve.  Loads the main index first (case records join by neutral
     cite)."""
     global _NOM_INDEX, _NOM_RE, _NOM_PAGES, _NOM_ALIAS_KEYS, _NOM_VOLUMELESS
+    global _NOM_VOLS
     if _NOM_INDEX is not None:
         return
     _load()  # outside _LOCK -- it takes the same (non-reentrant) lock
@@ -372,6 +392,7 @@ def _load_nominate() -> None:
             plist.sort()
         _NOM_VOLUMELESS = frozenset(
             k for k, vols in vols_by_key.items() if vols == {0})
+        _NOM_VOLS = {k: tuple(sorted(v)) for k, v in vols_by_key.items()}
         present = {key for (key, _v, _p) in idx}
         alias_keys = {}
         for form, canon in _NOM_ALIASES.items():
@@ -383,10 +404,13 @@ def _load_nominate() -> None:
         if forms:
             # Longest form first, so 'Ves Jun Supp' outranks 'Ves Jun' and
             # 'CB NS' outranks 'CB' (regex alternation is first-match).
+            # A comma may sit between reporter and page, as older U.S.
+            # opinions print ("1 Dodson, 37"; "Owen, 122").
             alt = "|".join(_nom_form_pattern(f)
                            for f in sorted(forms, key=len, reverse=True))
             _NOM_RE = re.compile(
-                r"\b(?:(\d{1,3})\s+)?(" + alt + r")\s+(\d{1,5})(?:\s*[ab])?\b")
+                r"\b(?:(\d{1,3})\s+)?(" + alt
+                + r"),?\s+(\d{1,5})(?:\s*[ab])?\b")
         _NOM_PAGES = pages
         _NOM_ALIAS_KEYS = alias_keys
         _NOM_INDEX = idx
@@ -410,7 +434,7 @@ def _vols_for(key: str, vol: int) -> "tuple[int, ...]":
     return (vol,)
 
 
-def _nom_resolve(key: str, vol: int, page: int
+def _nom_resolve(key: str, vol: int, page: int, dotted: bool = True
                  ) -> "tuple[str, int, int, list] | None":
     """``(canonical_key, volume, start_page, targets)`` for a matched
     nominate cite, or None — volume and start page as *indexed*, so the spec
@@ -418,11 +442,23 @@ def _nom_resolve(key: str, vol: int, page: int
     reporter and its aliases at the exact page first; a miss then resolves
     as a pin cite — the case beginning at the nearest preceding indexed page
     of the same reporter volume ("3 Burr. 1663" pins into Rex v.
-    Vice-Chancellor, 3 Burr. 1647)."""
+    Vice-Chancellor, 3 Burr. 1647).
+
+    A *volumeless* cite to a multi-volume reporter ("Cowp. 636" — Cowper's
+    two volumes are continuously paged) resolves when exactly one volume
+    starts a case at that page, and surfaces every candidate when several
+    do — but only for a dotted abbreviation of some substance: a word-shaped
+    form without its period ("East 426" in prose) proves nothing, and a
+    short generic one ("Insurance Co. 45") is company boilerplate, not
+    Coke."""
     keys = (key,) + _NOM_ALIAS_KEYS.get(key, ())
+    scan = not vol and dotted and len(key) >= 4
     hits: "list[tuple[str, int, list]]" = []
     for k in keys:
-        for v in _vols_for(k, vol):
+        vols: "tuple[int, ...]" = _vols_for(k, vol)
+        if scan and k not in _NOM_VOLUMELESS:
+            vols += tuple(v for v in _NOM_VOLS.get(k, ()) if v != 0)
+        for v in vols:
             targets = _NOM_INDEX.get((k, v, page))
             if targets:
                 hits.append((k, v, targets))
@@ -508,6 +544,7 @@ def iter_nominate_cites(text: str) -> "list[tuple[int, int, str, list[ERCase]]]"
             vol = int(m.group(1) or 0)
             key = _nom_key(m.group(2))
             page = int(m.group(3))
+            dotted = bool(re.search(r"[.&]", m.group(2)))
         else:
             m, j = ids[j], j + 1
             if last is None or m.start() < last[0]:
@@ -519,7 +556,8 @@ def iter_nominate_cites(text: str) -> "list[tuple[int, int, str, list[ERCase]]]"
             vol = int(m.group(1))
             key = last[1]
             page = int(m.group(2))
-        hit = _nom_resolve(key, vol, page)
+            dotted = True       # the id-form always carries a volume
+        hit = _nom_resolve(key, vol, page, dotted)
         if hit is None:
             # An unresolved citation-shaped match still stands between a
             # resolved cite and a later "id." — the id. refers to *it* (the
@@ -684,10 +722,15 @@ def resolve(spec: str) -> list[ERCase]:
         key, vol, page = nm.group(1), int(nm.group(2)), int(nm.group(3))
         # An ambiguous alias spec ("n:hagg:2:136") carries the alias key
         # itself; collect the union across its canonical reporters, exactly
-        # as _nom_resolve matched it.  Canonical specs hit the index direct.
+        # as _nom_resolve matched it — including the all-volumes scan a
+        # volumeless spec ("n:cowp:0:636") implies.  Canonical specs hit
+        # the index direct.
         targets: list = []
         for k in (key,) + _NOM_ALIAS_KEYS.get(key, ()):
-            for v in _vols_for(k, vol):
+            vols = _vols_for(k, vol)
+            if not vol and len(key) >= 4 and k not in _NOM_VOLUMELESS:
+                vols += tuple(v for v in _NOM_VOLS.get(k, ()) if v != 0)
+            for v in vols:
                 for t in _NOM_INDEX.get((k, v, page)) or []:
                     if t not in targets:
                         targets.append(t)
@@ -852,6 +895,34 @@ if __name__ == "__main__":
           and any(spec == "n:hagg:1:22"
                   for _s, _e, spec, _c in iter_nominate_cites("1 Hagg. 22")),
           "colliding bare 'Hagg.' page yields every candidate")
+    # The John G. Stevens (170 U.S. 113) forms: "Moore P.C." is Moore's
+    # Privy Council; "1 Dodson, 37" tolerates the comma; "Brown. & Lush. 89"
+    # (The Europa) must resolve as Browning & Lushington and never fall
+    # through to volumeless "Lush." (The Alpha, a different case).
+    # (CommonLII captions The Bold Buccleugh as "Daniel Harmer, Appellant
+    # …" and spells the Madonna D'Idra "D'Indra".)
+    nom_one("The Bold Buccleugh, 7 Moore P.C. 267", "n:moopc:7:267",
+            "Harmer")
+    nom_one("The Madonna D'Idra, 1 Dodson, 37, 40", "n:dods:1:37", "Madonna")
+    europa = iter_nominate_cites("The Europa, Brown. & Lush. 89, 91, 97")
+    check(any(spec == "n:brlush:0:89" for _s, _e, spec, _c in europa)
+          and not any("lush:0:89" in spec and "brlush" not in spec
+                      for _s, _e, spec, _c in europa),
+          f"Brown. & Lush. 89 is the Europa, not the Alpha (got "
+          f"{[s for _a, _b, s, _c in europa]})")
+    # Ramsay v. Allegre (25 U.S. 611) forms: "Lord Raym." for Ld Raym,
+    # comma'd volumeless "Owen, 122", and the volumeless "Cowp. 636" —
+    # Cowper's volumes are continuously paged, so page 636 places it in
+    # volume 2 (Rich v. Coe) — while a volumeless *word* form in prose
+    # ("East 426") stays unlinked.
+    nom_one("Justen v. Ballam, 2 Lord Raym. 805", "n:ldraym:2:805", "Ballam")
+    nom_one("Leigh against Burleigh, Owen, 122", "n:owen:0:122", "Leigh")
+    nom_one("Rich v. Coe, Cowp. 636", "n:cowp:2:636", "Rich")
+    check(iter_nominate_cites("travelling East 426 miles") == [],
+          "volumeless word-form 'East 426' in prose stays unlinked")
+    # Bare "Rob." can be Christopher or William Robinson; resolution decides
+    # ("The John, 3 Rob. 288" exists only in C Rob).
+    nom_one("The John, 3 Rob. 288", "n:crob:3:288", "John")
     nom_one(scotland, "n:dods:1:290", "Nostra Signora")
     nom_one(scotland, "n:hagadm:1:109", "Dundee")
     nom_one(scotland, "n:hagadm:3:169", "Girolamo")
