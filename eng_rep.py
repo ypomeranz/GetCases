@@ -32,8 +32,11 @@ row per citation:
 ``reporter`` is CommonLII's printed form ("Exch", "Cro Jac", "M & W"); the
 detection regex derives period/spacing-tolerant patterns from it so the dotted
 Bluebook forms briefs use ("M. & W.", "Q.B.", "Bro. C.C.") match too.
-``volume`` is 0 for one-volume reporters cited without one.  Nominate matching
-is *resolution-gated*: only a citation whose exact (reporter, volume, page) is
+``volume`` is 0 for one-volume reporters cited without one — a citation that
+spells the volume anyway ("1 Swa. 96", "1 Lush. 553") still resolves there.
+An old-style "<vol> id. <page>" ("The Girolamo, 3 id. 169" after "1 Hagg.
+Adm. 109") continues the reporter last cited.  Nominate matching is
+*resolution-gated*: only a citation whose exact (reporter, volume, page) is
 an indexed start page ever becomes a link, so U.S. citations that share an
 abbreviation (New York's volumed "5 Johns. 37" vs the volumeless English
 Johnson) are never claimed.
@@ -230,6 +233,13 @@ _NOM_RE: "re.Pattern | None" = None
 _NOM_PAGES: "dict[tuple[str, int], list[int]] | None" = None
 # Normalized alias key -> canonical reporter keys present in the index.
 _NOM_ALIAS_KEYS: "dict[str, tuple[str, ...]]" = {}
+# Reporters the index knows only volumeless (every row has volume 0) — the
+# one-volume reporters.  U.S. opinions still give them the explicit volume
+# ("1 Swa. 96", "1 Lush. 553" in The Scotland, 105 U.S. 24), so a cite with
+# volume 1 to such a reporter falls back to its volume-0 rows.  Reporters
+# that mix volume 0 with real volumes stay exact: their volume-0 rows could
+# belong to any volume.
+_NOM_VOLUMELESS: "frozenset[str]" = frozenset()
 
 # Reporter keys never matched in text, because in a U.S. document the bare
 # abbreviation means something else: "Curt." is Curtis' Circuit Court reports
@@ -250,6 +260,11 @@ _NOMINATE_DENY = frozenset({"curt", "and", "west", "lit"})
 # honest ("13 Ves." exists only in Vesey Junior; a company's "Co. 45" has
 # no volume and resolves nowhere).  U.S. Black (66-67 U.S., cited "Black.")
 # is deliberately NOT aliased: its two volumes collide with Wm. Blackstone's.
+# The admiralty forms are the ones the limitation-of-liability line of
+# SCOTUS cases uses (The Scotland, 105 U.S. 24: "1 Dod. 290", "1 Hagg.
+# Adm. 109", "1 Swa. 96", "4 Kay & J. 367", "1 John. & H. 180").  Bare
+# "Hagg." is NOT aliased: Haggard reported three courts (Adm/Ecc/Con)
+# whose volume/page ranges overlap, so an unqualified cite can't be placed.
 _NOM_ALIASES: "dict[str, tuple[str, ...]]" = {
     "Ves": ("Ves Sen", "Ves Jun"),
     "Co": ("Co Rep",),
@@ -261,6 +276,14 @@ _NOM_ALIASES: "dict[str, tuple[str, ...]]" = {
     "Stra": ("Str",),
     "Term Rep": ("TR",),
     "Dougl": ("Doug",),
+    "Dod": ("Dods",),
+    "Hagg Adm": ("Hag Adm",),
+    "Hagg Ecc": ("Hag Ecc",),
+    "Hagg Con": ("Hag Con",),
+    "Swa": ("Swab",),
+    "Kay & J": ("K & J",),
+    "John & H": ("J & H",),
+    "Johns & H": ("J & H",),
 }
 
 
@@ -299,7 +322,7 @@ def _load_nominate() -> None:
     failure leaves them empty so the app still runs; nominate citations just
     won't resolve.  Loads the main index first (case records join by neutral
     cite)."""
-    global _NOM_INDEX, _NOM_RE, _NOM_PAGES, _NOM_ALIAS_KEYS
+    global _NOM_INDEX, _NOM_RE, _NOM_PAGES, _NOM_ALIAS_KEYS, _NOM_VOLUMELESS
     if _NOM_INDEX is not None:
         return
     _load()  # outside _LOCK -- it takes the same (non-reentrant) lock
@@ -337,10 +360,14 @@ def _load_nominate() -> None:
         # 1663" into Rex v. Vice-Chancellor at 3 Burr. 1656) resolves to the
         # case beginning at the nearest preceding indexed page.
         pages: dict[tuple[str, int], list[int]] = {}
+        vols_by_key: dict[str, set] = {}
         for (key, vol, page) in idx:
             pages.setdefault((key, vol), []).append(page)
+            vols_by_key.setdefault(key, set()).add(vol)
         for plist in pages.values():
             plist.sort()
+        _NOM_VOLUMELESS = frozenset(
+            k for k, vols in vols_by_key.items() if vols == {0})
         present = {key for (key, _v, _p) in idx}
         alias_keys = {}
         for form, canon in _NOM_ALIASES.items():
@@ -369,17 +396,31 @@ def _load_nominate() -> None:
 _NOM_PIN_SPAN = 50
 
 
-def _nom_resolve(key: str, vol: int, page: int) -> "tuple[str, int, list] | None":
-    """``(canonical_key, start_page, targets)`` for a matched nominate cite,
-    or None.  Tries the matched reporter and its aliases at the exact page
-    first; a miss then resolves as a pin cite — the case beginning at the
-    nearest preceding indexed page of the same reporter volume ("3 Burr.
-    1663" pins into Rex v. Vice-Chancellor, 3 Burr. 1647)."""
+def _vols_for(key: str, vol: int) -> "tuple[int, ...]":
+    """Index volumes to try for a cite giving *vol*: the cite's own volume,
+    plus volume 0 when the cite says "1" but the index knows the reporter
+    only volumeless (a one-volume reporter — "1 Swa. 96" is Swabey's single
+    volume, indexed as "Swab 96")."""
+    if vol == 1 and key in _NOM_VOLUMELESS:
+        return (1, 0)
+    return (vol,)
+
+
+def _nom_resolve(key: str, vol: int, page: int
+                 ) -> "tuple[str, int, int, list] | None":
+    """``(canonical_key, volume, start_page, targets)`` for a matched
+    nominate cite, or None — volume and start page as *indexed*, so the spec
+    built from them round-trips through :func:`resolve`.  Tries the matched
+    reporter and its aliases at the exact page first; a miss then resolves
+    as a pin cite — the case beginning at the nearest preceding indexed page
+    of the same reporter volume ("3 Burr. 1663" pins into Rex v.
+    Vice-Chancellor, 3 Burr. 1647)."""
     keys = (key,) + _NOM_ALIAS_KEYS.get(key, ())
     for k in keys:
-        targets = _NOM_INDEX.get((k, vol, page))
-        if targets:
-            return k, page, targets
+        for v in _vols_for(k, vol):
+            targets = _NOM_INDEX.get((k, v, page))
+            if targets:
+                return k, v, page, targets
     if not vol:
         # Volumeless single-volume reporters carry word-like names ("Holt",
         # "Style"); a bare "Word NN" is also the shape of prose ("the West
@@ -387,24 +428,42 @@ def _nom_resolve(key: str, vol: int, page: int) -> "tuple[str, int, list] | None
         return None
     from bisect import bisect_right
     for k in keys:
-        pages = (_NOM_PAGES or {}).get((k, vol))
-        if pages:
-            i = bisect_right(pages, page) - 1
-            if i >= 0 and page - pages[i] <= _NOM_PIN_SPAN:
-                start = pages[i]
-                targets = _NOM_INDEX.get((k, vol, start))
-                if targets:
-                    return k, start, targets
+        for v in _vols_for(k, vol):
+            pages = (_NOM_PAGES or {}).get((k, v))
+            if pages:
+                i = bisect_right(pages, page) - 1
+                if i >= 0 and page - pages[i] <= _NOM_PIN_SPAN:
+                    start = pages[i]
+                    targets = _NOM_INDEX.get((k, v, start))
+                    if targets:
+                        return k, v, start, targets
     return None
+
+
+# Old-style "id." to the reporter just cited: "The Dundee, 1 Hagg. Adm. 109;
+# The Girolamo, 3 id. 169" means 3 Hagg. Adm. 169 (a *volume* of the same
+# reporter, unlike the modern pin-only "Id. at 152", which has no volume and
+# is never matched here).  Traced only across a short gap with no intervening
+# citation, and resolution-gated like every nominate match.
+_NOM_ID_RE = re.compile(r"\b(\d{1,3})\s+[Ii]d\.\s+(\d{1,5})\b")
+_NOM_ID_GAP = 160
+# A digit-then-capital run in the gap is another citation's tail ("105 U.S.
+# 24") — the "id." refers to *that* reporter, so the English one is dropped.
+_NOM_ID_BREAK_RE = re.compile(r"\d\s+[A-Z]")
+
+
+def _cases_for(targets: "list[tuple[int, int]]") -> "list[ERCase]":
+    return [c for c in (_BY_NEUTRAL.get(t) for t in targets) if c is not None]
 
 
 def iter_nominate_cites(text: str) -> "list[tuple[int, int, str, list[ERCase]]]":
     """Nominate-report citations in *text* that resolve to indexed cases, as
     ``(start, end, spec, cases)`` in document order.  ``spec`` ('n:exch:9:341')
     round-trips through :func:`resolve` — for an alias or pin-cite match it
-    carries the canonical reporter key and the case's first page.
-    Unresolvable look-alikes (a U.S. "5 Johns. 37", prose) are simply not
-    reported."""
+    carries the canonical reporter key and the case's indexed volume and
+    first page.  A following old-style "<vol> id. <page>" continues the
+    reporter last cited.  Unresolvable look-alikes (a U.S. "5 Johns. 37",
+    prose) are simply not reported."""
     if not text:
         return []
     _load_nominate()
@@ -412,18 +471,40 @@ def iter_nominate_cites(text: str) -> "list[tuple[int, int, str, list[ERCase]]]"
         return []
     assert _BY_NEUTRAL is not None
     out: list[tuple[int, int, str, list[ERCase]]] = []
-    for m in _NOM_RE.finditer(text):
-        vol = int(m.group(1) or 0)
-        key = _nom_key(m.group(2))
-        page = int(m.group(3))
+    nom = list(_NOM_RE.finditer(text))
+    ids = list(_NOM_ID_RE.finditer(text))
+    last: "tuple[int, str] | None" = None   # (end, canonical key) last resolved
+    i = j = 0
+    while i < len(nom) or j < len(ids):
+        if j >= len(ids) or (i < len(nom)
+                             and nom[i].start() <= ids[j].start()):
+            m, i = nom[i], i + 1
+            vol = int(m.group(1) or 0)
+            key = _nom_key(m.group(2))
+            page = int(m.group(3))
+        else:
+            m, j = ids[j], j + 1
+            if last is None or m.start() < last[0]:
+                continue
+            gap = text[last[0]:m.start()]
+            if len(gap) > _NOM_ID_GAP or _NOM_ID_BREAK_RE.search(gap):
+                last = None     # chain broken; later id.s must not reach back
+                continue
+            vol = int(m.group(1))
+            key = last[1]
+            page = int(m.group(2))
         hit = _nom_resolve(key, vol, page)
         if hit is None:
+            # An unresolved citation-shaped match still stands between a
+            # resolved cite and a later "id." — the id. refers to *it* (the
+            # "Holt 715" the gap regex cannot see), so the chain breaks.
+            last = None
             continue
-        ckey, start, targets = hit
-        cases = [c for c in (_BY_NEUTRAL.get(t) for t in targets)
-                 if c is not None]
+        ckey, rvol, start, targets = hit
+        cases = _cases_for(targets)
         if cases:
-            out.append((m.start(), m.end(), f"n:{ckey}:{vol}:{start}", cases))
+            out.append((m.start(), m.end(), f"n:{ckey}:{rvol}:{start}", cases))
+            last = (m.end(), ckey)
     return out
 
 
@@ -715,6 +796,54 @@ if __name__ == "__main__":
                     "In re X, 1 Curt. 344"]:
         check(iter_nominate_cites(us_text) == [],
               f"no nominate claim on {us_text!r}")
+    # The Scotland, 105 U.S. 24, 31 (1882) cites the English limitation-of-
+    # liability cases in the American short forms: "Dod." (Dods), "Hagg.
+    # Adm." (Hag Adm), "Swa."/"Lush." with an explicit volume 1 the index
+    # stores volumeless, "Kay & J." (K & J), "John. & H." (J & H) — and
+    # "3 id. 169" continuing the reporter last cited (3 Hagg. Adm. 169).
+    scotland = ("See The Nostra Signora de los Dolores, 1 Dod. 290; "
+                "The Carl Johan, cited in The Dundee, 1 Hagg. Adm. 109, 113; "
+                "The Girolamo, 3 id. 169, 186; The Zollverein, 1 Swa. 96; "
+                "Cope v. Doherty, 4 Kay & J. 367; S.C. 2 De G. & J. 614; "
+                "The General Iron Screw Collier Co. v. Schurmanns, "
+                "1 John. & H. 180; The Wild Ranger, 1 Lush. 553.")
+    nom_one(scotland, "n:dods:1:290", "Nostra Signora")
+    nom_one(scotland, "n:hagadm:1:109", "Dundee")
+    nom_one(scotland, "n:hagadm:3:169", "Girolamo")
+    nom_one(scotland, "n:swab:0:96", "Zollverein")
+    nom_one(scotland, "n:kj:4:367", "Cope")
+    nom_one(scotland, "n:degj:2:614", "Cope")
+    nom_one(scotland, "n:jh:1:180", "Schurman")
+    nom_one(scotland, "n:lush:0:553", "Wild Ranger")
+    check(len(iter_nominate_cites(scotland)) == 8,
+          "the Scotland passage yields exactly its 8 citations")
+    # Every emitted spec must round-trip through resolve().
+    check(all(resolve(spec) for _s, _e, spec, _c in
+              iter_nominate_cites(scotland)),
+          "Scotland specs round-trip through resolve()")
+    # An intervening citation breaks the id. chain: after "105 U.S. 24" the
+    # "3 id. 169" means 3 U.S. 169, not 3 Hagg. Adm. 169.
+    check(not any(spec.startswith("n:hagadm:3:")
+                  for _s, _e, spec, _c in iter_nominate_cites(
+                      "The Dundee, 1 Hagg. Adm. 109; The Scotland, "
+                      "105 U.S. 24; The Girolamo, 3 id. 169")),
+          "id. after an intervening citation stays unlinked")
+    # A bare "id." with no preceding English cite is never claimed.
+    check(iter_nominate_cites("See 3 id. 169.") == [],
+          "id. with no antecedent stays unlinked")
+    # An unresolved citation-shaped match ("Holt 715" is not indexed, and
+    # the digit-then-capital gap regex cannot see a volumeless cite) still
+    # breaks the chain: the id. refers to Holt, not Haggard.
+    check(len(iter_nominate_cites(
+        "The Dundee, 1 Hagg. Adm. 109; Philips v. Bury, Holt 715; "
+        "The Girolamo, 3 id. 169")) == 1,
+          "id. after an unresolved nominate look-alike stays unlinked")
+    # Volume 1 to a truly multi-volume reporter never falls back to the
+    # volume-0 rows ("1 Vern. 100": Vernon has real volumes 1-2, so its
+    # stray volumeless rows prove nothing about volume 1).
+    check(all(not spec.startswith("n:vern:0:")
+              for _s, _e, spec, _c in iter_nominate_cites("1 Vern. 100")),
+          "no volume-0 fallback for a multi-volume reporter")
 
     # --- name search ---
     def name_one(query, expect_substr):
