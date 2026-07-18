@@ -1,5 +1,6 @@
 import json
 import os
+import tkinter as tk
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -945,6 +946,62 @@ class NominativeCitationSearchTests(unittest.TestCase):
             fetcher.fetch_by_citation.call_args_list,
             [call("8 Wall 168"), call("75 U.S. 168")],
         )
+
+
+class SpotlightPopupLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def _win():
+        win = object.__new__(CourtListenerGUI)
+        win._quick_popup = None
+        win._spotlight_toggle_at = 0.0
+        win._mac_return_focus = Mock()  # platform-specific; not under test
+        return win
+
+    def test_close_quick_popup_withdraws_before_destroy(self):
+        # On macOS, destroying the borderless popup without unmapping it
+        # first can leave it painted on screen; the close helper withdraws,
+        # then destroys, and always clears the tracked reference.
+        win = self._win()
+        popup = Mock()
+        win._quick_popup = popup
+
+        win._close_quick_popup()
+
+        self.assertIsNone(win._quick_popup)
+        self.assertEqual(popup.mock_calls, [call.withdraw(), call.destroy()])
+
+    def test_close_quick_popup_survives_a_dead_window(self):
+        win = self._win()
+        popup = Mock()
+        popup.withdraw.side_effect = tk.TclError("gone")
+        popup.destroy.side_effect = tk.TclError("gone")
+        win._quick_popup = popup
+
+        win._close_quick_popup()  # must not raise
+
+        self.assertIsNone(win._quick_popup)
+        win._close_quick_popup()  # idempotent with nothing tracked
+
+    def test_hotkey_toggle_debounces_a_duplicate_fire(self):
+        # A duplicated hotkey delivery must not close the popup and
+        # immediately reopen it: a second toggle arriving within the
+        # debounce window is ignored outright.
+        win = self._win()
+        first = Mock()
+        win._quick_popup = first
+
+        win._toggle_quick_search_popup()
+
+        self.assertIsNone(win._quick_popup)
+        first.destroy.assert_called_once()
+        win._mac_return_focus.assert_called_once()
+
+        second = Mock()
+        win._quick_popup = second
+        win._toggle_quick_search_popup()  # the duplicate of the same press
+
+        self.assertIs(win._quick_popup, second)
+        second.destroy.assert_not_called()
 
 
 class CitationEnrichmentTriggerTests(unittest.TestCase):

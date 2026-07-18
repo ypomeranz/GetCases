@@ -3343,6 +3343,7 @@ class CourtListenerGUI:
         self._token_var = tk.StringVar(value=initial_token)
 
         self._quick_popup: Optional[tk.Toplevel] = None
+        self._spotlight_toggle_at = 0.0
         self._hotkey_listener = None
         self._spotlight_hotkey = _load_saved_spotlight_hotkey()
         self._root_hidden = False
@@ -3978,14 +3979,62 @@ class CourtListenerGUI:
         except tk.TclError:
             pass
 
-    def _toggle_quick_search_popup(self) -> None:
-        if self._quick_popup is not None:
+    def _close_quick_popup(self) -> None:
+        """Take down the spotlight popup (idempotent).  The window is
+        withdrawn before it is destroyed: on macOS, destroying the
+        borderless ("plain"-style) popup outright can leave it painted on
+        screen even though Tk has forgotten it — pressing the hotkey then
+        looks like the spotlight "didn't close" (and the next press, which
+        creates a fresh popup over the ghost, like it closed and instantly
+        reopened).  Withdrawing unmaps it first, so every close path
+        actually clears the screen."""
+        popup, self._quick_popup = self._quick_popup, None
+        if popup is None:
+            return
+        for step in (popup.withdraw, popup.destroy):
             try:
-                if self._quick_popup.winfo_exists():
-                    self._quick_popup.destroy()
+                step()
             except tk.TclError:
                 pass
-            self._quick_popup = None
+
+    def _mac_return_focus(self) -> None:
+        """macOS: after the spotlight (or its not-found toast) closes with
+        no other window showing, hide the app so the previous application
+        becomes frontmost again.  The popup activated this app to type
+        into; cancelling it would otherwise leave a window-less app
+        holding the keyboard, and hiding also takes any window the Aqua
+        compositor left behind off the screen.  No-op on other platforms,
+        or while any of this app's windows is visible."""
+        if sys.platform != "darwin":
+            return
+        stack = [self.root]
+        while stack:
+            w = stack.pop()
+            try:
+                if (isinstance(w, (tk.Tk, tk.Toplevel))
+                        and w.state() == "normal"):
+                    return
+                stack.extend(w.winfo_children())
+            except tk.TclError:
+                continue
+        try:
+            from AppKit import NSApplication
+            NSApplication.sharedApplication().hide_(None)
+        except Exception:
+            pass
+
+    def _toggle_quick_search_popup(self) -> None:
+        # One press = one toggle: a duplicate hotkey delivery (macOS event
+        # taps can fire twice for one chord) would close the popup and
+        # immediately reopen it, so a burst within the debounce window is
+        # a single toggle.
+        now = time.monotonic()
+        if now - self._spotlight_toggle_at < 0.3:
+            return
+        self._spotlight_toggle_at = now
+        if self._quick_popup is not None:
+            self._close_quick_popup()
+            self._mac_return_focus()
             return
 
         popup = tk.Toplevel(self.root)
@@ -4077,8 +4126,7 @@ class CourtListenerGUI:
             # The section sign is optional — it can't be typed on a keyboard.
             statute = _parse_statute_query(query)
             if statute:
-                popup.destroy()
-                self._quick_popup = None
+                self._close_quick_popup()
                 _open_statute_action(self.root, statute)
                 return
 
@@ -4092,8 +4140,7 @@ class CourtListenerGUI:
             # popup has already closed, looks like the app has hung.
             er_m = eng_rep.ER_CITE_RE.search(query)
             if er_m:
-                popup.destroy()
-                self._quick_popup = None
+                self._close_quick_popup()
                 _open_eng_rep(self.root, eng_rep.cite_spec(er_m),
                               self._status_var.set, app=self)
                 return
@@ -4102,8 +4149,7 @@ class CourtListenerGUI:
             # sharing an abbreviation falls through to the case search below.
             nom = eng_rep.iter_nominate_cites(query)
             if nom:
-                popup.destroy()
-                self._quick_popup = None
+                self._close_quick_popup()
                 _open_eng_rep(self.root, nom[0][2], self._status_var.set,
                               app=self)
                 return
@@ -4120,13 +4166,18 @@ class CourtListenerGUI:
                     if self._token_var.get().strip() else None
                 )
                 if fetcher is not None or client is not None:
-                    popup.destroy()
-                    self._quick_popup = None
+                    self._close_quick_popup()
 
                     def run() -> None:
-                        self._try_open_citation(
+                        # The popup is already gone; a citation that
+                        # resolves nowhere would otherwise end in silence,
+                        # which reads as the app having hung.
+                        if not self._try_open_citation(
                             name, cite, pin, fetcher, client,
-                        )
+                        ):
+                            label = f"{name}, {cite}" if name else cite
+                            self._post_root(self._spotlight_notify,
+                                            f"Nothing found for {label}")
                     threading.Thread(target=run, daemon=True).start()
                     return
 
@@ -4135,8 +4186,8 @@ class CourtListenerGUI:
             self._show_spotlight_dropdown(popup, border, entry, query)
 
         def _dismiss(_e=None) -> None:
-            popup.destroy()
-            self._quick_popup = None
+            self._close_quick_popup()
+            self._mac_return_focus()
 
         entry.bind("<Return>", _submit)
         entry.bind("<Escape>", _dismiss)
@@ -4184,11 +4235,7 @@ class CourtListenerGUI:
     ) -> None:
         """Close the spotlight popup and bring up the full search window,
         optionally seeding and running *query*."""
-        try:
-            popup.destroy()
-        except tk.TclError:
-            pass
-        self._quick_popup = None
+        self._close_quick_popup()
         self._ensure_root_exists()
         self.root.deiconify()
         self.root.lift()
@@ -4199,6 +4246,57 @@ class CourtListenerGUI:
         if query:
             self._query_var.set(query)
             self._do_search()
+
+    def _spotlight_notify(self, message: str) -> None:
+        """Transient toast in the spotlight's spot, for a spotlight lookup
+        that ends with nothing to open.  By then the popup is long closed
+        and the main window is often hidden, so a status-bar note would go
+        unseen and the app would just go quiet.  Display-only: it never
+        takes focus; a click dismisses it, and it dismisses itself after a
+        few seconds."""
+        self._status_var.set(message)
+        try:
+            toast = tk.Toplevel(self.root)
+            toast.overrideredirect(True)
+            toast.attributes("-topmost", True)
+            pw, ph = (600, 64) if _CTK_AVAILABLE else (520, 48)
+            sx = toast.winfo_screenwidth()
+            sy = toast.winfo_screenheight()
+            toast.geometry(f"{pw}x{ph}+{(sx - pw) // 2}+{sy // 3}")
+            if _CTK_AVAILABLE:
+                _ensure_modern_theme()
+                toast.configure(bg=_UI["window"])
+                self._spot_knockout_corners(toast)
+                card = ctk.CTkFrame(
+                    toast, corner_radius=16, fg_color=_UI["window"],
+                    border_width=1, border_color=_UI["border"],
+                )
+                card.pack(fill="both", expand=True)
+                ctk.CTkLabel(
+                    card, text=message, font=_ui_font(14),
+                    text_color=_UI["muted"], anchor="center",
+                ).pack(fill="both", expand=True, padx=16, pady=12)
+            else:
+                toast.configure(bg="#888888")
+                inner = tk.Frame(toast, bg="#ffffff", padx=12, pady=8)
+                inner.pack(fill="both", expand=True, padx=2, pady=2)
+                tk.Label(
+                    inner, text=message, bg="#ffffff", fg="#555555",
+                    font=("TkDefaultFont", 12), anchor="center",
+                ).pack(fill="both", expand=True)
+
+            def dismiss(_e=None) -> None:
+                try:
+                    toast.withdraw()
+                    toast.destroy()
+                except tk.TclError:
+                    pass
+                self._mac_return_focus()
+
+            _bind_recursive(toast, "<Button-1>", dismiss)
+            toast.after(4000, dismiss)
+        except tk.TclError:
+            pass
 
     @staticmethod
     def _spot_tier_color(court_id: str) -> str:
@@ -4512,8 +4610,7 @@ class CourtListenerGUI:
             this_idx = len(result_rows) - 1
 
             def on_click(_e=None, _r=r) -> None:
-                popup.destroy()
-                self._quick_popup = None
+                self._close_quick_popup()
                 _r["open_fn"]()
 
             _bind_recursive(r["row"], "<Button-1>", on_click)
@@ -4558,8 +4655,7 @@ class CourtListenerGUI:
                 _scroll_into_view(selected_idx[0])
             elif event.keysym == "Return":
                 if 0 <= selected_idx[0] < len(result_rows):
-                    popup.destroy()
-                    self._quick_popup = None
+                    self._close_quick_popup()
                     result_rows[selected_idx[0]]["open_fn"]()
 
         entry.bind("<Down>", _on_key)
