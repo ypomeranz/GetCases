@@ -521,6 +521,15 @@ def _install_status_label(parent, textvariable, *, padx=(10, 0)):
         lbl.configure(width=1)
     except tk.TclError:
         pass
+    if _CTK_AVAILABLE and isinstance(lbl, ctk.CTkLabel):
+        # A CTkLabel is a frame whose size request tracks the text label
+        # gridded inside it, so the width=1 above caps nothing and a long
+        # message still squeezes buttons off the bar (worst in the case
+        # window, where the view/Print buttons are re-packed after this
+        # label and so lose the space contest first).  Freezing propagation
+        # makes the 1×28 request stick; the message then only spreads into
+        # leftover space and clips at the bar's edge.
+        lbl.grid_propagate(False)
     lbl.pack(side="left", fill="x", expand=True, padx=padx)
     _HoverTip(lbl, textvariable.get)
     return lbl
@@ -18149,9 +18158,7 @@ class _SlipTextWindow:
         _ui_button(btns, "Copy All", primary=True, width=100,
                    command=self._copy_all).pack(side="right")
         self._status_var = tk.StringVar(value=f"{len(text):,} characters")
-        _ui_label(btns, muted=True, anchor="w",
-                  textvariable=self._status_var).pack(
-            side="left", fill="x", expand=True)
+        _install_status_label(btns, self._status_var, padx=(0, 0))
         win.bind("<Control-a>", self._select_all)
 
     def _select_all(self, _e=None) -> str:
@@ -19446,9 +19453,7 @@ class _LinkedPdfWindow:
         _ui_button(btns, "+", width=42,
                    command=lambda: self._zoom(+1)).pack(side="left", padx=(6, 10))
         self._status_var = tk.StringVar(value="Loading PDF…")
-        _ui_label(btns, muted=True, anchor="w",
-                  textvariable=self._status_var).pack(
-            side="left", fill="x", expand=True, padx=(10, 0))
+        _install_status_label(btns, self._status_var)
 
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
             self._win.bind(seq, lambda _e: self._zoom(+1))
@@ -19697,8 +19702,7 @@ class _StatuteWindow:
                    command=self._export_rtf).pack(side="right")
         # Status doubles as the provenance note until an action overwrites it
         self._status_var = tk.StringVar(value=self._doc.source_note)
-        _ui_label(btns, muted=True, anchor="w",
-                  textvariable=self._status_var).pack(side="left", padx=(10, 0))
+        _install_status_label(btns, self._status_var)
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
             win.bind(seq, lambda _e: self._zoom(+1))
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
