@@ -29,6 +29,7 @@ Usage:
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Generator, Iterator
 from urllib.parse import urljoin
@@ -750,8 +751,240 @@ class CourtListenerClient:
 
 
 # ---------------------------------------------------------------------------
-# RECAP lookup for unpublished opinions
+# Federal Cases lookup by case number ("Case No. 10,126")
 # ---------------------------------------------------------------------------
+# Pre-1880 lower federal opinions are cited by their Federal Cases number,
+# and no public index maps those numbers to reporter citations.  But the
+# citation almost always prints the case *name* just before the number, the
+# CourtListener cluster's ``headnotes`` field opens with the case's own
+# number ("Case No. 2,717. Lien on Foreign Vessel …"), and the reporter's
+# alphabetical arrangement fixes which F. Cas. *volume* a number must fall
+# in (fed_cas.VOLUME_RANGES).  So: search by name (exact, then relaxed,
+# then fuzzy — the source texts are OCR), keep candidates bearing an
+# "F. Cas." citation, and confirm the winner by the number at the head of
+# its headnotes, falling back to the volume check when no headnotes carry
+# the number.
+
+_FCAS_CITE_RE = re.compile(r"\b(\d{1,2})\s+F\.?\s?Cas\.?\s+(\d{1,5})\b")
+
+_FEDCAS_STOPWORDS = frozenset({
+    "the", "of", "and", "in", "re", "ex", "parte", "a", "an", "et", "al",
+    "v", "vs",
+})
+
+# How many cluster fetches one lookup may spend verifying candidates.
+_FEDCAS_VERIFY_BUDGET = 6
+
+
+def _fcas_volume(citations) -> "int | None":
+    """The F. Cas. volume among a result's citations, or None."""
+    import re as _re
+    for c in citations or []:
+        if isinstance(c, dict):
+            if "f. cas" in str(c.get("reporter") or "").lower():
+                try:
+                    return int(c.get("volume"))
+                except (TypeError, ValueError):
+                    continue
+        else:
+            m = _FCAS_CITE_RE.search(_re.sub(r"<[^>]+>", "", str(c)))
+            if m:
+                return int(m.group(1))
+    return None
+
+
+def _fedcas_name_tokens(name: str) -> list[str]:
+    import re as _re
+    toks = []
+    for w in _re.findall(r"[A-Za-z][A-Za-z'’]*", name or ""):
+        wl = w.lower().replace("’", "'").strip("'")
+        if len(wl) >= 3 and wl not in _FEDCAS_STOPWORDS and wl not in toks:
+            toks.append(wl)
+    return toks
+
+
+def _fedcas_loose_score(query_name: str, candidate_name: str) -> float:
+    """Fraction of the query name's identifying tokens present in the
+    candidate's — a token counts when equal, a prefix, or a near-identical
+    OCR variant ("chnsan" ≈ "chusan")."""
+    import difflib
+    q = _fedcas_name_tokens(query_name)
+    c = _fedcas_name_tokens(candidate_name)
+    if not q or not c:
+        return 0.0
+
+    def close(a: str, b: str) -> bool:
+        if a == b or (len(a) >= 4 and (a.startswith(b) or b.startswith(a))):
+            return True
+        return (len(a) >= 4 and len(b) >= 4
+                and difflib.SequenceMatcher(None, a, b).ratio() >= 0.8)
+
+    hit = sum(1 for t in q if any(close(t, ct) for ct in c))
+    return hit / len(q)
+
+
+def _fedcas_name_queries(name: "str | None") -> list[str]:
+    """caseName search queries for a printed name, tightest first: the name
+    as printed and de-hyphenated (OCR splits words: "Har-ney"), then its
+    identifying tokens ANDed, then the tokens fuzzed one edit each — the
+    OCR-forgiveness pass ("Chnsan~1" finds Chusan)."""
+    import re as _re
+
+    name = _re.sub(r"\s+", " ", (name or "")).strip(' ,;."')
+    if not name:
+        return []
+    queries: list[str] = []
+    variants = [name]
+    dehyph = _re.sub(r"(?<=[a-z])-(?=[a-z])", "", name)
+    if dehyph != name:
+        variants.append(dehyph)
+    # Surname particles printed with a space often index joined ("Macy v.
+    # De Wolf" is CourtListener's "Macy v. DeWolf") — neither the phrase,
+    # the token AND, nor a one-edit fuzz bridges that, so search the joined
+    # spelling as its own variant.
+    joined = _re.sub(r"\b(De|Di|Du|La|Le|Van|Von|Mc|Mac|O)[' ](?=[A-Z])",
+                     r"\1", name)
+    if joined != name:
+        variants.append(joined)
+    for v in variants:
+        queries.append(f'caseName:"{v}"')
+    tokens: list[str] = []
+    for v in variants:
+        for t in _fedcas_name_tokens(v):
+            if t not in tokens:
+                tokens.append(t)
+    tokens = tokens[:5]
+    if tokens:
+        joined = " AND ".join(tokens)
+        q = f"caseName:({joined})"
+        if q not in queries:
+            queries.append(q)
+        queries.append(
+            "caseName:(" + " AND ".join(f"{t}~1" for t in tokens) + ")")
+    return queries
+
+
+def _fedcas_headnote_number(headnotes: str) -> "str | None":
+    """The case number opening a cluster's headnotes ("Case No. 2,717. …"),
+    normalized ("2717"), or None.  Only the very start counts: numbers later
+    in the headnotes are cross-references to other cases."""
+    import re as _re
+    txt = _re.sub(r"\s+", " ", _re.sub(r"<[^>]+>", " ", headnotes or "")).strip()
+    m = _re.match(r"[\[\s]*Case No\W{0,3}(\d[\d.,\- ]{0,8}\d|\d)([a-z])?",
+                  txt[:120])
+    if not m:
+        return None
+    digits = _re.sub(r"\D", "", m.group(1))
+    return (str(int(digits)) + (m.group(2) or "")) if digits else None
+
+
+def find_fedcas_case(
+    case_no: str,
+    name: "str | None" = None,
+    session: "Session | None" = None,
+    timeout: int = 30,
+) -> "dict | None":
+    """Locate the CourtListener cluster behind a Federal Cases citation
+    given by case number ("Cole v. The Atlantic, Case No. 2,976").
+
+    Returns a search-result-shaped item — ``cluster_id``, ``caseName``,
+    ``citation`` (strings), ``dateFiled``, ``court_id``, plus
+    ``matched_by``: ``"headnote"`` when the number at the head of the
+    cluster's headnotes confirmed it, ``"volume"`` when only the
+    name match plus the F. Cas. volume check vouch for it — or ``None``.
+
+    Anonymous sessions work (rate-limited); pass an authenticated one when
+    available.
+    """
+    import fed_cas
+
+    num_key = fed_cas.number_key(case_no)
+    if num_key is None:
+        return None
+    s = session or requests.Session()
+    url = urljoin(BASE_URL, "search/")
+
+    queries = _fedcas_name_queries(name)
+    # Last resort (and the only key for a nameless citation): the number
+    # itself as printed in the reporter's headnote, which full-text search
+    # finds — along with later cases *citing* it, which the headnote check
+    # weeds out.
+    queries.append(f'"Case No. {fed_cas.pretty_number(case_no)}"')
+
+    def item_from(result: dict) -> dict:
+        import re as _re
+        cites = [_re.sub(r"<[^>]+>", "", str(c))
+                 for c in result.get("citation") or []]
+        return {
+            "cluster_id": result.get("cluster_id"),
+            "caseName": _re.sub(r"<[^>]+>", "",
+                                result.get("caseName") or ""),
+            "case_name": _re.sub(r"<[^>]+>", "",
+                                 result.get("caseName") or ""),
+            "citation": cites,
+            "dateFiled": str(result.get("dateFiled") or "")[:10],
+            "court_id": result.get("court_id") or "",
+        }
+
+    verified_budget = _FEDCAS_VERIFY_BUDGET
+    checked: set = set()
+    fallback: "tuple[float, dict] | None" = None
+    for q in queries:
+        params = {"type": "o", "q": q, "filed_before": "1882-12-31",
+                  "page_size": 20}
+        try:
+            resp = s.get(url, params=params, timeout=timeout)
+            if resp.status_code != 200:
+                continue
+            results = resp.json().get("results") or []
+        except Exception:
+            continue
+        candidates = []
+        for it in results:
+            vol = _fcas_volume(it.get("citation"))
+            if vol is None:
+                continue
+            plaus = fed_cas.plausible_volume(case_no, vol)
+            score = (_fedcas_loose_score(name, it.get("caseName") or "")
+                     if name else 0.0)
+            candidates.append((plaus, score, it))
+        # Most plausible volume first, then the closest name.
+        candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        for plaus, score, it in candidates[:4]:
+            cid = it.get("cluster_id")
+            if not cid or cid in checked:
+                continue
+            checked.add(cid)
+            if verified_budget > 0:
+                verified_budget -= 1
+                try:
+                    r = s.get(
+                        urljoin(BASE_URL, f"clusters/{cid}/"),
+                        params={"fields": "id,headnotes"}, timeout=timeout)
+                    headnotes = (r.json().get("headnotes") or ""
+                                 if r.status_code == 200 else "")
+                except Exception:
+                    headnotes = ""
+                if _fedcas_headnote_number(headnotes) == str(case_no):
+                    item = item_from(it)
+                    item["matched_by"] = "headnote"
+                    return item
+            # No headnote confirmation: remember the best name+volume match
+            # in case nothing ever confirms.  Never without a name: the
+            # number-phrase query surfaces cases *citing* the number, and
+            # with no name to hold against them a same-volume citer would
+            # slip through (Packard v. The Louisa, 18 F. Cas. 958, cites
+            # "Case No. 10,126" and shares the Nestor's volume 18).
+            if plaus and name is not None and score >= 0.5:
+                if fallback is None or score > fallback[0]:
+                    fallback = (score, item_from(it))
+        # A confidently-named exact-phrase hit that failed only the headnote
+        # check still shouldn't stop the looser passes — keep going.
+    if fallback is not None:
+        item = fallback[1]
+        item["matched_by"] = "volume"
+        return item
+    return None
 
 # Ranking for same-day docket entries: the cited document is the opinion
 # itself, but courts often docket a separate order the same day.

@@ -9,6 +9,7 @@ A desktop application (Tkinter) that searches U.S. case law, statutes, regulatio
 - California & Florida statutes (more states coming)
 - U.S. Statutes at Large (official PDFs)
 - English Reports (pre‑1865 cases from CommonLII)
+- Federal Cases (pre‑1880 lower federal opinions cited by case number, resolved via CourtListener)
 - Supreme Court case details (Oyez – summaries, vote splits, oral argument audio)
 
 ---
@@ -86,6 +87,7 @@ California & Florida Statutes	Official texts from the state legislatures (CA Leg
 Statutes at Large	U.S. Statutes at Large (GovInfo PDFs) – cited as 88 Stat. 1932.
 US Reports PDFs	Official Supreme Court opinion scans: GPO’s GovInfo (vols 2–583) first, the Library of Congress CDN (vols 1–542) as fallback; for vols 584+ the app downloads the Court’s own bound‑volume / preliminary‑print PDF from supremecourt.gov into the “US Reports” folder (once per volume) and carves the cited opinion out of it.
 English Reports	Pre‑1865 English case law from CommonLII – offline index + CloudFlare‑aware PDF download (via Firefox cookies or Playwright).
+Federal Cases	Pre‑1880 lower federal opinions cited by case number ("Cole v. The Atlantic, Case No. 2,976", chained "Id. 2,717") – no digital number‑to‑reporter index exists, so the case is found live on CourtListener by the printed name (OCR‑forgiving), confirmed by the number at the head of its headnotes or by the F. Cas. volume the number's alphabetical position dictates.
 Oyez	Supreme Court case summaries, question presented, holdings, justice vote splits, and oral argument audio links.
 Brief Reader	Extracts text from PDF, Word, RTF, and plain text briefs; highlights every citation and makes them clickable.
 Tips

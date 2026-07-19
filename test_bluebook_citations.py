@@ -1,5 +1,6 @@
 import json
 import os
+import tkinter as tk
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -55,6 +56,18 @@ class CaptionCapitalizationTests(unittest.TestCase):
             normal_case_caption("NBCUniversal Media, LLC"),
             "NBCUniversal Media, LLC",
         )
+
+    def test_quoted_all_caps_word_capitalizes_inside_the_quotes(self):
+        # THE "SCOTLAND.", 105 U.S. 24: the capital must reach the first
+        # letter through the reporter's quotation mark, in either style.
+        self.assertEqual(
+            normal_case_caption("THE “SCOTLAND.”"), "The “Scotland.”")
+        self.assertEqual(
+            normal_case_caption('THE "SCOTLAND."'), 'The "Scotland."')
+        # A digit-led token is an ordinal, not a name: its tail stays lower.
+        self.assertEqual(
+            normal_case_caption("42ND STREET CO. v. SMITH"),
+            "42nd Street Co. v. Smith")
 
     def test_naacp_survives_all_caps_caption_normalization(self):
         name = normal_case_caption("NAACP v. ALABAMA")
@@ -349,6 +362,29 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
             abbreviate_case_name(name),
             "In re Imerys Talc Am., Inc.",
         )
+
+    def test_quoted_in_rem_vessel_caption_drops_the_quotes(self):
+        # The Scotland, 105 U.S. 24 (1882): the reporter prints the vessel's
+        # name in quotation marks ("THE “SCOTLAND.”").  The quotes are the
+        # reporter's typography — the citation name is "The Scotland", with
+        # the ship's capital and its rule-10.2.1(d) "The" intact.
+        blocks = [
+            Block("center", [Span("105 U.S. 24 (____)")]),
+            Block("center", [Span("THE “SCOTLAND.”")]),
+            Block("center", [Span("Supreme Court of United States.")]),
+            Block("para", [Span(
+                "The case was argued by Mr. William Allen Butler, with "
+                "whom was Mr. Thomas E. Stillman and Mr. John Chetwood, "
+                "for the “Scotland,” and by Mr. James C. Carter and Mr. "
+                "Robert D. Benedict, with whom was Mr. Joseph H. Choate, "
+                "for the libellants."
+            )]),
+        ]
+
+        name = _scholar_caption_name(blocks)
+
+        self.assertEqual(name, "The “Scotland.”")
+        self.assertEqual(abbreviate_case_name(name), "The Scotland")
 
     def test_lowercase_words_do_not_end_a_procedural_case_name(self):
         blocks = [Block("center", [Span(
@@ -912,6 +948,62 @@ class NominativeCitationSearchTests(unittest.TestCase):
         )
 
 
+class SpotlightPopupLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def _win():
+        win = object.__new__(CourtListenerGUI)
+        win._quick_popup = None
+        win._spotlight_toggle_at = 0.0
+        win._mac_return_focus = Mock()  # platform-specific; not under test
+        return win
+
+    def test_close_quick_popup_withdraws_before_destroy(self):
+        # On macOS, destroying the borderless popup without unmapping it
+        # first can leave it painted on screen; the close helper withdraws,
+        # then destroys, and always clears the tracked reference.
+        win = self._win()
+        popup = Mock()
+        win._quick_popup = popup
+
+        win._close_quick_popup()
+
+        self.assertIsNone(win._quick_popup)
+        self.assertEqual(popup.mock_calls, [call.withdraw(), call.destroy()])
+
+    def test_close_quick_popup_survives_a_dead_window(self):
+        win = self._win()
+        popup = Mock()
+        popup.withdraw.side_effect = tk.TclError("gone")
+        popup.destroy.side_effect = tk.TclError("gone")
+        win._quick_popup = popup
+
+        win._close_quick_popup()  # must not raise
+
+        self.assertIsNone(win._quick_popup)
+        win._close_quick_popup()  # idempotent with nothing tracked
+
+    def test_hotkey_toggle_debounces_a_duplicate_fire(self):
+        # A duplicated hotkey delivery must not close the popup and
+        # immediately reopen it: a second toggle arriving within the
+        # debounce window is ignored outright.
+        win = self._win()
+        first = Mock()
+        win._quick_popup = first
+
+        win._toggle_quick_search_popup()
+
+        self.assertIsNone(win._quick_popup)
+        first.destroy.assert_called_once()
+        win._mac_return_focus.assert_called_once()
+
+        second = Mock()
+        win._quick_popup = second
+        win._toggle_quick_search_popup()  # the duplicate of the same press
+
+        self.assertIs(win._quick_popup, second)
+        second.destroy.assert_not_called()
+
+
 class CitationEnrichmentTriggerTests(unittest.TestCase):
     @staticmethod
     def _win(*, court: str, year: str, is_scotus: bool = False):
@@ -1378,6 +1470,68 @@ class CombinedOpinionCompletenessTests(unittest.TestCase):
         ]
 
         self.assertTrue(_combined_parts_cover_typed(opinions, combined_parts))
+
+
+class FederalCasesLookupTests(unittest.TestCase):
+    """Offline pieces of the Federal Cases case-number resolution: the name
+    query builder's OCR forgiveness, the headnote-number verifier, and the
+    F. Cas. volume extraction (courtlistener.find_fedcas_case's helpers)."""
+
+    def test_name_queries_tightest_first_with_ocr_variants(self):
+        from courtlistener import _fedcas_name_queries
+
+        qs = _fedcas_name_queries("Har-ney v. The Sydney L. Wright")
+        # The name as printed, then de-hyphenated, then ANDed tokens, then
+        # the one-edit fuzzy tokens.
+        self.assertEqual(qs[0], 'caseName:"Har-ney v. The Sydney L. Wright"')
+        self.assertIn('caseName:"Harney v. The Sydney L. Wright"', qs)
+        self.assertTrue(any("~1" in q for q in qs))
+
+    def test_name_queries_join_surname_particles(self):
+        from courtlistener import _fedcas_name_queries
+
+        # CourtListener titles the case "Macy v. DeWolf" — the joined
+        # spelling must be searched as its own variant.
+        qs = _fedcas_name_queries("Macy v. De Wolf")
+        self.assertIn('caseName:"Macy v. DeWolf"', qs)
+
+    def test_headnote_number_reads_only_the_head(self):
+        from courtlistener import _fedcas_headnote_number
+
+        self.assertEqual(
+            _fedcas_headnote_number(
+                "<p>Case No. 2,717. Lien on Foreign Vessel.</p>"),
+            "2717")
+        self.assertEqual(
+            _fedcas_headnote_number("[Case No. 6,082a.]"), "6082a")
+        # A number later in the headnotes is a cross-reference, not the
+        # case's own number.
+        self.assertIsNone(
+            _fedcas_headnote_number(
+                "Approving The Nestor, Case No. 10,126."))
+        self.assertIsNone(_fedcas_headnote_number(""))
+
+    def test_fcas_volume_from_citation_strings_and_dicts(self):
+        from courtlistener import _fcas_volume
+
+        self.assertEqual(_fcas_volume(["18 F. Cas. 9", "1 Sumn. 73"]), 18)
+        self.assertEqual(
+            _fcas_volume([{"volume": 5, "reporter": "F. Cas.", "page": 680}]),
+            5)
+        self.assertIsNone(_fcas_volume(["410 U.S. 113"]))
+
+    def test_detect_links_routes_fedcas_and_nominative_parallels(self):
+        from citations import detect_links
+
+        links = detect_links(
+            "See The General Smith, 4 Wheat. [17 U. S.] 438; Cole v. The "
+            "Atlantic, Case No. 2,976; The Chusan, Id. 2,717.")
+        actions = [a for _s, _e, a in links]
+        self.assertIn(("cite", "4 Wheat. 438"), actions)
+        fedcas = [json.loads(v) for k, v in actions if k == "fedcas"]
+        self.assertEqual(
+            [(f["no"], f.get("name")) for f in fedcas],
+            [("2976", "Cole v. The Atlantic"), ("2717", "The Chusan")])
 
 
 if __name__ == "__main__":

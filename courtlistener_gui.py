@@ -624,6 +624,7 @@ import constitution
 import ecfr
 import eng_rep
 import eng_rep_pdf
+import fed_cas
 import fed_rules
 import state_statutes
 import statutes_at_large
@@ -636,8 +637,14 @@ import slip_opinion
 from citations import (
     PINCITE_AFTER_RE as _PINCITE_AFTER_RE,
     TEXT_CITE_RE as _TEXT_CITE_RE,
+    NOMINATIVE_PARALLEL_RE as _NOMINATIVE_PARALLEL_RE,
+    US_NOMINATIVE_PARALLEL_RE as _US_NOMINATIVE_PARALLEL_RE,
+    NOMINATIVE_CITE_RE as _NOMINATIVE_TEXT_CITE_RE,
+    EARLY_FED_CITE_RE as _EARLY_FED_CITE_RE,
+    early_fed_cite_text as _early_fed_cite_text,
     SHORT_CITE_RE as _SHORT_CITE_RE,
     ID_CITE_RE as _ID_CITE_RE,
+    case_match_text as _case_match_text,
     norm_reporter as _norm_reporter,
     build_short_cite_index as _build_short_cite_index,
     cite_target_from_text as _cite_target_from_text,
@@ -1393,24 +1400,25 @@ def _case_law_pdf_choices_for_cites(cites: list[str]) -> list[_CaseLawPdfChoice]
 _NOMINATIVE_US_OFFSET = {
     "dall": 0, "dallas": 0, "cranch": 4, "wheat": 13, "wheaton": 13,
     "pet": 25, "peters": 25, "how": 41, "howard": 41, "black": 65,
-    "wall": 67, "wallace": 67,
+    "wall": 67, "wallace": 67, "otto": 90,
 }
 _NOMINATIVE_CANON = {
     "dall": "Dall.", "dallas": "Dall.", "cranch": "Cranch", "wheat": "Wheat.",
     "wheaton": "Wheat.", "pet": "Pet.", "peters": "Pet.", "how": "How.",
     "howard": "How.", "black": "Black", "wall": "Wall.", "wallace": "Wall.",
+    "otto": "Otto",
 }
 # Case-sensitive on purpose: a reporter abbreviation is capitalized in a real
 # cite, so the digits-around requirement plus the capital keeps common words
 # ("how", "black", "wall") in prose from being mistaken for a citation.
 _NOMINATIVE_CITE_RE = re.compile(
     r"\b(\d{1,2})\s+(Dall|Dallas|Cranch|Wheat|Wheaton|Pet|Peters|How|Howard|"
-    r"Black|Wall|Wallace)\.?\s+(\d{1,4})\b"
+    r"Black|Wall|Wallace|Otto)\.?\s+(\d{1,4})\b"
 )
 _NOMINATIVE_DISPLAY_RE = re.compile(
     r"^\s*(\d+)\s+U\.S\.\s+\((\d+)\s+"
     r"(Dall|Dallas|Cranch|Wheat|Wheaton|Pet|Peters|How|Howard|"
-    r"Black|Wall|Wallace)\.?\)\s+(\d+)\s*$",
+    r"Black|Wall|Wallace|Otto)\.?\)\s+(\d+)\s*$",
     re.IGNORECASE,
 )
 
@@ -3343,6 +3351,7 @@ class CourtListenerGUI:
         self._token_var = tk.StringVar(value=initial_token)
 
         self._quick_popup: Optional[tk.Toplevel] = None
+        self._spotlight_toggle_at = 0.0
         self._hotkey_listener = None
         self._spotlight_hotkey = _load_saved_spotlight_hotkey()
         self._root_hidden = False
@@ -3978,14 +3987,62 @@ class CourtListenerGUI:
         except tk.TclError:
             pass
 
-    def _toggle_quick_search_popup(self) -> None:
-        if self._quick_popup is not None:
+    def _close_quick_popup(self) -> None:
+        """Take down the spotlight popup (idempotent).  The window is
+        withdrawn before it is destroyed: on macOS, destroying the
+        borderless ("plain"-style) popup outright can leave it painted on
+        screen even though Tk has forgotten it — pressing the hotkey then
+        looks like the spotlight "didn't close" (and the next press, which
+        creates a fresh popup over the ghost, like it closed and instantly
+        reopened).  Withdrawing unmaps it first, so every close path
+        actually clears the screen."""
+        popup, self._quick_popup = self._quick_popup, None
+        if popup is None:
+            return
+        for step in (popup.withdraw, popup.destroy):
             try:
-                if self._quick_popup.winfo_exists():
-                    self._quick_popup.destroy()
+                step()
             except tk.TclError:
                 pass
-            self._quick_popup = None
+
+    def _mac_return_focus(self) -> None:
+        """macOS: after the spotlight (or its not-found toast) closes with
+        no other window showing, hide the app so the previous application
+        becomes frontmost again.  The popup activated this app to type
+        into; cancelling it would otherwise leave a window-less app
+        holding the keyboard, and hiding also takes any window the Aqua
+        compositor left behind off the screen.  No-op on other platforms,
+        or while any of this app's windows is visible."""
+        if sys.platform != "darwin":
+            return
+        stack = [self.root]
+        while stack:
+            w = stack.pop()
+            try:
+                if (isinstance(w, (tk.Tk, tk.Toplevel))
+                        and w.state() == "normal"):
+                    return
+                stack.extend(w.winfo_children())
+            except tk.TclError:
+                continue
+        try:
+            from AppKit import NSApplication
+            NSApplication.sharedApplication().hide_(None)
+        except Exception:
+            pass
+
+    def _toggle_quick_search_popup(self) -> None:
+        # One press = one toggle: a duplicate hotkey delivery (macOS event
+        # taps can fire twice for one chord) would close the popup and
+        # immediately reopen it, so a burst within the debounce window is
+        # a single toggle.
+        now = time.monotonic()
+        if now - self._spotlight_toggle_at < 0.3:
+            return
+        self._spotlight_toggle_at = now
+        if self._quick_popup is not None:
+            self._close_quick_popup()
+            self._mac_return_focus()
             return
 
         popup = tk.Toplevel(self.root)
@@ -4077,8 +4134,7 @@ class CourtListenerGUI:
             # The section sign is optional — it can't be typed on a keyboard.
             statute = _parse_statute_query(query)
             if statute:
-                popup.destroy()
-                self._quick_popup = None
+                self._close_quick_popup()
                 _open_statute_action(self.root, statute)
                 return
 
@@ -4092,8 +4148,7 @@ class CourtListenerGUI:
             # popup has already closed, looks like the app has hung.
             er_m = eng_rep.ER_CITE_RE.search(query)
             if er_m:
-                popup.destroy()
-                self._quick_popup = None
+                self._close_quick_popup()
                 _open_eng_rep(self.root, eng_rep.cite_spec(er_m),
                               self._status_var.set, app=self)
                 return
@@ -4102,8 +4157,7 @@ class CourtListenerGUI:
             # sharing an abbreviation falls through to the case search below.
             nom = eng_rep.iter_nominate_cites(query)
             if nom:
-                popup.destroy()
-                self._quick_popup = None
+                self._close_quick_popup()
                 _open_eng_rep(self.root, nom[0][2], self._status_var.set,
                               app=self)
                 return
@@ -4120,13 +4174,18 @@ class CourtListenerGUI:
                     if self._token_var.get().strip() else None
                 )
                 if fetcher is not None or client is not None:
-                    popup.destroy()
-                    self._quick_popup = None
+                    self._close_quick_popup()
 
                     def run() -> None:
-                        self._try_open_citation(
+                        # The popup is already gone; a citation that
+                        # resolves nowhere would otherwise end in silence,
+                        # which reads as the app having hung.
+                        if not self._try_open_citation(
                             name, cite, pin, fetcher, client,
-                        )
+                        ):
+                            label = f"{name}, {cite}" if name else cite
+                            self._post_root(self._spotlight_notify,
+                                            f"Nothing found for {label}")
                     threading.Thread(target=run, daemon=True).start()
                     return
 
@@ -4135,8 +4194,8 @@ class CourtListenerGUI:
             self._show_spotlight_dropdown(popup, border, entry, query)
 
         def _dismiss(_e=None) -> None:
-            popup.destroy()
-            self._quick_popup = None
+            self._close_quick_popup()
+            self._mac_return_focus()
 
         entry.bind("<Return>", _submit)
         entry.bind("<Escape>", _dismiss)
@@ -4184,11 +4243,7 @@ class CourtListenerGUI:
     ) -> None:
         """Close the spotlight popup and bring up the full search window,
         optionally seeding and running *query*."""
-        try:
-            popup.destroy()
-        except tk.TclError:
-            pass
-        self._quick_popup = None
+        self._close_quick_popup()
         self._ensure_root_exists()
         self.root.deiconify()
         self.root.lift()
@@ -4199,6 +4254,57 @@ class CourtListenerGUI:
         if query:
             self._query_var.set(query)
             self._do_search()
+
+    def _spotlight_notify(self, message: str) -> None:
+        """Transient toast in the spotlight's spot, for a spotlight lookup
+        that ends with nothing to open.  By then the popup is long closed
+        and the main window is often hidden, so a status-bar note would go
+        unseen and the app would just go quiet.  Display-only: it never
+        takes focus; a click dismisses it, and it dismisses itself after a
+        few seconds."""
+        self._status_var.set(message)
+        try:
+            toast = tk.Toplevel(self.root)
+            toast.overrideredirect(True)
+            toast.attributes("-topmost", True)
+            pw, ph = (600, 64) if _CTK_AVAILABLE else (520, 48)
+            sx = toast.winfo_screenwidth()
+            sy = toast.winfo_screenheight()
+            toast.geometry(f"{pw}x{ph}+{(sx - pw) // 2}+{sy // 3}")
+            if _CTK_AVAILABLE:
+                _ensure_modern_theme()
+                toast.configure(bg=_UI["window"])
+                self._spot_knockout_corners(toast)
+                card = ctk.CTkFrame(
+                    toast, corner_radius=16, fg_color=_UI["window"],
+                    border_width=1, border_color=_UI["border"],
+                )
+                card.pack(fill="both", expand=True)
+                ctk.CTkLabel(
+                    card, text=message, font=_ui_font(14),
+                    text_color=_UI["muted"], anchor="center",
+                ).pack(fill="both", expand=True, padx=16, pady=12)
+            else:
+                toast.configure(bg="#888888")
+                inner = tk.Frame(toast, bg="#ffffff", padx=12, pady=8)
+                inner.pack(fill="both", expand=True, padx=2, pady=2)
+                tk.Label(
+                    inner, text=message, bg="#ffffff", fg="#555555",
+                    font=("TkDefaultFont", 12), anchor="center",
+                ).pack(fill="both", expand=True)
+
+            def dismiss(_e=None) -> None:
+                try:
+                    toast.withdraw()
+                    toast.destroy()
+                except tk.TclError:
+                    pass
+                self._mac_return_focus()
+
+            _bind_recursive(toast, "<Button-1>", dismiss)
+            toast.after(4000, dismiss)
+        except tk.TclError:
+            pass
 
     @staticmethod
     def _spot_tier_color(court_id: str) -> str:
@@ -4512,8 +4618,7 @@ class CourtListenerGUI:
             this_idx = len(result_rows) - 1
 
             def on_click(_e=None, _r=r) -> None:
-                popup.destroy()
-                self._quick_popup = None
+                self._close_quick_popup()
                 _r["open_fn"]()
 
             _bind_recursive(r["row"], "<Button-1>", on_click)
@@ -4558,8 +4663,7 @@ class CourtListenerGUI:
                 _scroll_into_view(selected_idx[0])
             elif event.keysym == "Return":
                 if 0 <= selected_idx[0] < len(result_rows):
-                    popup.destroy()
-                    self._quick_popup = None
+                    self._close_quick_popup()
                     result_rows[selected_idx[0]]["open_fn"]()
 
         entry.bind("<Down>", _on_key)
@@ -10068,10 +10172,7 @@ def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
             doc.close()
 
 
-def _citation_links_from_pages(
-    pages: list,
-    link_pages: Optional[set[int]] = None,
-) -> dict:
+def _citation_links_from_pages(pages: list) -> dict:
     """Build the per-page clickable-citation rectangles from extracted page char
     data (see :func:`_extract_pdf_text_pages`).  Pure — no PDFium, no tk — so it
     is cheap to run on the worker right after extraction:
@@ -10103,8 +10204,6 @@ def _citation_links_from_pages(
             pi, li = gmap[g]
             if pi is None:
                 continue
-            if link_pages is not None and pi not in link_pages:
-                continue
             bx = pages[pi][li][1]
             if bx is not None:
                 per_page.setdefault(pi, []).append(bx)
@@ -10121,15 +10220,20 @@ def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
     return _citation_links_from_pages(_extract_pdf_text_pages(pdf_bytes))
 
 
-def _citation_links_from_visible_pdf_text(pdf_bytes: bytes, pages: list) -> dict:
-    """Citation rectangles only for born-digital text, not OCR-over-scan text."""
+def _citation_links_from_visible_pdf_text(
+    pdf_bytes: bytes, pages: list,
+) -> "tuple[dict, set[int]]":
+    """Citation rectangles for the whole document, plus the page indexes
+    whose text layer is OCR over a scan.  OCR glyph boxes land imprecisely,
+    so the pane renders those pages' links *quietly* — no tint, no
+    recoloring — while keeping them clickable (see
+    :meth:`_PdfPane.set_citation_links`)."""
     try:
         ocr_pages = _pdf_ocr_scan_pages(pdf_bytes)
     except Exception as exc:
         print(f"[pdf-links] OCR scan check failed: {exc}")
         ocr_pages = set()
-    link_pages = set(range(len(pages))) - ocr_pages
-    return _citation_links_from_pages(pages, link_pages=link_pages)
+    return _citation_links_from_pages(pages), ocr_pages
 
 
 # ---------------------------------------------------------------------------
@@ -10386,6 +10490,9 @@ class _PdfPane(ttk.Frame):
         self._overlay_ids: dict[int, list] = {}  # page → [canvas rectangle ids]
         self._cite_on_left = None
         self._cite_on_right = None
+        # Pages whose links are *quiet*: clickable but drawn with no tint and
+        # no recoloring (OCR-over-scan text, whose glyph boxes are imprecise).
+        self._quiet_pages: set[int] = set()
         # Optional text find (enabled via enable_find): per-page char data, the
         # current match list, and the page→highlight-ids map.
         self._search_pages: Optional[list] = None
@@ -10707,17 +10814,22 @@ class _PdfPane(ttk.Frame):
     # ------------------------------------------------------------------
 
     def set_citation_links(self, page_links: dict,
-                           on_left=None, on_right=None) -> None:
+                           on_left=None, on_right=None,
+                           quiet_pages: "Optional[set[int]]" = None) -> None:
         """Attach clickable citation overlays.  ``page_links`` maps a page index
         to ``[(rect_pts, action, snippet), …]`` (see
         :func:`_detect_pdf_citation_links`).  ``on_left(action, snippet)`` fires
-        on a left click, ``on_right(action, snippet)`` on a right click.  Redraws
-        the overlays on every page currently on screen (in recolor mode the
-        pages themselves are re-rendered, since the link color is baked into
-        the page image)."""
+        on a left click, ``on_right(action, snippet)`` on a right click.
+        Links on a page in ``quiet_pages`` (OCR-over-scan text, whose glyph
+        boxes are imprecise) are drawn with no tint or recoloring at all but
+        stay clickable, dispatched at the canvas level.  Redraws the overlays
+        on every page currently on screen (in recolor mode the pages
+        themselves are re-rendered, since the link color is baked into the
+        page image)."""
         self._cite_links = page_links or {}
         self._cite_on_left = on_left
         self._cite_on_right = on_right
+        self._quiet_pages = set(quiet_pages or ())
         if self._link_style == "recolor":
             self._bind_recolor_events()
             c = self._canvas
@@ -10726,6 +10838,8 @@ class _PdfPane(ttk.Frame):
                 _dispose_photo(self._photos.pop(i, None))
             self._render_visible()
             return
+        if self._quiet_pages:
+            self._bind_recolor_events()   # canvas-level clicks for quiet links
         for i in list(self._img_ids):
             self._draw_overlays(i)
 
@@ -10736,6 +10850,8 @@ class _PdfPane(ttk.Frame):
         rectangle are recolored, so the shapes stay crisp and the paper stays
         white — the text simply *is* blue, with no highlight box."""
         from PIL import Image
+        if i in self._quiet_pages:
+            return content   # OCR page: leave the scan untouched (quiet links)
         _w_pt, h_pt, _frac = self._meta[i]
         if content.mode != "RGB":
             content = content.convert("RGB")
@@ -10772,20 +10888,34 @@ class _PdfPane(ttk.Frame):
                add="+")
 
     def _link_at(self, event) -> "Optional[tuple]":
-        """The (action, snippet) under a mouse event, or None."""
+        """The (action, snippet) under a mouse event, or None.  In tint mode
+        only the *quiet* pages' links are canvas-dispatched — the tinted
+        rectangles have their own item bindings."""
         try:
             x = self._canvas.canvasx(event.x)
             y = self._canvas.canvasy(event.y)
         except tk.TclError:
             return None
         for i in list(self._img_ids):
+            if self._link_style != "recolor" and i not in self._quiet_pages:
+                continue
             for rect, action, snippet in self._cite_links.get(i, ()):
                 x0, y0, x1, y1 = self._rect_to_canvas(i, rect)
                 if x0 - 1 <= x <= x1 + 1 and y0 - 1 <= y <= y1 + 1:
                     return action, snippet
         return None
 
+    def _over_overlay_item(self) -> bool:
+        """True when the pointer sits on a tinted overlay rectangle (whose
+        own item bindings handle the cursor and the click)."""
+        try:
+            return "cite_ov" in self._canvas.gettags("current")
+        except tk.TclError:
+            return False
+
     def _on_recolor_motion(self, event) -> None:
+        if self._over_overlay_item():
+            return
         try:
             self._canvas.config(
                 cursor="hand2" if self._link_at(event) else "")
@@ -10793,6 +10923,8 @@ class _PdfPane(ttk.Frame):
             pass
 
     def _on_recolor_click(self, event, left: bool):
+        if self._over_overlay_item():
+            return None
         hit = self._link_at(event)
         if not hit:
             return None
@@ -10836,6 +10968,8 @@ class _PdfPane(ttk.Frame):
         links = self._cite_links.get(i)
         if not links or i >= len(self._slots):
             return
+        if i in self._quiet_pages:
+            return   # quiet page: no tint; clicks are canvas-dispatched
         ids: list = []
         for rect, action, snippet in links:
             x0, y0, x1, y1 = self._rect_to_canvas(i, rect)
@@ -12781,6 +12915,28 @@ class _ScholarTextWindow:
             matches.append((start, end, "recap", action[1]))
         for m in _TEXT_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "cite", m))
+        # Early-SCOTUS nominative cites, with or without the interpolated
+        # parallel U.S. volume ("4 Wheat. [17 U. S.] 438", "9 Wall. (76
+        # U. S.) 136", "76 U.S. (9 Wall.) 136", bare "1 Cranch 137") —
+        # pre-normalized to the two-part cite the resolvers know
+        # ("4 Wheat. 438"), whose modern U.S. volume the lookup paths
+        # already try via _citation_search_variants.
+        for pat in (_NOMINATIVE_PARALLEL_RE, _US_NOMINATIVE_PARALLEL_RE,
+                    _NOMINATIVE_TEXT_CITE_RE):
+            for m in pat.finditer(text):
+                if any(m.start() < e and s < m.end()
+                       for s, e, _k, _v in matches):
+                    continue
+                matches.append((m.start(), m.end(), "cite",
+                                _case_match_text(m)))
+        # Early lower-federal reporters ("1 Sumner, 73" -> "1 Sumn. 73",
+        # "35 Fed. Rep. 665" -> "35 F. 665"), the forms CourtListener knows.
+        for m in _EARLY_FED_CITE_RE.finditer(text):
+            if any(m.start() < e and s < m.end()
+                   for s, e, _k, _v in matches):
+                continue
+            matches.append((m.start(), m.end(), "cite",
+                            _early_fed_cite_text(m)))
         for m in us_code.USC_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "usc", m))
         for m in ecfr.CFR_CITE_RE.finditer(text):
@@ -12818,6 +12974,12 @@ class _ScholarTextWindow:
             matches.append((m.start(), m.end(), "engrep", m))
         for s, e, spec, _cases in eng_rep.iter_nominate_cites(text):
             matches.append((s, e, "engrepn", spec))
+        # Federal Cases cited by case number ("Cole v. The Atlantic, Case
+        # No. 2,976"; chained "The Chusan, Id. 2,717") — resolved at click
+        # time via the CourtListener API from the printed name and number.
+        # The span outranks the bare "Id." match at the same start.
+        for s, e, spec in fed_cas.iter_cites(text):
+            matches.append((s, e, "fedcas", spec))
         matches.sort(key=lambda t: (t[0], -t[1]))
         pos = 0
         for start, end, kind, m in matches:
@@ -12827,8 +12989,13 @@ class _ScholarTextWindow:
                 txt.insert("end", text[pos:start], tags)
             cite_base = ""  # set for case cites, to track the last citation
             if kind == "cite":
-                cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
-                cite = cite.replace("’", "'")  # straight apostrophe for the search query
+                # m is a regex match, or a pre-normalized string for the
+                # nominative-SCOTUS pass above.
+                if isinstance(m, str):
+                    cite = m
+                else:
+                    cite = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.")
+                    cite = cite.replace("’", "'")  # straight apostrophe for the search query
                 cite_base = cite  # base for a following "Id. at N"
                 # A pincite right after ("365 U.S. 167, 171") rides along
                 # so the opened case can jump to that page.  A number that
@@ -12881,6 +13048,10 @@ class _ScholarTextWindow:
                 # Nominate-report cite ("9 Exch. 341") → same viewer; m is the
                 # pre-built, resolution-gated spec ("n:exch:9:341").
                 action = ("engrep", m)
+            elif kind == "fedcas":
+                # Federal Cases case number → CourtListener lookup at click
+                # time; m is the pre-built JSON spec ({"no", "name"}).
+                action = ("fedcas", m)
             else:
                 action = ("cfr", ecfr.cite_spec(m))
             if action is None:
@@ -16131,6 +16302,10 @@ class _ScholarTextWindow:
             _open_recap_citation(
                 self._app, self._win, value, self._status_var.set)
             return
+        if kind == "fedcas":
+            _open_fedcas_citation(
+                self._app, self._win, value, self._status_var.set)
+            return
         # A Scholar case URL may carry a pincite, a reporter cite, and the case
         # name ("<url>\tpin=565\tcite=…\tname=…") so a failed/blocked fetch can
         # still be located on CourtListener.
@@ -17063,11 +17238,12 @@ class _ScholarTextWindow:
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
                 return
-            links = {}
+            links: dict = {}
+            quiet: set = set()
             if not any(pages or []):
                 return  # scan-only PDF: no text layer to select
             try:
-                links = _citation_links_from_visible_pdf_text(d, pages)
+                links, quiet = _citation_links_from_visible_pdf_text(d, pages)
             except Exception as exc:
                 print(f"[pdf-links] citation scan failed: {exc}")
             # The separate opinions (Syllabus, Opinion of the Court, each
@@ -17087,6 +17263,7 @@ class _ScholarTextWindow:
                                 links,
                                 self._open_pdf_cite,
                                 self._open_pdf_cite_browser,
+                                quiet_pages=quiet,
                             )
                         p.enable_find(pages, bind_keys=False)
                         if len(sections) > 1:
@@ -17095,10 +17272,13 @@ class _ScholarTextWindow:
                             nav.pack(side="right", fill="y", padx=(4, 0))
                         bits = []
                         n = sum(len(v) for v in links.values())
+                        nq = sum(len(v) for pg, v in links.items()
+                                 if pg in quiet)
                         if n:
                             bits.append(
                                 f"{n} citation link{'s' if n != 1 else ''} "
-                                "shown in blue"
+                                + ("clickable (not colored on scanned pages)"
+                                   if nq else "shown in blue")
                             )
                         if len(sections) > 1:
                             bits.append(f"{len(sections)} opinion parts "
@@ -17580,12 +17760,14 @@ class _PdfWindow:
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
                 return
-            links = {}
+            links: dict = {}
+            quiet: set = set()
             if not any(pages or []):
                 return
             if self._is_case:
                 try:
-                    links = _citation_links_from_visible_pdf_text(d, pages)
+                    links, quiet = _citation_links_from_visible_pdf_text(
+                        d, pages)
                 except Exception as exc:
                     print(f"[pdf-links] citation scan failed: {exc}")
 
@@ -17597,14 +17779,18 @@ class _PdfWindow:
                                 links,
                                 self._open_cite,
                                 self._open_cite_browser,
+                                quiet_pages=quiet,
                             )
                         p.enable_find(pages)
                         n = sum(len(v) for v in links.values())
+                        nq = sum(len(v) for pg, v in links.items()
+                                 if pg in quiet)
                         if n:
                             self._status_var.set(
-                                f"{n} citation link"
-                                f"{'' if n == 1 else 's'} shown in blue; "
-                                "drag to select text."
+                                f"{n} citation link{'' if n == 1 else 's'} "
+                                + ("clickable (not colored on scanned "
+                                   "pages); " if nq else "shown in blue; ")
+                                + "drag to select text."
                             )
                 except tk.TclError:
                     pass
@@ -18214,26 +18400,30 @@ class _SlipOpinionWindow:
             print(f"[slip] text extraction failed: {exc}")
             pages = []
         links: dict = {}
+        quiet: set = set()
         sections: list = []
         if pages:
             try:
-                links = _citation_links_from_visible_pdf_text(data, pages)
+                links, quiet = _citation_links_from_visible_pdf_text(
+                    data, pages)
             except Exception as exc:
                 print(f"[slip] citation scan failed: {exc}")
             try:
                 sections = slip_opinion.detect_sections(pages)
             except Exception as exc:
                 print(f"[slip] section detection failed: {exc}")
-        self._post(self._analyzed, pages, links, sections)
+        self._post(self._analyzed, pages, links, sections, quiet)
 
-    def _analyzed(self, pages: list, links: dict, sections: list) -> None:
+    def _analyzed(self, pages: list, links: dict, sections: list,
+                  quiet: "set[int] | None" = None) -> None:
         if self._pane is None:
             return
         self._pages = pages
         self._pane.enable_find(pages)
         if links:
             self._pane.set_citation_links(
-                links, self._open_cite, self._open_cite_browser)
+                links, self._open_cite, self._open_cite_browser,
+                quiet_pages=quiet)
         self._build_nav(sections)
         n = sum(len(v) for v in links.values())
         bits = []
@@ -18347,8 +18537,8 @@ def _open_eng_rep_case(parent: tk.Misc, case: "eng_rep.ERCase",
 
 #: Categories used to colour-code highlights by what the citation points at.
 def _brief_action_category(kind: str) -> str:
-    if kind in ("cite", "url", "engrep", "recap"):
-        return "case"  # English Reports and RECAP documents are cases too
+    if kind in ("cite", "url", "engrep", "recap", "fedcas"):
+        return "case"  # English Reports, RECAP and Federal Cases too
     if kind == "const":
         return "const"
     return "statute"
@@ -18385,6 +18575,20 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
         cite = value.split("@")[0]
         url = ("https://scholar.google.com/scholar?q="
                + urllib.parse.quote(f'"{cite}"'))
+    elif kind == "fedcas":
+        # Federal Cases number → the CourtListener search the in-app lookup
+        # would run, pre-filtered to the era: by printed case name when the
+        # citation gives one, else by the "Case No. N" phrase.
+        try:
+            spec = json.loads(value)
+        except Exception:
+            spec = {}
+        name = spec.get("name") or ""
+        q = (f'caseName:"{name}"' if name
+             else f'"Case No. {fed_cas.pretty_number(spec.get("no") or "")}"')
+        url = ("https://www.courtlistener.com/?"
+               + urllib.parse.urlencode(
+                   {"q": q, "type": "o", "filed_before": "1882-12-31"}))
     elif kind == "engrep":
         # English Reports → the CommonLII case page (first case at that page),
         # not the .pdf directly: the origin hotlink-blocks the scan unless you
@@ -18496,6 +18700,99 @@ def _open_recap_citation(app: "CourtListenerGUI", parent: tk.Misc,
     threading.Thread(target=run, daemon=True).start()
 
 
+def _open_fedcas_citation(app: "CourtListenerGUI", parent: tk.Misc,
+                          spec_json: str, status=lambda _s: None) -> None:
+    """Open a Federal Cases citation given by case number ("Cole v. The
+    Atlantic, Case No. 2,976").  No public index maps the numbers to
+    reporter pages, so the case is found live on CourtListener
+    (:func:`courtlistener.find_fedcas_case`): searched by the printed case
+    name — forgivingly, the sources being OCR — with the winner confirmed
+    by the number at the head of its headnotes or, failing that, by the
+    F. Cas. volume the number's alphabetical position dictates.  When
+    CourtListener doesn't hold the case at all, falls back to a Google
+    Scholar name search before giving up."""
+    try:
+        spec = json.loads(spec_json)
+    except Exception:
+        status("Couldn't read that citation.")
+        return
+    no = str(spec.get("no") or "")
+    name = spec.get("name") or ""
+    pretty = fed_cas.pretty_number(no)
+    label = (f"{name}, Case No. {pretty}" if name else f"Case No. {pretty}")
+
+    def safe_status(s: str) -> None:
+        try:
+            status(s)
+        except tk.TclError:
+            pass
+
+    safe_status(f"Looking up {label} on CourtListener…")
+    # Resolve these on the calling (main) thread — they touch tk variables.
+    client = app._get_client() if app._token_var.get().strip() else None
+    fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
+
+    def run() -> None:
+        item = None
+        try:
+            item = cl_api.find_fedcas_case(
+                no, name or None,
+                session=(client._session if client is not None else None),
+            )
+        except Exception as exc:
+            print(f"[fedcas] lookup failed for {label!r}: {exc}")
+        if item and client is not None:
+            try:
+                parts, blocks, plain, _cluster = _assemble_case_parts(
+                    client, item)
+            except Exception as exc:
+                print(f"[fedcas] assemble failed for {label!r}: {exc}")
+                parts, plain = [], ""
+            if parts or plain:
+                how = ("confirmed by its headnote number"
+                       if item.get("matched_by") == "headnote"
+                       else "matched by name and F. Cas. volume")
+                cite = "; ".join(item.get("citation") or [])
+
+                def open_cl(it=item) -> None:
+                    try:
+                        _ScholarTextWindow(
+                            app.root, app, "", "", item=it, cl_text=plain,
+                            cl_parts=parts, cl_blocks=blocks,
+                        )
+                    except tk.TclError:
+                        pass
+
+                app._post_root(open_cl)
+                app._post_root(lambda: safe_status(
+                    f"Opened {label}" + (f" — {cite}" if cite else "")
+                    + f" ({how})."))
+                return
+        # CourtListener doesn't hold the case (or no API token): try a
+        # Google Scholar search by the printed name, era-scoped.
+        if name and fetcher is not None:
+            result = None
+            try:
+                result = fetcher.fetch_by_name(name, None)
+            except Exception as exc:
+                print(f"[fedcas] scholar name lookup failed for {label!r}: {exc}")
+            if result:
+                def open_scholar(u=result[0], h=result[1]) -> None:
+                    try:
+                        _ScholarTextWindow(app.root, app, u, h, item=None,
+                                           prefetch_pdf=False)
+                    except tk.TclError:
+                        pass
+                app._post_root(open_scholar)
+                app._post_root(lambda: safe_status(
+                    f"CourtListener hasn't {label} — opened a Google "
+                    "Scholar name match (verify it yourself)."))
+                return
+        app._post_root(lambda: safe_status(f"Not found: {label}"))
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
                          action: tuple[str, str],
                          status=lambda _s: None,
@@ -18519,6 +18816,9 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
         return
     if kind == "recap":
         _open_recap_citation(app, parent, value, status)
+        return
+    if kind == "fedcas":
+        _open_fedcas_citation(app, parent, value, status)
         return
     if kind != "cite":
         status("Don't know how to open that citation.")
@@ -19203,25 +19503,32 @@ class _LinkedPdfWindow:
     def _scan(self) -> None:
         try:
             pages = _extract_pdf_text_pages(self._bytes)   # one extraction pass
-            links = _citation_links_from_visible_pdf_text(self._bytes, pages)
+            links, quiet = _citation_links_from_visible_pdf_text(
+                self._bytes, pages)
         except Exception as exc:
             self._post(self._scan_failed, str(exc))
             return
-        self._post(self._scan_done, links, pages)
+        self._post(self._scan_done, links, pages, quiet)
 
     def _scan_failed(self, msg: str) -> None:
         self._legend_lbl.configure(text="Citation scan failed:")
         self._status_var.set(msg)
 
-    def _scan_done(self, links: dict, pages: list) -> None:
+    def _scan_done(self, links: dict, pages: list,
+                   quiet: "set[int] | None" = None) -> None:
         if self._closed or self._pane is None:
             return
-        self._pane.set_citation_links(links, self._open_cite, self._open_cite_browser)
+        self._pane.set_citation_links(links, self._open_cite,
+                                      self._open_cite_browser,
+                                      quiet_pages=quiet)
         self._pane.enable_find(pages)   # Ctrl-F searches the text layer
         n = sum(len(v) for v in links.values())
+        n_quiet = sum(len(v) for pg, v in links.items() if pg in (quiet or ()))
         has_text = any(pages)
         self._legend_lbl.configure(
-            text=("Citations are shown in blue and clickable." if n
+            text=("Citations are clickable (not colored on scanned pages)."
+                  if n and n_quiet
+                  else "Citations are shown in blue and clickable." if n
                   else "No citations detected."))
         msg = (f"{n} citation link{'' if n == 1 else 's'} — left-click to open, "
                "right-click for the browser." if n
