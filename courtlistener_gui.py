@@ -10365,7 +10365,7 @@ def _whiten_pdf_redactions(img, _ds: int = 4) -> list:
     W, H = img.size
     w, h = max(1, W // _ds), max(1, H // _ds)
     small = img.convert("L").resize((w, h), Image.BOX)
-    black = [v <= 48 for v in small.getdata()]
+    black = [v <= 48 for v in small.tobytes()]
     seen = bytearray(w * h)
     min_w = max(6, int(0.08 * w))
     min_h = max(3, int(0.005 * h))
@@ -10683,8 +10683,8 @@ class _PdfPane(ttk.Frame):
             return full
         mask = img.convert("L").point(
             lambda p: 255 if p < self._INK_THRESH else 0)
-        cols = mask.resize((W, 1), Image.BOX).getdata()  # avg ink per column
-        rows = mask.resize((1, H), Image.BOX).getdata()  # avg ink per row
+        cols = mask.resize((W, 1), Image.BOX).tobytes()  # avg ink per column
+        rows = mask.resize((1, H), Image.BOX).tobytes()  # avg ink per row
 
         def span(profile, n):
             idx = [k for k, v in enumerate(profile) if v > self._PROFILE_MIN]
