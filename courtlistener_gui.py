@@ -3618,6 +3618,10 @@ class CourtListenerGUI:
             label="Quick Look Up (case or statute)…", accelerator="Ctrl+S",
             command=self._show_quick_lookup,
         )
+        lookup_menu.add_command(
+            label="Search English Reports (case name)…",
+            command=self._show_eng_rep_search,
+        )
         brief_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Brief", menu=brief_menu)
         brief_menu.add_command(
@@ -5462,6 +5466,125 @@ class CourtListenerGUI:
         ttk.Button(frame, text="Look Up", command=go).grid(row=0, column=2)
         entry.bind("<Return>", go)
         frame.columnconfigure(1, weight=1)
+
+    def _show_eng_rep_search(self) -> None:
+        """Search the English Reports by case name (or E.R. citation), listing
+        every decent match — the many-results counterpart of the spotlight's
+        single strict English Reports row.  Modeless: opening a case leaves
+        the box up for the next search."""
+        dlg = _ui_toplevel(self.root)
+        _ensure_modern_ttk_styles(dlg)
+        dlg.title("Search English Reports")
+        dlg.geometry(_fit_toplevel_geometry(dlg, 720, 460,
+                                            min_width=520, min_height=300))
+        dlg.minsize(520, 300)
+
+        top = _ui_frame(dlg)
+        top.pack(fill="x", padx=14, pady=(12, 0))
+        query_var = tk.StringVar()
+        entry = _ui_entry(top, textvariable=query_var)
+        entry.pack(side="left", fill="x", expand=True)
+        search_btn = _ui_button(top, "Search", primary=True, width=92)
+        search_btn.pack(side="left", padx=(8, 0))
+
+        box = _ui_frame(dlg, card=True)
+        box.pack(fill="both", expand=True, padx=12, pady=(10, 8))
+        sb_style = ("Modern.Vertical.TScrollbar" if _CTK_AVAILABLE
+                    else "Vertical.TScrollbar")
+        lb_kw = dict(activestyle="dotbox", borderwidth=0, highlightthickness=0)
+        if _CTK_AVAILABLE:
+            lb_kw.update(bg=_UI["window"], fg=_UI["text"],
+                         selectbackground=_UI["selection"],
+                         selectforeground=_UI["text"],
+                         font=("TkDefaultFont", 11))
+        lb = tk.Listbox(box, **lb_kw)
+        sb = ttk.Scrollbar(box, orient="vertical", command=lb.yview,
+                           style=sb_style)
+        lb.configure(yscrollcommand=sb.set)
+        pad = 8 if _CTK_AVAILABLE else 0
+        sb.pack(side="right", fill="y", pady=pad, padx=(0, pad))
+        lb.pack(side="left", fill="both", expand=True, padx=(pad, 0), pady=pad)
+
+        btns = _ui_frame(dlg)
+        btns.pack(fill="x", padx=14, pady=(0, 12))
+        open_btn = _ui_button(btns, "Open", primary=True, width=92)
+        open_btn.pack(side="right")
+        status_var = tk.StringVar(
+            value="Case name (e.g. Hadley v Baxendale) or citation "
+                  "(156 Eng. Rep. 145).")
+        _install_status_label(btns, status_var, padx=(0, 10))
+
+        results: "list[eng_rep.ERCase]" = []   # rows behind the listbox lines
+        gen = [0]                    # search generation; stale results dropped
+
+        def show(cases: "list[eng_rep.ERCase]", note: str) -> None:
+            results[:] = cases
+            lb.delete(0, "end")
+            for c in cases:
+                lb.insert("end", f"{c.name}  ·  {c.er_cite}  ·  {c.neutral}")
+            if cases:
+                lb.selection_set(0)
+            status_var.set(note)
+
+        def search(_e=None) -> None:
+            q = query_var.get().strip()
+            if not q:
+                return
+            gen[0] += 1
+            my_gen = gen[0]
+            status_var.set("Searching…")
+
+            def run() -> None:
+                try:
+                    m = eng_rep.ER_CITE_RE.search(q)
+                    if m:
+                        vol, page = int(m.group(1)), int(m.group(2))
+                        cases = eng_rep.lookup(vol, page)
+                        note = (f"{len(cases)} case(s) at {vol} E.R. {page}."
+                                if cases else
+                                f"{vol} Eng. Rep. {page} isn't in the index.")
+                    else:
+                        cap = 250
+                        cases = _eng_rep_name_search(q, cap)
+                        if not cases:
+                            note = ("No matching English Reports case."
+                                    if eng_rep.is_available() else
+                                    "The English Reports index isn't "
+                                    "available.")
+                        elif len(cases) == cap:
+                            note = (f"Showing the best {cap} matches — add a "
+                                    "word to narrow.")
+                        else:
+                            note = (f"{len(cases)} matches." if len(cases) > 1
+                                    else "1 match.")
+                except Exception as exc:
+                    cases, note = [], f"Search failed: {exc}"
+
+                def post() -> None:
+                    if my_gen == gen[0] and lb.winfo_exists():
+                        show(cases, note)
+
+                try:
+                    self.root.after(0, post)
+                except tk.TclError:
+                    pass  # app closed while searching
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def open_selected(_e=None) -> None:
+            sel = lb.curselection()
+            if sel and results:
+                # Parent on the root so the viewer outlives this box.
+                _open_eng_rep_case(self.root, results[sel[0]],
+                                   self._status_var.set, app=self)
+
+        search_btn.configure(command=search)
+        open_btn.configure(command=open_selected)
+        entry.bind("<Return>", search)
+        lb.bind("<Double-Button-1>", open_selected)
+        lb.bind("<Return>", open_selected)
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        entry.focus_set()
 
     # ------------------------------------------------------------------
     # Opinion database — find / open / merge / rebuild
@@ -18498,6 +18621,67 @@ class _SlipOpinionWindow:
         self._status_var.set("Text ready.")
         if self._clean_text is not None:
             _SlipTextWindow(self._win, self._title, self._clean_text)
+
+
+_ER_CAPTION_VS_RE = re.compile(r"\s+(?:against|versus)\s+", re.IGNORECASE)
+
+
+def _er_caption_to_modern(name: str) -> str:
+    """Fold an English Reports caption to the modern "A v B" shape the
+    spotlight's name matcher splits on: "against"/"versus" become "v"
+    ("John Entick, Clerk, versus Nathan Carrington…"), and failing those the
+    semicolon dividing an Appellant; Respondent caption does ("George
+    Booth,-Appellant; George, Earl of Warrington,-Respondent")."""
+    s = _ER_CAPTION_VS_RE.sub(" v ", name)
+    if ";" in s and not _NAME_PARTY_SPLIT_RE.search(s):
+        s = s.replace(";", " v ", 1)
+    return s
+
+
+def _eng_rep_name_search(query: str, cap: int = 250) -> "list[eng_rep.ERCase]":
+    """English Reports cases matching a typed case name, best first — the
+    many-results counterpart of ``eng_rep.search_by_name``'s single strict
+    spotlight hit.
+
+    Candidates (any indexed case sharing an identifying word with the query)
+    are ranked the way the spotlight ranks CourtListener name results: each is
+    tiered by :func:`_match_tier` and only the best tier present survives (the
+    case as captioned beats a swapped caption beats a one-party match — see
+    :func:`_filter_to_best_tier`), ordered within the tier by
+    :func:`_name_match_score`, then exact-word hits before prefix/fuzzy ones,
+    then the shorter (more precise) name."""
+    query = _er_caption_to_modern(query)
+    qtokens = _name_tokens(query)
+    if not qtokens:
+        return []
+
+    def shares_a_word(nset: frozenset) -> bool:
+        # Cheap necessary condition before the real scoring: some query word
+        # appears in the name — equal, or a ≥4-letter prefix either way as in
+        # _token_close (whose fuzzy tail is left to _match_tier).
+        return any(
+            qt in nset or (len(qt) >= 4 and any(
+                nt.startswith(qt) or (len(nt) >= 4 and qt.startswith(nt))
+                for nt in nset))
+            for qt in qtokens
+        )
+
+    scored: list[tuple[int, float, float, "eng_rep.ERCase"]] = []
+    for _nn, nset, case in eng_rep.named_cases():
+        if not shares_a_word(nset):
+            continue
+        name = _er_caption_to_modern(case.name)
+        tier = _match_tier(query, name)
+        if tier < 0:
+            continue
+        exact = sum(1 for qt in qtokens if qt in nset) / len(qtokens)
+        scored.append((tier, _name_match_score(query, name), exact, case))
+    if not scored:
+        return []
+    best = max(t for t, _s, _e, _c in scored)
+    kept = [(s, e, c) for t, s, e, c in scored if t == best]
+    kept.sort(key=lambda t: (-t[0], -t[1], len(t[2].name), t[2].year, t[2].num))
+    return [c for _s, _e, c in kept[:cap]]
 
 
 def _open_eng_rep(parent: tk.Misc, spec: str,

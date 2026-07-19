@@ -688,6 +688,16 @@ def search_by_name(query: str, limit: int = 1) -> "list[ERCase]":
     return [c for _s, _ln, c in scored[:limit]]
 
 
+def named_cases() -> "list[tuple[str, frozenset, ERCase]]":
+    """The name-search rows -- (normalised name, token set, case), one row per
+    case -- for callers that rank with their own scorer (the GUI's English
+    Reports search box, which reuses its spotlight name matching).  Treat the
+    list as read-only."""
+    _load_names()
+    assert _NAME_INDEX is not None
+    return _NAME_INDEX
+
+
 # ---------------------------------------------------------------------------
 # Helpers for the citation-detection / link-dispatch plumbing (mirrors the
 # other source modules: a regex match -> a compact spec string the GUI stores
