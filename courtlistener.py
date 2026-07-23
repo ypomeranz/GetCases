@@ -765,8 +765,6 @@ class CourtListenerClient:
 # its headnotes, falling back to the volume check when no headnotes carry
 # the number.
 
-_FCAS_CITE_RE = re.compile(r"\b(\d{1,2})\s+F\.?\s?Cas\.?\s+(\d{1,5})\b")
-
 _FEDCAS_STOPWORDS = frozenset({
     "the", "of", "and", "in", "re", "ex", "parte", "a", "an", "et", "al",
     "v", "vs",
@@ -778,17 +776,25 @@ _FEDCAS_VERIFY_BUDGET = 6
 
 def _fcas_volume(citations) -> "int | None":
     """The F. Cas. volume among a result's citations, or None."""
-    import re as _re
+    import citations as _citation_helpers
     for c in citations or []:
         if isinstance(c, dict):
-            if "f. cas" in str(c.get("reporter") or "").lower():
+            if (
+                _citation_helpers.reporter_key(c.get("reporter") or "")
+                == "fcas"
+            ):
                 try:
                     return int(c.get("volume"))
                 except (TypeError, ValueError):
                     continue
         else:
-            m = _FCAS_CITE_RE.search(_re.sub(r"<[^>]+>", "", str(c)))
-            if m:
+            m = _citation_helpers.find_case_citation(
+                re.sub(r"<[^>]+>", "", str(c)),
+            )
+            if (
+                m is not None
+                and _citation_helpers.reporter_key(m.group(2)) == "fcas"
+            ):
                 return int(m.group(1))
     return None
 

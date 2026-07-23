@@ -48,6 +48,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
 
+import citations
+
 try:
     import requests
     from bs4 import BeautifulSoup, Comment, NavigableString, Tag
@@ -291,7 +293,7 @@ def _cite_keys(text: str) -> set[tuple[str, str, str]]:
     the same key."""
     out: set[tuple[str, str, str]] = set()
     for m in _CITE_KEY_RE.finditer(text or ""):
-        rep = re.sub(r"[^a-z0-9]", "", m.group(2).lower())
+        rep = citations.reporter_key(m.group(2))
         if rep:
             out.add((m.group(1), rep, m.group(3)))
     return out
@@ -1876,11 +1878,7 @@ class GoogleScholarFetcher:
         q = (query or "").strip()
         if not q or q.isdigit():
             return False
-        try:
-            import citations
-            return citations.CITE_CAPTURE_RE.search(q) is None
-        except Exception:
-            return True
+        return citations.find_case_citation(q, permissive=True) is None
 
     def _db_name_hits(self, query: str, limit: int) -> Optional[list[dict]]:
         """Database name candidates re-ranked by the injected name matcher, or

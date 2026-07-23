@@ -54,7 +54,7 @@ from bluebook_names import (
     strip_related_case_note,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 # Word tokens too generic to help narrow a party search.
 _PARTY_STOP = {
@@ -156,11 +156,15 @@ def _gz_unpack(packed: str) -> str:
 
 def _cite_key(cite: str) -> Optional[tuple[int, str, int]]:
     """(volume, normalized-reporter, page) for a reporter citation, or None."""
-    m = citations.CITE_CAPTURE_RE.search(cite or "")
+    m = citations.find_case_citation(cite or "")
     if not m:
         return None
     try:
-        return (int(m.group(1)), citations.norm_reporter(m.group(2)), int(m.group(3)))
+        return (
+            int(m.group(1)),
+            citations.reporter_key(m.group(2)),
+            int(m.group(3)),
+        )
     except (TypeError, ValueError):
         return None
 
@@ -193,7 +197,7 @@ def _header_cites(blocks: list) -> list[str]:
         t = re.sub(r"\s+", " ", b.text()).strip()
         t = re.sub(r"\bU\.\s+S\.", "U.S.", t)
         t = re.sub(r"\b(\d{1,4})\s+US\s+(\d{1,5})\b", r"\1 U.S. \2", t)
-        for m in citations.CITE_CAPTURE_RE.finditer(t):
+        for m in citations.iter_case_citations(t):
             out.append(re.sub(r"\s+", " ", m.group(0)).strip())
     return out
 
@@ -275,7 +279,7 @@ def _court_from_cites(cites: list[str]) -> str:
     ``scotus``; otherwise leave it blank."""
     for c in cites:
         key = _cite_key(c)
-        if key and key[1] in ("u.s.", "s.ct.", "l.ed.", "l.ed.2d"):
+        if key and key[1] in ("us", "sct", "led", "led2d"):
             return "scotus"
     return ""
 
@@ -565,10 +569,14 @@ class OpinionDB:
         if not sid:
             return
         html = _gz_unpack(rec.get("html_gz", ""))
-        text = _blocks_text(_blocks(html)) if html else ""
-        cites = rec.get("cites")
-        if cites is None:
-            cites = _header_cites(_blocks(html))
+        blocks = _blocks(html) if html else []
+        text = _blocks_text(blocks) if blocks else ""
+        # Schema v3 re-parses stored HTML with the shared broad reporter
+        # detector.  Older JSONL rows were created with the narrow detector and
+        # may therefore omit F. Cas., first-series F., Wash., and other official
+        # reporters even though the caption HTML still contains them.
+        stored_cites = rec.get("cites") or []
+        cites = _dedupe_cites([*stored_cites, *_header_cites(blocks)])
         parties = rec.get("parties")
         if parties is None:
             parties = parties_from_name(rec.get("name", ""))
@@ -748,14 +756,16 @@ class OpinionDB:
             vol_i, page_i = int(vol), int(page)
         except (TypeError, ValueError):
             return []
-        rep = citations.norm_reporter(reporter)
+        reporters = citations.reporter_normalized_variants(reporter)
+        placeholders = ",".join("?" * len(reporters))
         with self._lock:
             rows = self._db.execute(
                 "SELECT o.* FROM citations c JOIN opinions o "
                 "ON o.scholar_id=c.scholar_id "
-                "WHERE c.reporter=? AND c.vol=? AND c.page=? "
+                f"WHERE c.reporter IN ({placeholders}) "
+                "AND c.vol=? AND c.page=? "
                 "ORDER BY o.year, o.name",
-                (rep, vol_i, page_i),
+                (*reporters, vol_i, page_i),
             ).fetchall()
         return [self._summary(r) for r in rows]
 
@@ -815,7 +825,7 @@ class OpinionDB:
         if q.isdigit():  # a bare number is a Google Scholar opinion id
             rec = self.get_by_scholar_id(q)
             return [self._summary_from_record(rec)] if rec else []
-        m = citations.CITE_CAPTURE_RE.search(q)
+        m = citations.find_case_citation(q, permissive=True)
         if m:
             return self.find_by_citation(m.group(1), m.group(2), m.group(3))
         return self.find_by_party(q)
