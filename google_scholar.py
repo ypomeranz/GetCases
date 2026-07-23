@@ -366,10 +366,44 @@ def educate_quotes(text: str) -> str:
     text = (text.replace("``", _D_OPEN).replace("''", _D_CLOSE)
             .replace("`", _S_OPEN))
     out = list(text)
+    double_depth = 0
     for i, ch in enumerate(text):
+        if ch == _D_OPEN:
+            double_depth += 1
+            continue
+        if ch == _D_CLOSE:
+            double_depth = max(0, double_depth - 1)
+            continue
         if ch == '"':
             prev = out[i - 1] if i else ""
-            out[i] = _D_OPEN if (not prev or prev in _QUOTE_OPENERS) else _D_CLOSE
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            # Whitespace normally introduces an opening quotation, but it can
+            # also sit between nested closing marks: ``... Nation.' " Brief``.
+            # In that position the following whitespace/end (or closing
+            # punctuation) is stronger evidence than the preceding space.  If
+            # the immediate look-ahead is itself ambiguous (the opening outer
+            # quote may also be followed by a space), the unmatched double-
+            # quote depth decides whether this mark opens or closes the pair.
+            visible_text_follows = bool(
+                nxt and not nxt.isspace() and nxt not in ".,;:!?)]}"
+            )
+            j = i - 1
+            while j >= 0 and out[j].isspace():
+                j -= 1
+            nested_single_just_closed = bool(
+                j >= 0 and out[j] == _S_CLOSE and double_depth > 0
+            )
+            opens = (
+                not prev
+                or (prev in _QUOTE_OPENERS and not prev.isspace())
+                or (prev.isspace() and (
+                    not nested_single_just_closed
+                    and (visible_text_follows or double_depth == 0)
+                ))
+            )
+            out[i] = _D_OPEN if opens else _D_CLOSE
+            double_depth = double_depth + 1 if opens else max(
+                0, double_depth - 1)
         elif ch == "'":
             prev = out[i - 1] if i else ""
             nxt = text[i + 1] if i + 1 < len(text) else ""

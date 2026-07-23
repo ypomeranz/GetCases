@@ -316,8 +316,12 @@ _ANALYSIS_SEC_RE = re.compile(
 )
 # Fallback ordering: the section heads themselves, in document order
 _SECHEAD_NUM_RE = re.compile(
-    r'<h3\s+class="section-head"[^>]*>\s*(?:<[^>]+>\s*)*\[?§+\s*'
+    r'<h3\s+class="section-head"[^>]*>\s*(?:<[^>]+>\s*)*\[?\s*'
+    # OLRC's current container pages emit ``&sect;1983``; older/saved
+    # pages and tests may contain the decoded character or a numeric entity.
+    r"(?:(?:§|&sect;|&#0*167;|&#x0*a7;)\s*)+"
     r"(\d+[A-Za-z0-9]*(?:[-–]\d+[A-Za-z0-9]*)?)",
+    re.IGNORECASE,
 )
 
 

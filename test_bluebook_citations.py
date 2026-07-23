@@ -28,19 +28,52 @@ from court_catalog import bluebook_federal_trial_court
 from courtlistener_gui import (
     CourtListenerGUI,
     _ScholarTextWindow,
+    _CaseLawPageOpinion,
+    _case_law_page_opinions,
+    _match_case_law_page_opinion,
+    _opinion_db_spotlight_results,
     _citation_search_variants,
     _cl_item_for_citation,
     _combined_parts_cover_typed,
     _cut_companion_cases,
+    _dump_to_rtf,
     _nominative_display_cite,
     _pick_combined_opinion,
+    _plain_without_layout_chars,
     _recap_citation_ranges,
     _recap_spec_index,
     _scholar_caption_name,
+    _spotlight_case_action,
     _special_citation_ranges,
     _wisconsin_display_cite,
 )
-from google_scholar import Block, OpinionPart, Span
+from google_scholar import Block, OpinionPart, Span, educate_quotes
+import us_code
+
+
+class SmartQuoteTests(unittest.TestCase):
+    def test_outer_double_quote_closes_after_spaced_inner_single_quote(self):
+        text = (
+            'The Government safeguards the flag\'s identity " \'as the unique '
+            'and unalloyed symbol of the Nation.\' " Brief for United States.'
+        )
+        expected = (
+            "The Government safeguards the flag" + chr(0x2019)
+            + "s identity " + chr(0x201c) + " " + chr(0x2018)
+            + "as the unique and unalloyed symbol of the Nation."
+            + chr(0x2019) + " " + chr(0x201d)
+            + " Brief for United States."
+        )
+        self.assertEqual(educate_quotes(text), expected)
+
+    def test_separate_double_quoted_phrases_still_pair(self):
+        expected = (
+            "One " + chr(0x201c) + "quotation" + chr(0x201d)
+            + " and another " + chr(0x201c) + "quotation" + chr(0x201d) + "."
+        )
+        self.assertEqual(
+            educate_quotes('One "quotation" and another "quotation".'), expected,
+        )
 
 
 class CaptionCapitalizationTests(unittest.TestCase):
@@ -946,6 +979,268 @@ class NominativeCitationSearchTests(unittest.TestCase):
             fetcher.fetch_by_citation.call_args_list,
             [call("8 Wall 168"), call("75 U.S. 168")],
         )
+
+
+class CopyWithCitationTests(unittest.TestCase):
+    class DumpText:
+        def __init__(self, before="words ", after=" remain"):
+            self.before = before
+            self.after = after
+
+        @staticmethod
+        def tag_names(_start):
+            return ()
+
+        def dump(self, _start, _end, **_kwargs):
+            return [
+                ("text", self.before, "1.0"),
+                ("tagon", "pagenum", "1.6"),
+                ("text", "*123", "1.6"),
+                ("tagoff", "pagenum", "1.10"),
+                ("text", self.after, "1.10"),
+            ]
+
+    @staticmethod
+    def _window(with_cite: bool):
+        win = object.__new__(_ScholarTextWindow)
+        win._text = Mock()
+        win._text.index.side_effect = ["2.0", "2.20"]
+        win._text.tag_ranges.return_value = ()
+        win._copy_with_cite = Mock()
+        win._copy_with_cite.get.return_value = with_cite
+        win._omitted_footnote_tags = Mock(return_value=(set(), 0))
+        win._bluebook_citation = Mock(return_value=("Case, 1 F.4th 2.", "rtf"))
+        win._parts = []
+        win._rendered_parts = []
+        win._link_actions = {}
+        win._mode = "courtlistener"
+        win._win = Mock()
+        win._status_var = Mock()
+        return win
+
+    def test_copy_with_citation_omits_inline_star_pagination(self):
+        win = self._window(True)
+        with (
+            patch("courtlistener_gui._dump_to_rtf", return_value="body") as dump,
+            patch("courtlistener_gui._plain_without_layout_chars",
+                  return_value="quotation") as plain,
+            patch("courtlistener_gui._rtf_document", return_value="document"),
+            patch("courtlistener_gui._copy_rich_clipboard", return_value="rich text"),
+        ):
+            win._copy_formatted()
+
+        self.assertEqual(dump.call_args.kwargs["omit_tags"], {"pagenum"})
+        self.assertEqual(plain.call_args.kwargs["omit_tags"], {"pagenum"})
+
+    def test_copy_without_citation_keeps_inline_star_pagination(self):
+        win = self._window(False)
+        with (
+            patch("courtlistener_gui._dump_to_rtf", return_value="body") as dump,
+            patch("courtlistener_gui._plain_without_layout_chars",
+                  return_value="quotation") as plain,
+            patch("courtlistener_gui._rtf_document", return_value="document"),
+            patch("courtlistener_gui._copy_rich_clipboard", return_value="rich text"),
+        ):
+            win._copy_formatted()
+
+        self.assertEqual(dump.call_args.kwargs["omit_tags"], set())
+        self.assertEqual(plain.call_args.kwargs["omit_tags"], set())
+
+    def test_omitted_pagination_collapses_two_surrounding_spaces(self):
+        txt = self.DumpText()
+
+        plain = _plain_without_layout_chars(
+            txt, "1.0", "end", omit_tags={"pagenum"},
+        )
+        rtf = _dump_to_rtf(txt, "1.0", "end", omit_tags={"pagenum"})
+
+        self.assertEqual(plain, "words remain")
+        self.assertIn("words remain", rtf)
+        self.assertNotIn("words  remain", rtf)
+
+    def test_omitted_pagination_does_not_invent_or_remove_one_sided_space(self):
+        cases = (
+            ("words ", "remain", "words remain"),
+            ("words", " remain", "words remain"),
+            ("words", "remain", "wordsremain"),
+        )
+        for before, after, expected in cases:
+            with self.subTest(before=before, after=after):
+                txt = self.DumpText(before, after)
+                self.assertEqual(
+                    _plain_without_layout_chars(
+                        txt, "1.0", "end", omit_tags={"pagenum"},
+                    ),
+                    expected,
+                )
+
+    def test_plain_copy_retains_pagination_and_its_original_spacing(self):
+        txt = self.DumpText()
+
+        self.assertEqual(
+            _plain_without_layout_chars(txt, "1.0", "end"),
+            "words *123 remain",
+        )
+
+
+class OpinionDatabaseSpotlightTests(unittest.TestCase):
+    class DB:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def search_names(self, _query, _limit):
+            return list(self.rows)
+
+        def find(self, _query):
+            return list(self.rows)
+
+        def get_by_scholar_id(self, sid):
+            return {"text": f"The parties in saved opinion {sid}."}
+
+    def test_saved_results_use_name_tier_then_court_and_cap_at_three(self):
+        rows = [
+            {"scholar_id": "1", "name": "ACME CORPORATION v. SMITH",
+             "cite": "1 U.S. 1", "cites": ["1 U.S. 1"],
+             "court": "ca9", "year": "2020", "url": "u1"},
+            {"scholar_id": "2", "name": "Acme Corp. v. Smith",
+             "cite": "2 U.S. 2", "cites": ["2 U.S. 2"],
+             "court": "scotus", "year": "2019", "url": "u2"},
+            {"scholar_id": "3", "name": "Acme Corp. v. Smith",
+             "cite": "3 F.4th 3", "cites": ["3 F.4th 3"],
+             "court": "ca2", "year": "2021", "url": "u3"},
+            {"scholar_id": "4", "name": "Acme Corp. v. Smith",
+             "cite": "4 F. Supp. 4", "cites": ["4 F. Supp. 4"],
+             "court": "nysd", "year": "2024", "url": "u4"},
+            {"scholar_id": "5", "name": "Acme Corp. v. Jones",
+             "cite": "5 F.4th 5", "cites": ["5 F.4th 5"],
+             "court": "ca1", "year": "2025", "url": "u5"},
+        ]
+
+        hits = _opinion_db_spotlight_results(
+            self.DB(rows), "Acme Corporation v. Smith", limit=3)
+
+        self.assertEqual([h["scholar_id"] for h in hits], ["2", "3", "1"])
+        self.assertTrue(all(h["name"] == "Acme Corp. v. Smith" for h in hits))
+
+    def test_saved_results_honor_spotlight_court_hint(self):
+        rows = [
+            {"scholar_id": "9", "name": "Acme Corp. v. Smith",
+             "cite": "9 F.4th 9", "cites": ["9 F.4th 9"],
+             "court": "ca9", "year": "2024", "url": "u9"},
+            {"scholar_id": "1", "name": "Acme Corp. v. Smith",
+             "cite": "1 U.S. 1", "cites": ["1 U.S. 1"],
+             "court": "scotus", "year": "2024", "url": "u1"},
+        ]
+
+        hits = _opinion_db_spotlight_results(
+            self.DB(rows), "Acme Corp. v. Smith (9th Cir. 2024)", limit=3)
+
+        self.assertEqual([h["scholar_id"] for h in hits], ["9"])
+
+
+class SpotlightCitationDetectionTests(unittest.TestCase):
+    def test_early_federal_reporter_uses_shared_normalization(self):
+        hit = _spotlight_case_action("The Nestor, 1 Sumner, 73")
+
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[2], ("cite", "1 Sumn. 73"))
+
+    def test_federal_cases_number_routes_to_special_opener(self):
+        hit = _spotlight_case_action(
+            "Cole v. The Atlantic, Case No. 2,976"
+        )
+
+        self.assertIsNotNone(hit)
+        kind, value = hit[2]
+        self.assertEqual(kind, "fedcas")
+        self.assertEqual(json.loads(value)["no"], "2976")
+
+    def test_federal_cases_reporter_is_a_direct_case_action(self):
+        hit = _spotlight_case_action("The Nestor, 18 F. Cas. 9")
+
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[2], ("cite", "18 F. Cas. 9"))
+
+    def test_multiple_case_citations_are_not_opened_arbitrarily(self):
+        self.assertIsNone(
+            _spotlight_case_action("1 Sumner, 73; 35 Fed. Rep. 665")
+        )
+
+
+class UsCodeNavigationTests(unittest.TestCase):
+    def test_current_olrc_section_heads_supply_neighbor_order(self):
+        # Current OLRC container pages no longer include the old analysis
+        # table and HTML-encode the section sign in each fallback heading.
+        page = """
+        <h3 class="section-head">&sect;1981. Equal rights</h3>
+        <h3 class="section-head">&sect;1981a. Damages</h3>
+        <h3 class="section-head">&#167;1982. Property rights</h3>
+        <h3 class="section-head">&#xA7;1983. Civil action</h3>
+        """
+
+        self.assertEqual(
+            us_code._sections_from_analysis(page),
+            ["1981", "1981a", "1982", "1983"],
+        )
+
+    def test_neighbors_use_section_head_fallback_order(self):
+        doc = us_code.UscSection(
+            title="42", section="1982", url="url",
+            container="title42-chapter21-subchapter1",
+        )
+
+        with patch(
+            "us_code._container_sections",
+            return_value=["1981", "1981a", "1982", "1983"],
+        ):
+            self.assertEqual(
+                doc.neighbors(),
+                (("42", "1981a"), ("42", "1983")),
+            )
+
+
+class CaseLawSharedPageTests(unittest.TestCase):
+    def test_discovers_sequential_pdfs_and_reads_every_json_name(self):
+        base = "https://static.case.law/f2d/100/case-pdfs/0123-01.pdf"
+        session = Mock()
+
+        def head(url, **_kwargs):
+            return SimpleNamespace(
+                status_code=200 if url.endswith(("-02.pdf", "-03.pdf")) else 404
+            )
+
+        def get(url, **_kwargs):
+            suffix = url.rsplit("-", 1)[-1].split(".", 1)[0]
+            names = {
+                "01": "Alpha Corp. v. One",
+                "02": "Beta Corp. v. Two",
+                "03": "Gamma Corp. v. Three",
+            }
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"name_abbreviation": names[suffix]},
+            )
+
+        session.head.side_effect = head
+        session.get.side_effect = get
+        with patch("courtlistener_gui._anon_session", session):
+            opinions = _case_law_page_opinions(base)
+
+        self.assertEqual([o.name for o in opinions], [
+            "Alpha Corp. v. One", "Beta Corp. v. Two", "Gamma Corp. v. Three",
+        ])
+        self.assertEqual(session.head.call_args_list[-1].args[0],
+                         base.replace("-01.pdf", "-04.pdf"))
+        self.assertEqual(session.get.call_count, 3)
+
+    def test_source_case_name_selects_matching_sibling(self):
+        opinions = [
+            _CaseLawPageOpinion("first.pdf", "first.json", "Alpha v. One"),
+            _CaseLawPageOpinion("second.pdf", "second.json", "Beta v. Two"),
+        ]
+        chosen = _match_case_law_page_opinion(opinions, "Beta v. Two")
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen.url, "second.pdf")
 
 
 class SpotlightPopupLifecycleTests(unittest.TestCase):
