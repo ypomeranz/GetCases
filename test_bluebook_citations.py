@@ -27,6 +27,7 @@ from citation_overrides import (
 from court_catalog import bluebook_federal_trial_court
 from courtlistener_gui import (
     CourtListenerGUI,
+    _CaseTabPage,
     _ScholarTextWindow,
     _CaseLawPageOpinion,
     _CaseLawTextRecord,
@@ -34,6 +35,7 @@ from courtlistener_gui import (
     _case_law_text_for_pdf_url,
     _case_law_text_record,
     _case_pdf_text_source,
+    _open_statute_action,
     _case_law_page_opinions,
     _match_case_law_page_opinion,
     _opinion_db_spotlight_results,
@@ -1412,6 +1414,75 @@ class CaseWindowModeTests(unittest.TestCase):
         self.assertEqual(_CaseTabsWindow._tab_label(short), short)
         self.assertEqual(len(_CaseTabsWindow._tab_label("x" * 80)), 52)
         self.assertTrue(_CaseTabsWindow._tab_label("x" * 80).endswith("..."))
+
+    def test_ctrl_tab_cycle_wraps_both_directions(self):
+        class Notebook:
+            def __init__(self):
+                self.items = ("one", "two", "three")
+                self.current = "one"
+
+            def tabs(self):
+                return self.items
+
+            def select(self, value=None):
+                if value is None:
+                    return self.current
+                self.current = value
+
+            def index(self, value):
+                return self.items.index(value)
+
+        manager = object.__new__(_CaseTabsWindow)
+        manager.notebook = Notebook()
+
+        self.assertEqual(manager._cycle_tab(-1), "break")
+        self.assertEqual(manager.notebook.current, "three")
+        manager._cycle_tab(1)
+        self.assertEqual(manager.notebook.current, "one")
+
+    def test_pop_out_reopens_one_tab_with_standalone_override(self):
+        app = object.__new__(CourtListenerGUI)
+        app._force_standalone_view = False
+        page = object.__new__(_CaseTabPage)
+        page.destroy = Mock()
+        seen = []
+
+        def reopen():
+            seen.append(app._force_standalone_view)
+            # Mirrors new_secondary_view_host consuming the one-shot.
+            app._force_standalone_view = False
+
+        app._open_case_views = {
+            1: {"view": page, "label": "A tab", "reopen": reopen},
+        }
+
+        app.pop_out_view(page)
+
+        page.destroy.assert_called_once()
+        self.assertEqual(seen, [True])
+        self.assertFalse(app._force_standalone_view)
+
+    def test_statute_and_statute_pdf_forward_the_shared_app(self):
+        app = object()
+        parent = object()
+        status = Mock()
+        with patch("courtlistener_gui._fetch_statute_window") as fetch:
+            _open_statute_action(
+                parent, ("usc", "42:1983:"), status, app=app,
+            )
+        fetch.assert_called_once_with(
+            parent, "usc", "42:1983:", status, app=app,
+        )
+
+        with patch("courtlistener_gui._open_statute_pdf") as open_pdf:
+            _open_statute_action(
+                parent,
+                ("statpdf", "https://www.govinfo.gov/example.pdf"),
+                status, app=app,
+            )
+        open_pdf.assert_called_once_with(
+            parent, "https://www.govinfo.gov/example.pdf", status, app=app,
+        )
 
 
 class SpotlightPopupLifecycleTests(unittest.TestCase):

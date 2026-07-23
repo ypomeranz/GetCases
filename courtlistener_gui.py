@@ -430,6 +430,28 @@ def _install_history_menubar(app, win: tk.Misc):
     return menubar
 
 
+def _install_window_menubar(app, win: tk.Misc):
+    """Attach the shared Window menu to a non-case document view."""
+    if app is None or not hasattr(app, "populate_window_menu"):
+        return None
+    menubar = tk.Menu(win)
+    window_menu = tk.Menu(menubar, tearoff=0)
+    try:
+        window_menu.configure(
+            postcommand=lambda m=window_menu, w=win:
+                app.populate_window_menu(m, w)
+        )
+    except tk.TclError:
+        pass
+    app.populate_window_menu(window_menu, win)
+    menubar.add_cascade(label="Window", menu=window_menu)
+    try:
+        win.config(menu=menubar)
+    except tk.TclError:
+        return None
+    return menubar
+
+
 class _CaseTabPage(ttk.Frame):
     """A notebook page that supplies the small Toplevel API case viewers use.
 
@@ -499,7 +521,10 @@ class _CaseTabPage(ttk.Frame):
 
     def protocol(self, name=None, func=None):
         if name == "WM_DELETE_WINDOW" and func is not None:
-            self._manager.win.protocol(name, func)
+            # The shared OS window owns its own close-all protocol.  Individual
+            # pages keep this only as metadata; their cleanup belongs on a
+            # <Destroy> binding so Close Tab and Pop Out run it too.
+            self._wm_delete_callback = func
             return None
         return self._manager.win.protocol(name, func)
 
@@ -540,7 +565,27 @@ class _CaseTabsWindow:
         self._pages: list[_CaseTabPage] = []
         self._geometry_set = False
         self._closing = False
+        self._long_press_after = None
+        self._long_press_xy = (0, 0)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self.notebook.bind("<Button-3>", self._show_tab_context_menu)
+        self.notebook.bind("<Button-2>", self._show_tab_context_menu)
+        self.notebook.bind("<Control-Button-1>", self._show_tab_context_menu)
+        self.notebook.bind("<ButtonPress-1>", self._start_tab_long_press, add="+")
+        self.notebook.bind(
+            "<ButtonRelease-1>", self._cancel_tab_long_press, add="+"
+        )
+        self.notebook.bind("<B1-Motion>", self._track_tab_long_press, add="+")
+        self.win.bind("<Control-Tab>", lambda _e: self._cycle_tab(1))
+        self.win.bind(
+            "<Control-Shift-Tab>", lambda _e: self._cycle_tab(-1)
+        )
+        try:
+            self.win.bind(
+                "<Control-ISO_Left_Tab>", lambda _e: self._cycle_tab(-1)
+            )
+        except tk.TclError:
+            pass  # Windows Tk has no ISO_Left_Tab keysym.
         self.win.protocol("WM_DELETE_WINDOW", self.close)
         self.win.bind("<Destroy>", self._on_destroy, add="+")
 
@@ -572,6 +617,91 @@ class _CaseTabsWindow:
             if str(page) == selected:
                 return page
         return None
+
+    def _page_at(self, x: int, y: int) -> "Optional[_CaseTabPage]":
+        try:
+            index = self.notebook.index(f"@{x},{y}")
+            tab_id = self.notebook.tabs()[index]
+        except (tk.TclError, IndexError):
+            return None
+        return next((page for page in self._pages if str(page) == tab_id), None)
+
+    def _cycle_tab(self, delta: int) -> str:
+        tabs = self.notebook.tabs()
+        if len(tabs) < 2:
+            return "break"
+        try:
+            current = self.notebook.index(self.notebook.select())
+            self.notebook.select(tabs[(current + delta) % len(tabs)])
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _show_tab_context_menu(self, event=None, page=None):
+        self._cancel_tab_long_press()
+        if page is None and event is not None:
+            page = self._page_at(event.x, event.y)
+        if page is None:
+            return None
+        try:
+            self.notebook.select(page)
+        except tk.TclError:
+            return None
+        menu = tk.Menu(self.win, tearoff=0)
+        menu.add_command(label="Close Tab", command=page.destroy)
+        can_pop = bool(
+            hasattr(self.app, "can_pop_out_view")
+            and self.app.can_pop_out_view(page)
+        )
+        menu.add_command(
+            label="Pop Out into New Window",
+            state="normal" if can_pop else "disabled",
+            command=lambda p=page: self.app.pop_out_view(p),
+        )
+        try:
+            if event is not None:
+                x_root, y_root = event.x_root, event.y_root
+            else:
+                x_root = page.winfo_rootx() + 24
+                y_root = self.notebook.winfo_rooty() + 24
+            menu.tk_popup(x_root, y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except tk.TclError:
+                pass
+        return "break"
+
+    def _start_tab_long_press(self, event) -> None:
+        self._cancel_tab_long_press()
+        page = self._page_at(event.x, event.y)
+        if page is None:
+            return
+        self._long_press_xy = (event.x_root, event.y_root)
+
+        def show(page=page) -> None:
+            self._long_press_after = None
+            event_like = type("_TabMenuEvent", (), {
+                "x_root": self._long_press_xy[0],
+                "y_root": self._long_press_xy[1],
+            })()
+            self._show_tab_context_menu(event_like, page)
+
+        self._long_press_after = self.notebook.after(650, show)
+
+    def _track_tab_long_press(self, event) -> None:
+        x0, y0 = self._long_press_xy
+        if abs(event.x_root - x0) > 8 or abs(event.y_root - y0) > 8:
+            self._cancel_tab_long_press()
+
+    def _cancel_tab_long_press(self, _event=None) -> None:
+        if self._long_press_after is None:
+            return
+        try:
+            self.notebook.after_cancel(self._long_press_after)
+        except tk.TclError:
+            pass
+        self._long_press_after = None
 
     @staticmethod
     def _tab_label(title: str) -> str:
@@ -611,6 +741,8 @@ class _CaseTabsWindow:
             self.win.title(page._case_title)
             if page._case_menu is not None:
                 self.win.config(menu=page._case_menu)
+            else:
+                self.win.config(menu="")
         except tk.TclError:
             pass
 
@@ -640,6 +772,13 @@ def _case_view_host(parent: tk.Misc, app):
     """Return a standalone Toplevel or a page in the shared case notebook."""
     if app is not None and hasattr(app, "new_case_view_host"):
         return app.new_case_view_host(parent)
+    return _ui_toplevel(parent)
+
+
+def _secondary_view_host(parent: tk.Misc, app):
+    """Host any non-modal document/tool view in the shared notebook mode."""
+    if app is not None and hasattr(app, "new_secondary_view_host"):
+        return app.new_secondary_view_host(parent)
     return _ui_toplevel(parent)
 
 
@@ -4005,6 +4144,7 @@ class CourtListenerGUI:
         )
         self._case_tabs_window: Optional[_CaseTabsWindow] = None
         self._open_case_views: dict[int, dict] = {}
+        self._force_standalone_view = False
 
         # Recently viewed cases, most recent first, for the "History ▾"
         # dropdown every case window carries: {"key", "label", "reopen"}.
@@ -4230,7 +4370,7 @@ class CourtListenerGUI:
         except tk.TclError:
             return
         menu.add_checkbutton(
-            label="Show All Cases in Tabbed View",
+            label="Show All Windows in Tabbed View",
             variable=self._case_tabs_var,
             command=lambda: self.set_case_tabs_enabled(
                 bool(self._case_tabs_var.get())
@@ -4244,7 +4384,17 @@ class CourtListenerGUI:
         )
 
     def new_case_view_host(self, parent: tk.Misc):
-        """Host a newly opened opinion according to the current Window mode."""
+        """Compatibility name for opinion viewers."""
+        return self.new_secondary_view_host(parent)
+
+    def new_secondary_view_host(self, parent: tk.Misc):
+        """Host a new non-modal view according to the current Window mode."""
+        if self._force_standalone_view:
+            # Pop Out may reopen through a short background resolver (notably
+            # same-page CAP PDFs), so this is a one-shot consumed by the next
+            # actual viewer host rather than a stack-scoped boolean.
+            self._force_standalone_view = False
+            return _ui_toplevel(parent)
         if not self._case_tabs_enabled:
             return _ui_toplevel(parent)
         manager = self._case_tabs_window
@@ -4256,7 +4406,13 @@ class CourtListenerGUI:
     def register_case_window(
         self, owner, view, key: str, label: str, reopen,
     ) -> None:
-        """Track an open opinion so Window-mode changes can reconstruct it."""
+        """Compatibility name for registered opinion views."""
+        self.register_secondary_window(owner, view, key, label, reopen)
+
+    def register_secondary_window(
+        self, owner, view, key: str, label: str, reopen,
+    ) -> None:
+        """Track a view so mode changes and Pop Out can reconstruct it."""
         ident = id(view)
         self._open_case_views[ident] = {
             "owner": owner, "view": view, "key": key,
@@ -4271,6 +4427,37 @@ class CourtListenerGUI:
             view.bind("<Destroy>", gone, add="+")
         except tk.TclError:
             pass
+        if isinstance(view, _CaseTabPage):
+            view._secondary_reopen = reopen
+            view._secondary_owner = owner
+
+    def _secondary_entry_for_view(self, view):
+        return next((
+            entry for entry in self._open_case_views.values()
+            if entry.get("view") is view
+        ), None)
+
+    def can_pop_out_view(self, view) -> bool:
+        return (
+            isinstance(view, _CaseTabPage)
+            and self._secondary_entry_for_view(view) is not None
+        )
+
+    def pop_out_view(self, view) -> None:
+        """Recreate one tab as a standalone OS window, leaving mode enabled."""
+        entry = self._secondary_entry_for_view(view)
+        if entry is None or not isinstance(view, _CaseTabPage):
+            return
+        try:
+            view.destroy()
+        except tk.TclError:
+            pass
+        self._force_standalone_view = True
+        try:
+            entry["reopen"]()
+        except Exception as exc:
+            self._force_standalone_view = False
+            print(f"[windows] could not pop out {entry['label']!r}: {exc}")
 
     @staticmethod
     def _case_view_is_live(view) -> bool:
@@ -4893,7 +5080,7 @@ class CourtListenerGUI:
             statute = _parse_statute_query(query)
             if statute:
                 self._close_quick_popup()
-                _open_statute_action(self.root, statute)
+                _open_statute_action(self.root, statute, app=self)
                 return
 
             # 1b. English Reports citation ("156 Eng. Rep. 145", "95 E.R. 807"):
@@ -6235,7 +6422,9 @@ class CourtListenerGUI:
             # read as volume 42, reporter "USC", page 1983
             statute = _parse_statute_query(q)
             if statute:
-                _open_statute_action(self.root, statute, set_status)
+                _open_statute_action(
+                    self.root, statute, set_status, app=self
+                )
                 return
             parsed = _parse_citation_line(q)
             if not parsed:
@@ -6307,7 +6496,9 @@ class CourtListenerGUI:
                 return
             # Parent on the root so the statute window outlives the dialog.
             # (A state we only link out to opens in the browser instead.)
-            _open_statute_action(self.root, parsed, status_var.set)
+            _open_statute_action(
+                self.root, parsed, status_var.set, app=self
+            )
 
         ttk.Button(frame, text="Look Up", command=go).grid(row=0, column=2)
         entry.bind("<Return>", go)
@@ -17403,7 +17594,9 @@ class _ScholarTextWindow:
             self._status_var.set("Opened in your browser.")
             return
         if kind == "statpdf":
-            _open_statute_pdf(self._win, value, self._status_var.set)
+            _open_statute_pdf(
+                self._win, value, self._status_var.set, app=self._app
+            )
             return
         if kind == "engrep":
             _open_eng_rep(self._win, value, self._status_var.set,
@@ -17715,7 +17908,9 @@ class _ScholarTextWindow:
 
     def _open_statute(self, kind: str, spec: str) -> None:
         """Fetch a U.S. Code (OLRC) or C.F.R. (eCFR) section and show it."""
-        _fetch_statute_window(self._win, kind, spec, self._status_var.set)
+        _fetch_statute_window(
+            self._win, kind, spec, self._status_var.set, app=self._app
+        )
 
     # ------------------------------------------------------------------
     # CourtListener toggle
@@ -18710,7 +18905,7 @@ _SOURCE_HOST: dict[str, str] = {
 
 
 def _fetch_statute_window(parent: tk.Misc, kind: str, spec: str,
-                          status=lambda _s: None) -> None:
+                          status=lambda _s: None, *, app=None) -> None:
     """Fetch a statute, regulation or federal rule section in a background
     thread and open a _StatuteWindow over `parent` when it arrives."""
     mod = _STATUTE_SOURCES[kind]
@@ -18741,8 +18936,10 @@ def _fetch_statute_window(parent: tk.Misc, kind: str, spec: str,
 
         def show() -> None:
             safe_status(f"{label} loaded.")
-            _StatuteWindow(parent, doc,
-                           tuple(s for s in subs.split(",") if s))
+            _StatuteWindow(
+                parent, doc, tuple(s for s in subs.split(",") if s),
+                app=app,
+            )
 
         post(show)
 
@@ -18750,7 +18947,7 @@ def _fetch_statute_window(parent: tk.Misc, kind: str, spec: str,
 
 
 def _open_statute_action(parent: tk.Misc, action: tuple[str, str],
-                         status=lambda _s: None) -> None:
+                         status=lambda _s: None, *, app=None) -> None:
     """Carry out a parsed statute-lookup action: open the in-app viewer, or —
     for a state we only link out to (N.Y., Tex., other states) — open the
     official source in the browser."""
@@ -18760,9 +18957,9 @@ def _open_statute_action(parent: tk.Misc, action: tuple[str, str],
         status("Opened in your browser.")
         return
     if kind == "statpdf":
-        _open_statute_pdf(parent, value, status)
+        _open_statute_pdf(parent, value, status, app=app)
         return
-    _fetch_statute_window(parent, kind, value, status)
+    _fetch_statute_window(parent, kind, value, status, app=app)
 
 
 def _stat_cite_from_url(url: str) -> str:
@@ -18915,11 +19112,13 @@ class _PdfWindow:
 
         self._win = (
             _case_view_host(parent, app) if self._is_case
-            else _ui_toplevel(parent)
+            else _secondary_view_host(parent, app)
         )
         self._win.title(title)
-        self._history_menubar = _install_history_menubar(
-            self._app if self._is_case else None, self._win
+        self._history_menubar = (
+            _install_history_menubar(self._app, self._win)
+            if self._is_case else
+            _install_window_menubar(self._app, self._win)
         )
         self._win.geometry(
             _fit_toplevel_geometry(
@@ -18971,6 +19170,17 @@ class _PdfWindow:
                 self._app.register_case_window(
                     self, self._win, entry[0], entry[1], entry[2]
                 )
+        elif self._app is not None and hasattr(
+            self._app, "register_secondary_window"
+        ):
+            def reopen(app=self._app, source=self) -> None:
+                _PdfWindow(
+                    app.root, source._url, source._title,
+                    app=app, is_case=False,
+                )
+            self._app.register_secondary_window(
+                self, self._win, f"pdf-view:{id(self)}", title, reopen,
+            )
 
         self._fetch()
         if self._can_discover_text:
@@ -19247,11 +19457,11 @@ def _print_pdf_file(parent: tk.Misc, path: str,
 
 
 def _open_statute_pdf(parent: tk.Misc, url: str,
-                      status=lambda _s: None) -> None:
+                      status=lambda _s: None, *, app=None) -> None:
     """Open a Statutes at Large GovInfo scan in the in-app PDF viewer."""
     cite = _stat_cite_from_url(url)
     status(f"Opening {cite}…")
-    _PdfWindow(parent, url, cite, status)
+    _PdfWindow(parent, url, cite, status, app=app)
 
 
 # ---------------------------------------------------------------------------
@@ -19474,14 +19684,20 @@ class _SlipTextWindow:
     :func:`slip_opinion.to_clean_text`) in a selectable Text widget, for the
     copy-paste convenience a rendered PDF page can't give."""
 
-    def __init__(self, parent: tk.Misc, title: str, text: str) -> None:
-        win = _ui_toplevel(parent)
+    def __init__(
+        self, parent: tk.Misc, title: str, text: str, *, app=None,
+    ) -> None:
+        self._app = app
+        self._title = title
+        self._source_text = text
+        win = _secondary_view_host(parent, app)
         _ensure_modern_ttk_styles(win)
         win.title(f"{title} — Text")
         win.geometry(_fit_toplevel_geometry(win, 760, 680,
                                             min_width=420, min_height=300))
         win.minsize(420, 300)
         self._win = win
+        self._window_menubar = _install_window_menubar(app, win)
 
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
@@ -19502,6 +19718,15 @@ class _SlipTextWindow:
         self._status_var = tk.StringVar(value=f"{len(text):,} characters")
         _install_status_label(btns, self._status_var, padx=(0, 0))
         win.bind("<Control-a>", self._select_all)
+        if app is not None and hasattr(app, "register_secondary_window"):
+            def reopen(app=app, source=self) -> None:
+                _SlipTextWindow(
+                    app.root, source._title, source._source_text, app=app
+                )
+            app.register_secondary_window(
+                self, win, f"slip-text:{id(self)}", f"{title} — Text",
+                reopen,
+            )
 
     def _select_all(self, _e=None) -> str:
         self._text.tag_add("sel", "1.0", "end-1c")
@@ -19818,7 +20043,9 @@ class _SlipOpinionWindow:
 
     def _show_text(self) -> None:
         if self._clean_text is not None:
-            _SlipTextWindow(self._win, self._title, self._clean_text)
+            _SlipTextWindow(
+                self._win, self._title, self._clean_text, app=self._app
+            )
             return
         if not self._pages:
             self._status_var.set(
@@ -19843,7 +20070,9 @@ class _SlipOpinionWindow:
     def _open_text_window(self) -> None:
         self._status_var.set("Text ready.")
         if self._clean_text is not None:
-            _SlipTextWindow(self._win, self._title, self._clean_text)
+            _SlipTextWindow(
+                self._win, self._title, self._clean_text, app=self._app
+            )
 
 
 _ER_CAPTION_VS_RE = re.compile(r"\s+(?:against|versus)\s+", re.IGNORECASE)
@@ -20223,7 +20452,7 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
     """
     kind, value = action
     if kind in _STATUTE_SOURCES or kind in ("browse", "statpdf"):
-        _open_statute_action(parent, action, status)
+        _open_statute_action(parent, action, status, app=app)
         return
     if kind == "engrep":
         _open_eng_rep(parent, value, status, app=app)
@@ -20279,16 +20508,27 @@ class _BriefTextWindow:
     def __init__(self, parent: tk.Misc, app: "CourtListenerGUI",
                  name: str, text: str) -> None:
         self._app = app
+        self._name = name
         self._src = text
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
 
-        self._win = _ui_toplevel(parent)
+        self._win = _secondary_view_host(parent, app)
         self._win.title(f"Brief — {name}")
         self._win.geometry("860x720")
         self._win.minsize(500, 320)
+        self._window_menubar = _install_window_menubar(app, self._win)
         self._build_ui()
         self._render()
+        if hasattr(app, "register_secondary_window"):
+            def reopen(app=app, source=self) -> None:
+                _BriefTextWindow(
+                    app.root, app, source._name, source._src
+                )
+            app.register_secondary_window(
+                self, self._win, f"brief-text:{id(self)}",
+                f"Brief — {name}", reopen,
+            )
 
     def _build_ui(self) -> None:
         win = self._win
@@ -20825,11 +21065,12 @@ class _LinkedPdfWindow:
     def __init__(self, parent: tk.Misc, app: "CourtListenerGUI",
                  pdf_bytes: bytes, name: str) -> None:
         self._app = app
+        self._name = name
         self._bytes = pdf_bytes
         self._pane: Optional[_PdfPane] = None
         self._closed = False
 
-        self._win = _ui_toplevel(parent)
+        self._win = _secondary_view_host(parent, app)
         self._win.title(f"PDF citations — {name}")
         self._win.geometry(
             _fit_toplevel_geometry(
@@ -20839,6 +21080,7 @@ class _LinkedPdfWindow:
         )
         self._win.minsize(520, 360)
         self._win.bind("<Destroy>", self._on_destroy)
+        self._window_menubar = _install_window_menubar(app, self._win)
 
         legend = _ui_frame(self._win)
         legend.pack(fill="x", padx=12, pady=(12, 0))
@@ -20868,6 +21110,15 @@ class _LinkedPdfWindow:
             self._win.bind(seq, lambda _e: self._zoom(-1))
         self._win.bind("<Control-0>", lambda _e: self._zoom(0))
 
+        if hasattr(app, "register_secondary_window"):
+            def reopen(app=app, source=self) -> None:
+                _LinkedPdfWindow(
+                    app.root, app, source._bytes, source._name
+                )
+            app.register_secondary_window(
+                self, self._win, f"linked-pdf:{id(self)}",
+                f"PDF citations — {name}", reopen,
+            )
         self._show()
 
     def _post(self, fn, *args) -> None:
@@ -21003,22 +21254,35 @@ class _StatuteWindow:
     text; long editorial/statutory notes sit behind a toggle.
     """
 
-    def __init__(self, parent: tk.Misc, doc, highlight: tuple = ()) -> None:
+    def __init__(
+        self, parent: tk.Misc, doc, highlight: tuple = (), *, app=None,
+    ) -> None:
+        self._app = app
         self._doc = doc
         self._highlight = tuple(highlight)
         self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
         self._neighbors: tuple = (None, None)
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
-        self._win = _ui_toplevel(parent)
+        self._win = _secondary_view_host(parent, app)
         _ensure_modern_ttk_styles(self._win)
         self._win.title(f"{doc.label} — {doc.source_name}")
         self._win.geometry("760x640")
         self._win.minsize(440, 280)
         self._base_size = _OPINION_FONT_PT
+        self._window_menubar = _install_window_menubar(app, self._win)
         self._build_ui()
         self._render()
         self._refresh_neighbors()
+        if app is not None and hasattr(app, "register_secondary_window"):
+            def reopen(app=app, source=self) -> None:
+                _StatuteWindow(
+                    app.root, source._doc, source._highlight, app=app
+                )
+            app.register_secondary_window(
+                self, self._win, f"statute:{id(self)}",
+                f"{doc.label} — {doc.source_name}", reopen,
+            )
 
     def _build_ui(self) -> None:
         win = self._win
@@ -21274,9 +21538,13 @@ class _StatuteWindow:
             self._status_var.set("Opened in your browser.")
             return
         if kind == "statpdf":
-            _open_statute_pdf(self._win, value, self._status_var.set)
+            _open_statute_pdf(
+                self._win, value, self._status_var.set, app=self._app
+            )
             return
-        _fetch_statute_window(self._win, kind, value, self._status_var.set)
+        _fetch_statute_window(
+            self._win, kind, value, self._status_var.set, app=self._app
+        )
 
     # ------------------------------------------------------------------
     # Previous/next provision
@@ -21497,14 +21765,23 @@ class _CitingOpinionsWindow:
             cited_item.get("caseName") or cited_item.get("case_name") or "?",
         ).strip()
 
-        self._win = _ui_toplevel(parent)
+        self._win = _secondary_view_host(parent, app)
         _ensure_modern_ttk_styles(self._win)
         self._win.title(f"Citing: {case_name}")
         self._win.geometry("950x480")
         self._win.minsize(700, 300)
         self._win.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._win.bind("<Destroy>", self._on_destroy, add="+")
+        self._window_menubar = _install_window_menubar(app, self._win)
 
         self._build_ui(case_name)
+        if hasattr(app, "register_secondary_window"):
+            def reopen(app=app, item=dict(cited_item)) -> None:
+                _CitingOpinionsWindow(app.root, app, item)
+            app.register_secondary_window(
+                self, self._win, f"citing:{id(self)}",
+                f"Citing: {case_name}", reopen,
+            )
         self._load_page()
 
     # ------------------------------------------------------------------
@@ -21614,6 +21891,10 @@ class _CitingOpinionsWindow:
     def _on_close(self) -> None:
         self._bg_stop.set()
         self._win.destroy()
+
+    def _on_destroy(self, event) -> None:
+        if event.widget is self._win:
+            self._bg_stop.set()
 
     def _cancel_bg_fetch(self) -> None:
         """Signal any running background fetch to stop and arm a fresh event."""
