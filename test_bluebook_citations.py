@@ -48,6 +48,7 @@ from courtlistener_gui import (
     _wisconsin_display_cite,
 )
 from google_scholar import Block, OpinionPart, Span, educate_quotes
+import us_code
 
 
 class SmartQuoteTests(unittest.TestCase):
@@ -1164,6 +1165,38 @@ class SpotlightCitationDetectionTests(unittest.TestCase):
         self.assertIsNone(
             _spotlight_case_action("1 Sumner, 73; 35 Fed. Rep. 665")
         )
+
+
+class UsCodeNavigationTests(unittest.TestCase):
+    def test_current_olrc_section_heads_supply_neighbor_order(self):
+        # Current OLRC container pages no longer include the old analysis
+        # table and HTML-encode the section sign in each fallback heading.
+        page = """
+        <h3 class="section-head">&sect;1981. Equal rights</h3>
+        <h3 class="section-head">&sect;1981a. Damages</h3>
+        <h3 class="section-head">&#167;1982. Property rights</h3>
+        <h3 class="section-head">&#xA7;1983. Civil action</h3>
+        """
+
+        self.assertEqual(
+            us_code._sections_from_analysis(page),
+            ["1981", "1981a", "1982", "1983"],
+        )
+
+    def test_neighbors_use_section_head_fallback_order(self):
+        doc = us_code.UscSection(
+            title="42", section="1982", url="url",
+            container="title42-chapter21-subchapter1",
+        )
+
+        with patch(
+            "us_code._container_sections",
+            return_value=["1981", "1981a", "1982", "1983"],
+        ):
+            self.assertEqual(
+                doc.neighbors(),
+                (("42", "1981a"), ("42", "1983")),
+            )
 
 
 class CaseLawSharedPageTests(unittest.TestCase):
