@@ -454,46 +454,6 @@ def _install_bookmark_menubar(app, win: tk.Toplevel, bookmark_target):
     return menubar
 
 
-def _bind_bookmark_right_click(win: tk.Misc, widgets, target) -> None:
-    """Bind a right-click "Bookmark / Remove Bookmark" context menu onto the
-    given top-bar (tab-strip) *widgets*, so the document can be bookmarked by
-    right-clicking its tab — the same toggle the Bookmarks menu offers."""
-    def popup(event) -> None:
-        app = _active_app()
-        if app is None or not hasattr(app, "is_bookmarked"):
-            return
-        try:
-            desc = target._bookmark_descriptor()
-        except Exception:
-            desc = None
-        if not desc:
-            return
-        noun = str(desc.get("noun") or "case").title()
-        menu = tk.Menu(win, tearoff=0)
-        if app.is_bookmarked(desc.get("key")):
-            menu.add_command(label=f"Remove Bookmark for This {noun}",
-                             command=target._toggle_bookmark)
-        else:
-            menu.add_command(label=f"Bookmark This {noun}",
-                             command=target._toggle_bookmark)
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            try:
-                menu.grab_release()
-            except tk.TclError:
-                pass
-
-    for w in widgets:
-        if w is None:
-            continue
-        for seq in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
-            try:
-                w.bind(seq, popup)
-            except tk.TclError:
-                pass
-
-
 def _ui_checkbox(parent, text: str, variable, command=None):
     if _CTK_AVAILABLE:
         return ctk.CTkCheckBox(parent, text=text, variable=variable,
@@ -3434,6 +3394,21 @@ class CourtListenerGUI:
                 return None
             return lambda: _StatuteWindow(
                 self.root, _SavedStatuteDoc(doc), app=self)
+        if kind == "engrep":
+            fields = payload.get("case")
+            if not isinstance(fields, dict):
+                return None
+            try:
+                case = eng_rep.ERCase(
+                    vol=int(fields["vol"]), page=int(fields["page"]),
+                    letter=str(fields.get("letter", "")),
+                    year=int(fields["year"]), num=int(fields["num"]),
+                    name=str(fields.get("name", "")),
+                )
+            except Exception:
+                return None
+            # Reopens through eng_rep_pdf's own on-disk scan cache (offline).
+            return lambda: _EngRepPdfWindow(self.root, case, app=self)
         return None
 
     def populate_bookmarks_menu(self, menu: tk.Menu, target=None) -> None:
@@ -11016,8 +10991,7 @@ class _ScholarTextWindow:
 
         url_frame = _ui_frame(win)
         url_frame.pack(fill="x", padx=12, pady=(12, 0))
-        src_label = ttk.Label(url_frame, text="Source", style=muted_style)
-        src_label.pack(side="left")
+        ttk.Label(url_frame, text="Source", style=muted_style).pack(side="left")
         self._source_var = tk.StringVar(value=self._scholar_url)
         ttk.Entry(url_frame, textvariable=self._source_var, state="readonly",
                   style=entry_style).pack(
@@ -11027,8 +11001,7 @@ class _ScholarTextWindow:
         # Part navigation: what you're viewing, and a selector to filter
         view_frame = _ui_frame(win)
         view_frame.pack(fill="x", padx=12, pady=(8, 0))
-        viewing_label = ttk.Label(view_frame, text="Viewing", style=muted_style)
-        viewing_label.pack(side="left")
+        ttk.Label(view_frame, text="Viewing", style=muted_style).pack(side="left")
         self._view_label_var = tk.StringVar(value="Full opinion")
         self._view_label = ttk.Label(
             view_frame,
@@ -11037,11 +11010,6 @@ class _ScholarTextWindow:
             font=("TkDefaultFont", 11, "bold"),
         )
         self._view_label.pack(side="left", padx=(6, 12))
-        # Right-click the top "tab" strip to bookmark / unbookmark this case.
-        _bind_bookmark_right_click(
-            win, (url_frame, src_label, view_frame, viewing_label,
-                  self._view_label), self,
-        )
         part_values = ["Full opinion"] + [
             f"{i + 1}. {p.label}" for i, p in enumerate(self._parts)
         ]
@@ -15695,11 +15663,7 @@ class _PdfWindow:
 
         top = _ui_frame(self._win)
         top.pack(fill="x", padx=12, pady=(12, 4))
-        top_label = _ui_label(top, title, size=14, weight="bold", anchor="w")
-        top_label.pack(side="left")
-        if self._is_case:
-            # Right-click the title "tab" to bookmark / unbookmark this case.
-            _bind_bookmark_right_click(self._win, (top, top_label), self)
+        _ui_label(top, title, size=14, weight="bold", anchor="w").pack(side="left")
 
         btns = _ui_frame(self._win)
         btns.pack(fill="x", side="bottom", padx=12, pady=(0, 10))
@@ -15984,6 +15948,12 @@ class _EngRepPdfWindow(_PdfWindow):
         name = case.name if len(case.name) <= 60 else case.name[:57] + "…"
         super().__init__(parent, case.pdf_url, f"{name} — {case.er_cite}",
                          status, app=app)
+        # English Reports scans aren't opened with is_case (the pane's citation
+        # linking is tuned for born-digital PDFs), so they carry no History
+        # menu — but they are cases and can still be bookmarked.
+        self._bookmark_menubar = _install_bookmark_menubar(
+            self._app, self._win, self,
+        )
 
     def _history_entry(self):  # overrides _PdfWindow
         app, case = self._app, self._case
@@ -15992,6 +15962,38 @@ class _EngRepPdfWindow(_PdfWindow):
         return (f"engrep:{case.year}:{case.num}",
                 f"{case.name} — {case.er_cite}",
                 lambda: _EngRepPdfWindow(app.root, case, app=app))
+
+    def _bookmark_descriptor(self):  # overrides _PdfWindow
+        if self._app is None:
+            return None
+        c = self._case
+        return {
+            "key": f"engrep:{c.year}:{c.num}",
+            "label": f"{c.name} — {c.er_cite}",
+            "noun": "case",
+            "payload": {
+                "type": "engrep",
+                "case": {
+                    "vol": c.vol, "page": c.page, "letter": c.letter,
+                    "year": c.year, "num": c.num, "name": c.name,
+                },
+            },
+        }
+
+    def _toggle_bookmark(self):  # overrides _PdfWindow
+        # The English Reports scan is kept by eng_rep_pdf's own on-disk cache,
+        # so (unlike a generic case scan) there is no separate PDF copy to
+        # save or delete here.
+        app = self._app
+        if app is None or not hasattr(app, "is_bookmarked"):
+            return
+        desc = self._bookmark_descriptor()
+        if not desc:
+            return
+        if app.is_bookmarked(desc["key"]):
+            app.remove_bookmark(desc["key"])
+        else:
+            app.add_bookmark(desc)
 
     def _fetch(self) -> None:  # overrides _PdfWindow._fetch
         try:
@@ -17097,10 +17099,7 @@ class _StatuteWindow:
         entry_style = "Modern.TEntry" if _CTK_AVAILABLE else "TEntry"
         top = _ui_frame(win)
         top.pack(fill="x", padx=12, pady=(12, 0))
-        src_label = ttk.Label(top, text="Source", style=muted_style)
-        src_label.pack(side="left")
-        # Right-click the top "tab" strip to bookmark / unbookmark this section.
-        _bind_bookmark_right_click(win, (top, src_label), self)
+        ttk.Label(top, text="Source", style=muted_style).pack(side="left")
         self._src_var = tk.StringVar(value=self._doc.url)
         ttk.Entry(top, textvariable=self._src_var, state="readonly",
                   style=entry_style).pack(
