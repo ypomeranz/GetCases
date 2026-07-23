@@ -975,6 +975,7 @@ class NominativeCitationSearchTests(unittest.TestCase):
 
     def test_direct_lookup_retries_us_reports_alias_after_scholar_miss(self):
         win = object.__new__(CourtListenerGUI)
+        win.root = object()
         win._post_root = Mock()
         fetcher = Mock()
         fetcher.fetch_by_citation.side_effect = [None, ("url", "html")]
@@ -1440,27 +1441,64 @@ class CaseWindowModeTests(unittest.TestCase):
         manager._cycle_tab(1)
         self.assertEqual(manager.notebook.current, "one")
 
-    def test_pop_out_reopens_one_tab_with_standalone_override(self):
+    def test_pop_out_reopens_one_tab_in_a_new_tab_group(self):
         app = object.__new__(CourtListenerGUI)
-        app._force_standalone_view = False
+        app.root = object()
+        app._case_tabs_window = None
+        app._detached_tab_windows = set()
         page = object.__new__(_CaseTabPage)
         page.destroy = Mock()
+        manager = Mock()
+        manager.win = object()
         seen = []
 
-        def reopen():
-            seen.append(app._force_standalone_view)
-            # Mirrors new_secondary_view_host consuming the one-shot.
-            app._force_standalone_view = False
+        def reopen(parent=None):
+            seen.append(parent)
 
         app._open_case_views = {
             1: {"view": page, "label": "A tab", "reopen": reopen},
         }
 
-        app.pop_out_view(page)
+        with patch("courtlistener_gui._CaseTabsWindow",
+                   return_value=manager) as make_manager:
+            app.pop_out_view(page)
 
         page.destroy.assert_called_once()
-        self.assertEqual(seen, [True])
-        self.assertFalse(app._force_standalone_view)
+        make_manager.assert_called_once_with(app, app.root)
+        self.assertEqual(seen, [manager.win])
+        self.assertIn(manager, app._detached_tab_windows)
+
+    def test_tab_group_is_inherited_from_page_or_detached_window(self):
+        app = object.__new__(CourtListenerGUI)
+        main = SimpleNamespace(win=object())
+        detached = Mock()
+        detached.win = object()
+        app._case_tabs_window = main
+        app._detached_tab_windows = {detached}
+        page = object.__new__(_CaseTabPage)
+        page._manager = detached
+
+        self.assertIs(app._tab_manager_for_parent(page), detached)
+        self.assertIs(app._tab_manager_for_parent(detached.win), detached)
+        self.assertIsNone(app._tab_manager_for_parent(object()))
+
+    def test_citation_result_uses_launching_tab_group_parent(self):
+        app = object.__new__(CourtListenerGUI)
+        app.root = object()
+        app._status_var = Mock()
+        app._post_root = lambda fn, *args: fn(*args)
+        fetcher = Mock()
+        fetcher.fetch_by_citation.return_value = ("url", "html")
+        parent = object()
+
+        with patch("courtlistener_gui._ScholarTextWindow") as text_window:
+            opened = app._try_open_citation(
+                "", "410 U.S. 113", "", fetcher, None,
+                view_parent=parent,
+            )
+
+        self.assertTrue(opened)
+        self.assertIs(text_window.call_args.args[0], parent)
 
     def test_statute_and_statute_pdf_forward_the_shared_app(self):
         app = object()
