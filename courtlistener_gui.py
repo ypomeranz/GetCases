@@ -560,8 +560,10 @@ class _CaseTabsWindow:
             )
         )
         self.win.minsize(560, 360)
-        self.notebook = ttk.Notebook(self.win)
-        self.notebook.pack(fill="both", expand=True)
+        self.notebook = ttk.Notebook(
+            self.win, style=_ensure_case_tab_style(self.win),
+        )
+        self.notebook.pack(fill="both", expand=True, padx=1, pady=(0, 1))
         self._pages: list[_CaseTabPage] = []
         self._geometry_set = False
         self._closing = False
@@ -911,6 +913,9 @@ def _ui_entry(parent, textvariable=None, show: Optional[str] = None):
 
 
 _MODERN_TTK_READY = False
+_CASE_TAB_STYLE = "CaseTabs.TNotebook"
+_CASE_TAB_IMAGES: list[tk.PhotoImage] = []
+_CASE_TAB_STYLED_INTERPRETERS: set[int] = set()
 
 
 def _ensure_modern_ttk_styles(widget: tk.Misc) -> None:
@@ -967,6 +972,113 @@ def _ensure_modern_ttk_styles(widget: tk.Misc) -> None:
     except tk.TclError:
         pass
     _MODERN_TTK_READY = True
+
+
+def _ensure_case_tab_style(widget: tk.Misc) -> str:
+    """Install the high-contrast notebook style used by tabbed document views.
+
+    Native notebook tabs can lose their edges under some Windows themes.  A
+    small stretchable image element gives every tab a reliable outline while
+    the style map makes the selected and hovered states unmistakable.
+    """
+    interpreter = id(widget.tk)
+    if interpreter in _CASE_TAB_STYLED_INTERPRETERS:
+        return _CASE_TAB_STYLE
+
+    style = ttk.Style(widget)
+    tab_style = f"{_CASE_TAB_STYLE}.Tab"
+
+    def tab_image(fill: str, border: str, indicator: str = ""):
+        size = 16
+        image = tk.PhotoImage(master=widget, width=size, height=size)
+        image.put(fill, to=(0, 0, size, size))
+        image.put(border, to=(0, 0, size, 1))
+        image.put(border, to=(0, size - 1, size, size))
+        image.put(border, to=(0, 0, 1, size))
+        image.put(border, to=(size - 1, 0, size, size))
+        if indicator:
+            image.put(indicator, to=(1, 1, size - 1, 4))
+        return image
+
+    normal = tab_image("#eef0f4", "#b9c0cb")
+    hover = tab_image("#e4ebf7", "#7f9dcc")
+    selected = tab_image("#ffffff", _UI["accent"], _UI["accent"])
+    disabled = tab_image("#f5f6f8", "#d5d8de")
+    images = (normal, hover, selected, disabled)
+
+    try:
+        style.element_create(
+            "CaseTabs.tab",
+            "image",
+            normal,
+            ("selected", selected),
+            ("active", hover),
+            ("disabled", disabled),
+            border=(5, 5, 5, 5),
+            sticky="nswe",
+        )
+
+        def replace_tab_element(layout):
+            replaced = []
+            for element, options in layout:
+                options = dict(options)
+                children = options.get("children")
+                if children:
+                    options["children"] = replace_tab_element(children)
+                if element == "Notebook.tab":
+                    element = "CaseTabs.tab"
+                replaced.append((element, options))
+            return replaced
+
+        style.layout(
+            tab_style,
+            replace_tab_element(style.layout("TNotebook.Tab")),
+        )
+        _CASE_TAB_IMAGES.extend(images)
+    except tk.TclError:
+        # The named style below still improves contrast on themes that do not
+        # allow a custom element to be added.
+        pass
+
+    style.configure(
+        _CASE_TAB_STYLE,
+        background="#dfe3ea",
+        bordercolor="#b9c0cb",
+        lightcolor="#dfe3ea",
+        darkcolor="#dfe3ea",
+        borderwidth=1,
+        tabmargins=(10, 8, 10, 0),
+    )
+    style.configure(
+        tab_style,
+        background="#eef0f4",
+        foreground="#4d5563",
+        bordercolor="#b9c0cb",
+        lightcolor="#b9c0cb",
+        darkcolor="#b9c0cb",
+        padding=(16, 9),
+        font=("TkDefaultFont", 10),
+        focuscolor=_UI["accent"],
+    )
+    style.map(
+        tab_style,
+        background=[
+            ("selected", "#ffffff"),
+            ("active", "#e4ebf7"),
+        ],
+        foreground=[
+            ("selected", "#173d7a"),
+            ("active", "#244f91"),
+            ("disabled", _UI["muted"]),
+        ],
+        font=[
+            ("selected", ("TkDefaultFont", 10, "bold")),
+            ("!selected", ("TkDefaultFont", 10)),
+        ],
+        expand=[("selected", (0, 2, 0, 0))],
+    )
+    _CASE_TAB_STYLED_INTERPRETERS.add(interpreter)
+    return _CASE_TAB_STYLE
 
 
 from bluebook_names import (
