@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 
 import constitution
 import court_catalog
@@ -97,14 +98,6 @@ US_NOMINATIVE_PARALLEL_RE = re.compile(
 # ordinary citation-resolution path then opens.  Case-sensitive, digits on
 # both sides, and "Fed." must be followed by the page (or "Rep." then the
 # page), so "Fed. R. Civ. P. 56", "Fed. Reg." and "Fed. Cl." never match.
-_EARLY_FED_CANON = {
-    "sumner": "Sumn.", "sumn": "Sumn.", "curtis": "Curt.", "curt": "Curt.",
-    "benedict": "Ben.", "ben": "Ben.", "lowell": "Low.", "low": "Low.",
-    "gallison": "Gall.", "gallis": "Gall.", "gall": "Gall.",
-    "sprague": "Sprague",
-    "story": "Story", "brock": "Brock.", "walljr": "Wall. Jr.",
-    "fed": "F.", "fedrep": "F.",
-}
 EARLY_FED_CITE_RE = re.compile(
     r"\b(\d{1,3})\s+(Sumner|Sumn\.|Curtis|Curt\.|Benedict|Ben\.|Lowell|"
     r"Low\.|Gallison|Gallis\.|Gall\.|Sprague|Story|Brock\.|Wall\.\s?Jr\.|"
@@ -114,7 +107,7 @@ EARLY_FED_CITE_RE = re.compile(
 def early_fed_cite_text(m: re.Match) -> str:
     """Normalized cite for an EARLY_FED_CITE_RE match ("2 Curtis, 72" ->
     "2 Curt. 72", "35 Fed. Rep. 665" -> "35 F. 665")."""
-    rep = _EARLY_FED_CANON[re.sub(r"[^a-z]", "", m.group(2).lower())]
+    rep = canonical_reporter(m.group(2))
     return f"{m.group(1)} {rep} {m.group(3)}"
 
 # Briefs often cite official state reporters that are too numerous to list in
@@ -130,6 +123,16 @@ BROAD_CITE_CAPTURE_RE = re.compile(
     + r"){0,5}?)"
     + _COURT_PAREN
     + r"\s+(\d{1,6})(?=[\s,;.)(]|$)"
+)
+
+# A reporter citation entered on its own line (Spotlight, an edited citation,
+# or a database query) can safely be more permissive than running-text
+# detection.  This accepts official state reporters and unpunctuated aliases
+# such as "81 Wash 2d 788"; callers scanning prose should use
+# :func:`iter_case_citations` instead.
+HAND_TYPED_CITE_RE = re.compile(
+    r"(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+"
+    r"(\d{1,6})(?=[\s,;.)(]|$)"
 )
 _NONCASE_REPORTERS = {
     "usc", "usca", "uscs", "cfr", "fr", "fedr", "fedreg",
@@ -172,19 +175,164 @@ _RECORD_CITE_RE = re.compile(
 
 
 def norm_reporter(rep: str) -> str:
-    """Reporter key for matching, ignoring spacing/case ('U. S.' == 'U.S.')."""
-    return re.sub(r"\s+", "", rep or "").lower()
+    """Legacy reporter key, ignoring spacing/case (``U. S.`` == ``U.S.``).
+
+    This punctuation-preserving form is kept for compatibility with saved
+    citation-override keys and older local opinion indexes.  New comparisons
+    should normally use :func:`canonical_norm_reporter` or
+    :func:`reporter_key`.
+    """
+    return re.sub(r"\s+", "", (rep or "").replace("’", "'")).lower()
 
 
-def _reporter_key(rep: str) -> str:
+def _loose_reporter_key(rep: str) -> str:
     # Lowercase *before* stripping: the character class is lowercase-only, so
     # stripping first would delete every capital letter ("Eng. Rep." → "ngep")
     # and no key would ever match the reporter sets below.
     return re.sub(r"[^a-z0-9]+", "", (rep or "").lower())
 
 
+@dataclass(frozen=True)
+class _ReporterFamily:
+    """Spellings that denote one reporter series.
+
+    ``aliases`` contains every form we accept as the same reporter, including
+    OCR/spacing forms retained by old local indexes.  ``search_forms`` is the
+    smaller useful set sent to external search services.  ``case_law_slug`` is
+    present only when static.case.law uses a non-mechanical canonical slug.
+    """
+
+    canonical: str
+    aliases: tuple[str, ...] = ()
+    search_forms: tuple[str, ...] = ()
+    case_law_slug: str = ""
+
+
+# Reporter identity belongs here rather than in individual resolvers.  These
+# are true same-volume/same-page aliases; parallel reporters (for example a
+# nominative Supreme Court cite and its U.S. Reports cite) remain a resolver
+# concern because their volume numbers differ.
+_REPORTER_FAMILIES = (
+    _ReporterFamily(
+        "F.", ("Fed.", "Fed. Rep."),
+        ("F.", "Fed. Rep."), "f",
+    ),
+    _ReporterFamily(
+        "F.2d", ("F. 2d", "Fed. Rep. 2d", "Fed. Rep.2d"),
+        ("F.2d", "Fed. Rep. 2d"), "f2d",
+    ),
+    _ReporterFamily(
+        "F.3d", ("F. 3d", "Fed. Rep. 3d", "Fed. Rep.3d"),
+        ("F.3d", "Fed. Rep. 3d"), "f3d",
+    ),
+    _ReporterFamily(
+        "F.4th", ("F. 4th", "Fed. Rep. 4th", "Fed. Rep.4th"),
+        ("F.4th", "Fed. Rep. 4th"), "f4th",
+    ),
+    _ReporterFamily(
+        "F. App'x",
+        (
+            "F.App'x", "F. Appx.", "F.Appx.",
+            "Fed. App'x", "Fed.App'x", "Fed. Appx.", "Fed.Appx.",
+        ),
+        ("F. App'x", "Fed. Appx."),
+        "f-appx",
+    ),
+    _ReporterFamily(
+        "F. Cas.", ("Fed. Cas.",),
+        ("F. Cas.", "Fed. Cas."), "f-cas",
+    ),
+    _ReporterFamily(
+        "Wash.", ("Wn.", "Wash", "Wn"),
+        ("Wash.", "Wn."), "wash",
+    ),
+    _ReporterFamily(
+        "Wash. 2d", ("Wn. 2d", "Wash 2d", "Wn 2d", "Wash.2d", "Wn.2d"),
+        ("Wash. 2d", "Wn. 2d"), "wash-2d",
+    ),
+    _ReporterFamily(
+        "Wash. App.",
+        ("Wn. App.", "Wash App", "Wn App", "Wash.App.", "Wn.App."),
+        ("Wash. App.", "Wn. App."), "wash-app",
+    ),
+    # Spelled-out nineteenth-century lower-federal reporters are normalized
+    # by the link detector, but declaring them here also makes database,
+    # override, and direct-search identity bidirectional.
+    _ReporterFamily("Sumn.", ("Sumner",), ("Sumn.", "Sumner")),
+    _ReporterFamily("Curt.", ("Curtis",), ("Curt.", "Curtis")),
+    _ReporterFamily("Ben.", ("Benedict",), ("Ben.", "Benedict")),
+    _ReporterFamily("Low.", ("Lowell",), ("Low.", "Lowell")),
+    _ReporterFamily(
+        "Gall.", ("Gallis.", "Gallison"),
+        ("Gall.", "Gallison"),
+    ),
+)
+
+_REPORTER_FAMILY_BY_KEY: dict[str, _ReporterFamily] = {}
+for _family in _REPORTER_FAMILIES:
+    for _form in (_family.canonical, *_family.aliases):
+        _REPORTER_FAMILY_BY_KEY[_loose_reporter_key(_form)] = _family
+
+
+def reporter_family(rep: str) -> "_ReporterFamily | None":
+    """The known same-reporter family for *rep*, if any."""
+    return _REPORTER_FAMILY_BY_KEY.get(_loose_reporter_key(rep))
+
+
+def canonical_reporter(rep: str) -> str:
+    """Preferred display spelling for *rep*, preserving unknown reporters."""
+    family = reporter_family(rep)
+    if family is not None:
+        return family.canonical
+    return re.sub(r"\s+", " ", (rep or "").replace("’", "'")).strip()
+
+
+def canonical_norm_reporter(rep: str) -> str:
+    """Punctuation-preserving canonical identity used by persistent data."""
+    return norm_reporter(canonical_reporter(rep))
+
+
+def reporter_key(rep: str) -> str:
+    """Punctuation-free canonical reporter identity for loose comparisons."""
+    return _loose_reporter_key(canonical_reporter(rep))
+
+
+def reporter_variants(rep: str) -> tuple[str, ...]:
+    """Useful external-search spellings for the reporter containing *rep*."""
+    family = reporter_family(rep)
+    if family is None:
+        value = re.sub(r"\s+", " ", (rep or "").replace("’", "'")).strip()
+        return (value,) if value else ()
+    return family.search_forms or (family.canonical, *family.aliases)
+
+
+def reporter_normalized_variants(rep: str) -> tuple[str, ...]:
+    """Canonical and legacy normalized keys for querying an existing index."""
+    family = reporter_family(rep)
+    forms = (
+        (family.canonical, *family.aliases)
+        if family is not None else (rep,)
+    )
+    out: list[str] = []
+    keys = [
+        canonical_norm_reporter(rep),
+        reporter_key(rep),
+        *(norm_reporter(value) for value in (*forms, rep)),
+    ]
+    for key in keys:
+        if key and key not in out:
+            out.append(key)
+    return tuple(out)
+
+
+def case_law_reporter_slug(rep: str) -> str:
+    """The canonical static.case.law slug for a known reporter family."""
+    family = reporter_family(rep)
+    return family.case_law_slug if family is not None else ""
+
+
 def _valid_case_reporter(rep: str) -> bool:
-    key = _reporter_key(rep)
+    key = _loose_reporter_key(rep)
     if not key or key in _NONCASE_REPORTERS:
         return False
     if key in _PLAIN_CASE_REPORTERS or key.endswith("lexis"):
@@ -233,6 +381,46 @@ def _iter_case_cites(text: str) -> list[re.Match]:
     return matches
 
 
+def iter_case_citations(text: str) -> tuple[re.Match, ...]:
+    """Every safely detected full case citation in running *text*."""
+    return tuple(_iter_case_cites(text or ""))
+
+
+def find_case_citation(
+    text: str, *, permissive: bool = False,
+) -> "re.Match | None":
+    """First full reporter citation in *text*.
+
+    ``permissive=True`` is for hand-typed citation fields, not arbitrary prose;
+    it tolerates unpunctuated and obscure official reporter spellings.
+    """
+    matches = _iter_case_cites(text or "")
+    if matches:
+        return matches[0]
+    return HAND_TYPED_CITE_RE.search(text or "") if permissive else None
+
+
+def reporter_citation_variants(query: str) -> tuple[str, ...]:
+    """Equivalent same-volume/same-page reporter spellings in *query*.
+
+    The exact input is always first.  Surrounding caption and pincite text are
+    preserved while only the first hand-typed reporter citation is replaced.
+    """
+    query = re.sub(r"\s+", " ", query or "").strip()
+    if not query:
+        return ()
+    variants = [query]
+    match = find_case_citation(query, permissive=True)
+    if match is None:
+        return tuple(variants)
+    for reporter in reporter_variants(match.group(2)):
+        cite = f"{match.group(1)} {reporter} {match.group(3)}"
+        expanded = query[:match.start()] + cite + query[match.end():]
+        if expanded not in variants:
+            variants.append(expanded)
+    return tuple(variants)
+
+
 def _iter_short_cites(text: str) -> list[re.Match]:
     matches: list[re.Match] = list(SHORT_CITE_RE.finditer(text or ""))
     for m in BROAD_SHORT_CITE_RE.finditer(text or ""):
@@ -260,7 +448,7 @@ def build_short_cite_index(text: str) -> dict[tuple[str, str], list[int]]:
     first page (and thence opened and pin-jumped)."""
     idx: dict[tuple[str, str], set] = {}
     for m in _iter_case_cites(text or ""):
-        idx.setdefault((m.group(1), norm_reporter(m.group(2))),
+        idx.setdefault((m.group(1), reporter_key(m.group(2))),
                        set()).add(int(m.group(3)))
     return {k: sorted(v) for k, v in idx.items()}
 
@@ -283,7 +471,9 @@ def cite_target_from_text(
         sm = short_matches[0]
         rep = re.sub(r"\s+", " ", sm.group(2)).strip().replace("U. S.", "U.S.")
         pin = int(sm.group(3))
-        pages = index.get((sm.group(1), norm_reporter(sm.group(2))))
+        pages = index.get((
+            sm.group(1), reporter_key(sm.group(2)),
+        ))
         if pages:
             below = [p for p in pages if p <= pin]
             first = max(below) if below else pages[0]
@@ -609,7 +799,9 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         # would outrank it (same start, longer) — the RECAP action wins.
         if any(m.start() < e and s < m.end() for s, e in recap_spans):
             continue
-        pages = index.get((m.group(1), norm_reporter(m.group(2))))
+        pages = index.get((
+            m.group(1), reporter_key(m.group(2)),
+        ))
         if not pages:
             continue
         pin = int(m.group(3))

@@ -26,12 +26,17 @@ def clean_base_citation(value: str) -> str:
     return value
 
 
-def _reporter_key(value: str) -> str:
-    match = citations.CITE_CAPTURE_RE.search(value or "")
+def _reporter_keys(value: str) -> tuple[str, ...]:
+    """Canonical and legacy identity keys for the first reporter cite."""
+    match = citations.find_case_citation(value or "", permissive=True)
     if not match:
-        return ""
-    reporter = citations.norm_reporter(match.group(2))
-    return f"cite:{int(match.group(1))}:{reporter}:{int(match.group(3))}"
+        return ()
+    prefix = f"cite:{int(match.group(1))}:"
+    suffix = f":{int(match.group(3))}"
+    return tuple(
+        prefix + reporter + suffix
+        for reporter in citations.reporter_normalized_variants(match.group(2))
+    )
 
 
 def citation_identity_keys(
@@ -57,9 +62,9 @@ def citation_identity_keys(
     values.extend(str(v) for v in parallel_cites or ())
     values.extend(str(v) for v in (item.get("citation") or ()))
     for value in values:
-        key = _reporter_key(value)
-        if key and key not in out:
-            out.append(key)
+        for key in _reporter_keys(value):
+            if key not in out:
+                out.append(key)
 
     try:
         case_id = (urllib.parse.parse_qs(
@@ -110,7 +115,7 @@ def add_pin_to_base(base_citation: str, pin: str | None) -> str:
     pin = (pin or "").strip()
     if not pin:
         return base
-    match = citations.CITE_CAPTURE_RE.search(base)
+    match = citations.find_case_citation(base, permissive=True)
     if not match or pin == match.group(3):
         return base
     return base[:match.end()] + f", {pin}" + base[match.end():]
@@ -119,7 +124,7 @@ def add_pin_to_base(base_citation: str, pin: str | None) -> str:
 def split_name_from_citation(base_citation: str) -> tuple[str, str]:
     """Split a case name from the roman remainder for rich-text italics."""
     base = clean_base_citation(base_citation)
-    match = citations.CITE_CAPTURE_RE.search(base)
+    match = citations.find_case_citation(base, permissive=True)
     if not match:
         return base, ""
     prefix = base[:match.start()]

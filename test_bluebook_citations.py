@@ -1,7 +1,9 @@
 import json
 import os
+import tempfile
 import tkinter as tk
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
@@ -34,6 +36,7 @@ from courtlistener_gui import (
     _CaseTabsWindow,
     _case_law_text_for_pdf_url,
     _case_law_text_record,
+    _case_law_pdf_choices_for_cites,
     _case_pdf_text_source,
     _open_statute_action,
     _case_law_page_opinions,
@@ -51,10 +54,14 @@ from courtlistener_gui import (
     _recap_spec_index,
     _scholar_caption_name,
     _spotlight_case_action,
+    _static_case_law_url,
     _special_citation_ranges,
     _wisconsin_display_cite,
 )
-from google_scholar import Block, OpinionPart, Span, educate_quotes
+from google_scholar import (
+    Block, OpinionPart, ScholarResult, Span, bears_citation, educate_quotes,
+)
+from opinion_db import OpinionDB, _gz_pack, _header_cites
 import us_code
 
 
@@ -758,6 +765,24 @@ class CitationOverrideTests(unittest.TestCase):
         self.assertEqual(find_override(saved, ["cl:123"]), saved["cl:123"])
         self.assertIn("cite:81:f.4th:699", saved)
 
+    def test_override_and_pin_work_across_federal_cases_aliases(self):
+        fed_keys = citation_identity_keys({}, "18 Fed. Cas. 9")
+        saved = update_overrides(
+            {}, fed_keys, "The Nestor, 18 Fed. Cas. 9 (C.C.D. Me. 1831)",
+        )
+        short_keys = citation_identity_keys({}, "18 F. Cas. 9")
+
+        self.assertEqual(
+            find_override(saved, short_keys),
+            "The Nestor, 18 Fed. Cas. 9 (C.C.D. Me. 1831)",
+        )
+        self.assertEqual(
+            add_pin_to_base(
+                "The Nestor, 18 Fed. Cas. 9 (C.C.D. Me. 1831)", "12",
+            ),
+            "The Nestor, 18 Fed. Cas. 9, 12 (C.C.D. Me. 1831)",
+        )
+
     def test_pin_is_inserted_before_parenthetical(self):
         base = "Deslandes v. McDonald's USA, LLC, 81 F.4th 699 (7th Cir. 2023)"
         self.assertEqual(
@@ -933,6 +958,44 @@ class NominativeCitationSearchTests(unittest.TestCase):
             ("410 U.S. 113",),
         )
 
+    def test_washington_reporter_aliases_expand_in_both_directions(self):
+        self.assertEqual(
+            _citation_search_variants("81 Wn. 2d 788"),
+            ("81 Wn. 2d 788", "81 Wash. 2d 788"),
+        )
+        self.assertEqual(
+            _citation_search_variants("81 Wash. 2d 788"),
+            ("81 Wash. 2d 788", "81 Wn. 2d 788"),
+        )
+        self.assertEqual(
+            _citation_search_variants(
+                "Example v. State, 81 Wash 2d 788, 791"
+            ),
+            (
+                "Example v. State, 81 Wash 2d 788, 791",
+                "Example v. State, 81 Wash. 2d 788, 791",
+                "Example v. State, 81 Wn. 2d 788, 791",
+            ),
+        )
+
+    def test_federal_reporter_aliases_expand_in_both_directions(self):
+        self.assertEqual(
+            _citation_search_variants("18 F. Cas. 9"),
+            ("18 F. Cas. 9", "18 Fed. Cas. 9"),
+        )
+        self.assertEqual(
+            _citation_search_variants("18 Fed. Cas. 9"),
+            ("18 Fed. Cas. 9", "18 F. Cas. 9"),
+        )
+        self.assertEqual(
+            _citation_search_variants("35 Fed. Rep. 665"),
+            ("35 Fed. Rep. 665", "35 F. 665"),
+        )
+        self.assertEqual(
+            _citation_search_variants("514 Fed. Appx. 210"),
+            ("514 Fed. Appx. 210", "514 F. App'x 210"),
+        )
+
     def test_courtlistener_retries_us_reports_alias_only_after_miss(self):
         client = Mock()
         client.lookup_citation.side_effect = [
@@ -954,6 +1017,29 @@ class NominativeCitationSearchTests(unittest.TestCase):
         self.assertEqual(
             client.lookup_citation.call_args_list,
             [call("8 Wall 168"), call("75 U.S. 168")],
+        )
+
+    def test_courtlistener_retries_federal_cases_alias_only_after_miss(self):
+        client = Mock()
+        client.lookup_citation.side_effect = [
+            [],
+            [{
+                "status": 200,
+                "clusters": [{
+                    "id": 18,
+                    "case_name": "The Nestor",
+                    "citations": ["18 F. Cas. 9"],
+                    "court_id": "circtdme",
+                }],
+            }],
+        ]
+
+        item = _cl_item_for_citation(client, "18 Fed. Cas. 9")
+
+        self.assertEqual(item["cluster_id"], 18)
+        self.assertEqual(
+            client.lookup_citation.call_args_list,
+            [call("18 Fed. Cas. 9"), call("18 F. Cas. 9")],
         )
 
     def test_courtlistener_keeps_successful_typed_citation_authoritative(self):
@@ -986,6 +1072,21 @@ class NominativeCitationSearchTests(unittest.TestCase):
         self.assertEqual(
             fetcher.fetch_by_citation.call_args_list,
             [call("8 Wall 168"), call("75 U.S. 168")],
+        )
+
+    def test_direct_lookup_retries_federal_cases_alias_after_scholar_miss(self):
+        win = object.__new__(CourtListenerGUI)
+        win.root = object()
+        win._post_root = Mock()
+        fetcher = Mock()
+        fetcher.fetch_by_citation.side_effect = [None, ("url", "html")]
+
+        self.assertTrue(
+            win._try_open_citation("", "18 Fed. Cas. 9", "", fetcher, None)
+        )
+        self.assertEqual(
+            fetcher.fetch_by_citation.call_args_list,
+            [call("18 Fed. Cas. 9"), call("18 F. Cas. 9")],
         )
 
 
@@ -1175,6 +1276,103 @@ class SpotlightCitationDetectionTests(unittest.TestCase):
         )
 
 
+class ReporterEquivalenceTests(unittest.TestCase):
+    def test_scholar_verification_accepts_equivalent_reporter_names(self):
+        nestor = ScholarResult(
+            "The Nestor, 18 F. Cas. 9", "https://example.test/nestor",
+        )
+        washington = ScholarResult(
+            "Example v. State", "https://example.test/washington",
+            source="81 Wn. 2d 788 (1973)",
+        )
+
+        self.assertTrue(bears_citation(nestor, "18 Fed. Cas. 9"))
+        self.assertTrue(bears_citation(washington, "81 Wash. 2d 788"))
+
+    def test_local_opinion_database_indexes_broad_reporters_and_aliases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = OpinionDB(root / "opinions.jsonl", root / "opinions.db")
+            try:
+                for sid, name, cite in (
+                    ("1", "The Nestor", "18 Fed. Cas. 9"),
+                    ("2", "Example v. State", "81 Wn. 2d 788"),
+                    ("3", "The Amos D. Carver", "35 Fed. Rep. 665"),
+                    ("4", "Regional Example", "529 N.W.2d 155"),
+                ):
+                    self.assertTrue(db.add({
+                        "scholar_id": sid,
+                        "name": name,
+                        "cites": [cite],
+                        "parties": [],
+                    }))
+
+                self.assertEqual(
+                    [hit["scholar_id"] for hit in db.find("18 F. Cas. 9")],
+                    ["1"],
+                )
+                self.assertEqual(
+                    [hit["scholar_id"]
+                     for hit in db.find("81 Wash. 2d 788")],
+                    ["2"],
+                )
+                self.assertEqual(
+                    [hit["scholar_id"] for hit in db.find("35 F. 665")],
+                    ["3"],
+                )
+                self.assertEqual(
+                    [hit["scholar_id"] for hit in db.find("529 NW 2d 155")],
+                    ["4"],
+                )
+            finally:
+                db.close()
+
+    def test_local_database_caption_extraction_uses_broad_detector(self):
+        cites = _header_cites([
+            Block("center", [Span("18 F. Cas. 9")]),
+            Block("center", [Span("35 F. 665")]),
+            Block("center", [Span("81 Wash. 2d 788")]),
+        ])
+
+        self.assertEqual(
+            cites, ["18 F. Cas. 9", "35 F. 665", "81 Wash. 2d 788"],
+        )
+
+    def test_old_local_index_rebuild_recovers_cites_from_stored_html(self):
+        html = (
+            '<div id="gs_opinion"><center>THE NESTOR</center>'
+            '<center>18 F. Cas. 9</center><p>The decree is affirmed.</p></div>'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jsonl = root / "opinions.jsonl"
+            index = root / "opinions.db"
+            db = OpinionDB(jsonl, index)
+            self.assertTrue(db.add({
+                "scholar_id": "18",
+                "name": "The Nestor",
+                "cites": [],  # what the pre-v3 narrow extractor persisted
+                "parties": ["nestor"],
+                "html_gz": _gz_pack(html),
+            }))
+            # Simulate the stale v2 materialized index.  Reopening must notice
+            # the version and rebuild from JSONL/the stored opinion HTML.
+            db._db.execute("DELETE FROM citations")
+            db._set_meta("schema_version", "2")
+            db._db.commit()
+            db.close()
+
+            rebuilt = OpinionDB(jsonl, index)
+            try:
+                self.assertEqual(
+                    [hit["scholar_id"]
+                     for hit in rebuilt.find("18 Fed. Cas. 9")],
+                    ["18"],
+                )
+            finally:
+                rebuilt.close()
+
+
 class UsCodeNavigationTests(unittest.TestCase):
     def test_current_olrc_section_heads_supply_neighbor_order(self):
         # Current OLRC container pages no longer include the old analysis
@@ -1208,6 +1406,53 @@ class UsCodeNavigationTests(unittest.TestCase):
 
 
 class CaseLawSharedPageTests(unittest.TestCase):
+    def test_federal_reporter_aliases_share_cap_slugs(self):
+        self.assertEqual(
+            _static_case_law_url("18 F. Cas. 9"),
+            "https://static.case.law/f-cas/18/case-pdfs/0009-01.pdf",
+        )
+        self.assertEqual(
+            _static_case_law_url("18 Fed. Cas. 9"),
+            "https://static.case.law/f-cas/18/case-pdfs/0009-01.pdf",
+        )
+        self.assertEqual(
+            _static_case_law_url("35 Fed. Rep. 665"),
+            "https://static.case.law/f/35/case-pdfs/0665-01.pdf",
+        )
+        self.assertEqual(
+            _static_case_law_url("514 Fed. Appx. 210"),
+            "https://static.case.law/f-appx/514/case-pdfs/0210-01.pdf",
+        )
+
+    def test_washington_text_cite_uses_cap_washington_reporter_slug(self):
+        expected = (
+            "https://static.case.law/wash-2d/81/"
+            "case-pdfs/0788-01.pdf"
+        )
+        self.assertEqual(_static_case_law_url("81 Wn. 2d 788"), expected)
+        self.assertEqual(_static_case_law_url("81 Wn 2d 788"), expected)
+        self.assertEqual(_static_case_law_url("81 Wash. 2d 788"), expected)
+        self.assertEqual(
+            _static_case_law_url("12 Wn. App. 45"),
+            "https://static.case.law/wash-app/12/case-pdfs/0045-01.pdf",
+        )
+        self.assertEqual(
+            _static_case_law_url("10 Wn. 25"),
+            "https://static.case.law/wash/10/case-pdfs/0025-01.pdf",
+        )
+
+        session = Mock()
+        session.head.side_effect = lambda url, **_kwargs: SimpleNamespace(
+            status_code=200 if url == expected else 404,
+        )
+        with patch("courtlistener_gui._anon_session", session):
+            choices = _case_law_pdf_choices_for_cites([
+                "81 Wn. 2d 788", "81 Wash. 2d 788",
+            ])
+
+        self.assertEqual(len(choices), 1)
+        self.assertEqual(choices[0].url, expected)
+
     def test_discovers_sequential_pdfs_and_reads_every_json_name(self):
         base = "https://static.case.law/f2d/100/case-pdfs/0123-01.pdf"
         session = Mock()
@@ -2122,9 +2367,16 @@ class FederalCasesLookupTests(unittest.TestCase):
         from courtlistener import _fcas_volume
 
         self.assertEqual(_fcas_volume(["18 F. Cas. 9", "1 Sumn. 73"]), 18)
+        self.assertEqual(_fcas_volume(["18 Fed. Cas. 9"]), 18)
         self.assertEqual(
             _fcas_volume([{"volume": 5, "reporter": "F. Cas.", "page": 680}]),
             5)
+        self.assertEqual(
+            _fcas_volume([
+                {"volume": 5, "reporter": "Fed. Cas.", "page": 680},
+            ]),
+            5,
+        )
         self.assertIsNone(_fcas_volume(["410 U.S. 113"]))
 
     def test_detect_links_routes_fedcas_and_nominative_parallels(self):

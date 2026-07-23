@@ -1277,8 +1277,11 @@ from citations import (
     early_fed_cite_text as _early_fed_cite_text,
     SHORT_CITE_RE as _SHORT_CITE_RE,
     ID_CITE_RE as _ID_CITE_RE,
+    HAND_TYPED_CITE_RE as _LINE_CITE_RE,
+    case_law_reporter_slug as _case_law_reporter_slug,
+    reporter_citation_variants as _reporter_citation_variants,
+    reporter_key as _canonical_reporter_key,
     case_match_text as _case_match_text,
-    norm_reporter as _norm_reporter,
     build_short_cite_index as _build_short_cite_index,
     cite_target_from_text as _cite_target_from_text,
     detect_links as detect_brief_links,
@@ -2131,27 +2134,15 @@ def _slugify_reporter(reporter: str) -> str:
       "Cal."        → "cal"
       "N.E.2d"      → "ne2d"
     """
+    canonical = _case_law_reporter_slug(reporter)
+    if canonical:
+        return canonical
     s = reporter.lower()
     s = s.replace(" ", "-")
     s = re.sub(r"[^a-z0-9-]", "", s)
     s = re.sub(r"-+", "-", s)
     s = s.strip("-")
-    # Old reporter names → the slug static.case.law actually uses.  The Federal
-    # Reporter is "F." today, so an old "Fed. Rep." cite must look there.
-    return _CASE_LAW_REPORTER_ALIASES.get(s, s)
-
-
-# Old/long reporter names → the slug static.case.law uses for the modern form.
-_CASE_LAW_REPORTER_ALIASES = {
-    "fed-rep": "f",        # Federal Reporter (old "Fed. Rep." → "F.")
-    "fed-rep-2d": "f2d",
-    "fed-rep-3d": "f3d",
-    # Federal Appendix spelled without the canonical spacing/apostrophe slugs to
-    # several forms; static.case.law uses "f-appx".
-    "fappx": "f-appx",     # "F.App'x", "F.Appx."
-    "fedappx": "f-appx",   # "Fed.App'x", "Fed.Appx."
-    "fed-appx": "f-appx",  # "Fed. App'x", "Fed. Appx."
-}
+    return s
 
 
 def _static_case_law_url(citation: str) -> Optional[str]:
@@ -2482,19 +2473,19 @@ def _us_reports_cite(cite: str) -> str:
 
 
 def _citation_search_variants(query: str) -> tuple[str, ...]:
-    """The query as entered, plus its U.S.-Reports equivalent when it
-    contains an early-SCOTUS nominative citation.
+    """Equivalent citation spellings, with the query as entered first.
 
     Search services do not agree on which side of a dual citation they index:
     a user may type ``8 Wall. 168`` while CourtListener or Google Scholar only
-    recognizes ``75 U.S. 168``.  Preserve surrounding case-name and pincite
-    text so a full query remains just as specific, and retain the typed form as
-    a fallback for sources that do index the old reporter.
+    recognizes ``75 U.S. 168``.  Washington opinions likewise alternate
+    between ``Wash. 2d`` and ``Wn. 2d``.  Preserve surrounding case-name and
+    pincite text so a full query remains just as specific, and retain the typed
+    form as the authoritative first attempt.
     """
     query = re.sub(r"\s+", " ", query or "").strip()
     if not query:
         return ()
-    variants = [query]
+    variants = list(_reporter_citation_variants(query))
     m = _NOMINATIVE_CITE_RE.search(query)
     if m:
         us_cite = _us_reports_cite(m.group(0))
@@ -2525,8 +2516,9 @@ def _link_cite(text: str, short_cite_index) -> tuple[str, str]:
 
 def _case_law_pdf_for_cite(cite: str) -> Optional[str]:
     """A static.case.law PDF URL that actually exists (HEAD 200) for *cite* —
-    trying the citation as printed and then its modern U.S.-Reports form for an
-    old nominative SCOTUS cite — or None when case.law has neither."""
+    canonicalizing reporter aliases (including Wn. → Wash.) and trying the
+    modern U.S.-Reports form for an old nominative SCOTUS cite — or None when
+    case.law has neither."""
     choices = _case_law_pdf_choices_for_cites([cite, _us_reports_cite(cite)])
     return choices[0].url if choices else None
 
@@ -3388,7 +3380,7 @@ def _case_signature(name: str, cite: str, year: str, court: str = "",
     for part in re.split(r"[;,]", re.sub(r"<[^>]+>", "", cite or "")):
         m = _CITE_PARSE_RE.match(part.strip())
         if m:
-            rep = re.sub(r"[^a-z0-9]", "", m.group(2).lower())
+            rep = _canonical_reporter_key(m.group(2))
             if rep:
                 cites.add((rep, m.group(1), m.group(3)))
                 series.add(rep)
@@ -6895,39 +6887,25 @@ class CourtListenerGUI:
         if fetcher is not None:
             result = None
             try:
-                result = fetcher.fetch_by_citation(cite)
-                if not result and name:
-                    # Accept a name+cite search hit only when the *result*
-                    # itself is this case — bearing the cite in its title or
-                    # byline, or matching the case name — never merely
-                    # because the search query found something (any opinion
-                    # quoting the cite also matches the query).
-                    hits = fetcher.search_cases(f"{name} {cite}", limit=3)
-                    for hit in hits:
-                        if _scholar_bears_citation(hit, cite) or (
-                            _name_match_score(name, hit.title or "")
-                            >= _NAME_MATCH_MIN
-                        ):
-                            result = fetcher.fetch_by_url(hit.url)
-                            break
-                # Scholar sometimes indexes early Supreme Court opinions only
-                # under the modern U.S. Reports citation.  Keep the literal
-                # cite first (it can be a different reporter), then retry its
-                # verified counterpart only when that lookup found nothing.
-                alt_cite = _us_reports_cite(cite)
-                if not result and alt_cite:
-                    result = fetcher.fetch_by_citation(alt_cite)
+                for lookup_cite in _citation_search_variants(cite):
+                    result = fetcher.fetch_by_citation(lookup_cite)
                     if not result and name:
+                        # Accept a name+cite search hit only when the *result*
+                        # itself is this case — bearing an equivalent cite in
+                        # its title/byline, or matching the case name — never
+                        # merely because another opinion quotes the query.
                         hits = fetcher.search_cases(
-                            f"{name} {alt_cite}", limit=3,
+                            f"{name} {lookup_cite}", limit=3,
                         )
                         for hit in hits:
-                            if _scholar_bears_citation(hit, alt_cite) or (
+                            if _scholar_bears_citation(hit, lookup_cite) or (
                                 _name_match_score(name, hit.title or "")
                                 >= _NAME_MATCH_MIN
                             ):
                                 result = fetcher.fetch_by_url(hit.url)
                                 break
+                    if result:
+                        break
             except Exception as exc:
                 print(f"[citelist] scholar {cite!r}: {exc}")
             if result:
@@ -13478,7 +13456,7 @@ _CASE_LAW_URL_RE = re.compile(
 _CASE_LAW_SLUG_REPORTERS = {_slugify_reporter(_r): _r for _r in (
     # Federal
     "U.S.", "S. Ct.", "L. Ed.", "L. Ed. 2d", "F.", "F.2d", "F.3d", "F.4th",
-    "F. App'x", "F. Supp.", "F. Supp. 2d", "F. Supp. 3d", "F.R.D.",
+    "F. App'x", "F. Cas.", "F. Supp.", "F. Supp. 2d", "F. Supp. 3d", "F.R.D.",
     "Fed. Cl.", "B.R.", "U.S. App. D.C.",
     # Regional
     "A.", "A.2d", "A.3d", "N.E.", "N.E.2d", "N.E.3d", "N.W.", "N.W.2d",
@@ -15016,7 +14994,7 @@ class _ScholarTextWindow:
         # jumps to the pin page.
         for m in _SHORT_CITE_RE.finditer(text):
             pages = self._short_cite_index.get(
-                (m.group(1), _norm_reporter(m.group(2))))
+                (m.group(1), _canonical_reporter_key(m.group(2))))
             if not pages:
                 continue
             pin = int(m.group(3))
@@ -19574,15 +19552,6 @@ _CFR_SECREF_RE = re.compile(
     r"§§?\s*(\d+[a-zA-Z]?\.\d+[a-zA-Z0-9]*)"
     r"((?:\((?:\d{1,3}|[ivxIVX]{2,4}|[a-zA-Z]{1,3})\))*)"
 )
-
-# A reporter citation on a hand-typed line: volume, reporter, page.
-# Broader than _TEXT_CITE_RE (any capitalized reporter form, so official
-# state reporters like "306 Md. 556" work) since the input is a citation
-# list, not running prose.
-_LINE_CITE_RE = re.compile(
-    r"(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})(?=[\s,;.)(]|$)"
-)
-
 
 _SPOTLIGHT_CASE_ACTIONS = frozenset(("cite", "engrep", "recap", "fedcas"))
 
