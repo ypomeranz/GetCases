@@ -1363,9 +1363,139 @@ def _static_case_law_url(citation: str) -> Optional[str]:
 class _CaseLawPdfChoice:
     cite: str
     url: str
+    label: str = ""
 
 
-def _case_law_pdf_choices_for_cites(cites: list[str]) -> list[_CaseLawPdfChoice]:
+@dataclass(frozen=True)
+class _CaseLawPageOpinion:
+    """One CAP opinion sharing a reporter page with one or more others."""
+    url: str
+    json_url: str
+    name: str
+
+
+_CASE_LAW_NUMBERED_PDF_RE = re.compile(
+    r"^(https://static\.case\.law/.*/case-pdfs/\d+)-(\d+)\.pdf$",
+    re.IGNORECASE,
+)
+
+
+def _case_law_numbered_pdf_url(url: str, number: int) -> Optional[str]:
+    """Sibling ``-NN.pdf`` URL for a static.case.law per-case PDF."""
+    m = _CASE_LAW_NUMBERED_PDF_RE.match((url or "").strip())
+    if not m or number < 1:
+        return None
+    width = max(2, len(m.group(2)))
+    return f"{m.group(1)}-{number:0{width}d}.pdf"
+
+
+def _case_law_json_for_pdf_url(url: str) -> Optional[str]:
+    """The CAP metadata JSON published beside a per-case PDF URL."""
+    if not _CASE_LAW_NUMBERED_PDF_RE.match((url or "").strip()):
+        return None
+    return re.sub(
+        r"/case-pdfs/(\d+-\d+)\.pdf$", r"/cases/\1.json",
+        url, flags=re.IGNORECASE,
+    )
+
+
+def _case_law_page_opinions(url: str) -> list[_CaseLawPageOpinion]:
+    """Discover all CAP opinions whose PDF begins on the same reporter page.
+
+    CAP names the first ``NNNN-01.pdf`` and, rarely, puts another opinion that
+    begins on that page at ``-02.pdf`` (then ``-03.pdf``, and so on).  A second
+    PDF is probed first; only when it exists are all sibling JSON files fetched
+    for their authoritative case names.  An empty list means the URL is not an
+    ``-01`` CAP PDF or no second opinion exists.
+    """
+    m = _CASE_LAW_NUMBERED_PDF_RE.match((url or "").strip())
+    if not m or int(m.group(2)) != 1:
+        return []
+
+    def exists(candidate: str) -> bool:
+        try:
+            resp = _anon_session.head(
+                candidate, timeout=10, allow_redirects=True)
+            return resp.status_code == 200
+        except Exception as exc:
+            print(f"[case.law] sibling check failed for {candidate}: {exc}")
+            return False
+
+    second = _case_law_numbered_pdf_url(url, 2)
+    if not second or not exists(second):
+        return []
+
+    pdf_urls = [url, second]
+    for number in range(3, 100):
+        candidate = _case_law_numbered_pdf_url(url, number)
+        if not candidate or not exists(candidate):
+            break
+        pdf_urls.append(candidate)
+
+    out: list[_CaseLawPageOpinion] = []
+    for pdf_url in pdf_urls:
+        json_url = _case_law_json_for_pdf_url(pdf_url) or ""
+        name = ""
+        if json_url:
+            try:
+                resp = _anon_session.get(json_url, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        name = re.sub(
+                            r"\s+", " ", str(
+                                data.get("name_abbreviation")
+                                or data.get("name") or ""
+                            ),
+                        ).strip()
+            except Exception as exc:
+                print(f"[case.law] metadata fetch failed {json_url}: {exc}")
+        out.append(_CaseLawPageOpinion(pdf_url, json_url, name))
+    return out
+
+
+def _case_law_opinion_name(opinion: _CaseLawPageOpinion) -> str:
+    """Readable, Bluebook-abbreviated label for a CAP page choice."""
+    if not opinion.name:
+        return ""
+    try:
+        return abbreviate_case_name(normal_case_caption(opinion.name))
+    except Exception:
+        return opinion.name
+
+
+def _match_case_law_page_opinion(
+    opinions: list[_CaseLawPageOpinion], expected_name: str,
+) -> Optional[_CaseLawPageOpinion]:
+    """Best unambiguous CAP page opinion for a CL/Scholar case name."""
+    expected = re.sub(r"<[^>]+>", "", expected_name or "").strip()
+    if not expected:
+        return None
+    rated: list[tuple[int, float, _CaseLawPageOpinion]] = []
+    for opinion in opinions:
+        if not opinion.name:
+            continue
+        tier = _match_tier(expected, opinion.name)
+        score = _name_match_score(expected, opinion.name)
+        if tier >= 0 and score >= _NAME_MATCH_MIN:
+            rated.append((tier, score, opinion))
+    if not rated:
+        return None
+    rated.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    best = rated[0]
+    # A two-sided source caption should match both CAP parties.  Falling back
+    # to a one-party coincidence is precisely when the user should choose.
+    if len(_name_parties(expected)) == 2 and best[0] < 2:
+        return None
+    if (len(rated) > 1 and rated[1][0] == best[0]
+            and abs(rated[1][1] - best[1]) < 0.01):
+        return None
+    return best[2]
+
+
+def _case_law_pdf_choices_for_cites(
+    cites: list[str], expected_name: str = "",
+) -> list[_CaseLawPdfChoice]:
     """Every static.case.law PDF that exists for the supplied parallel cites.
 
     State opinions are often printed in both an official state reporter and a
@@ -1390,7 +1520,34 @@ def _case_law_pdf_choices_for_cites(cites: list[str]) -> list[_CaseLawPdfChoice]
             continue
         if head.status_code == 200:
             seen_urls.add(url)
-            choices.append(_CaseLawPdfChoice(cite=cite, url=url))
+            chosen_url = url
+            page_opinions = _case_law_page_opinions(url)
+            if page_opinions and expected_name:
+                matched = _match_case_law_page_opinion(
+                    page_opinions, expected_name)
+                if matched is not None:
+                    chosen_url = matched.url
+                    print(
+                        f"[case.law] matched {expected_name!r} to "
+                        f"{_case_law_opinion_name(matched) or matched.url!r}"
+                    )
+                else:
+                    print(
+                        f"[case.law] could not match {expected_name!r} among "
+                        f"{len(page_opinions)} opinions on the reporter page"
+                    )
+                    # Preserve every sibling as a separate View PDF menu item.
+                    # The source name could not safely choose, so the user must.
+                    for i, opinion in enumerate(page_opinions, 1):
+                        name = _case_law_opinion_name(opinion)
+                        label = f"{cite} â€” {name}" if name else (
+                            f"{cite} â€” Opinion {i}"
+                        )
+                        choices.append(_CaseLawPdfChoice(
+                            cite=cite, url=opinion.url, label=label,
+                        ))
+                    continue
+            choices.append(_CaseLawPdfChoice(cite=cite, url=chosen_url))
         else:
             print(f"[case.law] static.case.law {head.status_code} for {cite!r}")
     return choices
@@ -2399,6 +2556,7 @@ def _same_case(a: dict, b: dict) -> bool:
 # next-best result takes the slot and the source still shows its full quota.
 _BUCKET_CAPS: dict[str, int] = {
     "scholar": 4,     # Google Scholar (best of the first results page)
+    "opiniondb": 3,   # already-saved Google Scholar opinions
     "exact": 3,       # strict AND match of two distinctive parties
     "ranked": 4,      # CourtListener name matches, ranked by citation count
     "reversed": 2,    # heavily-cited swapped-caption ("Texas v. United States")
@@ -2415,7 +2573,9 @@ def _prefer_source(new_bucket: str, shown_bucket: str) -> bool:
     source, so a Scholar hit replaces a CourtListener row for the same case
     rather than being dropped; every other collision keeps the row already
     shown (first arrival wins)."""
-    return new_bucket == "scholar" and shown_bucket != "scholar"
+    scholar_sources = {"scholar", "opiniondb"}
+    return (new_bucket in scholar_sources
+            and shown_bucket not in scholar_sources)
 
 
 def _is_scotus_order_item(item: dict) -> bool:
@@ -2732,6 +2892,115 @@ def _cl_name_ranked_search(client, query: str) -> list[tuple[str, dict]]:
     for group in groups:
         out.extend(group)
     return _filter_to_best_tier(query, out)
+
+
+_STATE_HIGH_COURT_IDS = {
+    courts[0][0] for _state, courts in _STATE_COURTS if courts
+}
+
+
+def _spotlight_court_priority(court_id: str) -> int:
+    """Coarse authority order for saved opinions lacking a citation count.
+
+    CourtListener's broad name pass uses citation count as its authority
+    signal and adds a dedicated Supreme Court pass.  The local opinion store
+    has no citation counts, so court level is the stable equivalent tie-break:
+    SCOTUS, then federal circuits/state high courts, then other known courts.
+    Name tier and name closeness still control before this value.
+    """
+    cid = (court_id or "").strip().lower()
+    if cid == _SCOTUS_COURT_ID:
+        return 4
+    if cid in _CIRCUIT_COURTS or cid in _STATE_HIGH_COURT_IDS:
+        return 3
+    if cid in _DISTRICT_COURTS or cid in _COURT_BLUEBOOK:
+        return 2
+    return 1 if cid else 0
+
+
+def _bluebook_saved_opinion_name(db, hit: dict) -> str:
+    """Put a saved opinion's caption through the app's Bluebook name ladder.
+
+    New database records are already abbreviated, but older/imported JSONL
+    rows need not be.  When the full record is available its opinion prose is
+    also used to repair ambiguous all-caps/title-case names before abbreviation.
+    """
+    raw = re.sub(r"<[^>]+>", "", str(hit.get("name") or "")).strip()
+    if not raw:
+        return ""
+    body = ""
+    sid = str(hit.get("scholar_id") or "").strip()
+    if sid:
+        try:
+            rec = db.get_by_scholar_id(sid) or {}
+            body = str(rec.get("text") or "")
+        except Exception:
+            body = ""
+    try:
+        name = refine_caption_case(normal_case_caption(raw), body)
+        name = simplify_historical_entity_caption(name, body)
+        return abbreviate_case_name(name)
+    except Exception:
+        return raw
+
+
+def _opinion_db_spotlight_results(db, query: str,
+                                  limit: int = 3) -> list[dict]:
+    """Up to ``limit`` name/court-ranked rows from an already-open opinion DB.
+
+    This deliberately accepts a database object rather than opening one: the
+    Spotlight caller uses it only when the application's lazy database load has
+    already completed.  Name searches reuse the CourtListener match tiers and
+    jurisdiction-hint parser; reporter citations keep the database's exact
+    citation lookup order and merely receive the court tie-break.
+    """
+    q = re.sub(r"\s+", " ", query or "").strip()
+    if not q or db is None:
+        return []
+
+    juris = _detect_jurisdiction(q)
+    name_query = juris[1] if juris and juris[1] else q
+    allowed_courts = set(juris[0].split()) if juris else set()
+    is_cite = bool(_LINE_CITE_RE.search(q))
+    try:
+        if is_cite:
+            candidates = db.find(q)
+        else:
+            candidates = db.search_names(name_query, max(60, limit * 20))
+    except Exception as exc:
+        print(f"[spotlight-db] search failed for {q!r}: {exc}")
+        return []
+
+    scored: list[tuple[int, float, int, str, dict]] = []
+    for hit in candidates:
+        court_id = str(hit.get("court") or "").strip().lower()
+        if allowed_courts and court_id not in allowed_courts:
+            continue
+        cand_name = str(hit.get("name") or "")
+        if is_cite:
+            tier, score = 3, 1.0
+        else:
+            tier = _match_tier(name_query, cand_name)
+            score = _name_match_score(name_query, cand_name)
+            if tier < 0 or score < _NAME_MATCH_MIN:
+                continue
+        scored.append((
+            tier, score, _spotlight_court_priority(court_id),
+            str(hit.get("year") or ""), hit,
+        ))
+
+    if not is_cite and scored:
+        best_tier = max(row[0] for row in scored)
+        scored = [row for row in scored if row[0] == best_tier]
+    scored.sort(key=lambda row: (row[0], row[1], row[2], row[3]),
+                reverse=True)
+
+    out: list[dict] = []
+    for _tier, _score, _court, _year, hit in scored[:limit]:
+        saved = dict(hit)
+        saved["name"] = _bluebook_saved_opinion_name(db, saved)
+        out.append(saved)
+    return out
 
 
 _OPINION_TYPE_LABELS: dict[str, str] = {
@@ -3499,16 +3768,23 @@ class CourtListenerGUI:
                     None, "opened from history", prefetch_pdf,
                 )
             else:
+                item_name = re.sub(
+                    r"<[^>]+>", "",
+                    str((item or {}).get("caseName")
+                        or (item or {}).get("case_name") or ""),
+                ).strip()
                 self._post_root(
-                    self._scholar_case_fallback, url, cite, "", prefetch_pdf
+                    self._scholar_case_fallback, url, cite, "", prefetch_pdf,
+                    item_name,
                 )
 
         threading.Thread(target=run, daemon=True).start()
 
     def _open_history_pdf(self, url: str, title: str) -> None:
         self._status_var.set(f"Opening {title} from history...")
-        _PdfWindow(self.root, url, title, self._status_var.set,
-                   app=self, is_case=True)
+        _open_case_law_pdf(
+            self.root, url, title, self._status_var.set, app=self,
+        )
 
     def record_case_view(
         self, key: str, label: str, reopen, payload: Optional[dict] = None,
@@ -4724,7 +5000,11 @@ class CourtListenerGUI:
         # initial "Searching…" state (the first _resize_to ran before it).
         _resize_to(0)
         search_done = [0]  # track how many searches completed
-        total_searches = 3  # Google Scholar + CourtListener + English Reports
+        # Do not start or wait for the lazy opinion database here.  If it was
+        # already loaded, search it as an independent fourth Spotlight source;
+        # otherwise the three existing sources proceed unchanged.
+        loaded_opinion_db = self._loaded_opinion_db()
+        total_searches = 3 + (1 if loaded_opinion_db is not None else 0)
 
         def _update_status() -> None:
             if my_gen != self._spotlight_generation:
@@ -4761,8 +5041,9 @@ class CourtListenerGUI:
             cite_label = re.sub(r"\s+", " ", cite_m.group(0)).strip()
 
             def _open_appx(u=appx_url, t=cite_label):
-                _PdfWindow(self.root, u, t, self._status_var.set,
-                           app=self, is_case=True)
+                _open_case_law_pdf(
+                    self.root, u, t, self._status_var.set, app=self,
+                )
 
             self.root.after(
                 0, _add_result, "appx", "", f"{cite_label} — Federal Appendix",
@@ -4858,6 +5139,7 @@ class CourtListenerGUI:
                                 # and retry Scholar in the background.
                                 self._post_root(
                                     self._scholar_case_fallback, sr.url, cite,
+                                    "", True, sr.title,
                                 )
                         threading.Thread(target=run, daemon=True).start()
                     return open_it
@@ -4968,6 +5250,74 @@ class CourtListenerGUI:
             search_done[0] += 1
             self.root.after(0, _update_status)
 
+        def opinion_db_search() -> None:
+            """Surface saved Scholar opinions even when live Scholar succeeds.
+
+            ``GoogleScholarFetcher.search_cases`` keeps its database lookup as
+            an offline fallback.  Spotlight is different: a loaded personal
+            corpus is useful in its own right, so these at-most-three rows are
+            searched, Bluebook-named, ranked, and streamed independently.
+            """
+            db = loaded_opinion_db
+            try:
+                hits = _opinion_db_spotlight_results(db, query, limit=3)
+                for hit in hits:
+                    name = str(hit.get("name") or "").strip()
+                    court_id = str(hit.get("court") or "").strip().lower()
+                    year = str(hit.get("year") or "").strip()
+                    cites = hit.get("cites") or []
+                    cite = str(hit.get("cite") or (cites[0] if cites else ""))
+                    sid = str(hit.get("scholar_id") or "").strip()
+                    item = {
+                        "caseName": name,
+                        "citation": list(cites),
+                        "dateFiled": f"{year}-01-01" if year else "",
+                        "court_id": court_id,
+                    }
+
+                    def make_opener(scholar_id=sid, db_item=item):
+                        def open_it():
+                            def run() -> None:
+                                try:
+                                    rec = db.get_by_scholar_id(scholar_id) or {}
+                                except Exception as exc:
+                                    print(f"[spotlight-db] open failed: {exc}")
+                                    rec = {}
+                                html = rec.get("html") or ""
+                                url = rec.get("url") or (
+                                    f"https://scholar.google.com/"
+                                    f"scholar_case?case={scholar_id}"
+                                    if scholar_id else ""
+                                )
+                                if not html:
+                                    self._post_root(
+                                        self._spotlight_notify,
+                                        "That saved opinion could not be read.",
+                                    )
+                                    return
+
+                                def show() -> None:
+                                    try:
+                                        _ScholarTextWindow(
+                                            self.root, self, url, html,
+                                            item=db_item,
+                                        )
+                                    except tk.TclError:
+                                        pass
+
+                                self._post_root(show)
+
+                            threading.Thread(target=run, daemon=True).start()
+                        return open_it
+
+                    self.root.after(
+                        0, _add_result, "opiniondb", court_id, name, cite,
+                        year, "Opinion database", make_opener(),
+                    )
+            finally:
+                search_done[0] += 1
+                self.root.after(0, _update_status)
+
         # English Reports name search: offline, against our own index, so a
         # pre-1865 English case (which Scholar/CL often lack a clean scan of)
         # surfaces by name next to the online results.  search_by_name is
@@ -4999,6 +5349,8 @@ class CourtListenerGUI:
 
         threading.Thread(target=scholar_search, daemon=True).start()
         threading.Thread(target=cl_search, daemon=True).start()
+        if loaded_opinion_db is not None:
+            threading.Thread(target=opinion_db_search, daemon=True).start()
         threading.Thread(target=engrep_search, daemon=True).start()
 
     @staticmethod
@@ -5113,15 +5465,17 @@ class CourtListenerGUI:
             pass
 
     def _post_case_law_pdf(self, url: str, cite: str, pin: str = "",
-                           name: str = "") -> None:
+                           name: str = "", expected_name: str = "") -> None:
         title = f"{name} — {cite}" if name and cite else (cite or name)
         if pin:
             title += f" at {pin}"
 
         def open_pdf() -> None:
             self._status_var.set(f"Opening {cite or name} (case.law PDF)…")
-            _PdfWindow(self.root, url, title, self._status_var.set,
-                       app=self, is_case=True)
+            _open_case_law_pdf(
+                self.root, url, title, self._status_var.set, app=self,
+                expected_name=expected_name,
+            )
 
         self._post_root(open_pdf)
 
@@ -5142,9 +5496,9 @@ class CourtListenerGUI:
             if url:
                 title = f"{name} — {cite}" if name else cite
                 self._post_root(
-                    lambda u=url, t=title: _PdfWindow(
-                        self.root, u, t, self._status_var.set,
-                        app=self, is_case=True)
+                    lambda u=url, t=title: _open_case_law_pdf(
+                        self.root, u, t, self._status_var.set, app=self,
+                    )
                 )
                 return True
         if fetcher is not None:
@@ -6611,7 +6965,12 @@ class CourtListenerGUI:
         #      parallel cite before giving up; when more than one reporter scan
         #      exists, keep all of them for the case window's View PDF menu.
         if not is_scotus:
-            choices = _case_law_pdf_choices_for_cites(all_cites)
+            expected_name = re.sub(
+                r"<[^>]+>", "",
+                str(item.get("caseName") or item.get("case_name") or ""),
+            ).strip()
+            choices = _case_law_pdf_choices_for_cites(
+                all_cites, expected_name=expected_name)
             if choices:
                 item["_case_law_pdf_choices"] = choices
                 print(f"[resolve] using static.case.law PDF: {choices[0].url}")
@@ -6805,6 +7164,15 @@ class CourtListenerGUI:
             self._attach_opinion_db_to_scholar(db)
         return db
 
+    def _loaded_opinion_db(self):
+        """Return the opinion DB only if its lazy load already finished.
+
+        Spotlight uses this non-starting probe so its local-results pass never
+        makes the first quick search wait for (or initiate) an index rebuild.
+        """
+        with self._opinion_db_lock:
+            return self._opinion_db
+
     # ------------------------------------------------------------------
     # Software update  (Settings ▸ Check for Updates…)
     # ------------------------------------------------------------------
@@ -6962,9 +7330,10 @@ class CourtListenerGUI:
     def _open_selected_scholar_result(self) -> None:
         r = self._selected_scholar_result()
         if r is not None:
-            self._open_scholar_url(r.url, _scholar_result_cite(r))
+            self._open_scholar_url(r.url, _scholar_result_cite(r), r.title)
 
-    def _open_scholar_url(self, url: str, cite: str = "") -> None:
+    def _open_scholar_url(self, url: str, cite: str = "",
+                          name: str = "") -> None:
         """Open a Scholar case page (from the Scholar results column).  If the
         opinion page won't load, fall back to CourtListener via ``cite`` and
         retry Scholar in the background."""
@@ -6985,12 +7354,15 @@ class CourtListenerGUI:
                     "opened from Scholar search",
                 )
             else:
-                self.root.after(0, self._scholar_case_fallback, url, cite)
+                self.root.after(
+                    0, self._scholar_case_fallback, url, cite, "", True, name,
+                )
 
         threading.Thread(target=run, daemon=True).start()
 
     def _scholar_case_fallback(
         self, url: str, cite: str, pin: str = "", prefetch_pdf: bool = True,
+        name: str = "",
     ) -> None:
         """A Google Scholar opinion page failed to load (Google is flaky).  Show
         the CourtListener view located by the case's reporter citation and retry
@@ -7012,7 +7384,8 @@ class CourtListenerGUI:
                     if not target:
                         pdf = _case_law_pdf_for_cite(cite)
                         if pdf:
-                            self._post_case_law_pdf(pdf, cite, pin)
+                            self._post_case_law_pdf(
+                                pdf, cite, pin, expected_name=name)
                             return
                         self._post_root(
                             lambda: self._status_var.set(
@@ -7039,7 +7412,8 @@ class CourtListenerGUI:
                 except Exception as exc:
                     pdf = _case_law_pdf_for_cite(cite)
                     if pdf:
-                        self._post_case_law_pdf(pdf, cite, pin)
+                        self._post_case_law_pdf(
+                            pdf, cite, pin, expected_name=name)
                         return
                     self._post_root(
                         lambda e=exc: self._status_var.set(f"CourtListener: {e}")
@@ -7054,7 +7428,8 @@ class CourtListenerGUI:
             def try_pdf() -> None:
                 pdf = _case_law_pdf_for_cite(cite)
                 if pdf:
-                    self._post_case_law_pdf(pdf, cite, pin)
+                    self._post_case_law_pdf(
+                        pdf, cite, pin, expected_name=name)
                     return
                 self._post_root(
                     self._status_var.set,
@@ -7173,8 +7548,10 @@ class CourtListenerGUI:
             ).strip()
             title = f"{name} — {cite}" if name else cite
             self._status_var.set(f"Opening {cite} (case.law)…")
-            _PdfWindow(self.root, url, title, self._status_var.set,
-                       app=self, is_case=True)
+            _open_case_law_pdf(
+                self.root, url, title, self._status_var.set, app=self,
+                expected_name=name,
+            )
             return
         self._status_var.set("Federal Appendix case — opening the PDF…")
         _ScholarTextWindow(self.root, self, "", "", item=item)
@@ -15070,6 +15447,12 @@ class _ScholarTextWindow:
             # (then it is being copied, not omitted).
             omit_tags, n_omitted = self._omitted_footnote_tags(start, end)
         if with_cite:
+            # The appended citation already carries the reporter-page pin.
+            # Keeping inline ``*123`` markers in the quotation duplicates that
+            # pagination and interrupts the copied prose.  A plain copy (the
+            # checkbox unchecked) deliberately retains the markers.
+            omit_tags.add("pagenum")
+        if with_cite:
             # Pin cites and the writer parenthetical apply whenever the opinion
             # on screen actually carries reporter page markers — the Google
             # Scholar view and any CourtListener opinion assembled with page
@@ -16471,9 +16854,11 @@ class _ScholarTextWindow:
             appx = _static_case_law_url(cite)
             if appx:
                 self._status_var.set(f"Opening {cite} (case.law)…")
-                _PdfWindow(self._win, appx,
-                           cite + (f" at {pin}" if pin else ""),
-                           self._status_var.set, app=self._app, is_case=True)
+                _open_case_law_pdf(
+                    self._win, appx,
+                    cite + (f" at {pin}" if pin else ""),
+                    self._status_var.set, app=self._app,
+                )
                 return
         fetcher = self._app._get_scholar()
         label = cite if kind == "cite" else "cited case"
@@ -16550,13 +16935,14 @@ class _ScholarTextWindow:
     def _on_cl_link_error(self, msg: str) -> None:
         self._status_var.set(f"CourtListener: {msg}")
 
-    def _try_case_law_link_pdf(self, cite: str, pin: str = "") -> bool:
+    def _try_case_law_link_pdf(self, cite: str, pin: str = "",
+                               name: str = "") -> bool:
         if not cite:
             return False
         pdf = _case_law_pdf_for_cite(cite)
         if not pdf:
             return False
-        self._post(self._open_cited_case_pdf, pdf, cite, pin)
+        self._post(self._open_cited_case_pdf, pdf, cite, pin, name)
         return True
 
     def _follow_cite_via_cl(self, cite: str, pin: str = "", name: str = "",
@@ -16602,7 +16988,8 @@ class _ScholarTextWindow:
                     # open the unrelated "Kilbourn v. Thompson, 103 U.S. 168".
                     pdf = _case_law_pdf_for_cite(cite)
                     if pdf:
-                        self._post(self._open_cited_case_pdf, pdf, cite, pin)
+                        self._post(
+                            self._open_cited_case_pdf, pdf, cite, pin, name)
                         return
                 if target is None and name:
                     target = _cl_item_for_name(client, name)
@@ -16622,7 +17009,7 @@ class _ScholarTextWindow:
                     self._on_cl_link_ready, parts, blocks, plain, target, retry,
                 )
             except Exception as exc:
-                if self._try_case_law_link_pdf(cite, pin):
+                if self._try_case_law_link_pdf(cite, pin, name):
                     return
                 if retry:
                     self._post(self._retry_scholar_only, *retry)
@@ -16631,13 +17018,15 @@ class _ScholarTextWindow:
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _open_cited_case_pdf(self, url: str, cite: str, pin: str = "") -> None:
+    def _open_cited_case_pdf(self, url: str, cite: str, pin: str = "",
+                             expected_name: str = "") -> None:
         """Open a cited case's static.case.law PDF (the fallback when neither
         Google Scholar nor CourtListener has the opinion)."""
         self._status_var.set(f"Opening {cite} (case.law PDF)…")
-        _PdfWindow(
+        _open_case_law_pdf(
             self._win, url, cite + (f" at {pin}" if pin else ""),
-            self._status_var.set, app=self._app, is_case=True,
+            self._status_var.set, app=self._app,
+            expected_name=expected_name,
         )
 
     def _on_link_ready(self, result: Optional[tuple[str, str]],
@@ -16670,7 +17059,7 @@ class _ScholarTextWindow:
             self._status_var.set(f"Checking case.law for {cite}…")
 
             def run() -> None:
-                if self._try_case_law_link_pdf(cite, pin):
+                if self._try_case_law_link_pdf(cite, pin, name):
                     return
                 if fetcher is not None and (url_val or cite):
                     self._post(self._retry_scholar_only, cite, pin, url_val, name)
@@ -16983,6 +17372,11 @@ class _ScholarTextWindow:
         """The search-result-shaped dict used to resolve a PDF URL.  Falls back
         to the Bluebook citation when this window wasn't opened from a result."""
         item = dict(self._item) if self._item else {}
+        if not (item.get("caseName") or item.get("case_name")):
+            # A Scholar-only window may have no CourtListener item, but its
+            # parsed/Bluebooked caption is still authoritative enough to pick
+            # the right ``-01``/``-02`` CAP opinion on a shared reporter page.
+            item["caseName"] = self._bb.get("name", "")
         cites: list[str] = []
         raw = item.get("citation")
         if raw:
@@ -17032,7 +17426,7 @@ class _ScholarTextWindow:
         menu = tk.Menu(self._win, tearoff=0)
         for choice in choices:
             menu.add_command(
-                label=choice.cite,
+                label=choice.label or choice.cite,
                 command=lambda c=choice: self._view_pdf_choice(c),
             )
         try:
@@ -17748,6 +18142,126 @@ def _stat_cite_from_url(url: str) -> str:
     return f"{m.group(1)} Stat. {m.group(2)}" if m else "Statutes at Large"
 
 
+def _choose_case_law_page_opinion(
+    parent: tk.Misc, opinions: list[_CaseLawPageOpinion], title: str,
+) -> Optional[_CaseLawPageOpinion]:
+    """Ask which CAP case to open when several begin on one reporter page."""
+    dlg = _ui_toplevel(parent)
+    _ensure_modern_ttk_styles(dlg)
+    dlg.title("Choose Case")
+    dlg.geometry("640x330")
+    if parent.winfo_viewable():
+        dlg.transient(parent)
+    _ui_label(
+        dlg,
+        f"{len(opinions)} cases begin at {title}. Pick the case to open:",
+        size=13, weight="bold", anchor="w",
+    ).pack(anchor="w", fill="x", padx=14, pady=(12, 0))
+    box = _ui_frame(dlg, card=True)
+    box.pack(fill="both", expand=True, padx=12, pady=(8, 8))
+    lb_kw = dict(activestyle="dotbox", borderwidth=0, highlightthickness=0)
+    if _CTK_AVAILABLE:
+        lb_kw.update(
+            bg=_UI["window"], fg=_UI["text"],
+            selectbackground=_UI["selection"],
+            selectforeground=_UI["text"], font=("TkDefaultFont", 11),
+        )
+    lb = tk.Listbox(box, **lb_kw)
+    sb = ttk.Scrollbar(box, orient="vertical", command=lb.yview)
+    lb.configure(yscrollcommand=sb.set)
+    pad = 8 if _CTK_AVAILABLE else 0
+    sb.pack(side="right", fill="y", pady=pad, padx=(0, pad))
+    lb.pack(side="left", fill="both", expand=True, padx=(pad, 0), pady=pad)
+    for i, opinion in enumerate(opinions, 1):
+        lb.insert("end", _case_law_opinion_name(opinion) or f"Opinion {i}")
+    lb.selection_set(0)
+    chosen: dict[str, Optional[_CaseLawPageOpinion]] = {"opinion": None}
+
+    def finish(accept: bool) -> None:
+        selected = lb.curselection()
+        chosen["opinion"] = (
+            opinions[selected[0]] if accept and selected else None
+        )
+        dlg.destroy()
+
+    lb.bind("<Double-Button-1>", lambda _e: finish(True))
+    buttons = _ui_frame(dlg)
+    buttons.pack(fill="x", padx=14, pady=(0, 12))
+    _ui_button(
+        buttons, "Open", command=lambda: finish(True), primary=True, width=92,
+    ).pack(side="right")
+    _ui_button(
+        buttons, "Cancel", command=lambda: finish(False), width=88,
+    ).pack(side="right", padx=8)
+    dlg.bind("<Return>", lambda _e: finish(True))
+    dlg.bind("<Escape>", lambda _e: finish(False))
+    dlg.update_idletasks()
+    dlg.deiconify()
+    dlg.lift()
+    lb.focus_set()
+    try:
+        dlg.grab_set()
+    except tk.TclError:
+        pass
+    parent.wait_window(dlg)
+    return chosen["opinion"]
+
+
+def _open_case_law_pdf(
+    parent: tk.Misc, url: str, title: str, status=lambda _s: None, *,
+    app=None, expected_name: str = "",
+) -> None:
+    """Open a CAP PDF after resolving rare same-page multiple opinions.
+
+    ``expected_name`` is supplied only by a CourtListener/Scholar-backed view.
+    It is matched against CAP's JSON names automatically.  Direct citation/PDF
+    paths deliberately leave it empty, so a multi-opinion page asks the user.
+    """
+    m = _CASE_LAW_NUMBERED_PDF_RE.match((url or "").strip())
+    if not m or int(m.group(2)) != 1:
+        _PdfWindow(parent, url, title, status, app=app, is_case=True)
+        return
+
+    try:
+        status("Checking for other cases on this reporter pageâ€¦")
+    except tk.TclError:
+        pass
+
+    def post(fn, *args) -> None:
+        try:
+            parent.after(0, fn, *args)
+        except tk.TclError:
+            pass
+
+    def ready(opinions: list[_CaseLawPageOpinion]) -> None:
+        chosen = (
+            _match_case_law_page_opinion(opinions, expected_name)
+            if opinions and expected_name else None
+        )
+        if opinions and chosen is None:
+            chosen = _choose_case_law_page_opinion(parent, opinions, title)
+            if chosen is None:
+                try:
+                    status("Case selection cancelled.")
+                except tk.TclError:
+                    pass
+                return
+        final_url = chosen.url if chosen is not None else url
+        final_title = title
+        picked_name = _case_law_opinion_name(chosen) if chosen else ""
+        if picked_name and picked_name.lower() not in title.lower():
+            final_title = f"{picked_name} â€” {title}"
+        _PdfWindow(
+            parent, final_url, final_title, status, app=app, is_case=True,
+        )
+
+    def run() -> None:
+        opinions = _case_law_page_opinions(url)
+        post(ready, opinions)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 class _PdfWindow:
     """A standalone in-app PDF viewer (e.g. a Statutes at Large scan).  Reuses
     the centered, zoomable pane from the opinion window and adds a Download
@@ -17819,8 +18333,9 @@ class _PdfWindow:
         app, url, title = self._app, self._url, self._title
         payload = {"type": "pdf", "url": url, "title": title}
         return (f"pdf:{url}", title,
-                lambda: _PdfWindow(app.root, url, title, app=app,
-                                   is_case=True),
+                lambda: _open_case_law_pdf(
+                    app.root, url, title, app=app,
+                ),
                 payload)
 
     def _post(self, fn, *args) -> None:
