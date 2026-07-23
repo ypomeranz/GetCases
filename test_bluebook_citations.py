@@ -1441,6 +1441,38 @@ class CaseWindowModeTests(unittest.TestCase):
         manager._cycle_tab(1)
         self.assertEqual(manager.notebook.current, "one")
 
+    def test_tab_close_target_is_confined_to_the_far_right(self):
+        bbox = (10, 5, 120, 30)
+
+        self.assertFalse(
+            _CaseTabsWindow._point_in_tab_close_box(bbox, 93, 20)
+        )
+        self.assertTrue(
+            _CaseTabsWindow._point_in_tab_close_box(bbox, 94, 20)
+        )
+        self.assertTrue(
+            _CaseTabsWindow._point_in_tab_close_box(bbox, 129, 20)
+        )
+        self.assertFalse(
+            _CaseTabsWindow._point_in_tab_close_box(bbox, 130, 20)
+        )
+        self.assertFalse(
+            _CaseTabsWindow._point_in_tab_close_box(bbox, 110, 35)
+        )
+
+    def test_clicking_tab_close_target_destroys_only_that_page(self):
+        manager = object.__new__(_CaseTabsWindow)
+        page = Mock()
+        manager._tab_close_page_at = Mock(return_value=page)
+        manager._cancel_tab_long_press = Mock()
+        manager._set_tab_close_hover = Mock()
+        event = SimpleNamespace(x=125, y=12)
+
+        self.assertEqual(manager._close_tab_from_click(event), "break")
+        page.destroy.assert_called_once_with()
+        manager._cancel_tab_long_press.assert_called_once_with()
+        manager._set_tab_close_hover.assert_called_once_with(None)
+
     def test_pop_out_reopens_one_tab_in_a_new_tab_group(self):
         app = object.__new__(CourtListenerGUI)
         app.root = object()

@@ -572,6 +572,8 @@ class _CaseTabPage(ttk.Frame):
 class _CaseTabsWindow:
     """One OS window containing all opinion views as notebook pages."""
 
+    _TAB_CLOSE_HIT_WIDTH = 36
+
     def __init__(self, app, parent: tk.Misc) -> None:
         self.app = app
         self.win = _ui_toplevel(parent)
@@ -586,6 +588,11 @@ class _CaseTabsWindow:
             self.win, style=_ensure_case_tab_style(self.win),
         )
         self.notebook.pack(fill="both", expand=True, padx=1, pady=(0, 1))
+        (
+            self._tab_close_image,
+            self._tab_close_hover_image,
+        ) = _case_tab_close_images(self.win)
+        self._close_hover_page: Optional[_CaseTabPage] = None
         self._pages: list[_CaseTabPage] = []
         self._geometry_set = False
         self._closing = False
@@ -595,6 +602,15 @@ class _CaseTabsWindow:
         self.notebook.bind("<Button-3>", self._show_tab_context_menu)
         self.notebook.bind("<Button-2>", self._show_tab_context_menu)
         self.notebook.bind("<Control-Button-1>", self._show_tab_context_menu)
+        self.notebook.bind(
+            "<Button-1>", self._close_tab_from_click, add="+",
+        )
+        self.notebook.bind(
+            "<Motion>", self._track_tab_close_hover, add="+",
+        )
+        self.notebook.bind(
+            "<Leave>", lambda _e: self._set_tab_close_hover(None), add="+",
+        )
         self.notebook.bind("<ButtonPress-1>", self._start_tab_long_press, add="+")
         self.notebook.bind(
             "<ButtonRelease-1>", self._cancel_tab_long_press, add="+"
@@ -615,13 +631,18 @@ class _CaseTabsWindow:
 
     def add_page(self, page: _CaseTabPage) -> None:
         self._pages.append(page)
-        self.notebook.add(page, text="Opinion")
+        self.notebook.add(
+            page, text="Opinion", image=self._tab_close_image,
+            compound="right",
+        )
         self.notebook.select(page)
         self.refresh_page(page)
 
     def remove_page(self, page: _CaseTabPage) -> None:
         if page not in self._pages:
             return
+        if self._close_hover_page is page:
+            self._set_tab_close_hover(None)
         self._pages.remove(page)
         try:
             self.notebook.forget(page)
@@ -659,6 +680,60 @@ class _CaseTabsWindow:
             self.notebook.select(tabs[(current + delta) % len(tabs)])
         except tk.TclError:
             pass
+        return "break"
+
+    @classmethod
+    def _point_in_tab_close_box(
+        cls, bbox: tuple[int, int, int, int], x: int, y: int,
+    ) -> bool:
+        """Whether *(x, y)* is in the compact close target at a tab's right."""
+        left, top, width, height = bbox
+        return (
+            left + max(0, width - cls._TAB_CLOSE_HIT_WIDTH) <= x
+            < left + width
+            and top <= y < top + height
+        )
+
+    def _tab_close_page_at(
+        self, x: int, y: int,
+    ) -> "Optional[_CaseTabPage]":
+        page = self._page_at(x, y)
+        if page is None:
+            return None
+        try:
+            bbox = self.notebook.bbox(self.notebook.index(page))
+        except (tk.TclError, ValueError):
+            return None
+        return page if self._point_in_tab_close_box(bbox, x, y) else None
+
+    def _set_tab_close_hover(
+        self, page: "Optional[_CaseTabPage]",
+    ) -> None:
+        if page is self._close_hover_page:
+            return
+        old = self._close_hover_page
+        self._close_hover_page = page
+        try:
+            if old in self._pages:
+                self.notebook.tab(old, image=self._tab_close_image)
+            if page in self._pages:
+                self.notebook.tab(page, image=self._tab_close_hover_image)
+            self.notebook.configure(cursor="hand2" if page is not None else "")
+        except tk.TclError:
+            self._close_hover_page = None
+
+    def _track_tab_close_hover(self, event) -> None:
+        self._set_tab_close_hover(
+            self._tab_close_page_at(event.x, event.y)
+        )
+
+    def _close_tab_from_click(self, event):
+        page = self._tab_close_page_at(event.x, event.y)
+        if page is None:
+            return None
+        self._cancel_tab_long_press()
+        self._set_tab_close_hover(None)
+        page.destroy()
         return "break"
 
     def _show_tab_context_menu(self, event=None, page=None):
@@ -1105,7 +1180,7 @@ def _ensure_case_tab_style(widget: tk.Misc) -> str:
         bordercolor="#b9c0cb",
         lightcolor="#b9c0cb",
         darkcolor="#b9c0cb",
-        padding=(16, 9),
+        padding=(16, 9, 8, 9),
         font=("TkDefaultFont", 10),
         focuscolor=_UI["accent"],
     )
@@ -1128,6 +1203,31 @@ def _ensure_case_tab_style(widget: tk.Misc) -> str:
     )
     _CASE_TAB_STYLED_INTERPRETERS.add(interpreter)
     return _CASE_TAB_STYLE
+
+
+def _case_tab_close_images(
+    widget: tk.Misc,
+) -> tuple[tk.PhotoImage, tk.PhotoImage]:
+    """Create the normal and hover artwork for a tab's compact close box."""
+
+    def image(*, hover: bool) -> tk.PhotoImage:
+        close = tk.PhotoImage(master=widget, width=18, height=14)
+        if hover:
+            close.put("#fbe9e7", to=(4, 1, 17, 14))
+            outline, mark = "#c96b63", _UI["danger"]
+        else:
+            outline, mark = "#c3c8d0", "#68717e"
+        close.put(outline, to=(4, 1, 17, 2))
+        close.put(outline, to=(4, 13, 17, 14))
+        close.put(outline, to=(4, 1, 5, 14))
+        close.put(outline, to=(16, 1, 17, 14))
+        for offset in range(4):
+            close.put(mark, to=(8 + offset, 5 + offset, 10 + offset, 7 + offset))
+            close.put(mark, to=(11 - offset, 5 + offset,
+                                13 - offset, 7 + offset))
+        return close
+
+    return image(hover=False), image(hover=True)
 
 
 from bluebook_names import (
