@@ -398,8 +398,8 @@ def _history_button(app, parent_frame):
     return btn
 
 
-def _install_history_menubar(app, win: tk.Toplevel):
-    """Attach a top History menu to case windows."""
+def _install_history_menubar(app, win: tk.Misc):
+    """Attach the shared History and Window menus to case views."""
     if app is None or not hasattr(app, "populate_history_menu"):
         return None
     menubar = tk.Menu(win)
@@ -412,11 +412,376 @@ def _install_history_menubar(app, win: tk.Toplevel):
         pass
     app.populate_history_menu(history_menu)
     menubar.add_cascade(label="History", menu=history_menu)
+    if hasattr(app, "populate_window_menu"):
+        window_menu = tk.Menu(menubar, tearoff=0)
+        try:
+            window_menu.configure(
+                postcommand=lambda m=window_menu, w=win:
+                    app.populate_window_menu(m, w)
+            )
+        except tk.TclError:
+            pass
+        app.populate_window_menu(window_menu, win)
+        menubar.add_cascade(label="Window", menu=window_menu)
     try:
         win.config(menu=menubar)
     except tk.TclError:
         return None
     return menubar
+
+
+def _install_window_menubar(app, win: tk.Misc):
+    """Attach the shared Window menu to a non-case document view."""
+    if app is None or not hasattr(app, "populate_window_menu"):
+        return None
+    menubar = tk.Menu(win)
+    window_menu = tk.Menu(menubar, tearoff=0)
+    try:
+        window_menu.configure(
+            postcommand=lambda m=window_menu, w=win:
+                app.populate_window_menu(m, w)
+        )
+    except tk.TclError:
+        pass
+    app.populate_window_menu(window_menu, win)
+    menubar.add_cascade(label="Window", menu=window_menu)
+    try:
+        win.config(menu=menubar)
+    except tk.TclError:
+        return None
+    return menubar
+
+
+class _CaseTabPage(ttk.Frame):
+    """A notebook page that supplies the small Toplevel API case viewers use.
+
+    Opinion viewers build the same widget tree regardless of whether their
+    host is a real OS window or one page in the app-wide tabbed case window.
+    Geometry, title, menu, and window-level key bindings are delegated to the
+    notebook's Toplevel; ordinary widget operations remain local to the page.
+    """
+
+    def __init__(self, manager: "_CaseTabsWindow") -> None:
+        super().__init__(manager.notebook)
+        self._manager = manager
+        self._case_title = "Opinion"
+        self._case_menu = None
+        manager.add_page(self)
+
+    def title(self, value=None):
+        if value is None:
+            return self._case_title
+        self._case_title = str(value)
+        self._manager.refresh_page(self)
+        return None
+
+    def geometry(self, spec=None):
+        if spec is None:
+            return self._manager.win.geometry()
+        self._manager.apply_geometry(str(spec))
+        return None
+
+    def minsize(self, width=None, height=None):
+        if width is None or height is None:
+            return self._manager.win.minsize()
+        self._manager.win.minsize(width, height)
+        return None
+
+    def config(self, cnf=None, **kw):
+        opts = {}
+        if isinstance(cnf, dict):
+            opts.update(cnf)
+        elif cnf is not None:
+            return super().config(cnf, **kw)
+        opts.update(kw)
+        if "menu" in opts:
+            self._case_menu = opts.pop("menu")
+            self._manager.refresh_page(self)
+        if opts:
+            return super().config(**opts)
+        return None
+
+    configure = config
+
+    def bind(self, sequence=None, func=None, add=None):
+        # Toplevel bindings are present in every descendant's bindtags.  A
+        # Frame is not, so route keyboard shortcuts through the shared window
+        # and dispatch them only while this page is selected.
+        if sequence and (
+            str(sequence).startswith("<Control-")
+            or str(sequence).startswith("<Command-")
+            or str(sequence) in ("<F3>", "<Shift-F3>", "<Escape>")
+        ):
+            def active_only(event, page=self, callback=func):
+                if page._manager.active_page() is page and callback is not None:
+                    return callback(event)
+                return None
+            return self._manager.win.bind(sequence, active_only, add="+")
+        return super().bind(sequence, func, add)
+
+    def protocol(self, name=None, func=None):
+        if name == "WM_DELETE_WINDOW" and func is not None:
+            # The shared OS window owns its own close-all protocol.  Individual
+            # pages keep this only as metadata; their cleanup belongs on a
+            # <Destroy> binding so Close Tab and Pop Out run it too.
+            self._wm_delete_callback = func
+            return None
+        return self._manager.win.protocol(name, func)
+
+    def transient(self, master=None):
+        return self._manager.win.transient(master)
+
+    def winfo_x(self):
+        return self._manager.win.winfo_x()
+
+    def winfo_y(self):
+        return self._manager.win.winfo_y()
+
+    def destroy(self) -> None:
+        manager = getattr(self, "_manager", None)
+        if manager is not None:
+            manager.remove_page(self)
+        try:
+            super().destroy()
+        except tk.TclError:
+            pass
+
+
+class _CaseTabsWindow:
+    """One OS window containing all opinion views as notebook pages."""
+
+    def __init__(self, app, parent: tk.Misc) -> None:
+        self.app = app
+        self.win = _ui_toplevel(parent)
+        self.win.title("Cases")
+        self.win.geometry(
+            _fit_toplevel_geometry(
+                self.win, 980, 780, min_width=560, min_height=360
+            )
+        )
+        self.win.minsize(560, 360)
+        self.notebook = ttk.Notebook(
+            self.win, style=_ensure_case_tab_style(self.win),
+        )
+        self.notebook.pack(fill="both", expand=True, padx=1, pady=(0, 1))
+        self._pages: list[_CaseTabPage] = []
+        self._geometry_set = False
+        self._closing = False
+        self._long_press_after = None
+        self._long_press_xy = (0, 0)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self.notebook.bind("<Button-3>", self._show_tab_context_menu)
+        self.notebook.bind("<Button-2>", self._show_tab_context_menu)
+        self.notebook.bind("<Control-Button-1>", self._show_tab_context_menu)
+        self.notebook.bind("<ButtonPress-1>", self._start_tab_long_press, add="+")
+        self.notebook.bind(
+            "<ButtonRelease-1>", self._cancel_tab_long_press, add="+"
+        )
+        self.notebook.bind("<B1-Motion>", self._track_tab_long_press, add="+")
+        self.win.bind("<Control-Tab>", lambda _e: self._cycle_tab(1))
+        self.win.bind(
+            "<Control-Shift-Tab>", lambda _e: self._cycle_tab(-1)
+        )
+        try:
+            self.win.bind(
+                "<Control-ISO_Left_Tab>", lambda _e: self._cycle_tab(-1)
+            )
+        except tk.TclError:
+            pass  # Windows Tk has no ISO_Left_Tab keysym.
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self.win.bind("<Destroy>", self._on_destroy, add="+")
+
+    def add_page(self, page: _CaseTabPage) -> None:
+        self._pages.append(page)
+        self.notebook.add(page, text="Opinion")
+        self.notebook.select(page)
+        self.refresh_page(page)
+
+    def remove_page(self, page: _CaseTabPage) -> None:
+        if page not in self._pages:
+            return
+        self._pages.remove(page)
+        try:
+            self.notebook.forget(page)
+        except tk.TclError:
+            pass
+        if not self._pages and not self._closing:
+            self.close()
+        else:
+            self._sync_active()
+
+    def active_page(self) -> "Optional[_CaseTabPage]":
+        try:
+            selected = self.notebook.select()
+        except tk.TclError:
+            return None
+        for page in self._pages:
+            if str(page) == selected:
+                return page
+        return None
+
+    def _page_at(self, x: int, y: int) -> "Optional[_CaseTabPage]":
+        try:
+            index = self.notebook.index(f"@{x},{y}")
+            tab_id = self.notebook.tabs()[index]
+        except (tk.TclError, IndexError):
+            return None
+        return next((page for page in self._pages if str(page) == tab_id), None)
+
+    def _cycle_tab(self, delta: int) -> str:
+        tabs = self.notebook.tabs()
+        if len(tabs) < 2:
+            return "break"
+        try:
+            current = self.notebook.index(self.notebook.select())
+            self.notebook.select(tabs[(current + delta) % len(tabs)])
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _show_tab_context_menu(self, event=None, page=None):
+        self._cancel_tab_long_press()
+        if page is None and event is not None:
+            page = self._page_at(event.x, event.y)
+        if page is None:
+            return None
+        try:
+            self.notebook.select(page)
+        except tk.TclError:
+            return None
+        menu = tk.Menu(self.win, tearoff=0)
+        menu.add_command(label="Close Tab", command=page.destroy)
+        can_pop = bool(
+            hasattr(self.app, "can_pop_out_view")
+            and self.app.can_pop_out_view(page)
+        )
+        menu.add_command(
+            label="Pop Out into New Window",
+            state="normal" if can_pop else "disabled",
+            command=lambda p=page: self.app.pop_out_view(p),
+        )
+        try:
+            if event is not None:
+                x_root, y_root = event.x_root, event.y_root
+            else:
+                x_root = page.winfo_rootx() + 24
+                y_root = self.notebook.winfo_rooty() + 24
+            menu.tk_popup(x_root, y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except tk.TclError:
+                pass
+        return "break"
+
+    def _start_tab_long_press(self, event) -> None:
+        self._cancel_tab_long_press()
+        page = self._page_at(event.x, event.y)
+        if page is None:
+            return
+        self._long_press_xy = (event.x_root, event.y_root)
+
+        def show(page=page) -> None:
+            self._long_press_after = None
+            event_like = type("_TabMenuEvent", (), {
+                "x_root": self._long_press_xy[0],
+                "y_root": self._long_press_xy[1],
+            })()
+            self._show_tab_context_menu(event_like, page)
+
+        self._long_press_after = self.notebook.after(650, show)
+
+    def _track_tab_long_press(self, event) -> None:
+        x0, y0 = self._long_press_xy
+        if abs(event.x_root - x0) > 8 or abs(event.y_root - y0) > 8:
+            self._cancel_tab_long_press()
+
+    def _cancel_tab_long_press(self, _event=None) -> None:
+        if self._long_press_after is None:
+            return
+        try:
+            self.notebook.after_cancel(self._long_press_after)
+        except tk.TclError:
+            pass
+        self._long_press_after = None
+
+    @staticmethod
+    def _tab_label(title: str) -> str:
+        label = re.sub(r"\s+", " ", title or "").strip() or "Opinion"
+        return label if len(label) <= 52 else label[:49] + "..."
+
+    def refresh_page(self, page: _CaseTabPage) -> None:
+        if page not in self._pages:
+            return
+        try:
+            self.notebook.tab(page, text=self._tab_label(page._case_title))
+        except tk.TclError:
+            return
+        if self.active_page() is page:
+            self._sync_active()
+
+    def apply_geometry(self, spec: str) -> None:
+        # Each viewer chooses a good initial size.  Honor the first page's
+        # request; later tabs should not resize the shared window underneath
+        # the reader as they are opened in the background.
+        if self._geometry_set:
+            return
+        self._geometry_set = True
+        try:
+            self.win.geometry(spec)
+        except tk.TclError:
+            pass
+
+    def _on_tab_changed(self, _event=None) -> None:
+        self._sync_active()
+
+    def _sync_active(self) -> None:
+        page = self.active_page()
+        if page is None:
+            return
+        try:
+            self.win.title(page._case_title)
+            if page._case_menu is not None:
+                self.win.config(menu=page._case_menu)
+            else:
+                self.win.config(menu="")
+        except tk.TclError:
+            pass
+
+    def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        for page in list(self._pages):
+            try:
+                page.destroy()
+            except tk.TclError:
+                pass
+        self._pages.clear()
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+    def _on_destroy(self, event) -> None:
+        if event.widget is self.win and hasattr(
+            self.app, "_case_tabs_window_destroyed"
+        ):
+            self.app._case_tabs_window_destroyed(self)
+
+
+def _case_view_host(parent: tk.Misc, app):
+    """Return a standalone Toplevel or a page in the shared case notebook."""
+    if app is not None and hasattr(app, "new_case_view_host"):
+        return app.new_case_view_host(parent)
+    return _ui_toplevel(parent)
+
+
+def _secondary_view_host(parent: tk.Misc, app):
+    """Host any non-modal document/tool view in the shared notebook mode."""
+    if app is not None and hasattr(app, "new_secondary_view_host"):
+        return app.new_secondary_view_host(parent)
+    return _ui_toplevel(parent)
 
 
 def _ui_checkbox(parent, text: str, variable, command=None):
@@ -548,6 +913,9 @@ def _ui_entry(parent, textvariable=None, show: Optional[str] = None):
 
 
 _MODERN_TTK_READY = False
+_CASE_TAB_STYLE = "CaseTabs.TNotebook"
+_CASE_TAB_IMAGES: list[tk.PhotoImage] = []
+_CASE_TAB_STYLED_INTERPRETERS: set[int] = set()
 
 
 def _ensure_modern_ttk_styles(widget: tk.Misc) -> None:
@@ -604,6 +972,113 @@ def _ensure_modern_ttk_styles(widget: tk.Misc) -> None:
     except tk.TclError:
         pass
     _MODERN_TTK_READY = True
+
+
+def _ensure_case_tab_style(widget: tk.Misc) -> str:
+    """Install the high-contrast notebook style used by tabbed document views.
+
+    Native notebook tabs can lose their edges under some Windows themes.  A
+    small stretchable image element gives every tab a reliable outline while
+    the style map makes the selected and hovered states unmistakable.
+    """
+    interpreter = id(widget.tk)
+    if interpreter in _CASE_TAB_STYLED_INTERPRETERS:
+        return _CASE_TAB_STYLE
+
+    style = ttk.Style(widget)
+    tab_style = f"{_CASE_TAB_STYLE}.Tab"
+
+    def tab_image(fill: str, border: str, indicator: str = ""):
+        size = 16
+        image = tk.PhotoImage(master=widget, width=size, height=size)
+        image.put(fill, to=(0, 0, size, size))
+        image.put(border, to=(0, 0, size, 1))
+        image.put(border, to=(0, size - 1, size, size))
+        image.put(border, to=(0, 0, 1, size))
+        image.put(border, to=(size - 1, 0, size, size))
+        if indicator:
+            image.put(indicator, to=(1, 1, size - 1, 4))
+        return image
+
+    normal = tab_image("#eef0f4", "#b9c0cb")
+    hover = tab_image("#e4ebf7", "#7f9dcc")
+    selected = tab_image("#ffffff", _UI["accent"], _UI["accent"])
+    disabled = tab_image("#f5f6f8", "#d5d8de")
+    images = (normal, hover, selected, disabled)
+
+    try:
+        style.element_create(
+            "CaseTabs.tab",
+            "image",
+            normal,
+            ("selected", selected),
+            ("active", hover),
+            ("disabled", disabled),
+            border=(5, 5, 5, 5),
+            sticky="nswe",
+        )
+
+        def replace_tab_element(layout):
+            replaced = []
+            for element, options in layout:
+                options = dict(options)
+                children = options.get("children")
+                if children:
+                    options["children"] = replace_tab_element(children)
+                if element == "Notebook.tab":
+                    element = "CaseTabs.tab"
+                replaced.append((element, options))
+            return replaced
+
+        style.layout(
+            tab_style,
+            replace_tab_element(style.layout("TNotebook.Tab")),
+        )
+        _CASE_TAB_IMAGES.extend(images)
+    except tk.TclError:
+        # The named style below still improves contrast on themes that do not
+        # allow a custom element to be added.
+        pass
+
+    style.configure(
+        _CASE_TAB_STYLE,
+        background="#dfe3ea",
+        bordercolor="#b9c0cb",
+        lightcolor="#dfe3ea",
+        darkcolor="#dfe3ea",
+        borderwidth=1,
+        tabmargins=(10, 8, 10, 0),
+    )
+    style.configure(
+        tab_style,
+        background="#eef0f4",
+        foreground="#4d5563",
+        bordercolor="#b9c0cb",
+        lightcolor="#b9c0cb",
+        darkcolor="#b9c0cb",
+        padding=(16, 9),
+        font=("TkDefaultFont", 10),
+        focuscolor=_UI["accent"],
+    )
+    style.map(
+        tab_style,
+        background=[
+            ("selected", "#ffffff"),
+            ("active", "#e4ebf7"),
+        ],
+        foreground=[
+            ("selected", "#173d7a"),
+            ("active", "#244f91"),
+            ("disabled", _UI["muted"]),
+        ],
+        font=[
+            ("selected", ("TkDefaultFont", 10, "bold")),
+            ("!selected", ("TkDefaultFont", 10)),
+        ],
+        expand=[("selected", (0, 2, 0, 0))],
+    )
+    _CASE_TAB_STYLED_INTERPRETERS.add(interpreter)
+    return _CASE_TAB_STYLE
 
 
 from bluebook_names import (
@@ -1806,6 +2281,105 @@ def _case_law_name_for_cites(cites) -> str:
     return ""
 
 
+@dataclass(frozen=True)
+class _CaseLawTextRecord:
+    """Parsed opinion text and display metadata from one exact CAP JSON file."""
+    text: str
+    citation: str
+    item: dict
+    json_url: str = ""
+
+
+def _case_law_text_record(
+    data, fallback_cite: str = "", json_url: str = "",
+) -> "Optional[_CaseLawTextRecord]":
+    """Turn a static.case.law case JSON object into a text-view record."""
+    if not isinstance(data, dict):
+        return None
+
+    name = re.sub(r"\s+", " ", str(
+        data.get("name_abbreviation") or data.get("name") or ""
+    )).strip()
+    citation_rows = data.get("citations") or []
+    cites = [
+        re.sub(r"\s+", " ", str(row.get("cite") or "")).strip()
+        for row in citation_rows if isinstance(row, dict) and row.get("cite")
+    ]
+    official = next((
+        re.sub(r"\s+", " ", str(row.get("cite") or "")).strip()
+        for row in citation_rows
+        if isinstance(row, dict) and row.get("type") == "official"
+        and row.get("cite")
+    ), "")
+    cite_str = official or (cites[0] if cites else "") or fallback_cite
+    court_data = data.get("court") or {}
+    if not isinstance(court_data, dict):
+        court_data = {}
+    court = str(
+        court_data.get("name_abbreviation")
+        or court_data.get("name") or ""
+    ).strip()
+    court_id = str(
+        court_data.get("slug")
+        or court_data.get("id") or ""
+    ).strip()
+    date = str(data.get("decision_date") or "")
+    year = date[:4] if len(date) >= 4 else ""
+    paren = " ".join(p for p in (court, year) if p)
+    stem = ", ".join(p for p in (name, cite_str) if p) or cite_str
+    if paren:
+        stem = f"{stem} ({paren})" if stem else f"({paren})"
+
+    body = data.get("casebody") or {}
+    # Some CAP exports nest the opinion under casebody["data"].
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        body = body["data"]
+    if not isinstance(body, dict):
+        return None
+    chunks: list[str] = []
+    head = str(body.get("head_matter") or "").strip()
+    if head:
+        chunks.append(head)
+    for op in body.get("opinions") or []:
+        if not isinstance(op, dict):
+            continue
+        text = str(op.get("text") or "").strip()
+        if text:
+            author = str(op.get("author") or "").strip()
+            chunks.append(
+                f"{author}\n{text}"
+                if author and not text.startswith(author) else text
+            )
+    text = "\n\n".join(chunks).strip()
+    if not text:
+        return None
+    item = {
+        "caseName": name,
+        "citation": cites or ([cite_str] if cite_str else []),
+        "court": court,
+        "court_id": court_id,
+        "dateFiled": date,
+    }
+    return _CaseLawTextRecord(text, stem, item, json_url)
+
+
+def _case_law_text_for_pdf_url(
+    pdf_url: str, fallback_cite: str = "",
+) -> "Optional[_CaseLawTextRecord]":
+    """Fetch the JSON corresponding to this exact numbered CAP case PDF."""
+    json_url = _case_law_json_for_pdf_url(pdf_url)
+    if not json_url:
+        return None
+    try:
+        resp = _anon_session.get(json_url, timeout=15)
+        if resp.status_code != 200:
+            return None
+        return _case_law_text_record(resp.json(), fallback_cite, json_url)
+    except Exception as exc:
+        print(f"[case.law-text] JSON fetch failed for {json_url}: {exc}")
+        return None
+
+
 def _case_law_json_case(cite: str) -> "Optional[tuple[str, str]]":
     """Fetch and parse static.case.law's per-case JSON for *cite*, returning
     ``(opinion_text, bluebook_citation)`` or None.
@@ -1818,43 +2392,8 @@ def _case_law_json_case(cite: str) -> "Optional[tuple[str, str]]":
     if not data:
         return None
 
-    name = re.sub(r"\s+", " ", str(
-        data.get("name_abbreviation") or data.get("name") or "")).strip()
-    cites = data.get("citations") or []
-    official = next((c.get("cite") for c in cites
-                     if isinstance(c, dict) and c.get("type") == "official"
-                     and c.get("cite")), "")
-    cite_str = official or (
-        cites[0].get("cite") if cites and isinstance(cites[0], dict) else "") \
-        or cite
-    court = str((data.get("court") or {}).get("name_abbreviation") or "").strip()
-    date = str(data.get("decision_date") or "")
-    year = date[:4] if len(date) >= 4 else ""
-    paren = " ".join(p for p in (court, year) if p)
-    stem = ", ".join(p for p in (name, cite_str) if p) or cite_str
-    if paren:
-        stem = f"{stem} ({paren})" if stem else f"({paren})"
-
-    body = data.get("casebody") or {}
-    # Some CAP exports nest the opinion under casebody["data"].
-    if isinstance(body, dict) and isinstance(body.get("data"), dict):
-        body = body["data"]
-    chunks: list[str] = []
-    head = str(body.get("head_matter") or "").strip()
-    if head:
-        chunks.append(head)
-    for op in body.get("opinions") or []:
-        if not isinstance(op, dict):
-            continue
-        text = str(op.get("text") or "").strip()
-        if text:
-            author = str(op.get("author") or "").strip()
-            chunks.append(f"{author}\n{text}" if author
-                          and not text.startswith(author) else text)
-    text = "\n\n".join(chunks).strip()
-    if not text:
-        return None
-    return text, stem
+    record = _case_law_text_record(data, cite)
+    return (record.text, record.citation) if record is not None else None
 
 
 def _link_name(text: str) -> str:
@@ -3549,6 +4088,79 @@ except ImportError:
     def fix_title_comma(text: str) -> str:  # graceful degradation
         return text
 
+@dataclass(frozen=True)
+class _CasePdfTextSource:
+    """A text representation discovered for a PDF-first case."""
+    kind: str
+    button_label: str
+    source_label: str
+    source_url: str
+    text: str
+    item: dict
+    parts: list
+    blocks: list
+    case_law_record: "Optional[_CaseLawTextRecord]" = None
+
+
+def _case_pdf_text_source(
+    pdf_url: str, title: str, client=None,
+) -> "Optional[_CasePdfTextSource]":
+    """Prefer CourtListener text for a CAP PDF, then its exact CAP JSON text."""
+    parsed = _parse_citation_line(title or "")
+    fallback_cite = parsed[1] if parsed else ""
+    fallback_name = parsed[0] if parsed else ""
+    record = _case_law_text_for_pdf_url(pdf_url, fallback_cite)
+    if record is not None:
+        name = str(record.item.get("caseName") or "").strip() or fallback_name
+        cites = _cluster_citations_to_strings(record.item.get("citation", []))
+    else:
+        name = fallback_name
+        cites = [fallback_cite] if fallback_cite else []
+
+    if client is not None:
+        try:
+            target = None
+            for cite in cites:
+                target = _cl_item_for_citation(client, cite, name=name)
+                if target:
+                    break
+            if target:
+                # CAP often has better reporter metadata than a sparse CL
+                # search result.  Preserve it as a fallback for the title.
+                target = dict(target)
+                if record is not None:
+                    target.setdefault("caseName", record.item.get("caseName", ""))
+                    target.setdefault("citation", record.item.get("citation", []))
+                    target.setdefault("dateFiled", record.item.get("dateFiled", ""))
+                    target.setdefault("court", record.item.get("court", ""))
+                    target.setdefault("court_id", record.item.get("court_id", ""))
+                parts, blocks, plain, _cluster = _assemble_case_parts(
+                    client, target
+                )
+                text = plain or _assemble_case_text(client, target)
+                if (text or "").strip():
+                    source_url = str(
+                        target.get("absolute_url")
+                        or target.get("cluster_absolute_url") or ""
+                    ).strip()
+                    if source_url.startswith("/"):
+                        source_url = "https://www.courtlistener.com" + source_url
+                    return _CasePdfTextSource(
+                        "courtlistener", "CourtListener Text",
+                        "CourtListener", source_url, text, target,
+                        parts or [], blocks or [], record,
+                    )
+        except Exception as exc:
+            print(f"[pdf-text] CourtListener discovery failed: {exc}")
+
+    if record is None:
+        return None
+    return _CasePdfTextSource(
+        "case_law", "static.case.law Text", "static.case.law",
+        record.json_url, record.text, record.item, [], [], record,
+    )
+
+
 try:
     from pynput import keyboard as _pynput_keyboard
 
@@ -3633,6 +4245,18 @@ class CourtListenerGUI:
         self._hotkey_listener = None
         self._spotlight_hotkey = _load_saved_spotlight_hotkey()
         self._root_hidden = False
+
+        # Opinion windows can remain separate (the default) or share one
+        # notebook Toplevel.  Viewers register no-refetch reopen callbacks so
+        # changing modes can migrate every case already on screen.
+        config = _load_config()
+        self._case_tabs_enabled = bool(config.get("case_tabs_enabled", False))
+        self._case_tabs_var = tk.BooleanVar(
+            master=self.root, value=self._case_tabs_enabled
+        )
+        self._case_tabs_window: Optional[_CaseTabsWindow] = None
+        self._detached_tab_windows: set[_CaseTabsWindow] = set()
+        self._open_case_views: dict[int, dict] = {}
 
         # Recently viewed cases, most recent first, for the "History ▾"
         # dropdown every case window carries: {"key", "label", "reopen"}.
@@ -3846,6 +4470,169 @@ class CourtListenerGUI:
                 menu.grab_release()
             except tk.TclError:
                 pass
+
+    # ------------------------------------------------------------------
+    # Opinion-window mode (separate OS windows or one tabbed window)
+    # ------------------------------------------------------------------
+
+    def populate_window_menu(self, menu: tk.Menu, view=None) -> None:
+        """Fill the Window menu shown beside History on every opinion."""
+        try:
+            menu.delete(0, "end")
+        except tk.TclError:
+            return
+        menu.add_checkbutton(
+            label="Show All Windows in Tabbed View",
+            variable=self._case_tabs_var,
+            command=lambda: self.set_case_tabs_enabled(
+                bool(self._case_tabs_var.get())
+            ),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="Close Current Tab" if isinstance(view, _CaseTabPage)
+            else "Close Window",
+            command=(view.destroy if view is not None else lambda: None),
+        )
+
+    def new_case_view_host(self, parent: tk.Misc):
+        """Compatibility name for opinion viewers."""
+        return self.new_secondary_view_host(parent)
+
+    def new_secondary_view_host(self, parent: tk.Misc):
+        """Host a new non-modal view according to the current Window mode."""
+        if not self._case_tabs_enabled:
+            return _ui_toplevel(parent)
+        manager = self._tab_manager_for_parent(parent)
+        if manager is not None:
+            return _CaseTabPage(manager)
+        manager = self._case_tabs_window
+        if manager is None:
+            manager = _CaseTabsWindow(self, self.root)
+            self._case_tabs_window = manager
+        return _CaseTabPage(manager)
+
+    def _tab_manager_for_parent(
+        self, parent: tk.Misc,
+    ) -> "Optional[_CaseTabsWindow]":
+        """Return the tab group containing *parent*, if it belongs to one."""
+        if isinstance(parent, _CaseTabPage):
+            return parent._manager
+        managers = []
+        main = getattr(self, "_case_tabs_window", None)
+        if main is not None:
+            managers.append(main)
+        managers.extend(getattr(self, "_detached_tab_windows", ()))
+        return next(
+            (manager for manager in managers if parent is manager.win), None
+        )
+
+    def register_case_window(
+        self, owner, view, key: str, label: str, reopen,
+    ) -> None:
+        """Compatibility name for registered opinion views."""
+        self.register_secondary_window(owner, view, key, label, reopen)
+
+    def register_secondary_window(
+        self, owner, view, key: str, label: str, reopen,
+    ) -> None:
+        """Track a view so mode changes and Pop Out can reconstruct it."""
+        ident = id(view)
+        self._open_case_views[ident] = {
+            "owner": owner, "view": view, "key": key,
+            "label": label, "reopen": reopen,
+        }
+
+        def gone(event, ident=ident, view=view) -> None:
+            if event.widget is view:
+                self._open_case_views.pop(ident, None)
+
+        try:
+            view.bind("<Destroy>", gone, add="+")
+        except tk.TclError:
+            pass
+        if isinstance(view, _CaseTabPage):
+            view._secondary_reopen = reopen
+            view._secondary_owner = owner
+
+    def _secondary_entry_for_view(self, view):
+        return next((
+            entry for entry in self._open_case_views.values()
+            if entry.get("view") is view
+        ), None)
+
+    def can_pop_out_view(self, view) -> bool:
+        return (
+            isinstance(view, _CaseTabPage)
+            and self._secondary_entry_for_view(view) is not None
+        )
+
+    def pop_out_view(self, view) -> None:
+        """Move one tab into a new independent tabbed OS window."""
+        entry = self._secondary_entry_for_view(view)
+        if entry is None or not isinstance(view, _CaseTabPage):
+            return
+        try:
+            view.destroy()
+        except tk.TclError:
+            pass
+        manager = _CaseTabsWindow(self, self.root)
+        self._detached_tab_windows.add(manager)
+        try:
+            entry["reopen"](manager.win)
+        except Exception as exc:
+            manager.close()
+            print(f"[windows] could not pop out {entry['label']!r}: {exc}")
+
+    @staticmethod
+    def _case_view_is_live(view) -> bool:
+        try:
+            return bool(view.winfo_exists())
+        except (AttributeError, tk.TclError):
+            return False
+
+    def set_case_tabs_enabled(self, enabled: bool) -> None:
+        """Switch modes and migrate every currently open opinion."""
+        enabled = bool(enabled)
+        self._case_tabs_var.set(enabled)
+        if enabled == self._case_tabs_enabled:
+            return
+
+        snapshots = [
+            entry for entry in self._open_case_views.values()
+            if self._case_view_is_live(entry.get("view"))
+        ]
+        self._case_tabs_enabled = enabled
+        config = _load_config()
+        config["case_tabs_enabled"] = enabled
+        _save_config(config)
+
+        # Set the new mode before closing anything; each snapshot's reopen
+        # callback will therefore choose the destination host automatically.
+        for entry in snapshots:
+            try:
+                entry["view"].destroy()
+            except tk.TclError:
+                pass
+        self._open_case_views.clear()
+        if not enabled:
+            managers = list(self._detached_tab_windows)
+            if self._case_tabs_window is not None:
+                managers.append(self._case_tabs_window)
+            for manager in managers:
+                manager.close()
+            self._case_tabs_window = None
+            self._detached_tab_windows.clear()
+        for entry in snapshots:
+            try:
+                entry["reopen"]()
+            except Exception as exc:
+                print(f"[windows] could not migrate {entry['label']!r}: {exc}")
+
+    def _case_tabs_window_destroyed(self, manager: _CaseTabsWindow) -> None:
+        if self._case_tabs_window is manager:
+            self._case_tabs_window = None
+        self._detached_tab_windows.discard(manager)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -4424,7 +5211,7 @@ class CourtListenerGUI:
             statute = _parse_statute_query(query)
             if statute:
                 self._close_quick_popup()
-                _open_statute_action(self.root, statute)
+                _open_statute_action(self.root, statute, app=self)
                 return
 
             # 1b. English Reports citation ("156 Eng. Rep. 145", "95 E.R. 807"):
@@ -5488,22 +6275,25 @@ class CourtListenerGUI:
             pass
 
     def _post_case_law_pdf(self, url: str, cite: str, pin: str = "",
-                           name: str = "", expected_name: str = "") -> None:
+                           name: str = "", expected_name: str = "",
+                           parent: "Optional[tk.Misc]" = None) -> None:
         title = f"{name} — {cite}" if name and cite else (cite or name)
         if pin:
             title += f" at {pin}"
+        view_parent = self.root if parent is None else parent
 
         def open_pdf() -> None:
             self._status_var.set(f"Opening {cite or name} (case.law PDF)…")
             _open_case_law_pdf(
-                self.root, url, title, self._status_var.set, app=self,
+                view_parent, url, title, self._status_var.set, app=self,
                 expected_name=expected_name,
             )
 
         self._post_root(open_pdf)
 
     def _try_open_citation(self, name: str, cite: str, pin: str,
-                           fetcher, client, prefetch_pdf: bool = True) -> bool:
+                           fetcher, client, prefetch_pdf: bool = True,
+                           view_parent: "Optional[tk.Misc]" = None) -> bool:
         """Resolve one case citation and open its window (call from a
         worker thread).  Google Scholar by citation first — retrying as a
         name+citation search — with a pin-cite jump; then the
@@ -5512,6 +6302,7 @@ class CourtListenerGUI:
         ``prefetch_pdf=False`` opens the Scholar/CL text without warming the
         official PDF in the background — used by the PDF brief viewer, where a
         second PDF load alongside the open brief can hang the app."""
+        target_parent = self.root if view_parent is None else view_parent
         # Federal Appendix cases are scans Google Scholar rarely has — open the
         # static.case.law PDF built straight from the citation.
         if _FED_APPX_RE.search(cite):
@@ -5520,7 +6311,7 @@ class CourtListenerGUI:
                 title = f"{name} — {cite}" if name else cite
                 self._post_root(
                     lambda u=url, t=title: _open_case_law_pdf(
-                        self.root, u, t, self._status_var.set, app=self,
+                        target_parent, u, t, self._status_var.set, app=self,
                     )
                 )
                 return True
@@ -5567,7 +6358,7 @@ class CourtListenerGUI:
 
                 def open_scholar() -> None:
                     try:
-                        w = _ScholarTextWindow(self.root, self, url, html,
+                        w = _ScholarTextWindow(target_parent, self, url, html,
                                                item=None,
                                                prefetch_pdf=prefetch_pdf)
                         if pin:
@@ -5597,7 +6388,7 @@ class CourtListenerGUI:
                         def open_cl() -> None:
                             try:
                                 w = _ScholarTextWindow(
-                                    self.root, self, "", "",
+                                    target_parent, self, "", "",
                                     item=target, cl_text=plain,
                                     cl_parts=parts, cl_blocks=blocks,
                                     prefetch_pdf=prefetch_pdf,
@@ -5613,7 +6404,9 @@ class CourtListenerGUI:
                 print(f"[citelist] courtlistener {cite!r}: {exc}")
         pdf = _case_law_pdf_for_cite(cite) if cite else None
         if pdf:
-            self._post_case_law_pdf(pdf, cite, pin, name)
+            self._post_case_law_pdf(
+                pdf, cite, pin, name, parent=target_parent,
+            )
             return True
         return False
 
@@ -5766,7 +6559,9 @@ class CourtListenerGUI:
             # read as volume 42, reporter "USC", page 1983
             statute = _parse_statute_query(q)
             if statute:
-                _open_statute_action(self.root, statute, set_status)
+                _open_statute_action(
+                    self.root, statute, set_status, app=self
+                )
                 return
             parsed = _parse_citation_line(q)
             if not parsed:
@@ -5838,7 +6633,9 @@ class CourtListenerGUI:
                 return
             # Parent on the root so the statute window outlives the dialog.
             # (A state we only link out to opens in the browser instead.)
-            _open_statute_action(self.root, parsed, status_var.set)
+            _open_statute_action(
+                self.root, parsed, status_var.set, app=self
+            )
 
         ttk.Button(frame, text="Look Up", command=go).grid(row=0, column=2)
         entry.bind("<Return>", go)
@@ -12582,11 +13379,22 @@ class _ScholarTextWindow:
         cl_parts: Optional[list] = None,
         cl_blocks: Optional[list] = None,
         prefetch_pdf: bool = True,
+        primary_source_label: str = "CourtListener",
+        primary_source_url: str = "",
+        primary_source_kind: str = "courtlistener",
+        history_pdf_url: str = "",
+        initial_pdf: "Optional[tuple[bytes, str]]" = None,
     ) -> None:
         self._app = app
         self._item = item or {}
         self._scholar_url = url
         self._note = note
+        self._primary_source_label = (
+            primary_source_label.strip() or "CourtListener"
+        )
+        self._primary_source_url = primary_source_url.strip()
+        self._primary_source_kind = primary_source_kind
+        self._history_pdf_url = history_pdf_url.strip()
         self._header_cites: list[str] = []  # parallel reporter cites (PDF resolve)
         self._cl_primary = cl_parts is not None and not opinion_html
         if self._cl_primary:
@@ -12638,6 +13446,15 @@ class _ScholarTextWindow:
         # still looking, True/False = found/not), gating its "View PDF" button.
         self._pdf_located: Optional[bool] = None
         self._pdf_locate_started = False
+        if initial_pdf is not None:
+            self._pdf_prefetch = initial_pdf
+            self._pdf_bytes, self._pdf_url = initial_pdf
+            self._pdf_located = True
+        elif self._history_pdf_url:
+            # A PDF-first view already knows the exact numbered CAP file even
+            # if its bytes are still arriving in the other window.
+            self._pdf_url = self._history_pdf_url
+            self._pdf_located = True
         self._prefetch_ok = prefetch_pdf
         self._pre_pdf_mode = "scholar"  # text view to return to from the PDF
         self._link_actions: dict[str, tuple[str, str]] = {}
@@ -12685,11 +13502,11 @@ class _ScholarTextWindow:
         )
         self._fed_appx = (not self._cl_primary) and self._is_fed_appx()
 
-        self._win = _ui_toplevel(parent)
+        self._win = _case_view_host(parent, app)
         _ensure_modern_ttk_styles(self._win)
         self._win.title(
             self._title_citation() or (
-                "CourtListener Opinion Text" if self._cl_primary
+                f"{self._primary_source_label} Opinion Text" if self._cl_primary
                 else "Google Scholar Opinion Text"
             )
         )
@@ -12737,6 +13554,8 @@ class _ScholarTextWindow:
     def _history_key(self) -> str:
         """Identity of this case for the History dropdown (a re-view of the
         same case replaces its entry instead of duplicating it)."""
+        if self._primary_source_kind == "case_law" and self._history_pdf_url:
+            return f"pdf:{self._history_pdf_url}"
         if self._scholar_url:
             return f"scholar:{self._scholar_url}"
         cluster = self._item.get("cluster_id") or self._item.get("id")
@@ -12758,7 +13577,37 @@ class _ScholarTextWindow:
         if app is None or not hasattr(app, "record_case_view"):
             return
         item = dict(self._item)
-        if self._cl_primary:
+        if self._cl_primary and self._primary_source_kind == "case_law":
+            parts, blocks = self._cl_parts, self._cl_blocks
+            text = self._cl_text
+            prefetch = self._prefetch_ok
+            source_label = self._primary_source_label
+            source_url = self._primary_source_url
+            pdf_url = self._history_pdf_url
+            initial_pdf = self._pdf_prefetch
+            payload = {
+                "type": "pdf",
+                "url": pdf_url,
+                "title": self._history_label(),
+            }
+
+            def reopen(
+                parent=None, app=app, item=item, parts=parts, blocks=blocks,
+                text=text,
+                prefetch=prefetch, source_label=source_label,
+                source_url=source_url, pdf_url=pdf_url,
+                initial_pdf=initial_pdf,
+            ) -> None:
+                _ScholarTextWindow(
+                    app.root if parent is None else parent,
+                    app, "", "", item=item, cl_text=text,
+                    cl_parts=parts, cl_blocks=blocks, prefetch_pdf=prefetch,
+                    primary_source_label=source_label,
+                    primary_source_url=source_url,
+                    primary_source_kind="case_law",
+                    history_pdf_url=pdf_url, initial_pdf=initial_pdf,
+                )
+        elif self._cl_primary:
             parts, blocks = self._cl_parts, self._cl_blocks
             text = self._cl_text
             prefetch = self._prefetch_ok
@@ -12768,11 +13617,15 @@ class _ScholarTextWindow:
                 "prefetch_pdf": bool(prefetch),
             }
 
-            def reopen(app=app, item=item, parts=parts, blocks=blocks,
-                       text=text, prefetch=prefetch) -> None:
-                _ScholarTextWindow(app.root, app, "", "", item=item,
-                                   cl_text=text, cl_parts=parts,
-                                   cl_blocks=blocks, prefetch_pdf=prefetch)
+            def reopen(
+                parent=None, app=app, item=item, parts=parts, blocks=blocks,
+                text=text, prefetch=prefetch,
+            ) -> None:
+                _ScholarTextWindow(
+                    app.root if parent is None else parent,
+                    app, "", "", item=item, cl_text=text, cl_parts=parts,
+                    cl_blocks=blocks, prefetch_pdf=prefetch,
+                )
         else:
             url, html = self._scholar_url, self._history_html
             prefetch = self._prefetch_ok
@@ -12784,15 +13637,18 @@ class _ScholarTextWindow:
                 "prefetch_pdf": bool(prefetch),
             }
 
-            def reopen(app=app, url=url, html=html, item=item,
+            def reopen(parent=None, app=app, url=url, html=html, item=item,
                        prefetch=prefetch) -> None:
-                _ScholarTextWindow(app.root, app, url, html, item=item,
-                                   prefetch_pdf=prefetch)
+                _ScholarTextWindow(
+                    app.root if parent is None else parent,
+                    app, url, html, item=item, prefetch_pdf=prefetch,
+                )
 
-        app.record_case_view(
-            self._history_key(), self._history_label(), reopen,
-            payload=payload,
-        )
+        key = self._history_key()
+        label = self._history_label()
+        app.record_case_view(key, label, reopen, payload=payload)
+        if hasattr(app, "register_case_window"):
+            app.register_case_window(self, self._win, key, label, reopen)
 
     # ------------------------------------------------------------------
     # UI
@@ -12808,7 +13664,11 @@ class _ScholarTextWindow:
         url_frame = _ui_frame(win)
         url_frame.pack(fill="x", padx=12, pady=(12, 0))
         ttk.Label(url_frame, text="Source", style=muted_style).pack(side="left")
-        self._source_var = tk.StringVar(value=self._scholar_url)
+        initial_source = (
+            self._primary_source_url or self._primary_source_label
+            if self._cl_primary else self._scholar_url
+        )
+        self._source_var = tk.StringVar(value=initial_source)
         ttk.Entry(url_frame, textvariable=self._source_var, state="readonly",
                   style=entry_style).pack(
             side="left", fill="x", expand=True, padx=(8, 0)
@@ -14556,7 +15416,12 @@ class _ScholarTextWindow:
                 prev_kind = part.kind
         txt.config(state="disabled")
         self._mode = "courtlistener"
-        self._source_var.set("CourtListener (REST API)")
+        source = self._primary_source_url or (
+            "CourtListener (REST API)"
+            if self._primary_source_kind == "courtlistener"
+            else self._primary_source_label
+        )
+        self._source_var.set(source)
         _style_ui_button(self._toggle_btn, primary=False)
         self._toggle_btn.configure(
             text="Google Scholar Text", command=self._toggle_source,
@@ -14580,7 +15445,7 @@ class _ScholarTextWindow:
                 self._PART_LABEL_COLORS.get(part.kind, "black"))
         char_count = len(self._cl_text or self._scholar_text or "")
         self._status_var.set(
-            f"{char_count:,} characters | CourtListener version"
+            f"{char_count:,} characters | {self._primary_source_label} version"
         )
         self._hide_cl_button()  # CL view uses the toggle for "Google Scholar Text"
         self._show_pdf_button()
@@ -14599,7 +15464,12 @@ class _ScholarTextWindow:
         self._insert_plain_with_links(self._cl_text or "(no text)", ())
         txt.config(state="disabled")
         self._mode = "courtlistener"
-        self._source_var.set("CourtListener (assembled from the REST API)")
+        source = self._primary_source_url or (
+            "CourtListener (assembled from the REST API)"
+            if self._primary_source_kind == "courtlistener"
+            else self._primary_source_label
+        )
+        self._source_var.set(source)
         _style_ui_button(self._toggle_btn, primary=False)
         self._toggle_btn.configure(
             text="Google Scholar Text", command=self._toggle_source,
@@ -14611,10 +15481,11 @@ class _ScholarTextWindow:
         self._zoom_in_btn.configure(text="A+")
         self._hide_cl_button()
         self._part_combo.config(state="disabled")
-        self._view_label_var.set("CourtListener text")
+        self._view_label_var.set(f"{self._primary_source_label} text")
         self._set_view_color("black")
         self._status_var.set(
-            f"{len(self._cl_text or ''):,} characters | CourtListener version"
+            f"{len(self._cl_text or ''):,} characters | "
+            f"{self._primary_source_label} version"
         )
         self._show_pdf_button()
         self._finder.refresh()
@@ -16868,7 +17739,9 @@ class _ScholarTextWindow:
             self._status_var.set("Opened in your browser.")
             return
         if kind == "statpdf":
-            _open_statute_pdf(self._win, value, self._status_var.set)
+            _open_statute_pdf(
+                self._win, value, self._status_var.set, app=self._app
+            )
             return
         if kind == "engrep":
             _open_eng_rep(self._win, value, self._status_var.set,
@@ -17180,7 +18053,9 @@ class _ScholarTextWindow:
 
     def _open_statute(self, kind: str, spec: str) -> None:
         """Fetch a U.S. Code (OLRC) or C.F.R. (eCFR) section and show it."""
-        _fetch_statute_window(self._win, kind, spec, self._status_var.set)
+        _fetch_statute_window(
+            self._win, kind, spec, self._status_var.set, app=self._app
+        )
 
     # ------------------------------------------------------------------
     # CourtListener toggle
@@ -17635,8 +18510,9 @@ class _ScholarTextWindow:
         exists so the View PDF button is enabled or left greyed out.  Warms the
         bytes for an instant view when that's allowed and the libs are present.
         """
-        if self._pdf_locate_started or self._pdf_prefetch is not None:
-            if self._pdf_prefetch is not None:
+        if (self._pdf_locate_started or self._pdf_prefetch is not None
+                or (self._pdf_located is True and self._pdf_url)):
+            if self._pdf_prefetch is not None or self._pdf_url:
                 self._pdf_located = True
                 self._refresh_pdf_button()
             return
@@ -17745,8 +18621,9 @@ class _ScholarTextWindow:
             self._pdf_url = url
             self._show_pdf(data, url)
             return
-        client = self._app._get_client()
-        self._pdf_url = None
+        known_url = self._pdf_url if self._pdf_located is True else None
+        client = None if known_url else self._app._get_client()
+        self._pdf_url = known_url
         # Disable the control that was clicked while we look (the CL view uses
         # its own View PDF button; the Scholar view reuses the toggle).
         busy = (self._pdf_btn if self._pre_pdf_mode == "courtlistener"
@@ -17760,8 +18637,10 @@ class _ScholarTextWindow:
 
         def run() -> None:
             try:
-                url = (self._app._resolve_pdf_url(client, item)
-                       if client is not None else None)
+                url = known_url or (
+                    self._app._resolve_pdf_url(client, item)
+                    if client is not None else None
+                )
                 self._remember_case_law_pdf_choices(item)
                 if not url:
                     self._post(self._on_pdf_error,
@@ -18014,6 +18893,10 @@ class _ScholarTextWindow:
 
     def _open_pdf_in_browser(self) -> None:
         """Resolve the PDF URL in the background and open it in the browser."""
+        if self._pdf_url and self._pdf_located is True:
+            webbrowser.open(self._pdf_url)
+            self._status_var.set("Opened the PDF in your browser.")
+            return
         client = self._app._get_client()
         if client is None:
             return
@@ -18167,7 +19050,7 @@ _SOURCE_HOST: dict[str, str] = {
 
 
 def _fetch_statute_window(parent: tk.Misc, kind: str, spec: str,
-                          status=lambda _s: None) -> None:
+                          status=lambda _s: None, *, app=None) -> None:
     """Fetch a statute, regulation or federal rule section in a background
     thread and open a _StatuteWindow over `parent` when it arrives."""
     mod = _STATUTE_SOURCES[kind]
@@ -18198,8 +19081,10 @@ def _fetch_statute_window(parent: tk.Misc, kind: str, spec: str,
 
         def show() -> None:
             safe_status(f"{label} loaded.")
-            _StatuteWindow(parent, doc,
-                           tuple(s for s in subs.split(",") if s))
+            _StatuteWindow(
+                parent, doc, tuple(s for s in subs.split(",") if s),
+                app=app,
+            )
 
         post(show)
 
@@ -18207,7 +19092,7 @@ def _fetch_statute_window(parent: tk.Misc, kind: str, spec: str,
 
 
 def _open_statute_action(parent: tk.Misc, action: tuple[str, str],
-                         status=lambda _s: None) -> None:
+                         status=lambda _s: None, *, app=None) -> None:
     """Carry out a parsed statute-lookup action: open the in-app viewer, or —
     for a state we only link out to (N.Y., Tex., other states) — open the
     official source in the browser."""
@@ -18217,9 +19102,9 @@ def _open_statute_action(parent: tk.Misc, action: tuple[str, str],
         status("Opened in your browser.")
         return
     if kind == "statpdf":
-        _open_statute_pdf(parent, value, status)
+        _open_statute_pdf(parent, value, status, app=app)
         return
-    _fetch_statute_window(parent, kind, value, status)
+    _fetch_statute_window(parent, kind, value, status, app=app)
 
 
 def _stat_cite_from_url(url: str) -> str:
@@ -18365,11 +19250,20 @@ class _PdfWindow:
         self._is_case = is_case  # case scan (case.law) vs statute scan
         self._bytes: Optional[bytes] = None
         self._pane: Optional[_PdfPane] = None
+        self._text_source: Optional[_CasePdfTextSource] = None
+        self._can_discover_text = bool(
+            self._is_case and _case_law_json_for_pdf_url(self._url)
+        )
 
-        self._win = _ui_toplevel(parent)
+        self._win = (
+            _case_view_host(parent, app) if self._is_case
+            else _secondary_view_host(parent, app)
+        )
         self._win.title(title)
-        self._history_menubar = _install_history_menubar(
-            self._app if self._is_case else None, self._win
+        self._history_menubar = (
+            _install_history_menubar(self._app, self._win)
+            if self._is_case else
+            _install_window_menubar(self._app, self._win)
         )
         self._win.geometry(
             _fit_toplevel_geometry(
@@ -18389,6 +19283,14 @@ class _PdfWindow:
                    command=self._download).pack(side="right")
         _ui_button(btns, "Print…", width=96,
                    command=self._print).pack(side="right", padx=(0, 6))
+        self._text_btn = None
+        if self._can_discover_text:
+            self._text_btn = _ui_button(
+                btns, "Finding Text...", width=142,
+                command=self._open_discovered_text,
+            )
+            self._text_btn.configure(state="disabled")
+            self._text_btn.pack(side="right", padx=(0, 6))
         _ui_button(btns, "−", width=42,
                    command=lambda: self._zoom(-1)).pack(side="left")
         _ui_button(btns, "+", width=42,
@@ -18409,8 +19311,26 @@ class _PdfWindow:
         if entry is not None and self._app is not None and hasattr(
                 self._app, "record_case_view"):
             self._app.record_case_view(*entry)
+            if hasattr(self._app, "register_case_window"):
+                self._app.register_case_window(
+                    self, self._win, entry[0], entry[1], entry[2]
+                )
+        elif self._app is not None and hasattr(
+            self._app, "register_secondary_window"
+        ):
+            def reopen(parent=None, app=self._app, source=self) -> None:
+                _PdfWindow(
+                    app.root if parent is None else parent,
+                    source._url, source._title,
+                    app=app, is_case=False,
+                )
+            self._app.register_secondary_window(
+                self, self._win, f"pdf-view:{id(self)}", title, reopen,
+            )
 
         self._fetch()
+        if self._can_discover_text:
+            self._discover_text()
 
     def _history_entry(self) -> "Optional[tuple[str, str, object]]":
         """(key, label, reopen) for the History dropdown, or None when this
@@ -18420,8 +19340,9 @@ class _PdfWindow:
         app, url, title = self._app, self._url, self._title
         payload = {"type": "pdf", "url": url, "title": title}
         return (f"pdf:{url}", title,
-                lambda: _open_case_law_pdf(
-                    app.root, url, title, app=app,
+                lambda parent=None: _open_case_law_pdf(
+                    app.root if parent is None else parent,
+                    url, title, app=app,
                 ),
                 payload)
 
@@ -18435,6 +19356,59 @@ class _PdfWindow:
         if self._pane is not None:
             self._pane.zoom(delta)
             self._status_var.set(f"Zoom: {self._pane.zoom_percent()}%")
+
+    def _discover_text(self) -> None:
+        """Find the best text version without delaying the PDF viewer."""
+        client = _client_for_window(self._app)
+        url, title = self._url, self._title
+
+        def run() -> None:
+            source = _case_pdf_text_source(url, title, client=client)
+            self._post(self._on_text_discovered, source)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_text_discovered(
+        self, source: "Optional[_CasePdfTextSource]",
+    ) -> None:
+        self._text_source = source
+        btn = self._text_btn
+        if btn is None:
+            return
+        try:
+            if source is None:
+                btn.configure(text="No Text", state="disabled")
+            else:
+                btn.configure(
+                    text=source.button_label, state="normal",
+                    command=self._open_discovered_text,
+                )
+        except tk.TclError:
+            pass
+
+    def _open_discovered_text(self) -> None:
+        source = self._text_source
+        if source is None or self._app is None:
+            return
+        initial_pdf = (
+            (self._bytes, self._url) if self._bytes is not None else None
+        )
+        try:
+            _ScholarTextWindow(
+                self._app.root, self._app, "", "",
+                item=dict(source.item), cl_text=source.text,
+                cl_parts=list(source.parts), cl_blocks=list(source.blocks),
+                prefetch_pdf=False,
+                primary_source_label=source.source_label,
+                primary_source_url=source.source_url,
+                primary_source_kind=source.kind,
+                history_pdf_url=self._url,
+                initial_pdf=initial_pdf,
+            )
+        except Exception as exc:
+            self._status_var.set(f"Could not open the text view: {exc}")
+            return
+        self._win.destroy()
 
     def _fetch(self) -> None:
         try:
@@ -18630,11 +19604,11 @@ def _print_pdf_file(parent: tk.Misc, path: str,
 
 
 def _open_statute_pdf(parent: tk.Misc, url: str,
-                      status=lambda _s: None) -> None:
+                      status=lambda _s: None, *, app=None) -> None:
     """Open a Statutes at Large GovInfo scan in the in-app PDF viewer."""
     cite = _stat_cite_from_url(url)
     status(f"Opening {cite}…")
-    _PdfWindow(parent, url, cite, status)
+    _PdfWindow(parent, url, cite, status, app=app)
 
 
 # ---------------------------------------------------------------------------
@@ -18653,7 +19627,7 @@ class _EngRepPdfWindow(_PdfWindow):
         self._case = case
         name = case.name if len(case.name) <= 60 else case.name[:57] + "…"
         super().__init__(parent, case.pdf_url, f"{name} — {case.er_cite}",
-                         status, app=app)
+                         status, app=app, is_case=True)
 
     def _history_entry(self):  # overrides _PdfWindow
         app, case = self._app, self._case
@@ -18661,7 +19635,9 @@ class _EngRepPdfWindow(_PdfWindow):
             return None
         return (f"engrep:{case.year}:{case.num}",
                 f"{case.name} — {case.er_cite}",
-                lambda: _EngRepPdfWindow(app.root, case, app=app))
+                lambda parent=None: _EngRepPdfWindow(
+                    app.root if parent is None else parent, case, app=app,
+                ))
 
     def _fetch(self) -> None:  # overrides _PdfWindow._fetch
         try:
@@ -18857,14 +19833,20 @@ class _SlipTextWindow:
     :func:`slip_opinion.to_clean_text`) in a selectable Text widget, for the
     copy-paste convenience a rendered PDF page can't give."""
 
-    def __init__(self, parent: tk.Misc, title: str, text: str) -> None:
-        win = _ui_toplevel(parent)
+    def __init__(
+        self, parent: tk.Misc, title: str, text: str, *, app=None,
+    ) -> None:
+        self._app = app
+        self._title = title
+        self._source_text = text
+        win = _secondary_view_host(parent, app)
         _ensure_modern_ttk_styles(win)
         win.title(f"{title} — Text")
         win.geometry(_fit_toplevel_geometry(win, 760, 680,
                                             min_width=420, min_height=300))
         win.minsize(420, 300)
         self._win = win
+        self._window_menubar = _install_window_menubar(app, win)
 
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
@@ -18885,6 +19867,16 @@ class _SlipTextWindow:
         self._status_var = tk.StringVar(value=f"{len(text):,} characters")
         _install_status_label(btns, self._status_var, padx=(0, 0))
         win.bind("<Control-a>", self._select_all)
+        if app is not None and hasattr(app, "register_secondary_window"):
+            def reopen(parent=None, app=app, source=self) -> None:
+                _SlipTextWindow(
+                    app.root if parent is None else parent,
+                    source._title, source._source_text, app=app,
+                )
+            app.register_secondary_window(
+                self, win, f"slip-text:{id(self)}", f"{title} — Text",
+                reopen,
+            )
 
     def _select_all(self, _e=None) -> str:
         self._text.tag_add("sel", "1.0", "end-1c")
@@ -18959,13 +19951,14 @@ class _SlipOpinionWindow:
         self._clean_text: Optional[str] = None
         self._pane: Optional[_PdfPane] = None
 
-        win = _ui_toplevel(parent)
+        win = _case_view_host(parent, app)
         _ensure_modern_ttk_styles(win)
         win.title(f"{title} — Slip Opinion")
         win.geometry(_fit_toplevel_geometry(win, 980, 900,
                                             min_width=560, min_height=360))
         win.minsize(560, 360)
         self._win = win
+        self._history_menubar = _install_history_menubar(app, win)
 
         top = _ui_frame(win)
         top.pack(fill="x", padx=12, pady=(12, 4))
@@ -19004,10 +19997,18 @@ class _SlipOpinionWindow:
         win.bind("<Control-0>", lambda _e: self._zoom(0))
 
         if app is not None and hasattr(app, "record_case_view"):
-            def reopen(app=app, url=url, title=title, description=description):
-                _SlipOpinionWindow(app.root, url, title, app=app,
-                                   description=description)
-            app.record_case_view(f"slip:{url}", f"{title} (slip op.)", reopen)
+            def reopen(
+                parent=None, app=app, url=url, title=title,
+                description=description,
+            ):
+                _SlipOpinionWindow(
+                    app.root if parent is None else parent,
+                    url, title, app=app, description=description,
+                )
+            key, label = f"slip:{url}", f"{title} (slip op.)"
+            app.record_case_view(key, label, reopen)
+            if hasattr(app, "register_case_window"):
+                app.register_case_window(self, self._win, key, label, reopen)
 
         self._fetch()
 
@@ -19197,7 +20198,9 @@ class _SlipOpinionWindow:
 
     def _show_text(self) -> None:
         if self._clean_text is not None:
-            _SlipTextWindow(self._win, self._title, self._clean_text)
+            _SlipTextWindow(
+                self._win, self._title, self._clean_text, app=self._app
+            )
             return
         if not self._pages:
             self._status_var.set(
@@ -19222,7 +20225,9 @@ class _SlipOpinionWindow:
     def _open_text_window(self) -> None:
         self._status_var.set("Text ready.")
         if self._clean_text is not None:
-            _SlipTextWindow(self._win, self._title, self._clean_text)
+            _SlipTextWindow(
+                self._win, self._title, self._clean_text, app=self._app
+            )
 
 
 _ER_CAPTION_VS_RE = re.compile(r"\s+(?:against|versus)\s+", re.IGNORECASE)
@@ -19446,7 +20451,7 @@ def _open_recap_citation(app: "CourtListenerGUI", parent: tk.Misc,
             print(f"[recap] lookup failed for {label!r}: {exc}")
         if info and info.get("pdf_url"):
             def open_pdf(url=info["pdf_url"], t=title):
-                _PdfWindow(app.root, url, t, safe_status, app=app,
+                _PdfWindow(parent, url, t, safe_status, app=app,
                            is_case=True)
             app._post_root(open_pdf)
             app._post_root(lambda: safe_status(
@@ -19459,7 +20464,8 @@ def _open_recap_citation(app: "CourtListenerGUI", parent: tk.Misc,
         if cite and (fetcher is not None or client is not None):
             try:
                 ok = app._try_open_citation(name, cite, "", fetcher, client,
-                                            prefetch_pdf=False)
+                                            prefetch_pdf=False,
+                                            view_parent=parent)
             except Exception as exc:
                 print(f"[recap] scholar fallback failed for {label!r}: {exc}")
         elif name and fetcher is not None:
@@ -19474,7 +20480,7 @@ def _open_recap_citation(app: "CourtListenerGUI", parent: tk.Misc,
             if result:
                 def open_scholar(u=result[0], h=result[1]) -> None:
                     try:
-                        _ScholarTextWindow(app.root, app, u, h, item=None,
+                        _ScholarTextWindow(parent, app, u, h, item=None,
                                            prefetch_pdf=False)
                     except tk.TclError:
                         pass
@@ -19550,7 +20556,7 @@ def _open_fedcas_citation(app: "CourtListenerGUI", parent: tk.Misc,
                 def open_cl(it=item) -> None:
                     try:
                         _ScholarTextWindow(
-                            app.root, app, "", "", item=it, cl_text=plain,
+                            parent, app, "", "", item=it, cl_text=plain,
                             cl_parts=parts, cl_blocks=blocks,
                         )
                     except tk.TclError:
@@ -19572,7 +20578,7 @@ def _open_fedcas_citation(app: "CourtListenerGUI", parent: tk.Misc,
             if result:
                 def open_scholar(u=result[0], h=result[1]) -> None:
                     try:
-                        _ScholarTextWindow(app.root, app, u, h, item=None,
+                        _ScholarTextWindow(parent, app, u, h, item=None,
                                            prefetch_pdf=False)
                     except tk.TclError:
                         pass
@@ -19602,7 +20608,7 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
     """
     kind, value = action
     if kind in _STATUTE_SOURCES or kind in ("browse", "statpdf"):
-        _open_statute_action(parent, action, status)
+        _open_statute_action(parent, action, status, app=app)
         return
     if kind == "engrep":
         _open_eng_rep(parent, value, status, app=app)
@@ -19634,7 +20640,8 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
 
     def run() -> None:
         ok = app._try_open_citation("", cite, pin, fetcher, client,
-                                    prefetch_pdf=prefetch_pdf)
+                                    prefetch_pdf=prefetch_pdf,
+                                    view_parent=parent)
         try:
             parent.after(0, lambda: safe_status(
                 f"Opened {cite}." if ok else f"Not found: {cite}"))
@@ -19658,16 +20665,28 @@ class _BriefTextWindow:
     def __init__(self, parent: tk.Misc, app: "CourtListenerGUI",
                  name: str, text: str) -> None:
         self._app = app
+        self._name = name
         self._src = text
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
 
-        self._win = _ui_toplevel(parent)
+        self._win = _secondary_view_host(parent, app)
         self._win.title(f"Brief — {name}")
         self._win.geometry("860x720")
         self._win.minsize(500, 320)
+        self._window_menubar = _install_window_menubar(app, self._win)
         self._build_ui()
         self._render()
+        if hasattr(app, "register_secondary_window"):
+            def reopen(parent=None, app=app, source=self) -> None:
+                _BriefTextWindow(
+                    app.root if parent is None else parent,
+                    app, source._name, source._src,
+                )
+            app.register_secondary_window(
+                self, self._win, f"brief-text:{id(self)}",
+                f"Brief — {name}", reopen,
+            )
 
     def _build_ui(self) -> None:
         win = self._win
@@ -20204,11 +21223,12 @@ class _LinkedPdfWindow:
     def __init__(self, parent: tk.Misc, app: "CourtListenerGUI",
                  pdf_bytes: bytes, name: str) -> None:
         self._app = app
+        self._name = name
         self._bytes = pdf_bytes
         self._pane: Optional[_PdfPane] = None
         self._closed = False
 
-        self._win = _ui_toplevel(parent)
+        self._win = _secondary_view_host(parent, app)
         self._win.title(f"PDF citations — {name}")
         self._win.geometry(
             _fit_toplevel_geometry(
@@ -20218,6 +21238,7 @@ class _LinkedPdfWindow:
         )
         self._win.minsize(520, 360)
         self._win.bind("<Destroy>", self._on_destroy)
+        self._window_menubar = _install_window_menubar(app, self._win)
 
         legend = _ui_frame(self._win)
         legend.pack(fill="x", padx=12, pady=(12, 0))
@@ -20247,6 +21268,16 @@ class _LinkedPdfWindow:
             self._win.bind(seq, lambda _e: self._zoom(-1))
         self._win.bind("<Control-0>", lambda _e: self._zoom(0))
 
+        if hasattr(app, "register_secondary_window"):
+            def reopen(parent=None, app=app, source=self) -> None:
+                _LinkedPdfWindow(
+                    app.root if parent is None else parent,
+                    app, source._bytes, source._name,
+                )
+            app.register_secondary_window(
+                self, self._win, f"linked-pdf:{id(self)}",
+                f"PDF citations — {name}", reopen,
+            )
         self._show()
 
     def _post(self, fn, *args) -> None:
@@ -20382,22 +21413,36 @@ class _StatuteWindow:
     text; long editorial/statutory notes sit behind a toggle.
     """
 
-    def __init__(self, parent: tk.Misc, doc, highlight: tuple = ()) -> None:
+    def __init__(
+        self, parent: tk.Misc, doc, highlight: tuple = (), *, app=None,
+    ) -> None:
+        self._app = app
         self._doc = doc
         self._highlight = tuple(highlight)
         self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
         self._neighbors: tuple = (None, None)
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
-        self._win = _ui_toplevel(parent)
+        self._win = _secondary_view_host(parent, app)
         _ensure_modern_ttk_styles(self._win)
         self._win.title(f"{doc.label} — {doc.source_name}")
         self._win.geometry("760x640")
         self._win.minsize(440, 280)
         self._base_size = _OPINION_FONT_PT
+        self._window_menubar = _install_window_menubar(app, self._win)
         self._build_ui()
         self._render()
         self._refresh_neighbors()
+        if app is not None and hasattr(app, "register_secondary_window"):
+            def reopen(parent=None, app=app, source=self) -> None:
+                _StatuteWindow(
+                    app.root if parent is None else parent,
+                    source._doc, source._highlight, app=app,
+                )
+            app.register_secondary_window(
+                self, self._win, f"statute:{id(self)}",
+                f"{doc.label} — {doc.source_name}", reopen,
+            )
 
     def _build_ui(self) -> None:
         win = self._win
@@ -20653,9 +21698,13 @@ class _StatuteWindow:
             self._status_var.set("Opened in your browser.")
             return
         if kind == "statpdf":
-            _open_statute_pdf(self._win, value, self._status_var.set)
+            _open_statute_pdf(
+                self._win, value, self._status_var.set, app=self._app
+            )
             return
-        _fetch_statute_window(self._win, kind, value, self._status_var.set)
+        _fetch_statute_window(
+            self._win, kind, value, self._status_var.set, app=self._app
+        )
 
     # ------------------------------------------------------------------
     # Previous/next provision
@@ -20876,14 +21925,25 @@ class _CitingOpinionsWindow:
             cited_item.get("caseName") or cited_item.get("case_name") or "?",
         ).strip()
 
-        self._win = _ui_toplevel(parent)
+        self._win = _secondary_view_host(parent, app)
         _ensure_modern_ttk_styles(self._win)
         self._win.title(f"Citing: {case_name}")
         self._win.geometry("950x480")
         self._win.minsize(700, 300)
         self._win.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._win.bind("<Destroy>", self._on_destroy, add="+")
+        self._window_menubar = _install_window_menubar(app, self._win)
 
         self._build_ui(case_name)
+        if hasattr(app, "register_secondary_window"):
+            def reopen(parent=None, app=app, item=dict(cited_item)) -> None:
+                _CitingOpinionsWindow(
+                    app.root if parent is None else parent, app, item,
+                )
+            app.register_secondary_window(
+                self, self._win, f"citing:{id(self)}",
+                f"Citing: {case_name}", reopen,
+            )
         self._load_page()
 
     # ------------------------------------------------------------------
@@ -20993,6 +22053,10 @@ class _CitingOpinionsWindow:
     def _on_close(self) -> None:
         self._bg_stop.set()
         self._win.destroy()
+
+    def _on_destroy(self, event) -> None:
+        if event.widget is self._win:
+            self._bg_stop.set()
 
     def _cancel_bg_fetch(self) -> None:
         """Signal any running background fetch to stop and arm a fresh event."""

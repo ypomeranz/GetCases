@@ -3,7 +3,7 @@ import os
 import tkinter as tk
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 os.environ["GETCASES_SKIP_DEPENDENCY_PROMPT"] = "1"
 
@@ -27,8 +27,15 @@ from citation_overrides import (
 from court_catalog import bluebook_federal_trial_court
 from courtlistener_gui import (
     CourtListenerGUI,
+    _CaseTabPage,
     _ScholarTextWindow,
     _CaseLawPageOpinion,
+    _CaseLawTextRecord,
+    _CaseTabsWindow,
+    _case_law_text_for_pdf_url,
+    _case_law_text_record,
+    _case_pdf_text_source,
+    _open_statute_action,
     _case_law_page_opinions,
     _match_case_law_page_opinion,
     _opinion_db_spotlight_results,
@@ -968,6 +975,7 @@ class NominativeCitationSearchTests(unittest.TestCase):
 
     def test_direct_lookup_retries_us_reports_alias_after_scholar_miss(self):
         win = object.__new__(CourtListenerGUI)
+        win.root = object()
         win._post_root = Mock()
         fetcher = Mock()
         fetcher.fetch_by_citation.side_effect = [None, ("url", "html")]
@@ -1241,6 +1249,278 @@ class CaseLawSharedPageTests(unittest.TestCase):
         chosen = _match_case_law_page_opinion(opinions, "Beta v. Two")
         self.assertIsNotNone(chosen)
         self.assertEqual(chosen.url, "second.pdf")
+
+
+class CaseLawPdfTextTests(unittest.TestCase):
+    @staticmethod
+    def _data():
+        return {
+            "name_abbreviation": "Smith v. Jones",
+            "citations": [
+                {"type": "vendor", "cite": "123 F. App'x 456"},
+                {"type": "official", "cite": "77 Example 12"},
+            ],
+            "court": {
+                "name_abbreviation": "2d Cir.",
+                "slug": "ca2",
+            },
+            "decision_date": "2004-05-06",
+            "casebody": {
+                "data": {
+                    "head_matter": "Smith v. Jones\nNo. 03-1000",
+                    "opinions": [
+                        {
+                            "author": "Per Curiam.",
+                            "text": "See Roe v. Wade, 410 U.S. 113.",
+                        },
+                        {"text": "The judgment is affirmed."},
+                    ],
+                },
+            },
+        }
+
+    def test_cap_json_record_keeps_exact_text_and_display_metadata(self):
+        record = _case_law_text_record(
+            self._data(), "123 F. App'x 456",
+            "https://static.case.law/f-appx/123/cases/0456-02.json",
+        )
+
+        self.assertIsNotNone(record)
+        self.assertIn("Per Curiam.", record.text)
+        self.assertIn("410 U.S. 113", record.text)
+        self.assertEqual(
+            record.citation,
+            "Smith v. Jones, 77 Example 12 (2d Cir. 2004)",
+        )
+        self.assertEqual(record.item["court_id"], "ca2")
+        self.assertEqual(record.item["citation"],
+                         ["123 F. App'x 456", "77 Example 12"])
+
+    def test_exact_numbered_pdf_uses_its_matching_json(self):
+        response = SimpleNamespace(
+            status_code=200, json=lambda: self._data(),
+        )
+        session = Mock()
+        session.get.return_value = response
+        pdf = "https://static.case.law/f-appx/123/case-pdfs/0456-02.pdf"
+
+        with patch("courtlistener_gui._anon_session", session):
+            record = _case_law_text_for_pdf_url(pdf)
+
+        self.assertIsNotNone(record)
+        session.get.assert_called_once_with(
+            "https://static.case.law/f-appx/123/cases/0456-02.json",
+            timeout=15,
+        )
+
+    def test_pdf_text_source_prefers_courtlistener(self):
+        record = _CaseLawTextRecord(
+            "CAP fallback", "Smith v. Jones, 123 F. App'x 456 (2d Cir. 2004)",
+            {
+                "caseName": "Smith v. Jones",
+                "citation": ["123 F. App'x 456"],
+                "court": "2d Cir.",
+                "court_id": "ca2",
+                "dateFiled": "2004-05-06",
+            },
+            "https://static.case.law/f-appx/123/cases/0456-01.json",
+        )
+        target = {
+            "cluster_id": 99,
+            "absolute_url": "/opinion/99/smith-v-jones/",
+        }
+        with (
+            patch("courtlistener_gui._case_law_text_for_pdf_url",
+                  return_value=record),
+            patch("courtlistener_gui._cl_item_for_citation",
+                  return_value=target) as find,
+            patch("courtlistener_gui._assemble_case_parts",
+                  return_value=(["part"], ["block"], "CL opinion", {})),
+        ):
+            source = _case_pdf_text_source(
+                "https://static.case.law/f-appx/123/case-pdfs/0456-01.pdf",
+                "123 F. App'x 456", client=object(),
+            )
+
+        self.assertEqual(source.kind, "courtlistener")
+        self.assertEqual(source.text, "CL opinion")
+        self.assertEqual(
+            source.source_url,
+            "https://www.courtlistener.com/opinion/99/smith-v-jones/",
+        )
+        find.assert_called_once_with(
+            ANY, "123 F. App'x 456", name="Smith v. Jones",
+        )
+
+    def test_pdf_text_source_falls_back_to_cap_json(self):
+        record = _CaseLawTextRecord(
+            "CAP fallback with 410 U.S. 113", "Smith v. Jones",
+            {"caseName": "Smith v. Jones",
+             "citation": ["123 F. App'x 456"]},
+            "https://static.case.law/f-appx/123/cases/0456-01.json",
+        )
+        with (
+            patch("courtlistener_gui._case_law_text_for_pdf_url",
+                  return_value=record),
+            patch("courtlistener_gui._cl_item_for_citation",
+                  return_value=None),
+        ):
+            source = _case_pdf_text_source(
+                "https://static.case.law/f-appx/123/case-pdfs/0456-01.pdf",
+                "123 F. App'x 456", client=object(),
+            )
+
+        self.assertEqual(source.kind, "case_law")
+        self.assertEqual(source.button_label, "static.case.law Text")
+        self.assertIn("410 U.S. 113", source.text)
+
+
+class CaseWindowModeTests(unittest.TestCase):
+    class _View:
+        def __init__(self):
+            self.destroyed = False
+
+        def winfo_exists(self):
+            return not self.destroyed
+
+        def destroy(self):
+            self.destroyed = True
+
+    def test_mode_switch_migrates_each_live_case(self):
+        app = object.__new__(CourtListenerGUI)
+        app._case_tabs_enabled = False
+        app._case_tabs_var = Mock()
+        app._case_tabs_window = None
+        opened = []
+        one, two = self._View(), self._View()
+        app._open_case_views = {
+            1: {"view": one, "label": "One", "reopen": lambda: opened.append(1)},
+            2: {"view": two, "label": "Two", "reopen": lambda: opened.append(2)},
+        }
+
+        with (
+            patch("courtlistener_gui._load_config", return_value={}),
+            patch("courtlistener_gui._save_config") as save,
+        ):
+            app.set_case_tabs_enabled(True)
+
+        self.assertTrue(app._case_tabs_enabled)
+        self.assertTrue(one.destroyed)
+        self.assertTrue(two.destroyed)
+        self.assertEqual(opened, [1, 2])
+        save.assert_called_once_with({"case_tabs_enabled": True})
+
+    def test_tab_titles_are_compact(self):
+        short = "Marbury v. Madison, 5 U.S. 137 (1803)"
+        self.assertEqual(_CaseTabsWindow._tab_label(short), short)
+        self.assertEqual(len(_CaseTabsWindow._tab_label("x" * 80)), 52)
+        self.assertTrue(_CaseTabsWindow._tab_label("x" * 80).endswith("..."))
+
+    def test_ctrl_tab_cycle_wraps_both_directions(self):
+        class Notebook:
+            def __init__(self):
+                self.items = ("one", "two", "three")
+                self.current = "one"
+
+            def tabs(self):
+                return self.items
+
+            def select(self, value=None):
+                if value is None:
+                    return self.current
+                self.current = value
+
+            def index(self, value):
+                return self.items.index(value)
+
+        manager = object.__new__(_CaseTabsWindow)
+        manager.notebook = Notebook()
+
+        self.assertEqual(manager._cycle_tab(-1), "break")
+        self.assertEqual(manager.notebook.current, "three")
+        manager._cycle_tab(1)
+        self.assertEqual(manager.notebook.current, "one")
+
+    def test_pop_out_reopens_one_tab_in_a_new_tab_group(self):
+        app = object.__new__(CourtListenerGUI)
+        app.root = object()
+        app._case_tabs_window = None
+        app._detached_tab_windows = set()
+        page = object.__new__(_CaseTabPage)
+        page.destroy = Mock()
+        manager = Mock()
+        manager.win = object()
+        seen = []
+
+        def reopen(parent=None):
+            seen.append(parent)
+
+        app._open_case_views = {
+            1: {"view": page, "label": "A tab", "reopen": reopen},
+        }
+
+        with patch("courtlistener_gui._CaseTabsWindow",
+                   return_value=manager) as make_manager:
+            app.pop_out_view(page)
+
+        page.destroy.assert_called_once()
+        make_manager.assert_called_once_with(app, app.root)
+        self.assertEqual(seen, [manager.win])
+        self.assertIn(manager, app._detached_tab_windows)
+
+    def test_tab_group_is_inherited_from_page_or_detached_window(self):
+        app = object.__new__(CourtListenerGUI)
+        main = SimpleNamespace(win=object())
+        detached = Mock()
+        detached.win = object()
+        app._case_tabs_window = main
+        app._detached_tab_windows = {detached}
+        page = object.__new__(_CaseTabPage)
+        page._manager = detached
+
+        self.assertIs(app._tab_manager_for_parent(page), detached)
+        self.assertIs(app._tab_manager_for_parent(detached.win), detached)
+        self.assertIsNone(app._tab_manager_for_parent(object()))
+
+    def test_citation_result_uses_launching_tab_group_parent(self):
+        app = object.__new__(CourtListenerGUI)
+        app.root = object()
+        app._status_var = Mock()
+        app._post_root = lambda fn, *args: fn(*args)
+        fetcher = Mock()
+        fetcher.fetch_by_citation.return_value = ("url", "html")
+        parent = object()
+
+        with patch("courtlistener_gui._ScholarTextWindow") as text_window:
+            opened = app._try_open_citation(
+                "", "410 U.S. 113", "", fetcher, None,
+                view_parent=parent,
+            )
+
+        self.assertTrue(opened)
+        self.assertIs(text_window.call_args.args[0], parent)
+
+    def test_statute_and_statute_pdf_forward_the_shared_app(self):
+        app = object()
+        parent = object()
+        status = Mock()
+        with patch("courtlistener_gui._fetch_statute_window") as fetch:
+            _open_statute_action(
+                parent, ("usc", "42:1983:"), status, app=app,
+            )
+        fetch.assert_called_once_with(
+            parent, "usc", "42:1983:", status, app=app,
+        )
+
+        with patch("courtlistener_gui._open_statute_pdf") as open_pdf:
+            _open_statute_action(
+                parent,
+                ("statpdf", "https://www.govinfo.gov/example.pdf"),
+                status, app=app,
+            )
+        open_pdf.assert_called_once_with(
+            parent, "https://www.govinfo.gov/example.pdf", status, app=app,
+        )
 
 
 class SpotlightPopupLifecycleTests(unittest.TestCase):
