@@ -395,9 +395,31 @@ def _history_button(app, parent_frame):
     return btn
 
 
-def _install_history_menubar(app, win: tk.Toplevel):
-    """Attach a top History menu to case windows."""
+def _add_bookmarks_cascade(menubar: tk.Menu, app, target) -> None:
+    """Add a "Bookmarks" cascade to *menubar*: the current document's
+    bookmark/unbookmark toggle first, then the saved bookmarks ordered by
+    most-recent access.  ``target`` is the reader window (it must supply
+    ``_bookmark_descriptor`` and ``_toggle_bookmark``)."""
+    if app is None or target is None or not hasattr(app, "populate_bookmarks_menu"):
+        return
+    bm = tk.Menu(menubar, tearoff=0)
+    try:
+        bm.configure(
+            postcommand=lambda m=bm: app.populate_bookmarks_menu(m, target)
+        )
+    except tk.TclError:
+        pass
+    app.populate_bookmarks_menu(bm, target)
+    menubar.add_cascade(label="Bookmarks", menu=bm)
+
+
+def _install_history_menubar(app, win: tk.Toplevel, bookmark_target=None):
+    """Attach the top History menu case windows share — plus, when the window
+    can be bookmarked, a Bookmarks menu beside it."""
     if app is None or not hasattr(app, "populate_history_menu"):
+        # No history dropdown, but the window may still support bookmarks.
+        if bookmark_target is not None:
+            return _install_bookmark_menubar(app, win, bookmark_target)
         return None
     menubar = tk.Menu(win)
     history_menu = tk.Menu(menubar, tearoff=0)
@@ -409,11 +431,67 @@ def _install_history_menubar(app, win: tk.Toplevel):
         pass
     app.populate_history_menu(history_menu)
     menubar.add_cascade(label="History", menu=history_menu)
+    _add_bookmarks_cascade(menubar, app, bookmark_target)
     try:
         win.config(menu=menubar)
     except tk.TclError:
         return None
     return menubar
+
+
+def _install_bookmark_menubar(app, win: tk.Toplevel, bookmark_target):
+    """Attach a top Bookmarks menu to a reader window that carries no History
+    menu (the statute / rule viewer)."""
+    if (app is None or bookmark_target is None
+            or not hasattr(app, "populate_bookmarks_menu")):
+        return None
+    menubar = tk.Menu(win)
+    _add_bookmarks_cascade(menubar, app, bookmark_target)
+    try:
+        win.config(menu=menubar)
+    except tk.TclError:
+        return None
+    return menubar
+
+
+def _bind_bookmark_right_click(win: tk.Misc, widgets, target) -> None:
+    """Bind a right-click "Bookmark / Remove Bookmark" context menu onto the
+    given top-bar (tab-strip) *widgets*, so the document can be bookmarked by
+    right-clicking its tab — the same toggle the Bookmarks menu offers."""
+    def popup(event) -> None:
+        app = _active_app()
+        if app is None or not hasattr(app, "is_bookmarked"):
+            return
+        try:
+            desc = target._bookmark_descriptor()
+        except Exception:
+            desc = None
+        if not desc:
+            return
+        noun = str(desc.get("noun") or "case").title()
+        menu = tk.Menu(win, tearoff=0)
+        if app.is_bookmarked(desc.get("key")):
+            menu.add_command(label=f"Remove Bookmark for This {noun}",
+                             command=target._toggle_bookmark)
+        else:
+            menu.add_command(label=f"Bookmark This {noun}",
+                             command=target._toggle_bookmark)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except tk.TclError:
+                pass
+
+    for w in widgets:
+        if w is None:
+            continue
+        for seq in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            try:
+                w.bind(seq, popup)
+            except tk.TclError:
+                pass
 
 
 def _ui_checkbox(parent, text: str, variable, command=None):
@@ -649,6 +727,14 @@ def _brief_cache_read(entry: dict) -> Optional[bytes]:
         return None
 
 
+def _as_float(value) -> float:
+    """A best-effort float (0.0 when the value isn't numeric)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _json_ready(value):
     """Convert nested values to something json can persist."""
     if isinstance(value, dict):
@@ -658,6 +744,188 @@ def _json_ready(value):
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+# ---------------------------------------------------------------------------
+# Bookmarks: a persistent, most-recently-accessed-first list of saved
+# cases/statutes/rules, shown in the "Bookmarks" menu every reader window
+# carries.  Bookmarking also stores a *local copy* of the document so the
+# bookmark reopens offline (no refetch): opinion HTML / serialized opinion
+# blocks for cases, the parsed section stream for statutes and rules, and the
+# PDF bytes (in ``_BOOKMARK_CACHE_DIR``) for scanned-PDF cases.
+# ---------------------------------------------------------------------------
+
+_BOOKMARK_CACHE_DIR = Path.home() / ".config" / "courtlistener" / "bookmark_cache"
+
+# The one live CourtListenerGUI, so reader windows opened deep in the call tree
+# (a statute viewer reached from a citation link, say) can reach the bookmark
+# store without every intermediate call having to thread the app through.
+_ACTIVE_APP: "Optional[CourtListenerGUI]" = None
+
+
+def _active_app() -> "Optional[CourtListenerGUI]":
+    return _ACTIVE_APP
+
+
+def _bookmark_pdf_path(url: str) -> Path:
+    import hashlib
+
+    digest = hashlib.sha1((url or "").encode("utf-8")).hexdigest()
+    return _BOOKMARK_CACHE_DIR / f"{digest}.pdf"
+
+
+def _bookmark_pdf_save(url: str, data: Optional[bytes]) -> bool:
+    """Persist a bookmarked case scan so it reopens without refetching."""
+    try:
+        if not data or not data.startswith(b"%PDF"):
+            return False
+        _BOOKMARK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _bookmark_pdf_path(url)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+        return True
+    except Exception as exc:
+        print(f"[bookmark] pdf save failed: {exc}")
+        return False
+
+
+def _bookmark_pdf_read(url: str) -> Optional[bytes]:
+    try:
+        data = _bookmark_pdf_path(url).read_bytes()
+        return data if data.startswith(b"%PDF") else None
+    except Exception:
+        return None
+
+
+def _bookmark_pdf_delete(url: str) -> None:
+    try:
+        _bookmark_pdf_path(url).unlink()
+    except OSError:
+        pass
+
+
+# --- opinion-block (de)serialization for offline case copies ---------------
+
+_SPAN_FIELDS = (
+    "text", "italic", "bold", "underline", "small", "sup", "pagenum",
+    "link", "fnref", "fndef",
+)
+
+
+def _span_to_json(span) -> dict:
+    return {k: getattr(span, k) for k in _SPAN_FIELDS}
+
+
+def _block_to_json(block) -> dict:
+    return {"kind": block.kind,
+            "spans": [_span_to_json(s) for s in block.spans]}
+
+
+def _blocks_to_json(blocks) -> list:
+    return [_block_to_json(b) for b in (blocks or [])]
+
+
+def _part_to_json(part) -> dict:
+    return {"label": part.label, "kind": part.kind,
+            "blocks": _blocks_to_json(part.blocks),
+            "footnotes": _blocks_to_json(part.footnotes)}
+
+
+def _parts_to_json(parts) -> list:
+    return [_part_to_json(p) for p in (parts or [])]
+
+
+def _span_from_json(d: dict):
+    from google_scholar import Span
+
+    return Span(
+        text=str(d.get("text", "")),
+        italic=bool(d.get("italic", False)),
+        bold=bool(d.get("bold", False)),
+        underline=bool(d.get("underline", False)),
+        small=bool(d.get("small", False)),
+        sup=bool(d.get("sup", False)),
+        pagenum=bool(d.get("pagenum", False)),
+        link=str(d.get("link", "")),
+        fnref=str(d.get("fnref", "")),
+        fndef=str(d.get("fndef", "")),
+    )
+
+
+def _block_from_json(d: dict):
+    from google_scholar import Block
+
+    return Block(kind=str(d.get("kind", "para")),
+                 spans=[_span_from_json(s) for s in d.get("spans", [])])
+
+
+def _blocks_from_json(raw) -> list:
+    return [_block_from_json(b) for b in (raw or [])]
+
+
+def _part_from_json(d: dict):
+    from google_scholar import OpinionPart
+
+    return OpinionPart(
+        label=str(d.get("label", "")),
+        kind=str(d.get("kind", "majority")),
+        blocks=_blocks_from_json(d.get("blocks")),
+        footnotes=_blocks_from_json(d.get("footnotes")),
+    )
+
+
+def _parts_from_json(raw) -> list:
+    return [_part_from_json(p) for p in (raw or [])]
+
+
+class _SavedStatuteDoc:
+    """A statute / regulation / rule reopened from its bookmarked local copy.
+
+    Exposes the read surface :class:`_StatuteWindow` needs (``paras``,
+    ``label``, ``kind`` …) from stored data; section-to-section navigation is
+    disabled because there is nothing to fetch offline."""
+
+    def __init__(self, data: dict) -> None:
+        self.paras = [tuple(p) for p in (data.get("paras") or []) if len(p) == 3]
+        self.url = str(data.get("url", ""))
+        self.title = str(data.get("title", ""))
+        self.set_key = data.get("set_key")
+        self.container = None
+        self._kind = str(data.get("kind", "usc"))
+        self._label = str(data.get("label", ""))
+        self._source_name = str(data.get("source_name", ""))
+        self._source_note = str(data.get("source_note", ""))
+        self._bluebook = str(data.get("bluebook_cite", "") or data.get("label", ""))
+
+    @property
+    def kind(self) -> str:
+        return self._kind
+
+    @property
+    def label(self) -> str:
+        return self._label
+
+    @property
+    def source_name(self) -> str:
+        return self._source_name
+
+    @property
+    def source_note(self) -> str:
+        return self._source_note
+
+    @property
+    def heading(self) -> str:
+        for kind, _i, text in self.paras:
+            if kind == "sechead":
+                return text
+        return self._label
+
+    def bluebook_cite(self, subs: tuple = ()) -> str:
+        return self._bluebook + "".join(f"({s})" for s in subs)
+
+    def neighbors(self):
+        return (None, None)
 
 
 def _load_saved_token() -> str:
@@ -2771,6 +3039,8 @@ def _mac_activate_app(allow_osascript: bool = True) -> bool:
 class CourtListenerGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
+        global _ACTIVE_APP
+        _ACTIVE_APP = self
         self.root.title("CourtListener Case Law Search")
         self.root.geometry("1300x720")
         self.root.minsize(900, 500)
@@ -2800,6 +3070,12 @@ class CourtListenerGUI:
         # dropdown every case window carries: {"key", "label", "reopen"}.
         # Deduped by key (a re-view moves the case to the front), capped.
         self._case_history: list[dict] = self._load_case_history()
+
+        # Bookmarked cases/statutes/rules, for the "Bookmarks" menu every
+        # reader window carries.  Each entry keeps a local copy of the
+        # document (see _save_bookmarks) so it reopens offline; the menu lists
+        # them by most-recent access, not by when they were bookmarked.
+        self._bookmarks: list[dict] = self._load_bookmarks()
 
         self._build_ui()
         self._setup_global_hotkey()
@@ -2956,6 +3232,9 @@ class CourtListenerGUI:
         self._case_history.insert(0, entry)
         del self._case_history[self._CASE_HISTORY_MAX:]
         self._save_case_history()
+        # A view is also an access — keep the case's bookmark (if any) at the
+        # top of the access-ordered Bookmarks menu.
+        self.touch_bookmark(key)
 
     def retitle_case_view(self, key: str, label: str) -> None:
         """Update a history entry's label in place (e.g. once the Bluebook
@@ -2963,6 +3242,7 @@ class CourtListenerGUI:
         label = re.sub(r"\s+", " ", label or "").strip()
         if not label:
             return
+        self.retitle_bookmark(key, label)
         for e in self._case_history:
             if e["key"] == key:
                 e["label"] = label
@@ -3001,6 +3281,200 @@ class CourtListenerGUI:
                 menu.grab_release()
             except tk.TclError:
                 pass
+
+    # ------------------------------------------------------------------
+    # Bookmarks (the "Bookmarks" dropdown on reader windows)
+    # ------------------------------------------------------------------
+
+    _BOOKMARK_MAX = 200
+
+    def _load_bookmarks(self) -> list[dict]:
+        saved = _load_config().get("bookmarks", [])
+        if not isinstance(saved, list):
+            return []
+        out: list[dict] = []
+        seen: set[str] = set()
+        for raw in saved:
+            if not isinstance(raw, dict):
+                continue
+            key = str(raw.get("key") or "").strip()
+            payload = raw.get("payload")
+            if not key or key in seen or not isinstance(payload, dict):
+                continue
+            seen.add(key)
+            label = re.sub(r"\s+", " ", str(raw.get("label") or "")).strip()
+            marked = _as_float(raw.get("bookmarked_at")) or time.time()
+            out.append({
+                "key": key,
+                "label": label or key,
+                "noun": str(raw.get("noun") or "case"),
+                "payload": payload,
+                "bookmarked_at": marked,
+                "last_accessed": _as_float(raw.get("last_accessed")) or marked,
+            })
+        return out[:self._BOOKMARK_MAX]
+
+    def _save_bookmarks(self) -> None:
+        data = _load_config()
+        saved: list[dict] = []
+        for e in self._bookmarks[:self._BOOKMARK_MAX]:
+            payload = e.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            saved.append({
+                "key": e.get("key", ""),
+                "label": e.get("label", ""),
+                "noun": e.get("noun", "case"),
+                "payload": _json_ready(payload),
+                "bookmarked_at": e.get("bookmarked_at", time.time()),
+                "last_accessed": e.get("last_accessed", time.time()),
+            })
+        data["bookmarks"] = saved
+        _save_config(data)
+
+    def is_bookmarked(self, key: str) -> bool:
+        return any(e.get("key") == key for e in self._bookmarks)
+
+    def add_bookmark(self, descriptor: Optional[dict]) -> None:
+        """Store *descriptor* ({key, label, noun, payload}) as a bookmark,
+        moving it to the front and stamping it accessed-now."""
+        if not descriptor:
+            return
+        key = str(descriptor.get("key") or "").strip()
+        payload = descriptor.get("payload")
+        if not key or not isinstance(payload, dict):
+            return
+        now = time.time()
+        label = re.sub(r"\s+", " ", str(descriptor.get("label") or "")).strip()
+        self._bookmarks = [e for e in self._bookmarks if e.get("key") != key]
+        self._bookmarks.insert(0, {
+            "key": key,
+            "label": label or key,
+            "noun": str(descriptor.get("noun") or "case"),
+            "payload": _json_ready(payload),
+            "bookmarked_at": now,
+            "last_accessed": now,
+        })
+        del self._bookmarks[self._BOOKMARK_MAX:]
+        self._save_bookmarks()
+
+    def remove_bookmark(self, key: str) -> Optional[dict]:
+        """Drop the bookmark with *key*; return the removed entry (or None)."""
+        removed = next((e for e in self._bookmarks if e.get("key") == key), None)
+        if removed is None:
+            return None
+        self._bookmarks = [e for e in self._bookmarks if e.get("key") != key]
+        self._save_bookmarks()
+        return removed
+
+    def touch_bookmark(self, key: str) -> None:
+        """Mark a bookmark accessed-now (so it rises in the Bookmarks menu,
+        which is ordered by access, not by when it was bookmarked)."""
+        for e in self._bookmarks:
+            if e.get("key") == key:
+                e["last_accessed"] = time.time()
+                self._save_bookmarks()
+                return
+
+    def retitle_bookmark(self, key: str, label: str) -> None:
+        label = re.sub(r"\s+", " ", label or "").strip()
+        if not label:
+            return
+        for e in self._bookmarks:
+            if e.get("key") == key and e.get("label") != label:
+                e["label"] = label
+                self._save_bookmarks()
+                return
+
+    def _bookmarks_by_access(self) -> list[dict]:
+        return sorted(self._bookmarks,
+                      key=lambda e: e.get("last_accessed") or 0, reverse=True)
+
+    def _bookmark_opener_from_entry(self, entry: dict):
+        """A no-argument callable that reopens a bookmarked document from its
+        stored local copy (no network), falling back to a refetch only when the
+        local copy is missing."""
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        kind = payload.get("type")
+        label = entry.get("label", "")
+        if kind == "scholar":
+            url = str(payload.get("url") or "")
+            html = str(payload.get("html") or "")
+            item = dict(payload.get("item") or {})
+            prefetch = bool(payload.get("prefetch_pdf", True))
+            if html:
+                return lambda: _ScholarTextWindow(
+                    self.root, self, url, html, item=item,
+                    prefetch_pdf=prefetch)
+            cite = str(payload.get("cite") or "")
+            return lambda: self._open_history_scholar(
+                url, item, cite, label, prefetch)
+        if kind == "cl":
+            item = dict(payload.get("item") or {})
+            prefetch = bool(payload.get("prefetch_pdf", True))
+            parts = _parts_from_json(payload.get("parts"))
+            if parts:
+                blocks = _blocks_from_json(payload.get("blocks"))
+                text = str(payload.get("cl_text") or "")
+                return lambda: _ScholarTextWindow(
+                    self.root, self, "", "", item=item, cl_text=text,
+                    cl_parts=parts, cl_blocks=blocks, prefetch_pdf=prefetch)
+            return lambda: self._open_history_cl(item, label, prefetch)
+        if kind == "pdf":
+            url = str(payload.get("url") or "")
+            title = str(payload.get("title") or label or url)
+            return lambda: _PdfWindow(
+                self.root, url, title, self._status_var.set, app=self,
+                is_case=True, local_pdf=str(_bookmark_pdf_path(url)))
+        if kind == "statute":
+            doc = payload.get("doc")
+            if not isinstance(doc, dict):
+                return None
+            return lambda: _StatuteWindow(
+                self.root, _SavedStatuteDoc(doc), app=self)
+        return None
+
+    def populate_bookmarks_menu(self, menu: tk.Menu, target=None) -> None:
+        """Fill the Bookmarks dropdown: the current document's
+        bookmark/unbookmark toggle first (always, tabs or no tabs), then the
+        saved bookmarks ordered by most-recent access."""
+        try:
+            menu.delete(0, "end")
+        except tk.TclError:
+            return
+        desc = None
+        if target is not None:
+            try:
+                desc = target._bookmark_descriptor()
+            except Exception:
+                desc = None
+        current_key = None
+        if desc:
+            current_key = desc.get("key")
+            noun = str(desc.get("noun") or "case").title()
+            if self.is_bookmarked(current_key):
+                menu.add_command(label=f"Remove Bookmark for This {noun}",
+                                 command=target._toggle_bookmark)
+            else:
+                menu.add_command(label=f"Bookmark This {noun}",
+                                 command=target._toggle_bookmark)
+            menu.add_separator()
+        entries = self._bookmarks_by_access()
+        if not entries:
+            menu.add_command(label="No bookmarks yet", state="disabled")
+            return
+        for e in entries:
+            opener = self._bookmark_opener_from_entry(e)
+            if opener is None:
+                continue
+            label = e.get("label", "")
+            if len(label) > 72:
+                label = label[:69] + "…"
+            if e.get("key") == current_key:
+                label = "• " + label  # the document this window is showing
+            menu.add_command(label=label, command=opener)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -10378,7 +10852,9 @@ class _ScholarTextWindow:
                 else "Google Scholar Opinion Text"
             )
         )
-        self._history_menubar = _install_history_menubar(self._app, self._win)
+        self._history_menubar = _install_history_menubar(
+            self._app, self._win, bookmark_target=self
+        )
         # SCOTUS cases open the Oyez "Case details" panel by default (wired up
         # in _build_ui); widen the window by the panel's width so the opinion
         # text keeps its usual room with the panel added to the right of it.
@@ -10480,6 +10956,54 @@ class _ScholarTextWindow:
         )
 
     # ------------------------------------------------------------------
+    # Bookmarks
+    # ------------------------------------------------------------------
+
+    def _bookmark_descriptor(self) -> Optional[dict]:
+        """This case's bookmark record, including a local copy that reopens
+        offline: the opinion HTML for a Scholar case, or the serialized
+        opinion blocks for a CourtListener-primary one."""
+        if self._app is None:
+            return None
+        item = dict(self._item)
+        if self._cl_primary:
+            payload = {
+                "type": "cl",
+                "item": item,
+                "cl_text": self._cl_text or self._scholar_text or "",
+                "parts": _parts_to_json(self._cl_parts),
+                "blocks": _blocks_to_json(self._cl_blocks),
+                "prefetch_pdf": bool(self._prefetch_ok),
+            }
+        else:
+            payload = {
+                "type": "scholar",
+                "url": self._scholar_url,
+                "html": self._history_html,
+                "item": item,
+                "cite": self._bb.get("cite", ""),
+                "prefetch_pdf": bool(self._prefetch_ok),
+            }
+        return {
+            "key": self._history_key(),
+            "label": self._history_label(),
+            "noun": "case",
+            "payload": payload,
+        }
+
+    def _toggle_bookmark(self) -> None:
+        app = self._app
+        if app is None or not hasattr(app, "is_bookmarked"):
+            return
+        desc = self._bookmark_descriptor()
+        if not desc:
+            return
+        if app.is_bookmarked(desc["key"]):
+            app.remove_bookmark(desc["key"])
+        else:
+            app.add_bookmark(desc)
+
+    # ------------------------------------------------------------------
     # UI
     # ------------------------------------------------------------------
 
@@ -10492,7 +11016,8 @@ class _ScholarTextWindow:
 
         url_frame = _ui_frame(win)
         url_frame.pack(fill="x", padx=12, pady=(12, 0))
-        ttk.Label(url_frame, text="Source", style=muted_style).pack(side="left")
+        src_label = ttk.Label(url_frame, text="Source", style=muted_style)
+        src_label.pack(side="left")
         self._source_var = tk.StringVar(value=self._scholar_url)
         ttk.Entry(url_frame, textvariable=self._source_var, state="readonly",
                   style=entry_style).pack(
@@ -10502,7 +11027,8 @@ class _ScholarTextWindow:
         # Part navigation: what you're viewing, and a selector to filter
         view_frame = _ui_frame(win)
         view_frame.pack(fill="x", padx=12, pady=(8, 0))
-        ttk.Label(view_frame, text="Viewing", style=muted_style).pack(side="left")
+        viewing_label = ttk.Label(view_frame, text="Viewing", style=muted_style)
+        viewing_label.pack(side="left")
         self._view_label_var = tk.StringVar(value="Full opinion")
         self._view_label = ttk.Label(
             view_frame,
@@ -10511,6 +11037,11 @@ class _ScholarTextWindow:
             font=("TkDefaultFont", 11, "bold"),
         )
         self._view_label.pack(side="left", padx=(6, 12))
+        # Right-click the top "tab" strip to bookmark / unbookmark this case.
+        _bind_bookmark_right_click(
+            win, (url_frame, src_label, view_frame, viewing_label,
+                  self._view_label), self,
+        )
         part_values = ["Full opinion"] + [
             f"{i + 1}. {p.label}" for i, p in enumerate(self._parts)
         ]
@@ -15137,19 +15668,22 @@ class _PdfWindow:
 
     def __init__(self, parent: tk.Misc, url: str, title: str,
                  status=lambda _s: None, *, app=None,
-                 is_case: bool = False) -> None:
+                 is_case: bool = False, local_pdf: Optional[str] = None) -> None:
         self._url = url
         self._title = title
         self._ext_status = status
         self._app = app          # for the History dropdown (may be None)
         self._is_case = is_case  # case scan (case.law) vs statute scan
+        # A bookmarked case scan reopens from this saved copy (no refetch).
+        self._local_pdf = local_pdf
         self._bytes: Optional[bytes] = None
         self._pane: Optional[_PdfPane] = None
 
         self._win = _ui_toplevel(parent)
         self._win.title(title)
         self._history_menubar = _install_history_menubar(
-            self._app if self._is_case else None, self._win
+            self._app if self._is_case else None, self._win,
+            bookmark_target=self if self._is_case else None,
         )
         self._win.geometry(
             _fit_toplevel_geometry(
@@ -15161,7 +15695,11 @@ class _PdfWindow:
 
         top = _ui_frame(self._win)
         top.pack(fill="x", padx=12, pady=(12, 4))
-        _ui_label(top, title, size=14, weight="bold", anchor="w").pack(side="left")
+        top_label = _ui_label(top, title, size=14, weight="bold", anchor="w")
+        top_label.pack(side="left")
+        if self._is_case:
+            # Right-click the title "tab" to bookmark / unbookmark this case.
+            _bind_bookmark_right_click(self._win, (top, top_label), self)
 
         btns = _ui_frame(self._win)
         btns.pack(fill="x", side="bottom", padx=12, pady=(0, 10))
@@ -15206,6 +15744,30 @@ class _PdfWindow:
                                    is_case=True),
                 payload)
 
+    def _bookmark_descriptor(self) -> Optional[dict]:
+        if not self._is_case or self._app is None:
+            return None
+        return {
+            "key": f"pdf:{self._url}",
+            "label": self._title,
+            "noun": "case",
+            "payload": {"type": "pdf", "url": self._url, "title": self._title},
+        }
+
+    def _toggle_bookmark(self) -> None:
+        app = self._app
+        if app is None or not hasattr(app, "is_bookmarked"):
+            return
+        desc = self._bookmark_descriptor()
+        if not desc:
+            return
+        if app.is_bookmarked(desc["key"]):
+            app.remove_bookmark(desc["key"])
+            _bookmark_pdf_delete(self._url)   # drop the saved local copy
+        else:
+            _bookmark_pdf_save(self._url, self._bytes)  # save a local copy
+            app.add_bookmark(desc)
+
     def _post(self, fn, *args) -> None:
         try:
             self._win.after(0, fn, *args)
@@ -15235,6 +15797,15 @@ class _PdfWindow:
 
         def run() -> None:
             try:
+                # Reopened from a bookmark: use the saved local copy, no refetch.
+                if self._local_pdf:
+                    try:
+                        saved = Path(self._local_pdf).read_bytes()
+                    except OSError:
+                        saved = b""
+                    if saved.startswith(b"%PDF"):
+                        self._post(self._show, saved)
+                        return
                 client = (
                     getattr(self._app, "_client", None)
                     if self._app is not None and _is_courtlistener_url(self._url)
@@ -16497,9 +17068,11 @@ class _StatuteWindow:
     text; long editorial/statutory notes sit behind a toggle.
     """
 
-    def __init__(self, parent: tk.Misc, doc, highlight: tuple = ()) -> None:
+    def __init__(self, parent: tk.Misc, doc, highlight: tuple = (),
+                 *, app=None) -> None:
         self._doc = doc
         self._highlight = tuple(highlight)
+        self._app = app if app is not None else _active_app()
         self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
         self._neighbors: tuple = (None, None)
         self._link_actions: dict[str, tuple[str, str]] = {}
@@ -16507,12 +17080,16 @@ class _StatuteWindow:
         self._win = _ui_toplevel(parent)
         _ensure_modern_ttk_styles(self._win)
         self._win.title(f"{doc.label} — {doc.source_name}")
+        self._bookmark_menubar = _install_bookmark_menubar(
+            self._app, self._win, self,
+        )
         self._win.geometry("760x640")
         self._win.minsize(440, 280)
         self._base_size = _OPINION_FONT_PT
         self._build_ui()
         self._render()
         self._refresh_neighbors()
+        self._touch_bookmark()
 
     def _build_ui(self) -> None:
         win = self._win
@@ -16520,7 +17097,10 @@ class _StatuteWindow:
         entry_style = "Modern.TEntry" if _CTK_AVAILABLE else "TEntry"
         top = _ui_frame(win)
         top.pack(fill="x", padx=12, pady=(12, 0))
-        ttk.Label(top, text="Source", style=muted_style).pack(side="left")
+        src_label = ttk.Label(top, text="Source", style=muted_style)
+        src_label.pack(side="left")
+        # Right-click the top "tab" strip to bookmark / unbookmark this section.
+        _bind_bookmark_right_click(win, (top, src_label), self)
         self._src_var = tk.StringVar(value=self._doc.url)
         ttk.Entry(top, textvariable=self._src_var, state="readonly",
                   style=entry_style).pack(
@@ -16853,6 +17433,66 @@ class _StatuteWindow:
         self._render()
         self._text.yview_moveto(0.0)
         self._refresh_neighbors()
+        self._touch_bookmark()  # navigating here counts as accessing it
+
+    # ------------------------------------------------------------------
+    # Bookmarks
+    # ------------------------------------------------------------------
+
+    def _bookmark_noun(self) -> str:
+        kind = getattr(self._doc, "kind", "")
+        if kind == "rule":
+            return "rule"
+        if kind == "const":
+            return "provision"
+        return "statute"
+
+    def _bookmark_descriptor(self) -> Optional[dict]:
+        """This section's bookmark record, with a local copy of the parsed
+        text so it reopens offline (section navigation is disabled there)."""
+        if self._app is None:
+            return None
+        doc = self._doc
+        try:
+            local = {
+                "paras": _json_ready([list(p) for p in doc.paras]),
+                "url": doc.url,
+                "kind": doc.kind,
+                "title": getattr(doc, "title", ""),
+                "set_key": getattr(doc, "set_key", None),
+                "label": doc.label,
+                "source_name": doc.source_name,
+                "source_note": doc.source_note,
+                "bluebook_cite": doc.bluebook_cite(),
+            }
+        except Exception:
+            return None
+        return {
+            "key": f"statute:{doc.url}",
+            "label": doc.label,
+            "noun": self._bookmark_noun(),
+            "payload": {"type": "statute", "doc": local},
+        }
+
+    def _toggle_bookmark(self) -> None:
+        app = self._app
+        if app is None or not hasattr(app, "is_bookmarked"):
+            return
+        desc = self._bookmark_descriptor()
+        if not desc:
+            return
+        if app.is_bookmarked(desc["key"]):
+            app.remove_bookmark(desc["key"])
+        else:
+            app.add_bookmark(desc)
+
+    def _touch_bookmark(self) -> None:
+        app = self._app
+        if app is not None and hasattr(app, "touch_bookmark"):
+            try:
+                app.touch_bookmark(f"statute:{self._doc.url}")
+            except Exception:
+                pass
 
     def _pin_for(self, index: str) -> tuple:
         """Enumerator path of the paragraph containing a text index, for
