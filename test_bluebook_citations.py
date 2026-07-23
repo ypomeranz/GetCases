@@ -36,11 +36,14 @@ from courtlistener_gui import (
     _cl_item_for_citation,
     _combined_parts_cover_typed,
     _cut_companion_cases,
+    _dump_to_rtf,
     _nominative_display_cite,
     _pick_combined_opinion,
+    _plain_without_layout_chars,
     _recap_citation_ranges,
     _recap_spec_index,
     _scholar_caption_name,
+    _spotlight_case_action,
     _special_citation_ranges,
     _wisconsin_display_cite,
 )
@@ -978,6 +981,24 @@ class NominativeCitationSearchTests(unittest.TestCase):
 
 
 class CopyWithCitationTests(unittest.TestCase):
+    class DumpText:
+        def __init__(self, before="words ", after=" remain"):
+            self.before = before
+            self.after = after
+
+        @staticmethod
+        def tag_names(_start):
+            return ()
+
+        def dump(self, _start, _end, **_kwargs):
+            return [
+                ("text", self.before, "1.0"),
+                ("tagon", "pagenum", "1.6"),
+                ("text", "*123", "1.6"),
+                ("tagoff", "pagenum", "1.10"),
+                ("text", self.after, "1.10"),
+            ]
+
     @staticmethod
     def _window(with_cite: bool):
         win = object.__new__(_ScholarTextWindow)
@@ -1023,6 +1044,42 @@ class CopyWithCitationTests(unittest.TestCase):
 
         self.assertEqual(dump.call_args.kwargs["omit_tags"], set())
         self.assertEqual(plain.call_args.kwargs["omit_tags"], set())
+
+    def test_omitted_pagination_collapses_two_surrounding_spaces(self):
+        txt = self.DumpText()
+
+        plain = _plain_without_layout_chars(
+            txt, "1.0", "end", omit_tags={"pagenum"},
+        )
+        rtf = _dump_to_rtf(txt, "1.0", "end", omit_tags={"pagenum"})
+
+        self.assertEqual(plain, "words remain")
+        self.assertIn("words remain", rtf)
+        self.assertNotIn("words  remain", rtf)
+
+    def test_omitted_pagination_does_not_invent_or_remove_one_sided_space(self):
+        cases = (
+            ("words ", "remain", "words remain"),
+            ("words", " remain", "words remain"),
+            ("words", "remain", "wordsremain"),
+        )
+        for before, after, expected in cases:
+            with self.subTest(before=before, after=after):
+                txt = self.DumpText(before, after)
+                self.assertEqual(
+                    _plain_without_layout_chars(
+                        txt, "1.0", "end", omit_tags={"pagenum"},
+                    ),
+                    expected,
+                )
+
+    def test_plain_copy_retains_pagination_and_its_original_spacing(self):
+        txt = self.DumpText()
+
+        self.assertEqual(
+            _plain_without_layout_chars(txt, "1.0", "end"),
+            "words *123 remain",
+        )
 
 
 class OpinionDatabaseSpotlightTests(unittest.TestCase):
@@ -1078,6 +1135,35 @@ class OpinionDatabaseSpotlightTests(unittest.TestCase):
             self.DB(rows), "Acme Corp. v. Smith (9th Cir. 2024)", limit=3)
 
         self.assertEqual([h["scholar_id"] for h in hits], ["9"])
+
+
+class SpotlightCitationDetectionTests(unittest.TestCase):
+    def test_early_federal_reporter_uses_shared_normalization(self):
+        hit = _spotlight_case_action("The Nestor, 1 Sumner, 73")
+
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[2], ("cite", "1 Sumn. 73"))
+
+    def test_federal_cases_number_routes_to_special_opener(self):
+        hit = _spotlight_case_action(
+            "Cole v. The Atlantic, Case No. 2,976"
+        )
+
+        self.assertIsNotNone(hit)
+        kind, value = hit[2]
+        self.assertEqual(kind, "fedcas")
+        self.assertEqual(json.loads(value)["no"], "2976")
+
+    def test_federal_cases_reporter_is_a_direct_case_action(self):
+        hit = _spotlight_case_action("The Nestor, 18 F. Cas. 9")
+
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[2], ("cite", "18 F. Cas. 9"))
+
+    def test_multiple_case_citations_are_not_opened_arbitrarily(self):
+        self.assertIsNone(
+            _spotlight_case_action("1 Sumner, 73; 35 Fed. Rep. 665")
+        )
 
 
 class CaseLawSharedPageTests(unittest.TestCase):

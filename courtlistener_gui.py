@@ -4451,8 +4451,31 @@ class CourtListenerGUI:
                               app=self)
                 return
 
+            # The opinion/brief readers recognize several case-citation forms
+            # that the permissive hand-typed parser below cannot normalize on
+            # its own: early federal reporters ("1 Sumner, 73", "35 Fed.
+            # Rep. 665"), Federal Cases case numbers, federal slip opinions,
+            # and similar special forms.  Reuse that shared detector so the
+            # same citation opens directly from Spotlight too.
+            detected = _spotlight_case_action(query)
+            if detected and detected[2][0] != "cite":
+                self._close_quick_popup()
+                _follow_brief_action(
+                    self, self.root, detected[2], self._status_var.set,
+                )
+                return
+
             # 2. Case citation: "365 U.S. 167" or "Monroe v. Pape, 365 U.S. 167, 171"
             parsed = _parse_citation_line(query)
+            if detected:
+                start, _end, (_kind, target) = detected
+                cite, _, pin = target.partition("@")
+                # Preserve the broader parser's case-name fallback when it
+                # found one; otherwise take the caption preceding the shared
+                # detector's citation span.
+                name = parsed[0] if parsed else query[:start]
+                name = name.strip().rstrip(",;–—- ").strip()
+                parsed = name, cite, pin
             if parsed:
                 name, cite, pin = parsed
                 fetcher = (
@@ -8914,6 +8937,21 @@ def _fn_bookmark(side: str, fid: str) -> str:
     return ("FNR_" if side == "fnref" else "FNB_") + safe
 
 
+def _collapse_pagenum_omission_seam(
+    value: str, previous_char: str, omitted_pagenum: bool,
+) -> str:
+    """Remove the right-hand space only when omitting an inline page marker
+    would otherwise leave spaces on both sides of the omission.
+
+    This deliberately does not insert spacing where either side lacked it and
+    does not collapse across a newline.  CourtListener source text is not as
+    consistent as Scholar about surrounding ``*123`` with two spaces.
+    """
+    if omitted_pagenum and previous_char == " " and value.startswith(" "):
+        return value.lstrip(" ")
+    return value
+
+
 def _dump_to_rtf(
     txt: tk.Text, start: str, end: str, part_colors: bool = False,
     fn_links: Optional[dict[str, tuple[str, str]]] = None,
@@ -8933,6 +8971,8 @@ def _dump_to_rtf(
     par_open = False
     pending_marks: list[str] = []   # bookmarks to emit at the next run
     marks_done: set[str] = set()    # bookmark names must be unique
+    omitted_pagenum = False
+    previous_char = ""
 
     def par_prefix() -> str:
         if "center" in active:
@@ -8970,8 +9010,16 @@ def _dump_to_rtf(
         elif key == "tagoff":
             active.discard(value)
         elif key == "text":
-            if "justify-pad" in active or active & omit_tags:
+            if "justify-pad" in active:
                 continue
+            if active & omit_tags:
+                if "pagenum" in active and "pagenum" in omit_tags:
+                    omitted_pagenum = True
+                continue
+            value = _collapse_pagenum_omission_seam(
+                value, previous_char, omitted_pagenum,
+            )
+            omitted_pagenum = False
             for i, seg in enumerate(value.split("\n")):
                 if i and par_open:
                     out.append("\\par\n")
@@ -8989,6 +9037,8 @@ def _dump_to_rtf(
                         run = ("{\\field{\\*\\fldinst{HYPERLINK \\\\l \""
                                + target + "\"}}{\\fldrslt " + run + "}}")
                     out.append(run)
+            if value:
+                previous_char = value[-1]
     if par_open:
         out.append("\\par\n")
     return "".join(out)
@@ -9094,14 +9144,25 @@ def _plain_without_layout_chars(
     out: list[str] = []
     omit_tags = omit_tags or set()
     active: set[str] = set(txt.tag_names(start))
+    omitted_pagenum = False
+    previous_char = ""
     for key, value, _index in txt.dump(start, end, text=True, tag=True):
         if key == "tagon":
             active.add(value)
         elif key == "tagoff":
             active.discard(value)
-        elif key == "text" and "justify-pad" not in active \
-                and not active & omit_tags:
+        elif key == "text" and "justify-pad" not in active:
+            if active & omit_tags:
+                if "pagenum" in active and "pagenum" in omit_tags:
+                    omitted_pagenum = True
+                continue
+            value = _collapse_pagenum_omission_seam(
+                value, previous_char, omitted_pagenum,
+            )
+            omitted_pagenum = False
             out.append(value)
+            if value:
+                previous_char = value[-1]
     return "".join(out)
 
 
@@ -18002,6 +18063,32 @@ _CFR_SECREF_RE = re.compile(
 _LINE_CITE_RE = re.compile(
     r"(\d{1,4})\s+([A-Z][A-Za-z0-9.'’ ]{0,24}?)\s+(\d{1,5})(?=[\s,;.)(]|$)"
 )
+
+
+_SPOTLIGHT_CASE_ACTIONS = frozenset(("cite", "engrep", "recap", "fedcas"))
+
+
+def _spotlight_case_action(
+    query: str,
+) -> Optional[tuple[int, int, tuple[str, str]]]:
+    """Return Spotlight's one unambiguous case action from the shared
+    opinion/brief citation detector.
+
+    Spotlight falls back to its ordinary results dropdown when the text has no
+    case citation or has multiple case citations.  Filtering to case actions
+    is important because statute and rule queries have their own earlier route.
+    """
+    try:
+        cases = [
+            (start, end, action)
+            for start, end, action in detect_brief_links(query or "")
+            if action[0] in _SPOTLIGHT_CASE_ACTIONS
+        ]
+    except Exception:
+        # A convenience detector should never prevent the existing permissive
+        # hand-typed parser and case-name search from getting their chance.
+        return None
+    return cases[0] if len(cases) == 1 else None
 
 
 def _parse_citation_line(line: str) -> Optional[tuple[str, str, str]]:
