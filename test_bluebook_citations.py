@@ -1705,6 +1705,52 @@ class CaseWindowModeTests(unittest.TestCase):
             _CaseTabsWindow._point_in_tab_close_box(bbox, 110, 35)
         )
 
+    def test_tab_close_target_is_measured_from_the_notebook_hit_test(self):
+        # ttk::notebook has no bbox subcommand, so notebook.bbox() reaches
+        # tkinter's grid geometry and reports (0, 0, 0, 0) — the close box has
+        # to come from Tk's own "@x,y" tab hit test instead.
+        class Notebook:
+            spans = ((0, 99), (100, 199))  # tab index -> inclusive x range
+
+            def __init__(self):
+                self.pages = ("first", "second")
+
+            def winfo_width(self):
+                return 400
+
+            def bbox(self, *_args):
+                return (0, 0, 0, 0)
+
+            def tabs(self):
+                return self.pages
+
+            def index(self, value):
+                text = str(value)
+                if text.startswith("@"):
+                    x, y = (int(n) for n in text[1:].split(","))
+                    if not 0 <= y < 24:  # the tab strip's height
+                        raise tk.TclError(text)
+                    for i, (lo, hi) in enumerate(self.spans):
+                        if lo <= x <= hi:
+                            return i
+                    raise tk.TclError(text)
+                return self.pages.index(text)
+
+        manager = object.__new__(_CaseTabsWindow)
+        manager.notebook = Notebook()
+        manager._pages = list(manager.notebook.pages)
+
+        self.assertEqual(manager._tab_bounds(0, 50, 10), (0, 99))
+        self.assertEqual(manager._tab_bounds(1, 150, 10), (100, 199))
+
+        # The rightmost _TAB_CLOSE_HIT_WIDTH px of a tab close it; the label
+        # side selects it, and the page body below the strip is not a tab.
+        self.assertEqual(manager._tab_close_page_at(98, 10), "first")
+        self.assertEqual(manager._tab_close_page_at(198, 10), "second")
+        self.assertIsNone(manager._tab_close_page_at(5, 10))
+        self.assertIsNone(manager._tab_close_page_at(120, 10))
+        self.assertIsNone(manager._tab_close_page_at(98, 200))
+
     def test_clicking_tab_close_target_destroys_only_that_page(self):
         manager = object.__new__(_CaseTabsWindow)
         page = Mock()

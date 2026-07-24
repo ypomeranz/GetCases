@@ -720,6 +720,44 @@ class _CaseTabsWindow:
             and top <= y < top + height
         )
 
+    def _tab_bounds(
+        self, index: int, x: int, y: int,
+    ) -> "Optional[tuple[int, int]]":
+        """The leftmost and rightmost pixel columns of tab *index* on row *y*.
+
+        ``ttk::notebook`` has no bbox subcommand: ``notebook.bbox(i)`` reaches
+        tkinter's ``Misc.bbox``, which is grid geometry, ignores *i*, and
+        reports (0, 0, 0, 0) for a notebook that has no grid slaves.  Tk's own
+        ``@x,y`` tab hit test is authoritative, so the edges are found by
+        binary searching it outward from a point known to be on the tab.
+        """
+        notebook = self.notebook
+
+        def on_tab(probe: int) -> bool:
+            try:
+                return notebook.index(f"@{probe},{y}") == index
+            except tk.TclError:
+                return False
+
+        if not on_tab(x):
+            return None
+        lo, hi = 0, x
+        while lo < hi:  # leftmost column still on this tab
+            mid = (lo + hi) // 2
+            if on_tab(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        left = lo
+        lo, hi = x, max(x, notebook.winfo_width() - 1)
+        while lo < hi:  # rightmost column still on this tab
+            mid = (lo + hi + 1) // 2
+            if on_tab(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return left, lo
+
     def _tab_close_page_at(
         self, x: int, y: int,
     ) -> "Optional[_CaseTabPage]":
@@ -727,10 +765,19 @@ class _CaseTabsWindow:
         if page is None:
             return None
         try:
-            bbox = self.notebook.bbox(self.notebook.index(page))
+            index = self.notebook.index(page)
         except (tk.TclError, ValueError):
             return None
-        return page if self._point_in_tab_close_box(bbox, x, y) else None
+        bounds = self._tab_bounds(index, x, y)
+        if bounds is None:
+            return None
+        left, right = bounds
+        # _page_at already proved the point is on this tab, so only the
+        # horizontal range is in question; the box is anchored to the row
+        # actually probed.
+        return page if self._point_in_tab_close_box(
+            (left, y, right - left + 1, 1), x, y,
+        ) else None
 
     def _set_tab_close_hover(
         self, page: "Optional[_CaseTabPage]",
