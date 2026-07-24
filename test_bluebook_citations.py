@@ -1705,6 +1705,45 @@ class CaseWindowModeTests(unittest.TestCase):
             _CaseTabsWindow._point_in_tab_close_box(bbox, 110, 35)
         )
 
+    def test_main_window_bookmarks_menu_lists_saved_documents(self):
+        # The root window is not a document view, so its Bookmarks cascade
+        # lists the saved documents with no "Bookmark This …" toggle first.
+        class Menu:
+            def __init__(self):
+                self.items = []
+
+            def delete(self, *_args):
+                self.items.clear()
+
+            def add_separator(self):
+                self.items.append("--")
+
+            def add_command(self, label="", command=None, state=None):
+                self.items.append(label)
+
+        app = object.__new__(CourtListenerGUI)
+        app.root = object()
+        app._open_case_views = {}
+        app._bookmarks = [
+            {"key": "scholar:1", "label": "Roe v. Wade", "last_accessed": 200,
+             "payload": {"type": "scholar", "url": "u", "html": "<p>x</p>",
+                         "item": {}}},
+            {"key": "statute:2", "label": "18 U.S.C. § 922",
+             "last_accessed": 300,
+             "payload": {"type": "statute",
+                         "doc": {"url": "u2", "label": "18 USC 922",
+                                 "paras": [], "kind": "usc"}}},
+        ]
+
+        menu = Menu()
+        app.populate_bookmarks_menu(menu, app.root)
+        # Most recently accessed first, and nothing to bookmark from here.
+        self.assertEqual(menu.items, ["18 U.S.C. § 922", "Roe v. Wade"])
+
+        app._bookmarks = []
+        app.populate_bookmarks_menu(menu, app.root)
+        self.assertEqual(menu.items, ["No bookmarks yet"])
+
     def test_tab_close_target_is_measured_from_the_notebook_hit_test(self):
         # ttk::notebook has no bbox subcommand, so notebook.bbox() reaches
         # tkinter's grid geometry and reports (0, 0, 0, 0) — the close box has

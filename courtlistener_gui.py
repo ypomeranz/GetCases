@@ -5371,6 +5371,11 @@ class CourtListenerGUI:
         db_menu.add_command(
             label="Rebuild Search Index", command=self._rebuild_db_index,
         )
+        # The same Bookmarks cascade the readers carry, so saved documents can
+        # be reopened straight from the main window.  The root window is not a
+        # document view, so this one lists the saved bookmarks without the
+        # "Bookmark This …" toggle the readers show first.
+        _add_bookmarks_cascade(menubar, self, self.root)
         self.root.bind("<Control-l>", lambda _e: self._show_statute_lookup())
         self.root.bind("<Control-s>", lambda _e: self._show_quick_lookup())
         self.root.bind("<Control-b>", lambda _e: self._open_brief())
