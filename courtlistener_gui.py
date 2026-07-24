@@ -22296,16 +22296,42 @@ class _StatuteWindow:
             except Exception:
                 pass
 
+    def _toggle_source_bar_from_menu(self) -> None:
+        """Apply the Window menu's "Show Source Bar" checkbutton, which Tk has
+        already flipped in _source_bar_var by the time this runs."""
+        self._apply_source_bar_visibility()
+
+    def _apply_source_bar_visibility(self) -> None:
+        """Show or hide the source display to match _source_bar_var, leaving
+        the § navigation buttons on the right in place."""
+        bar = getattr(self, "_source_bar", None)
+        if bar is None:
+            return
+        try:
+            if self._source_bar_var.get():
+                bar.pack(side="left", fill="x", expand=True)
+            else:
+                bar.pack_forget()
+        except tk.TclError:
+            pass
+
     def _build_ui(self) -> None:
         win = self._win
         muted_style = "ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel"
         entry_style = "Modern.TEntry" if _CTK_AVAILABLE else "TEntry"
         top = _ui_frame(win)
         top.pack(fill="x", padx=12, pady=(12, 0))
-        ttk.Label(top, text="Source", style=muted_style).pack(side="left")
+        # The source display (label + read-only URL) sits in its own frame so
+        # the Window menu's "Show Source Bar" toggle can hide it while leaving
+        # the § navigation buttons in place.  Hidden by default.
+        self._source_bar = _ui_frame(top)
+        self._source_bar_var = tk.BooleanVar(value=False)
+        self._win._source_bar_control = self
+        ttk.Label(self._source_bar, text="Source",
+                  style=muted_style).pack(side="left")
         self._src_var = tk.StringVar(value=self._doc.url)
-        ttk.Entry(top, textvariable=self._src_var, state="readonly",
-                  style=entry_style).pack(
+        ttk.Entry(self._source_bar, textvariable=self._src_var,
+                  state="readonly", style=entry_style).pack(
             side="left", fill="x", expand=True, padx=(8, 8)
         )
         _ui_button(
