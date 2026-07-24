@@ -450,6 +450,31 @@ def _install_history_menubar(app, win: tk.Misc):
     return menubar
 
 
+def _widget_accepts_typing(widget) -> bool:
+    """True when *widget* is a focused input that consumes typed characters.
+
+    Single-key window shortcuts (e.g. "s" to toggle the side panel) must yield
+    to the keyboard while the user is typing in an entry, the Find bar, or an
+    editable text box.  Disabled and read-only fields don't take typing, so a
+    shortcut is free to fire while they hold focus.
+    """
+    if widget is None:
+        return False
+    try:
+        cls = widget.winfo_class()
+    except tk.TclError:
+        return False
+    if cls in ("Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox"):
+        try:
+            state = str(widget.cget("state"))
+        except tk.TclError:
+            state = "normal"
+        return state not in ("disabled", "readonly")
+    # CustomTkinter wraps its inputs (CTkEntry / CTkTextbox); the inner tk
+    # widget usually holds focus, but match the wrapper name defensively.
+    return cls.endswith("Entry") or cls.endswith("Textbox")
+
+
 def _install_window_menubar(app, win: tk.Misc):
     """Attach the shared Window and Bookmarks menus to a non-case document
     view (a statute/rule reader), so it too can be bookmarked."""
@@ -532,6 +557,7 @@ class _CaseTabPage(ttk.Frame):
         if sequence and (
             str(sequence).startswith("<Control-")
             or str(sequence).startswith("<Command-")
+            or str(sequence).startswith("<KeyPress")  # bare-key accelerators
             or str(sequence) in ("<F3>", "<Shift-F3>", "<Escape>")
         ):
             def active_only(event, page=self, callback=func):
@@ -5062,6 +5088,14 @@ class CourtListenerGUI:
                 bool(self._case_tabs_var.get())
             ),
         )
+        # Opinion viewers expose their (default-hidden) source bar here.
+        source_owner = getattr(view, "_source_bar_control", None)
+        if source_owner is not None and hasattr(source_owner, "_source_bar_var"):
+            menu.add_checkbutton(
+                label="Show Source Bar",
+                variable=source_owner._source_bar_var,
+                command=source_owner._toggle_source_bar_from_menu,
+            )
         menu.add_separator()
         menu.add_command(
             label="Close Current Tab" if isinstance(view, _CaseTabPage)
@@ -14280,8 +14314,13 @@ class _ScholarTextWindow:
         entry_style = "Modern.TEntry" if _CTK_AVAILABLE else "TEntry"
         combo_style = "Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox"
 
+        # The source bar (a read-only field naming where this text came from)
+        # starts hidden; the Window menu's "Show Source Bar" item packs it in
+        # above the "Viewing" row via _apply_source_bar_visibility.
         url_frame = _ui_frame(win)
-        url_frame.pack(fill="x", padx=12, pady=(12, 0))
+        self._source_bar = url_frame
+        self._source_bar_var = tk.BooleanVar(value=False)
+        self._win._source_bar_control = self
         ttk.Label(url_frame, text="Source", style=muted_style).pack(side="left")
         initial_source = (
             self._primary_source_url or self._primary_source_label
@@ -14295,6 +14334,7 @@ class _ScholarTextWindow:
 
         # Part navigation: what you're viewing, and a selector to filter
         view_frame = _ui_frame(win)
+        self._view_frame = view_frame
         view_frame.pack(fill="x", padx=12, pady=(8, 0))
         ttk.Label(view_frame, text="Viewing", style=muted_style).pack(side="left")
         self._view_label_var = tk.StringVar(value="Full opinion")
@@ -14473,6 +14513,8 @@ class _ScholarTextWindow:
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
             win.bind(seq, lambda _e: self._zoom(-1))
         win.bind("<Control-0>", lambda _e: self._zoom(0))
+        # Bare "s" toggles the side panel, except while a text field has focus.
+        win.bind("<KeyPress-s>", self._toggle_details_shortcut)
         txt.bind(
             "<Control-MouseWheel>",
             lambda e: self._zoom(+1 if e.delta > 0 else -1) or "break",
@@ -17648,6 +17690,45 @@ class _ScholarTextWindow:
         self._apply_details_fonts()
         self._status_var.set(
             f"Side panel text: {self._details_fonts['body'].cget('size')} pt")
+
+    def _focused_widget(self):
+        """The widget holding keyboard focus in this window, or None."""
+        try:
+            return self._win.focus_get()
+        except (KeyError, tk.TclError):
+            return None
+
+    def _toggle_details_shortcut(self, event=None):
+        """Toggle the side panel from the bare "s" accelerator.
+
+        Ignored while focus is in a field that accepts typed text, so "s"
+        types normally in the Find bar and similar inputs.
+        """
+        if _widget_accepts_typing(self._focused_widget()):
+            return None
+        self._details_var.set(not self._details_var.get())
+        self._toggle_details()
+        return "break"
+
+    def _toggle_source_bar_from_menu(self) -> None:
+        """Apply the Window menu's "Show Source Bar" checkbutton, which Tk has
+        already flipped in _source_bar_var by the time this runs."""
+        self._apply_source_bar_visibility()
+
+    def _apply_source_bar_visibility(self) -> None:
+        """Show or hide the source bar to match _source_bar_var, keeping it
+        anchored above the "Viewing" row when shown."""
+        bar = getattr(self, "_source_bar", None)
+        if bar is None:
+            return
+        try:
+            if self._source_bar_var.get():
+                bar.pack(fill="x", padx=12, pady=(12, 0),
+                         before=self._view_frame)
+            else:
+                bar.pack_forget()
+        except tk.TclError:
+            pass
 
     def _toggle_details(self) -> None:
         if self._details_var.get():
