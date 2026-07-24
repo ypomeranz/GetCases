@@ -1172,6 +1172,11 @@ def _ensure_case_tab_style(widget: tk.Misc) -> str:
         darkcolor="#dfe3ea",
         borderwidth=1,
         tabmargins=(10, 8, 10, 0),
+        # Anchor tabs to the top-left on every platform.  Windows themes
+        # already default to "nw", but the macOS aqua theme defaults to a
+        # centred tab row ("n"); forcing "nw" makes the tabs fill left to
+        # right there too without changing the Windows appearance.
+        tabposition="nw",
     )
     style.configure(
         tab_style,
