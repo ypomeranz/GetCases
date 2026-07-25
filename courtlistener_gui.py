@@ -2860,6 +2860,154 @@ def _gather_all_citations(client, item: dict) -> list[str]:
     return out
 
 
+_SCOTUS_DOCKET_TOKEN_RE = re.compile(
+    r"\b(?:\d{1,3}[-‐-―−]\d{1,5}|\d{1,3}[A-Z]\d{1,5})\b",
+    re.IGNORECASE,
+)
+
+
+def _scotus_docket_tokens(value: str) -> set[str]:
+    normalized = re.sub(r"[-‐-―−]", "-", str(value or ""))
+    return {
+        re.sub(r"\s+", "", m.group(0)).upper()
+        for m in _SCOTUS_DOCKET_TOKEN_RE.finditer(normalized)
+    }
+
+
+def _item_docket_text(item: dict) -> str:
+    values = [
+        item.get("docketNumber"), item.get("docket_number"),
+        item.get("docket"), item.get("docket_no"),
+    ]
+    return " ".join(str(value) for value in values if value)
+
+
+def _scotus_slip_pdf_url(item: dict, cites: list[str]) -> Optional[str]:
+    """Official archived slip-opinion PDF for a recent SCOTUS item.
+
+    The archive matcher uses docket first, then U.S.-Reports citation, then
+    caption plus decision year.  It is intentionally limited to decisions
+    after 2020 so an old case never causes archive probes.
+    """
+    court = str(item.get("court_id") or item.get("court") or "").lower()
+    is_scotus = (
+        "scotus" in court
+        or any(_US_CITE_RE.search(c) or _SCT_CITE_RE.search(c) for c in cites)
+    )
+    if not is_scotus:
+        return None
+    date_filed = str(
+        item.get("dateFiled") or item.get("date_filed") or ""
+    )
+    year_match = re.match(r"(20\d{2})", date_filed)
+    year = int(year_match.group(1)) if year_match else 0
+    docket = _item_docket_text(item)
+    docket_years = {
+        2000 + int(token[:2])
+        for token in _scotus_docket_tokens(docket)
+        if token[:2].isdigit()
+    }
+    if year and year <= 2020:
+        return None
+    if not year and not any(
+        docket_year >= 2020 for docket_year in docket_years
+    ):
+        return None
+    name = re.sub(
+        r"<[^>]+>", "",
+        str(item.get("caseName") or item.get("case_name") or ""),
+    ).strip()
+    try:
+        import scotus_recent
+        match = scotus_recent.find_slip_opinion(
+            name=name,
+            docket=docket,
+            date_filed=date_filed,
+            citations=tuple(cites),
+            session=_anon_session,
+            name_scorer=_name_match_score,
+        )
+    except Exception as exc:
+        print(f"[resolve] Supreme Court slip-opinion lookup failed: {exc}")
+        return None
+    if match is None:
+        return None
+    print(
+        f"[resolve] using Supreme Court slip opinion "
+        f"{match.docket or match.name}: {match.opinion_url}"
+    )
+    return match.opinion_url
+
+
+def _courtlistener_pdf_fallback_item(
+    client, item: dict, cites: list[str],
+) -> Optional[dict]:
+    """Locate a recent SCOTUS case on CourtListener from sparse Scholar data.
+
+    Citation lookup is exact.  A name lookup is accepted only from the SCOTUS
+    court and, when a year/docket is known, must agree with it.
+    """
+    if client is None:
+        return None
+    name = re.sub(
+        r"<[^>]+>", "",
+        str(item.get("caseName") or item.get("case_name") or ""),
+    ).strip()
+    for cite in cites:
+        try:
+            target = _cl_item_for_citation(client, cite, name=name)
+        except Exception:
+            target = None
+        if target:
+            return target
+    if not name:
+        return None
+    date_filed = str(
+        item.get("dateFiled") or item.get("date_filed") or ""
+    )
+    wanted_year = date_filed[:4] if date_filed[:4].isdigit() else ""
+    wanted_dockets = _scotus_docket_tokens(_item_docket_text(item))
+    try:
+        candidates = _cl_name_search(
+            client, name, _SCOTUS_COURT_ID,
+            page_size=20, limit=20, drop_scotus_orders=False,
+        )
+    except Exception as exc:
+        print(f"[resolve] CourtListener metadata fallback failed: {exc}")
+        return None
+    rated: list[tuple[int, float, dict]] = []
+    for candidate in candidates:
+        candidate_name = re.sub(
+            r"<[^>]+>", "",
+            str(candidate.get("caseName") or candidate.get("case_name") or ""),
+        ).strip()
+        score = _name_match_score(name, candidate_name)
+        if score < _NAME_MATCH_MIN:
+            continue
+        candidate_date = str(
+            candidate.get("dateFiled") or candidate.get("date_filed") or ""
+        )
+        if wanted_year and candidate_date[:4] != wanted_year:
+            continue
+        candidate_dockets = _scotus_docket_tokens(
+            _item_docket_text(candidate)
+        )
+        if (
+            wanted_dockets and candidate_dockets
+            and not (wanted_dockets & candidate_dockets)
+        ):
+            continue
+        rated.append((
+            1 if wanted_dockets & candidate_dockets else 0,
+            score,
+            candidate,
+        ))
+    if not rated:
+        return None
+    rated.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return rated[0][2]
+
+
 # Federal Appendix reporter: "F. App'x", "F.App'x", "Fed. Appx.", etc.
 # (straight or typographic apostrophe).  These cases are scans — Google Scholar
 # rarely has the text — so the app opens them straight on the official PDF.
@@ -3440,8 +3588,21 @@ def _filter_to_best_tier(query: str,
     return out
 
 
+def _scholar_result_identity(url: str) -> str:
+    """Stable opinion identity carried by a Scholar ``case=`` URL."""
+    try:
+        values = urllib.parse.parse_qs(
+            urllib.parse.urlparse(url or "").query
+        ).get("case") or []
+    except Exception:
+        values = []
+    sid = str(values[0]).strip() if values else ""
+    return f"scholar:{sid}" if sid.isdigit() else ""
+
+
 def _case_signature(name: str, cite: str, year: str, court: str = "",
-                    *, include_name: bool = True) -> dict:
+                    *, include_name: bool = True,
+                    opinion_id: str = "") -> dict:
     """Structured identity of a case for spotlight de-duplication:
 
     * ``cites``  — exact reporter citations as (series, volume, page) tuples;
@@ -3473,6 +3634,7 @@ def _case_signature(name: str, cite: str, year: str, court: str = "",
     return {
         "nk": nk, "cites": cites, "series": series,
         "court": re.sub(r"[^a-z0-9]", "", (court or "").lower()),
+        "opinion_id": str(opinion_id or "").strip().lower(),
     }
 
 
@@ -3487,10 +3649,24 @@ def _same_case(a: dict, b: dict) -> bool:
     still be one, so name-and-year still merges them.  Parallel citations in
     different series ("59 N.W.2d 336" and "157 Neb. 226") do not disagree, so a
     case reported two ways still collapses to one row."""
+    if (
+        a.get("opinion_id")
+        and a["opinion_id"] == b.get("opinion_id")
+    ):
+        return True
     if a["cites"] & b["cites"]:
         return True
     if a["nk"] and a["nk"] == b["nk"]:
         if a["court"] and b["court"] and a["court"] != b["court"]:
+            return False
+        # A recent Supreme Court caption/year can cover the merits opinion,
+        # separate writings, and several orders before any reporter cite has
+        # been assigned.  Keep those rows distinct unless the exact Scholar
+        # opinion id above proves they are the same writing.
+        if (
+            "scotus" in {a["court"], b["court"]}
+            and (not a["cites"] or not b["cites"])
+        ):
             return False
         if a["series"] & b["series"]:
             return False
@@ -3503,7 +3679,7 @@ def _same_case(a: dict, b: dict) -> bool:
 # one of its results duplicates a case already shown by another source, the
 # next-best result takes the slot and the source still shows its full quota.
 _BUCKET_CAPS: dict[str, int] = {
-    "scholar": 4,     # Google Scholar (best of the first results page)
+    "scholar": 6,     # Google Scholar (best of the first results page)
     "opiniondb": 3,   # already-saved Google Scholar opinions
     "exact": 3,       # strict AND match of two distinctive parties
     "ranked": 4,      # CourtListener name matches, ranked by citation count
@@ -3521,9 +3697,87 @@ def _prefer_source(new_bucket: str, shown_bucket: str) -> bool:
     source, so a Scholar hit replaces a CourtListener row for the same case
     rather than being dropped; every other collision keeps the row already
     shown (first arrival wins)."""
+    if new_bucket == "scholar" and shown_bucket == "opiniondb":
+        return True
     scholar_sources = {"scholar", "opiniondb"}
-    return (new_bucket in scholar_sources
-            and shown_bucket not in scholar_sources)
+    return (
+        new_bucket in scholar_sources
+        and shown_bucket not in scholar_sources
+    )
+
+
+def _rank_scholar_spotlight_results(
+    query: str, results: list, limit: int,
+) -> list:
+    """Rank a Scholar name-search page and promote the likely lead opinion.
+
+    Match tier and caption closeness remain authoritative.  Within the
+    resulting order, when several SCOTUS rows have the same caption, the one
+    with the largest result-page ``Cited by`` count moves to the first position
+    occupied by that case.  The other writings keep their relative order.
+    """
+    scored = [
+        (
+            _match_tier(query, getattr(result, "title", "") or ""),
+            _name_match_score(
+                query, getattr(result, "title", "") or "",
+            ),
+            index,
+            result,
+        )
+        for index, result in enumerate(results)
+    ]
+    scored = [row for row in scored if row[1] >= _NAME_MATCH_MIN]
+    scored.sort(key=lambda row: (-row[0], -row[1], row[2]))
+    best_tier = scored[0][0] if scored else -1
+    ranked = [
+        result for tier, _score, _index, result in scored
+        if tier == best_tier
+    ]
+
+    group_order: list[tuple[str, str, tuple[str, ...]]] = []
+    for result in ranked:
+        if _scholar_source_to_court_id(
+            getattr(result, "source", "") or ""
+        ) != _SCOTUS_COURT_ID:
+            continue
+        key = (
+            _SCOTUS_COURT_ID,
+            _scholar_source_year(getattr(result, "source", "") or ""),
+            tuple(sorted(set(_name_tokens(
+                getattr(result, "title", "") or ""
+            )))),
+        )
+        if key[2] and key not in group_order:
+            group_order.append(key)
+    for key in group_order:
+        positions = [
+            index for index, result in enumerate(ranked)
+            if (
+                _scholar_source_to_court_id(
+                    getattr(result, "source", "") or ""
+                ),
+                _scholar_source_year(
+                    getattr(result, "source", "") or ""
+                ),
+                tuple(sorted(set(_name_tokens(
+                    getattr(result, "title", "") or ""
+                )))),
+            ) == key
+        ]
+        if len(positions) < 2:
+            continue
+        first = positions[0]
+        winner = max(
+            positions,
+            key=lambda index: (
+                int(getattr(ranked[index], "cited_by", 0) or 0),
+                -index,
+            ),
+        )
+        if winner != first:
+            ranked.insert(first, ranked.pop(winner))
+    return ranked[:limit]
 
 
 def _is_scotus_order_item(item: dict) -> bool:
@@ -4688,6 +4942,10 @@ class CourtListenerGUI:
         # If we just restarted from an update, fold the pre-update opinions
         # backup back in (shortly, so the window comes up first).
         self.root.after(100, self._apply_pending_update_merge)
+        # Open the opinion database in the background now rather than on the
+        # first lookup, so a search never arrives while the index is still
+        # being built.  Deferred briefly so the window paints first.
+        self.root.after(200, self._start_opinion_db_load)
 
     # ------------------------------------------------------------------
     # Case-view history (the "History ▾" dropdown on case windows)
@@ -6298,8 +6556,24 @@ class CourtListenerGUI:
                           if detail else source_label)
             return detail
 
+        def _promote_row(r: dict) -> None:
+            """Move a result to the first visible slot, preserving its widget."""
+            try:
+                index = result_rows.index(r)
+            except ValueError:
+                return
+            if index == 0:
+                return
+            try:
+                r["row"].pack_configure(before=result_rows[0]["row"])
+            except tk.TclError:
+                return
+            result_rows.pop(index)
+            result_rows.insert(0, r)
+            selected_idx[0] = -1
+
         def _replace_row(r: dict, cite: str, year: str, source_label: str,
-                         open_fn) -> None:
+                         open_fn, *, promote: bool = False) -> None:
             # A preferred source (Google Scholar) took over an already-shown
             # row: swap its opener and re-label the detail line.  Badge and name
             # stay — it is the same case, so they already match.
@@ -6309,9 +6583,12 @@ class CourtListenerGUI:
                     text=_detail_text(cite, year, source_label))
             except tk.TclError:
                 pass
+            if promote:
+                _promote_row(r)
 
         def _add_result(bucket: str, court_id: str, name: str, cite: str,
-                        year: str, source_label: str, open_fn) -> None:
+                        year: str, source_label: str, open_fn,
+                        opinion_id: str = "", promote: bool = False) -> None:
             # Ignore results streaming in from a superseded search.
             if my_gen != self._spotlight_generation:
                 return
@@ -6330,25 +6607,61 @@ class CourtListenerGUI:
             # de-duplicates only by citation and sits beside the as-captioned
             # case rather than being eaten by it.
             sig = _case_signature(name, cite, year, court_id,
-                                  include_name=(bucket != "reversed"))
+                                  include_name=(bucket != "reversed"),
+                                  opinion_id=opinion_id)
             for entry in shown:
                 if _same_case(sig, entry["sig"]):
                     if _prefer_source(bucket, entry["bucket"]):
+                        old_bucket = entry["bucket"]
                         _replace_row(entry["row"], cite, year, source_label,
-                                     open_fn)
+                                     open_fn, promote=promote)
                         entry["bucket"] = bucket
+                        entry["row"]["bucket"] = bucket
+                        if old_bucket != bucket:
+                            if old_bucket:
+                                bucket_counts[old_bucket] = max(
+                                    0,
+                                    bucket_counts.get(old_bucket, 0) - 1,
+                                )
+                            if bucket:
+                                bucket_counts[bucket] = (
+                                    bucket_counts.get(bucket, 0) + 1
+                                )
+                    elif promote:
+                        _promote_row(entry["row"])
                     entry["sig"]["cites"] |= sig["cites"]
                     entry["sig"]["series"] |= sig["series"]
                     entry["sig"]["court"] = entry["sig"]["court"] or sig["court"]
+                    entry["sig"]["opinion_id"] = (
+                        entry["sig"].get("opinion_id")
+                        or sig.get("opinion_id")
+                    )
                     return
 
             # A genuinely new case: honour the overall row limit and the
             # source's per-tier display cap.
-            if len(result_rows) >= max_rows:
-                return
             if bucket and bucket_counts.get(bucket, 0) >= _BUCKET_CAPS.get(
                     bucket, 99):
                 return
+            if len(result_rows) >= max_rows:
+                if not promote:
+                    return
+                # A likely lead SCOTUS opinion should never lose a race to a
+                # slower source merely because ten streaming rows arrived
+                # first.  Evict the final row and reclaim its bucket slot.
+                victim = result_rows.pop()
+                shown[:] = [
+                    entry for entry in shown if entry["row"] is not victim
+                ]
+                victim_bucket = str(victim.get("bucket") or "")
+                if victim_bucket:
+                    bucket_counts[victim_bucket] = max(
+                        0, bucket_counts.get(victim_bucket, 0) - 1,
+                    )
+                try:
+                    victim["row"].destroy()
+                except tk.TclError:
+                    pass
 
             # Append a fresh row at the bottom.  Rows are added in arrival order
             # and never moved, so a result already on screen keeps its position
@@ -6370,11 +6683,13 @@ class CourtListenerGUI:
             )
             _bind_wheel(r["row"])
             r["open_fn"] = open_fn
+            r["bucket"] = bucket
             result_rows.append(r)
             shown.append({"sig": sig, "bucket": bucket, "row": r})
             if bucket:
                 bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
-            this_idx = len(result_rows) - 1
+            if promote:
+                _promote_row(r)
 
             def on_click(_e=None, _r=r) -> None:
                 self._close_quick_popup()
@@ -6383,7 +6698,11 @@ class CourtListenerGUI:
             _bind_recursive(r["row"], "<Button-1>", on_click)
             # Hovering a row selects it, so mouse and keyboard share one
             # highlight and a click always opens the row under the pointer.
-            def on_hover(_e=None, i=this_idx) -> None:
+            def on_hover(_e=None, _r=r) -> None:
+                try:
+                    i = result_rows.index(_r)
+                except ValueError:
+                    return
                 selected_idx[0] = i
                 _highlight(i)
             _bind_recursive(r["row"], "<Enter>", on_hover)
@@ -6470,10 +6789,11 @@ class CourtListenerGUI:
         # initial "Searching…" state (the first _resize_to ran before it).
         _resize_to(0)
         search_done = [0]  # track how many searches completed
-        # Do not start or wait for the lazy opinion database here.  If it was
-        # already loaded, search it as an independent fourth Spotlight source;
-        # otherwise the three existing sources proceed unchanged.
-        loaded_opinion_db = self._loaded_opinion_db()
+        # Never wait for the opinion database here.  When it is already open it
+        # is searched as an independent fourth Spotlight source; when it is not,
+        # its background open is kicked off (so later lookups have it) and the
+        # three online sources proceed immediately without it.
+        loaded_opinion_db = self._get_opinion_db(wait=False)
         total_searches = 3 + (1 if loaded_opinion_db is not None else 0)
 
         def _update_status() -> None:
@@ -6560,22 +6880,15 @@ class CourtListenerGUI:
                 # relevance order stands in for CourtListener's
                 # citation-count tiebreak — and keep only the best tier
                 # present, as _filter_to_best_tier does across the pooled CL
-                # passes.  Up to the best four are shown (the scholar bucket
+                # passes.  Up to the best six are shown (the scholar bucket
                 # cap); a couple of spares are kept past those so a duplicate
                 # of a case another source already listed can be replaced.
-                scored = [
-                    (_match_tier(query, getattr(r, "title", "") or ""),
-                     _name_match_score(query, getattr(r, "title", "") or ""),
-                     i, r)
-                    for i, r in enumerate(results)
-                ]
-                scored = [t for t in scored if t[1] >= _NAME_MATCH_MIN]
-                scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
-                best_tier = scored[0][0] if scored else -1
-                results = [r for tier, _s, _i, r in scored
-                           if tier == best_tier]
-                results = results[:_BUCKET_CAPS["scholar"] + 2]
-            for r in results:
+                results = _rank_scholar_spotlight_results(
+                    query,
+                    results,
+                    _BUCKET_CAPS["scholar"] + 2,
+                )
+            for result_index, r in enumerate(results):
                 court_id = _scholar_source_to_court_id(r.source)
                 year = _scholar_source_year(r.source)
                 # The case's own reporter citation sits in the source byline.
@@ -6617,6 +6930,8 @@ class CourtListenerGUI:
                 self.root.after(
                     0, _add_result, "scholar", court_id, r.title, cite, year,
                     "Scholar", make_opener(),
+                    _scholar_result_identity(r.url),
+                    result_index == 0 and court_id == _SCOTUS_COURT_ID,
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
@@ -6783,6 +7098,7 @@ class CourtListenerGUI:
                     self.root.after(
                         0, _add_result, "opiniondb", court_id, name, cite,
                         year, "Opinion database", make_opener(),
+                        f"scholar:{sid}" if sid else "",
                     )
             finally:
                 search_done[0] += 1
@@ -8319,7 +8635,7 @@ class CourtListenerGUI:
         threading.Thread(target=run, daemon=True).start()
 
     def _resolve_pdf_url(
-        self, client: CourtListenerClient, item: dict
+        self, client: Optional[CourtListenerClient], item: dict
     ) -> Optional[str]:
         """
         Attempt to find a PDF URL for the selected search result.
@@ -8338,9 +8654,16 @@ class CourtListenerGUI:
         3. download_url from the search result (original court source).
         4. download_url from the fetched opinion record.
         5. Walk the cluster's sub_opinions checking local_path then download_url.
+        6. Recent SCOTUS case metadata → supremecourt.gov's term archive.
+        7. If the sparse saved record had no CourtListener ids, resolve it on
+           CourtListener by citation or by SCOTUS name + year/docket and retry
+           that matched cluster's PDF fields.
         """
         storage_base = "https://storage.courtlistener.com/"
         item.pop("_case_law_pdf_choices", None)
+        skip_metadata_fallback = bool(
+            item.get("_skip_pdf_metadata_fallback")
+        )
 
         # Determine whether this is a SCOTUS case.
         court_val = str(item.get("court_id") or "")
@@ -8377,6 +8700,10 @@ class CourtListenerGUI:
         # official-PDF path below keys on.  Ask CourtListener whether that
         # S. Ct. cite has a parallel U.S. Reports cite and, if so, try it too —
         # that's what lets "View PDF" reach the official opinion scan.
+        is_scotus = is_scotus or any(
+            _US_CITE_RE.search(c) or _SCT_CITE_RE.search(c)
+            for c in all_cites
+        )
         us_from_sct = _us_reports_cite_via_courtlistener(client, all_cites)
         if us_from_sct and us_from_sct not in all_cites:
             print(f"[resolve] S. Ct. cite resolved to U.S. Reports cite: "
@@ -8508,6 +8835,31 @@ class CourtListenerGUI:
             except Exception as exc:
                 print(f"[resolve] cluster walk failed: {exc}")
 
+        # 6. Recent Supreme Court cases may have neither a reporter scan nor a
+        # downloadable path on their saved Scholar/CourtListener record.  The
+        # Court's term archive is authoritative and carries the released PDF.
+        if is_scotus and not skip_metadata_fallback:
+            slip_url = _scotus_slip_pdf_url(item, all_cites)
+            if slip_url:
+                return slip_url
+
+            # 7. If the saved item was too sparse to expose CourtListener ids,
+            # resolve it by citation or SCOTUS name + year/docket, then rerun
+            # the existing PDF ladder for that exact cluster.
+            target = _courtlistener_pdf_fallback_item(
+                client, item, all_cites,
+            )
+            if target:
+                retry_item = dict(target)
+                retry_item["_skip_pdf_metadata_fallback"] = True
+                url = self._resolve_pdf_url(client, retry_item)
+                if url:
+                    print(
+                        "[resolve] using PDF from metadata-matched "
+                        "CourtListener cluster"
+                    )
+                    return url
+
         return None
 
     # ------------------------------------------------------------------
@@ -8629,15 +8981,6 @@ class CourtListenerGUI:
         if db is not None:
             self._attach_opinion_db_to_scholar(db)
         return db
-
-    def _loaded_opinion_db(self):
-        """Return the opinion DB only if its lazy load already finished.
-
-        Spotlight uses this non-starting probe so its local-results pass never
-        makes the first quick search wait for (or initiate) an index rebuild.
-        """
-        with self._opinion_db_lock:
-            return self._opinion_db
 
     # ------------------------------------------------------------------
     # Software update  (Settings ▸ Check for Updates…)
@@ -19065,6 +19408,22 @@ class _ScholarTextWindow:
             # parsed/Bluebooked caption is still authoritative enough to pick
             # the right ``-01``/``-02`` CAP opinion on a shared reporter page.
             item["caseName"] = self._bb.get("name", "")
+        if self._is_scotus:
+            # Saved Scholar opinions often have no CourtListener result object.
+            # Preserve the metadata the archive fallback needs from the parsed
+            # opinion itself: court, decision year, and the "No. 24-123" line.
+            item["court_id"] = "scotus"
+            if not (item.get("dateFiled") or item.get("date_filed")):
+                year = str(self._bb.get("year") or "")
+                if year.isdigit():
+                    item["dateFiled"] = f"{year}-01-01"
+            if not _scotus_docket_tokens(_item_docket_text(item)):
+                front_matter = " ".join(
+                    b.text() for b in self._blocks[:16]
+                )
+                dockets = list(_scotus_docket_tokens(front_matter))
+                if dockets:
+                    item["docketNumber"] = ", ".join(sorted(dockets))
         cites: list[str] = []
         raw = item.get("citation")
         if raw:

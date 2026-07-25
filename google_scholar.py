@@ -277,6 +277,7 @@ class ScholarResult:
     url: str
     source: str = ""   # the green byline, e.g. "Supreme Court, 1973"
     snippet: str = ""
+    cited_by: int = 0  # Scholar's inexpensive result-page authority signal
 
 
 # A reporter citation ("410 U.S. 113", "529 NW 2d 155", "8 F.4th 557") for
@@ -766,12 +767,13 @@ _SEP_DELIVERED_RE = re.compile(
 # Another role-less historical U.S. Reports form reverses the usual byline:
 #
 #   Separate opinion of MR. JUSTICE McREYNOLDS.
+#   The separate opinion of MR. JUSTICE McREYNOLDS.
 #
 # It is a definite opinion boundary, but "separate" alone does not establish
 # whether the writing concurs or dissents.  The role is resolved after all
 # boundaries are known, using the disposition and neighboring writings.
 _SEP_OF_RE = re.compile(
-    r"^\s*Separate\s+opinion\s+of\s+"
+    r"^\s*(?:The\s+)?Separate\s+opinion\s+of\s+"
     r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(?:CHIEF\s+)?JUSTICE\s+"
     r"[A-Z][\w.'â€™-]+\s*[.:]?\s*$",
     re.IGNORECASE,
@@ -788,8 +790,11 @@ def _peek_sep_kind_evidence(
             continue
         # Role language after another byline belongs to that later judge, not
         # to the candidate being classified.
-        if (_BARE_SEP_HEADER_RE.match(t)
+        if ((len(t) <= 300 and _SEP_HEADER_RE.match(t)
+             and not _NOT_SEP_RE.search(t))
+                or _BARE_SEP_HEADER_RE.match(t)
                 or _JOINED_SEP_HEADER_RE.match(t)
+                or _SEP_DELIVERED_RE.match(t)
                 or _SEP_OF_RE.match(t)
                 or _OCR_JUSTICE_BYLINE_RE.match(t)):
             break
@@ -1967,7 +1972,23 @@ class GoogleScholarFetcher:
             source = _WS_RE.sub(" ", gs_a.get_text()).strip() if gs_a else ""
             rs = div.find("div", class_="gs_rs")
             snippet = _WS_RE.sub(" ", rs.get_text()).strip() if rs else ""
-            out.append(ScholarResult(title=title, url=href, source=source, snippet=snippet))
+            cited_by = 0
+            for link in div.find_all("a"):
+                m = re.fullmatch(
+                    r"Cited by\s+(\d+)",
+                    _WS_RE.sub(" ", link.get_text()).strip(),
+                    re.IGNORECASE,
+                )
+                if m:
+                    cited_by = int(m.group(1))
+                    break
+            out.append(ScholarResult(
+                title=title,
+                url=href,
+                source=source,
+                snippet=snippet,
+                cited_by=cited_by,
+            ))
         if not out:
             # Markup changed?  Fall back to bare scholar_case anchors.
             for a in soup.find_all("a", href=True):

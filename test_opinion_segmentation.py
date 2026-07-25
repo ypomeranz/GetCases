@@ -224,6 +224,37 @@ class GluedDispositionBylineTests(unittest.TestCase):
 
 
 class HistoricalAndSignatureBoundaryTests(unittest.TestCase):
+    def test_myers_definite_article_separate_opinion_heading(self):
+        # Myers v. United States, 272 U.S. 52, 178 (1926): Scholar includes
+        # both a page marker and a definite article in McReynolds's neutral
+        # heading.  Neither should hide the separate-opinion boundary.
+        parts = segment_blocks([
+            _block("MR. CHIEF JUSTICE TAFT delivered the opinion of the Court."),
+            _block("Judgment affirmed."),
+            _block("MR. JUSTICE HOLMES, dissenting."),
+            _block("I agree with the conclusions of my colleagues."),
+            Block(kind="para", spans=[
+                Span(text="*178", pagenum=True),
+                Span(
+                    text=(
+                        " The separate opinion of MR. JUSTICE McREYNOLDS."
+                    )
+                ),
+            ]),
+            _block("The statute has not been repealed or superseded."),
+            _block("The constitutional question must therefore be resolved."),
+            _block("MR. JUSTICE BRANDEIS, dissenting."),
+            _block("The issue is whether the removal was lawful."),
+        ])
+
+        self.assertEqual(
+            [part.kind for part in parts],
+            ["majority", "dissent", "separate", "dissent"],
+        )
+        self.assertIn("McREYNOLDS", parts[2].label)
+        self.assertNotIn("*178", parts[2].label)
+        self.assertTrue(parts[2].blocks[0].spans[0].pagenum)
+
     def test_unresolved_roleless_opinion_remains_neutral(self):
         parts = segment_blocks([
             _block("MR. JUSTICE MARSHALL delivered the opinion of the Court."),

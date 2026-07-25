@@ -16,8 +16,11 @@ Storage is two files (see the project plan):
     to Git so it can be diffed, merged, and synced via GitHub by hand.  The
     opinion HTML is gzip+base64 packed into ``html_gz`` to keep lines compact.
   * ``opinions.index.db`` — a **local SQLite index** rebuilt from the JSONL
-    (and therefore *gitignored*).  It materializes the plain text and the
-    ``citations`` / ``parties`` lookup tables for fast, collision-aware search.
+    (and therefore *gitignored*).  It holds what searching actually needs — the
+    case name, court, year, and the ``citations`` / ``parties`` lookup tables —
+    plus the byte offset of each opinion's line in the JSONL.  The opinions
+    themselves are read back through that pointer on demand instead of being
+    copied into the index, which keeps the index small and its rebuild quick.
 
 Because two different cases can share party names *or* begin on the same
 reporter page, the citation/party lookups deliberately return a **list** of
@@ -34,6 +37,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import html as _html
 import json
 import os
 import re
@@ -41,6 +45,8 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+import zlib
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -54,7 +60,25 @@ from bluebook_names import (
     strip_related_case_note,
 )
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 5
+
+# The ``opinions`` columns this release expects.  An index whose table differs
+# was written by another schema and is dropped and rebuilt (see
+# ``_drop_outdated_tables``); the JSONL is the source of truth, so nothing is
+# lost by discarding it.
+_OPINION_COLUMNS = (
+    "scholar_id", "url", "name", "court", "year", "date_filed",
+    "line_offset", "line_length", "cites_json", "parties_json",
+    "added_at", "source",
+)
+
+# How much of an opinion's HTML the indexer expands.  It reads only the
+# caption — the reporter citations printed above the opinion, which older
+# records omit from their stored ``cites`` — so the body is never decompressed
+# or parsed.  Measured over the shipped corpus, 1 KB already yields the same
+# header citations as parsing the whole document for every record; this leaves
+# a wide margin for unusually long captions.
+_CAPTION_HTML_BYTES = 8192
 
 # Word tokens too generic to help narrow a party search.
 _PARTY_STOP = {
@@ -154,6 +178,26 @@ def _gz_unpack(packed: str) -> str:
         return ""
 
 
+def _gz_unpack_prefix(packed: str, limit: int = _CAPTION_HTML_BYTES) -> str:
+    """The leading *limit* bytes of a packed HTML payload.
+
+    The gzip stream is expanded incrementally and abandoned once enough has
+    come out, so indexing never inflates the body of a long opinion.  Falls
+    back to a full unpack if the stream can't be read incrementally."""
+    if not packed:
+        return ""
+    try:
+        raw = base64.b64decode(packed.encode("ascii"))
+    except Exception:
+        return ""
+    try:
+        # 16 + MAX_WBITS selects zlib's gzip wrapper.
+        head = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw, limit)
+        return head.decode("utf-8", "replace")
+    except Exception:
+        return _gz_unpack(packed)[:limit]
+
+
 def _cite_key(cite: str) -> Optional[tuple[int, str, int]]:
     """(volume, normalized-reporter, page) for a reporter citation, or None."""
     m = citations.find_case_citation(cite or "")
@@ -200,6 +244,107 @@ def _header_cites(blocks: list) -> list[str]:
         for m in citations.iter_case_citations(t):
             out.append(re.sub(r"\s+", " ", m.group(0)).strip())
     return out
+
+
+_MONTHS = (
+    "January|February|March|April|May|June|July|August|"
+    "September|October|November|December"
+)
+_FULL_DATE_RE = re.compile(
+    rf"\b({_MONTHS})\s+(\d{{1,2}}),?\s+((?:1[6-9]|20)\d{{2}})\b",
+    re.IGNORECASE,
+)
+_DOCKET_TOKEN_RE = re.compile(
+    r"\b(?:\d{1,3}[-\u2010-\u2015\u2212]\d{1,5}|"
+    r"\d{1,3}[A-Z]\d{1,5})\b",
+    re.IGNORECASE,
+)
+
+
+def _block_text_without_markers(block) -> str:
+    spans = getattr(block, "spans", None)
+    if spans is None:
+        return block.text()
+    return "".join(
+        span.text for span in spans
+        if not getattr(span, "pagenum", False)
+    )
+
+
+def _front_matter_text(blocks: list, *, centers_only: bool = False) -> str:
+    kinds = ("center",) if centers_only else ("center", "heading")
+    return "  ".join(
+        _block_text_without_markers(block)
+        for block in blocks[:16]
+        if getattr(block, "kind", None) in kinds
+    )
+
+
+def _iso_full_date(value: str) -> str:
+    m = _FULL_DATE_RE.search(value or "")
+    if not m:
+        return ""
+    try:
+        return datetime.strptime(
+            f"{m.group(1)} {m.group(2)} {m.group(3)}",
+            "%B %d %Y",
+        ).date().isoformat()
+    except ValueError:
+        return ""
+
+
+def _decision_date(blocks: list) -> str:
+    """Exact decision date printed in an opinion's front matter.
+
+    A labelled ``Decided``/``Filed`` date wins over argued and reargued dates.
+    Short orders often print only ``[May 4, 2026]`` or a bare centered date, so
+    those forms are conservative fallbacks.
+    """
+    header = _front_matter_text(blocks)
+    centers = _front_matter_text(blocks, centers_only=True)
+    labelled = re.search(
+        rf"\b(?:Decided|Filed|Released|Entered)\b[^A-Za-z0-9]{{0,20}}"
+        rf"((?:{_MONTHS})\s+\d{{1,2}},?\s+(?:1[6-9]|20)\d{{2}})\b",
+        header,
+        re.IGNORECASE,
+    )
+    if labelled:
+        return _iso_full_date(labelled.group(1))
+    bracketed = re.search(
+        rf"\[\s*((?:{_MONTHS})\s+\d{{1,2}},?\s+"
+        rf"(?:1[6-9]|20)\d{{2}})\s*\]",
+        header,
+        re.IGNORECASE,
+    )
+    if bracketed:
+        return _iso_full_date(bracketed.group(1))
+    dates = list(_FULL_DATE_RE.finditer(centers))
+    return _iso_full_date(dates[-1].group(0)) if dates else ""
+
+
+def _header_dockets(blocks: list) -> list[str]:
+    """Normalized Supreme Court docket tokens from the front matter."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _DOCKET_TOKEN_RE.finditer(_front_matter_text(blocks)):
+        docket = re.sub(
+            r"[-\u2010-\u2015\u2212]", "-", match.group(0)
+        ).upper()
+        if docket not in seen:
+            seen.add(docket)
+            out.append(docket)
+    return out
+
+
+def _court_from_header(blocks: list) -> str:
+    header = _front_matter_text(blocks)
+    if re.search(
+        r"\bSupreme Court of (?:the )?United States\b",
+        header,
+        re.IGNORECASE,
+    ):
+        return "scotus"
+    return ""
 
 
 def _caption_name(blocks: list) -> str:
@@ -319,7 +464,19 @@ def extract_record(
 
     parties = parties_from_name(name or raw_name)
 
-    date_filed = item.get("dateFiled") or item.get("date_filed") or ""
+    date_filed = str(
+        item.get("dateFiled") or item.get("date_filed") or ""
+    ).strip()
+    header_date = _decision_date(blocks)
+    header_court = _court_from_header(blocks)
+    # Scholar-only records otherwise retain just a year.  For SCOTUS, trust
+    # the opinion's own "Decided ..." line even when external metadata carries
+    # a later rehearing date.
+    if header_date and (
+        not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_filed)
+        or header_court == "scotus"
+    ):
+        date_filed = header_date
     year = date_filed[:4] if len(str(date_filed)) >= 4 else ""
     if not year:
         # Same ladder as the viewer's Bluebook year: page markers are
@@ -358,7 +515,7 @@ def extract_record(
 
     court = str(item.get("court_id") or "").strip().lower()
     if not court:
-        court = _court_from_cites(cites)
+        court = _court_from_cites(cites) or header_court
 
     return {
         "v": _SCHEMA_VERSION,
@@ -370,10 +527,60 @@ def extract_record(
         "court": court,
         "year": year,
         "date_filed": date_filed,
+        "dockets": _header_dockets(blocks),
         "added_at": time.time(),
         "source": item.get("source") or "scholar",
         "html_gz": _gz_pack(html),
     }
+
+
+def _record_html(record: dict) -> str:
+    packed = str(record.get("html_gz") or "")
+    return _gz_unpack(packed) if packed else str(record.get("html") or "")
+
+
+def _record_dockets(record: dict) -> set[str]:
+    stored = {
+        re.sub(r"[-\u2010-\u2015\u2212]", "-", str(value)).upper()
+        for value in (record.get("dockets") or [])
+        if value
+    }
+    if stored:
+        return stored
+    markup = _record_html(record)
+    return set(_header_dockets(_blocks(markup))) if markup else set()
+
+
+def _revision_shingles(record: dict, width: int = 7) -> set[tuple[str, ...]]:
+    """Word shingles used to recognize the reported version of saved text.
+
+    Reporter publication adds pagination, headnotes, and counsel material but
+    preserves the actual opinion.  Measuring containment against the shorter
+    version therefore stays high for a true revision and very low for a
+    different order or separate writing from the same docket.
+    """
+    markup = _record_html(record)
+    if not markup:
+        return set()
+    text = _html.unescape(re.sub(r"<[^>]+>", " ", markup))
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    if len(words) < width:
+        return set()
+    return {
+        tuple(words[index:index + width])
+        for index in range(len(words) - width + 1)
+    }
+
+
+def _revision_similarity(
+    left: dict, right: dict,
+    left_shingles: Optional[set[tuple[str, ...]]] = None,
+) -> float:
+    a = left_shingles if left_shingles is not None else _revision_shingles(left)
+    b = _revision_shingles(right)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
 
 
 # ---------------------------------------------------------------------------
@@ -418,11 +625,47 @@ class OpinionDB:
         self._db.row_factory = sqlite3.Row
         self._init_schema()
         self._sync_from_jsonl()
+        self._reconcile_scotus_revisions()
 
     # -- schema -------------------------------------------------------------
 
+    def _drop_outdated_tables(self) -> None:
+        """Discard derived tables left by an older release.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves an existing table's columns
+        alone, so an index built by an earlier schema would keep its old
+        layout and reject every insert.  Everything here is derived from the
+        JSONL, so an index that does not match the current schema is dropped
+        and rebuilt rather than migrated in place.
+        """
+        try:
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, "
+                "value TEXT)"
+            )
+            columns = {
+                row[1] for row in
+                self._db.execute("PRAGMA table_info(opinions)").fetchall()
+            }
+        except sqlite3.Error:
+            return
+        if not columns:
+            return  # no index yet: the CREATEs below make a current one
+        if (columns == set(_OPINION_COLUMNS)
+                and self._get_meta("schema_version") == str(_SCHEMA_VERSION)):
+            return
+        self._db.executescript(
+            "DROP TABLE IF EXISTS opinions;"
+            "DROP TABLE IF EXISTS citations;"
+            "DROP TABLE IF EXISTS parties;"
+        )
+        self._set_meta("jsonl_size", "-1")   # force the rebuild below
+        self._set_meta("jsonl_lines", "0")
+        self._db.commit()
+
     def _init_schema(self) -> None:
         with self._lock:
+            self._drop_outdated_tables()
             self._db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS opinions (
@@ -432,8 +675,8 @@ class OpinionDB:
                     court        TEXT,
                     year         TEXT,
                     date_filed   TEXT,
-                    html         TEXT,
-                    text         TEXT,
+                    line_offset  INTEGER,
+                    line_length  INTEGER,
                     cites_json   TEXT,
                     parties_json TEXT,
                     added_at     REAL,
@@ -458,6 +701,8 @@ class OpinionDB:
                 CREATE INDEX IF NOT EXISTS ix_cite_sid ON citations(scholar_id);
                 CREATE INDEX IF NOT EXISTS ix_party ON parties(token);
                 CREATE INDEX IF NOT EXISTS ix_party_sid ON parties(scholar_id);
+                CREATE INDEX IF NOT EXISTS ix_opinion_date
+                    ON opinions(court, date_filed);
                 """
             )
             if self._get_meta("schema_version") is None:
@@ -521,17 +766,23 @@ class OpinionDB:
 
     def _ingest_tail(self, offset: int) -> None:
         added = 0
-        with open(self.jsonl_path, "r", encoding="utf-8") as f:
+        # Binary mode: the index stores byte offsets into the JSONL.
+        with open(self.jsonl_path, "rb") as f:
             f.seek(offset)
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    self._index_record(json.loads(line))
-                    added += 1
-                except Exception:
-                    continue
+            pos = offset
+            for raw in f:
+                stripped = raw.strip()
+                if stripped:
+                    try:
+                        self._index_record(
+                            json.loads(stripped.decode("utf-8")), pos, len(raw),
+                        )
+                        added += 1
+                    except sqlite3.Error:
+                        raise  # an index fault: let the caller rebuild
+                    except Exception:
+                        pass
+                pos += len(raw)
         prev = int(self._get_meta("jsonl_lines") or "0")
         self._set_meta("jsonl_lines", str(prev + added))
         self._set_meta("jsonl_size", str(self.jsonl_path.stat().st_size))
@@ -544,17 +795,30 @@ class OpinionDB:
                 "DELETE FROM opinions; DELETE FROM citations; DELETE FROM parties;"
             )
             lines = 0
+            skipped = 0
             if self.jsonl_path.exists():
-                with open(self.jsonl_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            self._index_record(json.loads(line))
-                            lines += 1
-                        except Exception:
-                            continue
+                # Binary mode: the index stores byte offsets into the JSONL.
+                with open(self.jsonl_path, "rb") as f:
+                    pos = 0
+                    for raw in f:
+                        stripped = raw.strip()
+                        if stripped:
+                            try:
+                                self._index_record(
+                                    json.loads(stripped.decode("utf-8")),
+                                    pos, len(raw),
+                                )
+                                lines += 1
+                            except sqlite3.Error:
+                                # A fault in the index itself, not a bad line:
+                                # every record would fail the same way, so stop
+                                # instead of quietly building an empty index.
+                                raise
+                            except Exception:
+                                skipped += 1
+                        pos += len(raw)
+            if skipped:
+                print(f"[db] skipped {skipped} unreadable opinion line(s)")
             size = self.jsonl_path.stat().st_size if self.jsonl_path.exists() else 0
             self._set_meta("schema_version", str(_SCHEMA_VERSION))
             self._set_meta("jsonl_lines", str(lines))
@@ -563,14 +827,22 @@ class OpinionDB:
 
     # -- indexing a single record ------------------------------------------
 
-    def _index_record(self, rec: dict) -> None:
-        """Upsert one record into the SQLite index (no JSONL write)."""
+    def _index_record(
+        self, rec: dict, offset: int = -1, length: int = -1,
+    ) -> None:
+        """Upsert one record into the SQLite index (no JSONL write).
+
+        ``offset``/``length`` locate the record's line in the JSONL so the
+        opinion itself can be read back on demand; the index stores a pointer
+        rather than a second copy of every opinion.  Only the caption is
+        expanded here — parsing whole documents was ~95% of a rebuild, and it
+        materialized ``html``/``text`` columns that no search ever read.
+        """
         sid = rec.get("scholar_id")
         if not sid:
             return
-        html = _gz_unpack(rec.get("html_gz", ""))
-        blocks = _blocks(html) if html else []
-        text = _blocks_text(blocks) if blocks else ""
+        head_html = _gz_unpack_prefix(rec.get("html_gz", ""))
+        blocks = _blocks(head_html) if head_html else []
         # Schema v3 re-parses stored HTML with the shared broad reporter
         # detector.  Older JSONL rows were created with the narrow detector and
         # may therefore omit F. Cas., first-series F., Wash., and other official
@@ -580,14 +852,29 @@ class OpinionDB:
         parties = rec.get("parties")
         if parties is None:
             parties = parties_from_name(rec.get("name", ""))
+        date_filed = str(rec.get("date_filed") or "").strip()
+        header_date = _decision_date(blocks)
+        if header_date and (
+            not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_filed)
+            or _court_from_header(blocks) == "scotus"
+        ):
+            date_filed = header_date
+        year = str(rec.get("year") or "").strip()
+        if not year and date_filed:
+            year = date_filed[:4]
+        court = str(rec.get("court") or "").strip().lower()
+        if not court:
+            court = _court_from_cites(cites) or _court_from_header(blocks)
 
         self._db.execute(
             "INSERT OR REPLACE INTO opinions (scholar_id, url, name, court, year, "
-            "date_filed, html, text, cites_json, parties_json, added_at, source) "
+            "date_filed, line_offset, line_length, cites_json, "
+            "parties_json, added_at, source) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                sid, rec.get("url", ""), rec.get("name", ""), rec.get("court", ""),
-                rec.get("year", ""), rec.get("date_filed", ""), html, text,
+                sid, rec.get("url", ""), rec.get("name", ""), court,
+                year, date_filed,
+                int(offset), int(length),
                 json.dumps(cites, ensure_ascii=False),
                 json.dumps(parties, ensure_ascii=False),
                 rec.get("added_at") or time.time(), rec.get("source", "scholar"),
@@ -608,6 +895,150 @@ class OpinionDB:
                 "INSERT INTO parties (scholar_id, token) VALUES (?, ?)", (sid, tok)
             )
 
+    # -- reported-version reconciliation ----------------------------------
+
+    @staticmethod
+    def _reported_cites(raw) -> list[str]:
+        try:
+            values = json.loads(raw) if isinstance(raw, str) else (raw or [])
+        except Exception:
+            values = []
+        return [str(value) for value in values if _cite_key(str(value))]
+
+    def _revision_candidate(self, record: dict) -> Optional[str]:
+        """Unreported SCOTUS record superseded by *record*, if safely known.
+
+        Exact decision date narrows the pool; docket disagreement rejects a
+        candidate; and substantial seven-word-shingle containment proves that
+        the reported page preserves the same writing.  This keeps a concurrence,
+        dissent, or same-docket order from being mistaken for a revision.
+        """
+        if (
+            str(record.get("court") or "").lower() != "scotus"
+            or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}",
+                str(record.get("date_filed") or ""),
+            )
+            or not self._reported_cites(record.get("cites") or [])
+        ):
+            return None
+        sid = str(record.get("scholar_id") or "")
+        rows = self._db.execute(
+            "SELECT scholar_id, cites_json FROM opinions "
+            "WHERE court='scotus' AND date_filed=? AND scholar_id<>?",
+            (record["date_filed"], sid),
+        ).fetchall()
+        new_dockets = _record_dockets(record)
+        new_shingles = _revision_shingles(record)
+        best: tuple[float, str] | None = None
+        for row in rows:
+            if self._reported_cites(row["cites_json"]):
+                continue
+            old = self.stored_record(str(row["scholar_id"]))
+            if not old:
+                continue
+            old_dockets = _record_dockets(old)
+            if (
+                new_dockets and old_dockets
+                and not (new_dockets & old_dockets)
+            ):
+                continue
+            similarity = _revision_similarity(
+                record, old, left_shingles=new_shingles,
+            )
+            if similarity < 0.55:
+                continue
+            candidate = (similarity, str(row["scholar_id"]))
+            if best is None or candidate > best:
+                best = candidate
+        return best[1] if best else None
+
+    def _remove_jsonl_sids(self, scholar_ids: set[str]) -> bool:
+        """Remove known duplicate ids in one atomic rewrite."""
+        if not scholar_ids or not self.jsonl_path.exists():
+            return False
+        kept: list[str] = []
+        removed = 0
+        with open(self.jsonl_path, "r", encoding="utf-8") as source:
+            for line in source:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    sid = str(json.loads(stripped).get("scholar_id") or "")
+                except Exception:
+                    sid = ""
+                if sid in scholar_ids:
+                    removed += 1
+                else:
+                    kept.append(stripped)
+        if not removed:
+            return False
+        tmp = self.jsonl_path.with_suffix(f".{os.getpid()}.tmp")
+        with open(tmp, "w", encoding="utf-8") as target:
+            for line in kept:
+                target.write(line + "\n")
+        tmp.replace(self.jsonl_path)
+        self.rebuild_index()
+        return True
+
+    def _reconcile_scotus_revisions(self) -> None:
+        """Collapse already-stored unreported/reported SCOTUS revisions.
+
+        Schema v5 derives exact dates and the SCOTUS court from stored headers,
+        so old JSONL rows can be reconciled without changing their format.
+        """
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT scholar_id, date_filed, cites_json FROM opinions "
+                "WHERE court='scotus' AND length(date_filed)=10"
+            ).fetchall()
+            by_date: dict[str, list] = {}
+            for row in rows:
+                by_date.setdefault(str(row["date_filed"]), []).append(row)
+            remove: set[str] = set()
+            for dated in by_date.values():
+                reported = [
+                    row for row in dated
+                    if self._reported_cites(row["cites_json"])
+                ]
+                unreported = [
+                    row for row in dated
+                    if not self._reported_cites(row["cites_json"])
+                ]
+                if not reported or not unreported:
+                    continue
+                reported_records = [
+                    (
+                        row,
+                        self.stored_record(str(row["scholar_id"])),
+                    )
+                    for row in reported
+                ]
+                for old_row in unreported:
+                    old = self.stored_record(str(old_row["scholar_id"]))
+                    if not old:
+                        continue
+                    old_dockets = _record_dockets(old)
+                    best = 0.0
+                    for _new_row, new in reported_records:
+                        if not new:
+                            continue
+                        new_dockets = _record_dockets(new)
+                        if (
+                            old_dockets and new_dockets
+                            and not (old_dockets & new_dockets)
+                        ):
+                            continue
+                        best = max(best, _revision_similarity(new, old))
+                    if best >= 0.55:
+                        remove.add(str(old_row["scholar_id"]))
+            if remove and self._remove_jsonl_sids(remove):
+                print(
+                    f"[db] replaced {len(remove)} unreported Supreme Court "
+                    f"version(s) with their reported records"
+                )
+
     # -- writes -------------------------------------------------------------
 
     def add(self, record: dict) -> bool:
@@ -621,9 +1052,15 @@ class OpinionDB:
             if self._exists(sid):
                 return False
             line = json.dumps(record, ensure_ascii=False)
-            with open(self.jsonl_path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-            self._index_record(record)
+            raw = (line + "\n").encode("utf-8")
+            # The append lands at the current end of file: that byte offset is
+            # the record's pointer for later reads.
+            offset = (
+                self.jsonl_path.stat().st_size if self.jsonl_path.exists() else 0
+            )
+            with open(self.jsonl_path, "ab") as f:
+                f.write(raw)
+            self._index_record(record, offset, len(raw))
             prev = int(self._get_meta("jsonl_lines") or "0")
             self._set_meta("jsonl_lines", str(prev + 1))
             self._set_meta("jsonl_size", str(self.jsonl_path.stat().st_size))
@@ -633,10 +1070,23 @@ class OpinionDB:
     def add_opinion(
         self, url: str, html: str, item: Optional[dict] = None
     ) -> bool:
-        """Extract a record from a fetched Scholar opinion and add it."""
+        """Extract and store a fetched Scholar opinion.
+
+        A newly reported SCOTUS page replaces an older unreported Scholar id
+        only when date, docket, and substantial opinion text establish that it
+        is the same writing.
+        """
         rec = extract_record(url, html, item)
         if rec is None:
             return False
+        with self._lock:
+            old_sid = self._revision_candidate(rec)
+            if old_sid:
+                print(
+                    f"[db] replacing unreported Scholar opinion {old_sid} "
+                    f"with reported version {rec['scholar_id']}"
+                )
+                return self._rewrite_jsonl(old_sid, rec)
         return self.add(rec)
 
     def _rewrite_jsonl(self, sid: str, new_record: Optional[dict]) -> bool:
@@ -733,16 +1183,108 @@ class OpinionDB:
         with self._lock:
             return self._db.execute("SELECT COUNT(*) FROM opinions").fetchone()[0]
 
-    def get_by_scholar_id(self, sid: str) -> Optional[dict]:
-        """Full stored record (including opinion ``html`` and plain ``text``),
-        or ``None``."""
+    def _line_at(self, offset: int, length: int, sid: str) -> Optional[dict]:
+        """The JSONL record at *offset*, or ``None`` if it isn't *sid* there.
+
+        The identity check makes a stale pointer (a JSONL rewritten behind the
+        index) fail closed rather than return the wrong opinion."""
+        if offset is None or offset < 0:
+            return None
+        try:
+            with open(self.jsonl_path, "rb") as f:
+                f.seek(offset)
+                raw = f.read(length if length and length > 0 else -1)
+            rec = json.loads(raw.split(b"\n", 1)[0].decode("utf-8"))
+        except Exception:
+            return None
+        if str(rec.get("scholar_id") or "") != str(sid):
+            return None
+        return rec
+
+    def _scan_for(self, sid: str) -> Optional[tuple[dict, int, int]]:
+        """Find *sid* by scanning the JSONL — the recovery path when a stored
+        pointer no longer lands on its record.  Returns the record with its
+        current offset and length."""
+        try:
+            with open(self.jsonl_path, "rb") as f:
+                pos = 0
+                for raw in f:
+                    stripped = raw.strip()
+                    if stripped:
+                        try:
+                            rec = json.loads(stripped.decode("utf-8"))
+                        except Exception:
+                            rec = None
+                        if rec is not None and str(
+                            rec.get("scholar_id") or ""
+                        ) == str(sid):
+                            return rec, pos, len(raw)
+                    pos += len(raw)
+        except OSError:
+            return None
+        return None
+
+    def stored_record(self, sid: str) -> Optional[dict]:
+        """The raw JSONL record for *sid* (with its packed ``html_gz``)."""
         if not sid:
             return None
+        sid = str(sid).strip()
         with self._lock:
             row = self._db.execute(
-                "SELECT * FROM opinions WHERE scholar_id=?", (str(sid).strip(),)
+                "SELECT line_offset, line_length FROM opinions WHERE scholar_id=?",
+                (sid,),
             ).fetchone()
-        return self._row_to_record(row) if row else None
+            if row is None:
+                return None
+            rec = self._line_at(row["line_offset"], row["line_length"], sid)
+            if rec is not None:
+                return rec
+            found = self._scan_for(sid)
+            if found is None:
+                return None
+            rec, offset, length = found
+            # Heal the pointer so the next read is a seek again.
+            self._db.execute(
+                "UPDATE opinions SET line_offset=?, line_length=? "
+                "WHERE scholar_id=?",
+                (offset, length, sid),
+            )
+            self._db.commit()
+            return rec
+
+    def get_by_scholar_id(self, sid: str) -> Optional[dict]:
+        """Full stored record (including opinion ``html`` and plain ``text``),
+        or ``None``.
+
+        The opinion is read from the JSONL through the index's pointer and
+        expanded here, so the index itself stays small and quick to rebuild.
+        """
+        if not sid:
+            return None
+        sid = str(sid).strip()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM opinions WHERE scholar_id=?", (sid,)
+            ).fetchone()
+        if row is None:
+            return None
+        stored = self.stored_record(sid) or {}
+        html = _gz_unpack(stored.get("html_gz", ""))
+        blocks = _blocks(html) if html else []
+        return {
+            "scholar_id": row["scholar_id"],
+            "url": row["url"],
+            "name": row["name"],
+            "court": row["court"],
+            "year": row["year"],
+            "date_filed": row["date_filed"],
+            "html": html,
+            "text": _blocks_text(blocks) if blocks else "",
+            "cites": json.loads(row["cites_json"] or "[]"),
+            "parties": json.loads(row["parties_json"] or "[]"),
+            "added_at": row["added_at"],
+            "source": row["source"],
+        }
 
     def get_by_url(self, url: str) -> Optional[dict]:
         """Full stored record for a ``scholar_case`` URL (matched on its
@@ -760,7 +1302,7 @@ class OpinionDB:
         placeholders = ",".join("?" * len(reporters))
         with self._lock:
             rows = self._db.execute(
-                "SELECT o.* FROM citations c JOIN opinions o "
+                "SELECT o.scholar_id, o.name, o.court, o.year, o.url, o.cites_json FROM citations c JOIN opinions o "
                 "ON o.scholar_id=c.scholar_id "
                 f"WHERE c.reporter IN ({placeholders}) "
                 "AND c.vol=? AND c.page=? "
@@ -779,7 +1321,7 @@ class OpinionDB:
         placeholders = ",".join("?" * len(toks))
         with self._lock:
             rows = self._db.execute(
-                f"SELECT o.* FROM parties p JOIN opinions o "
+                f"SELECT o.scholar_id, o.name, o.court, o.year, o.url, o.cites_json FROM parties p JOIN opinions o "
                 f"ON o.scholar_id=p.scholar_id "
                 f"WHERE p.token IN ({placeholders}) "
                 f"GROUP BY o.scholar_id "
@@ -804,7 +1346,7 @@ class OpinionDB:
         placeholders = ",".join("?" * len(toks))
         with self._lock:
             rows = self._db.execute(
-                f"SELECT o.*, COUNT(DISTINCT p.token) AS _n "
+                f"SELECT o.scholar_id, o.name, o.court, o.year, o.url, o.cites_json, COUNT(DISTINCT p.token) AS _n "
                 f"FROM parties p JOIN opinions o ON o.scholar_id=p.scholar_id "
                 f"WHERE p.token IN ({placeholders}) "
                 f"GROUP BY o.scholar_id "
@@ -831,23 +1373,6 @@ class OpinionDB:
         return self.find_by_party(q)
 
     # -- row helpers --------------------------------------------------------
-
-    @staticmethod
-    def _row_to_record(row: sqlite3.Row) -> dict:
-        return {
-            "scholar_id": row["scholar_id"],
-            "url": row["url"],
-            "name": row["name"],
-            "court": row["court"],
-            "year": row["year"],
-            "date_filed": row["date_filed"],
-            "html": row["html"],
-            "text": row["text"],
-            "cites": json.loads(row["cites_json"] or "[]"),
-            "parties": json.loads(row["parties_json"] or "[]"),
-            "added_at": row["added_at"],
-            "source": row["source"],
-        }
 
     @classmethod
     def _summary(cls, row: sqlite3.Row) -> dict:
