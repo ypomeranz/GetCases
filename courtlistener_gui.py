@@ -2860,6 +2860,154 @@ def _gather_all_citations(client, item: dict) -> list[str]:
     return out
 
 
+_SCOTUS_DOCKET_TOKEN_RE = re.compile(
+    r"\b(?:\d{1,3}[-‐-―−]\d{1,5}|\d{1,3}[A-Z]\d{1,5})\b",
+    re.IGNORECASE,
+)
+
+
+def _scotus_docket_tokens(value: str) -> set[str]:
+    normalized = re.sub(r"[-‐-―−]", "-", str(value or ""))
+    return {
+        re.sub(r"\s+", "", m.group(0)).upper()
+        for m in _SCOTUS_DOCKET_TOKEN_RE.finditer(normalized)
+    }
+
+
+def _item_docket_text(item: dict) -> str:
+    values = [
+        item.get("docketNumber"), item.get("docket_number"),
+        item.get("docket"), item.get("docket_no"),
+    ]
+    return " ".join(str(value) for value in values if value)
+
+
+def _scotus_slip_pdf_url(item: dict, cites: list[str]) -> Optional[str]:
+    """Official archived slip-opinion PDF for a recent SCOTUS item.
+
+    The archive matcher uses docket first, then U.S.-Reports citation, then
+    caption plus decision year.  It is intentionally limited to decisions
+    after 2020 so an old case never causes archive probes.
+    """
+    court = str(item.get("court_id") or item.get("court") or "").lower()
+    is_scotus = (
+        "scotus" in court
+        or any(_US_CITE_RE.search(c) or _SCT_CITE_RE.search(c) for c in cites)
+    )
+    if not is_scotus:
+        return None
+    date_filed = str(
+        item.get("dateFiled") or item.get("date_filed") or ""
+    )
+    year_match = re.match(r"(20\d{2})", date_filed)
+    year = int(year_match.group(1)) if year_match else 0
+    docket = _item_docket_text(item)
+    docket_years = {
+        2000 + int(token[:2])
+        for token in _scotus_docket_tokens(docket)
+        if token[:2].isdigit()
+    }
+    if year and year <= 2020:
+        return None
+    if not year and not any(
+        docket_year >= 2020 for docket_year in docket_years
+    ):
+        return None
+    name = re.sub(
+        r"<[^>]+>", "",
+        str(item.get("caseName") or item.get("case_name") or ""),
+    ).strip()
+    try:
+        import scotus_recent
+        match = scotus_recent.find_slip_opinion(
+            name=name,
+            docket=docket,
+            date_filed=date_filed,
+            citations=tuple(cites),
+            session=_anon_session,
+            name_scorer=_name_match_score,
+        )
+    except Exception as exc:
+        print(f"[resolve] Supreme Court slip-opinion lookup failed: {exc}")
+        return None
+    if match is None:
+        return None
+    print(
+        f"[resolve] using Supreme Court slip opinion "
+        f"{match.docket or match.name}: {match.opinion_url}"
+    )
+    return match.opinion_url
+
+
+def _courtlistener_pdf_fallback_item(
+    client, item: dict, cites: list[str],
+) -> Optional[dict]:
+    """Locate a recent SCOTUS case on CourtListener from sparse Scholar data.
+
+    Citation lookup is exact.  A name lookup is accepted only from the SCOTUS
+    court and, when a year/docket is known, must agree with it.
+    """
+    if client is None:
+        return None
+    name = re.sub(
+        r"<[^>]+>", "",
+        str(item.get("caseName") or item.get("case_name") or ""),
+    ).strip()
+    for cite in cites:
+        try:
+            target = _cl_item_for_citation(client, cite, name=name)
+        except Exception:
+            target = None
+        if target:
+            return target
+    if not name:
+        return None
+    date_filed = str(
+        item.get("dateFiled") or item.get("date_filed") or ""
+    )
+    wanted_year = date_filed[:4] if date_filed[:4].isdigit() else ""
+    wanted_dockets = _scotus_docket_tokens(_item_docket_text(item))
+    try:
+        candidates = _cl_name_search(
+            client, name, _SCOTUS_COURT_ID,
+            page_size=20, limit=20, drop_scotus_orders=False,
+        )
+    except Exception as exc:
+        print(f"[resolve] CourtListener metadata fallback failed: {exc}")
+        return None
+    rated: list[tuple[int, float, dict]] = []
+    for candidate in candidates:
+        candidate_name = re.sub(
+            r"<[^>]+>", "",
+            str(candidate.get("caseName") or candidate.get("case_name") or ""),
+        ).strip()
+        score = _name_match_score(name, candidate_name)
+        if score < _NAME_MATCH_MIN:
+            continue
+        candidate_date = str(
+            candidate.get("dateFiled") or candidate.get("date_filed") or ""
+        )
+        if wanted_year and candidate_date[:4] != wanted_year:
+            continue
+        candidate_dockets = _scotus_docket_tokens(
+            _item_docket_text(candidate)
+        )
+        if (
+            wanted_dockets and candidate_dockets
+            and not (wanted_dockets & candidate_dockets)
+        ):
+            continue
+        rated.append((
+            1 if wanted_dockets & candidate_dockets else 0,
+            score,
+            candidate,
+        ))
+    if not rated:
+        return None
+    rated.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return rated[0][2]
+
+
 # Federal Appendix reporter: "F. App'x", "F.App'x", "Fed. Appx.", etc.
 # (straight or typographic apostrophe).  These cases are scans — Google Scholar
 # rarely has the text — so the app opens them straight on the official PDF.
@@ -8324,7 +8472,7 @@ class CourtListenerGUI:
         threading.Thread(target=run, daemon=True).start()
 
     def _resolve_pdf_url(
-        self, client: CourtListenerClient, item: dict
+        self, client: Optional[CourtListenerClient], item: dict
     ) -> Optional[str]:
         """
         Attempt to find a PDF URL for the selected search result.
@@ -8343,9 +8491,16 @@ class CourtListenerGUI:
         3. download_url from the search result (original court source).
         4. download_url from the fetched opinion record.
         5. Walk the cluster's sub_opinions checking local_path then download_url.
+        6. Recent SCOTUS case metadata → supremecourt.gov's term archive.
+        7. If the sparse saved record had no CourtListener ids, resolve it on
+           CourtListener by citation or by SCOTUS name + year/docket and retry
+           that matched cluster's PDF fields.
         """
         storage_base = "https://storage.courtlistener.com/"
         item.pop("_case_law_pdf_choices", None)
+        skip_metadata_fallback = bool(
+            item.get("_skip_pdf_metadata_fallback")
+        )
 
         # Determine whether this is a SCOTUS case.
         court_val = str(item.get("court_id") or "")
@@ -8382,6 +8537,10 @@ class CourtListenerGUI:
         # official-PDF path below keys on.  Ask CourtListener whether that
         # S. Ct. cite has a parallel U.S. Reports cite and, if so, try it too —
         # that's what lets "View PDF" reach the official opinion scan.
+        is_scotus = is_scotus or any(
+            _US_CITE_RE.search(c) or _SCT_CITE_RE.search(c)
+            for c in all_cites
+        )
         us_from_sct = _us_reports_cite_via_courtlistener(client, all_cites)
         if us_from_sct and us_from_sct not in all_cites:
             print(f"[resolve] S. Ct. cite resolved to U.S. Reports cite: "
@@ -8512,6 +8671,31 @@ class CourtListenerGUI:
                             return dl
             except Exception as exc:
                 print(f"[resolve] cluster walk failed: {exc}")
+
+        # 6. Recent Supreme Court cases may have neither a reporter scan nor a
+        # downloadable path on their saved Scholar/CourtListener record.  The
+        # Court's term archive is authoritative and carries the released PDF.
+        if is_scotus and not skip_metadata_fallback:
+            slip_url = _scotus_slip_pdf_url(item, all_cites)
+            if slip_url:
+                return slip_url
+
+            # 7. If the saved item was too sparse to expose CourtListener ids,
+            # resolve it by citation or SCOTUS name + year/docket, then rerun
+            # the existing PDF ladder for that exact cluster.
+            target = _courtlistener_pdf_fallback_item(
+                client, item, all_cites,
+            )
+            if target:
+                retry_item = dict(target)
+                retry_item["_skip_pdf_metadata_fallback"] = True
+                url = self._resolve_pdf_url(client, retry_item)
+                if url:
+                    print(
+                        "[resolve] using PDF from metadata-matched "
+                        "CourtListener cluster"
+                    )
+                    return url
 
         return None
 
@@ -19061,6 +19245,22 @@ class _ScholarTextWindow:
             # parsed/Bluebooked caption is still authoritative enough to pick
             # the right ``-01``/``-02`` CAP opinion on a shared reporter page.
             item["caseName"] = self._bb.get("name", "")
+        if self._is_scotus:
+            # Saved Scholar opinions often have no CourtListener result object.
+            # Preserve the metadata the archive fallback needs from the parsed
+            # opinion itself: court, decision year, and the "No. 24-123" line.
+            item["court_id"] = "scotus"
+            if not (item.get("dateFiled") or item.get("date_filed")):
+                year = str(self._bb.get("year") or "")
+                if year.isdigit():
+                    item["dateFiled"] = f"{year}-01-01"
+            if not _scotus_docket_tokens(_item_docket_text(item)):
+                front_matter = " ".join(
+                    b.text() for b in self._blocks[:16]
+                )
+                dockets = list(_scotus_docket_tokens(front_matter))
+                if dockets:
+                    item["docketNumber"] = ", ".join(sorted(dockets))
         cites: list[str] = []
         raw = item.get("citation")
         if raw:
