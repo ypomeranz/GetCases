@@ -61,7 +61,7 @@ from courtlistener_gui import (
 from google_scholar import (
     Block, OpinionPart, ScholarResult, Span, bears_citation, educate_quotes,
 )
-from opinion_db import OpinionDB, _gz_pack, _header_cites
+from opinion_db import OpinionDB, _gz_pack, _gz_unpack_prefix, _header_cites
 import us_code
 
 
@@ -1371,6 +1371,110 @@ class ReporterEquivalenceTests(unittest.TestCase):
                 )
             finally:
                 rebuilt.close()
+
+
+    def test_index_points_at_the_jsonl_instead_of_copying_opinions(self):
+        # The index keeps only what search reads plus a byte offset into the
+        # JSONL; the opinion itself is read back through that pointer.
+        html = (
+            '<div id="gs_opinion"><center>THE NESTOR</center>'
+            '<center>18 F. Cas. 9</center><p>The decree is affirmed.</p></div>'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jsonl = root / "opinions.jsonl"
+            db = OpinionDB(jsonl, root / "opinions.db")
+            try:
+                for sid, name in (("1", "First Case"), ("18", "The Nestor")):
+                    self.assertTrue(db.add({
+                        "scholar_id": sid,
+                        "name": name,
+                        "cites": [],
+                        "parties": [name.lower()],
+                        "html_gz": _gz_pack(html),
+                    }))
+
+                columns = {
+                    r[1] for r in
+                    db._db.execute("PRAGMA table_info(opinions)").fetchall()
+                }
+                self.assertIn("line_offset", columns)
+                self.assertNotIn("html", columns)   # no second copy of the corpus
+                self.assertNotIn("text", columns)
+
+                # The stored offset addresses that record's line in the JSONL.
+                row = db._db.execute(
+                    "SELECT line_offset, line_length FROM opinions "
+                    "WHERE scholar_id='18'"
+                ).fetchone()
+                raw = jsonl.read_bytes()[
+                    row["line_offset"]:row["line_offset"] + row["line_length"]
+                ]
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8"))["scholar_id"], "18",
+                )
+
+                # Reading an opinion still yields its HTML and plain text.
+                rec = db.get_by_scholar_id("18")
+                self.assertIn("The decree is affirmed.", rec["html"])
+                self.assertIn("The decree is affirmed.", rec["text"])
+                self.assertEqual(rec["name"], "The Nestor")
+                self.assertIsNone(db.get_by_scholar_id("no-such-id"))
+            finally:
+                db.close()
+
+    def test_stale_jsonl_pointer_is_recovered_by_scanning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = OpinionDB(root / "opinions.jsonl", root / "opinions.db")
+            try:
+                db.add({
+                    "scholar_id": "7",
+                    "name": "Example",
+                    "cites": [],
+                    "parties": ["example"],
+                    "html_gz": _gz_pack("<p>Body text.</p>"),
+                })
+                # A pointer left behind by an out-of-band rewrite must not
+                # return the wrong opinion — it is re-found and healed.
+                db._db.execute("UPDATE opinions SET line_offset=99999")
+                db._db.commit()
+
+                rec = db.get_by_scholar_id("7")
+                self.assertIsNotNone(rec)
+                self.assertIn("Body text.", rec["html"])
+                healed = db._db.execute(
+                    "SELECT line_offset FROM opinions WHERE scholar_id='7'"
+                ).fetchone()
+                self.assertEqual(healed["line_offset"], 0)
+            finally:
+                db.close()
+
+    def test_caption_prefix_yields_the_header_citations(self):
+        # Indexing expands only the caption, so a citation printed above the
+        # opinion is still found without parsing the body.
+        body = "<p>%s</p>" % ("padding text " * 4000)
+        html = (
+            '<div id="gs_opinion"><center>THE NESTOR</center>'
+            '<center>18 F. Cas. 9</center>' + body + '</div>'
+        )
+        packed = _gz_pack(html)
+        head = _gz_unpack_prefix(packed)
+
+        self.assertLess(len(head), len(html))  # body never inflated
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = OpinionDB(root / "opinions.jsonl", root / "opinions.db")
+            try:
+                db.add({
+                    "scholar_id": "18", "name": "The Nestor",
+                    "cites": [], "parties": ["nestor"], "html_gz": packed,
+                })
+                self.assertEqual(
+                    [h["scholar_id"] for h in db.find("18 Fed. Cas. 9")], ["18"],
+                )
+            finally:
+                db.close()
 
 
 class UsCodeNavigationTests(unittest.TestCase):

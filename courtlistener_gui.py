@@ -4688,6 +4688,10 @@ class CourtListenerGUI:
         # If we just restarted from an update, fold the pre-update opinions
         # backup back in (shortly, so the window comes up first).
         self.root.after(100, self._apply_pending_update_merge)
+        # Open the opinion database in the background now rather than on the
+        # first lookup, so a search never arrives while the index is still
+        # being built.  Deferred briefly so the window paints first.
+        self.root.after(200, self._start_opinion_db_load)
 
     # ------------------------------------------------------------------
     # Case-view history (the "History ▾" dropdown on case windows)
@@ -6470,10 +6474,11 @@ class CourtListenerGUI:
         # initial "Searching…" state (the first _resize_to ran before it).
         _resize_to(0)
         search_done = [0]  # track how many searches completed
-        # Do not start or wait for the lazy opinion database here.  If it was
-        # already loaded, search it as an independent fourth Spotlight source;
-        # otherwise the three existing sources proceed unchanged.
-        loaded_opinion_db = self._loaded_opinion_db()
+        # Never wait for the opinion database here.  When it is already open it
+        # is searched as an independent fourth Spotlight source; when it is not,
+        # its background open is kicked off (so later lookups have it) and the
+        # three online sources proceed immediately without it.
+        loaded_opinion_db = self._get_opinion_db(wait=False)
         total_searches = 3 + (1 if loaded_opinion_db is not None else 0)
 
         def _update_status() -> None:
@@ -8629,15 +8634,6 @@ class CourtListenerGUI:
         if db is not None:
             self._attach_opinion_db_to_scholar(db)
         return db
-
-    def _loaded_opinion_db(self):
-        """Return the opinion DB only if its lazy load already finished.
-
-        Spotlight uses this non-starting probe so its local-results pass never
-        makes the first quick search wait for (or initiate) an index rebuild.
-        """
-        with self._opinion_db_lock:
-            return self._opinion_db
 
     # ------------------------------------------------------------------
     # Software update  (Settings ▸ Check for Updates…)
