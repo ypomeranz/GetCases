@@ -450,6 +450,31 @@ def _install_history_menubar(app, win: tk.Misc):
     return menubar
 
 
+def _widget_accepts_typing(widget) -> bool:
+    """True when *widget* is a focused input that consumes typed characters.
+
+    Single-key window shortcuts (e.g. "s" to toggle the side panel) must yield
+    to the keyboard while the user is typing in an entry, the Find bar, or an
+    editable text box.  Disabled and read-only fields don't take typing, so a
+    shortcut is free to fire while they hold focus.
+    """
+    if widget is None:
+        return False
+    try:
+        cls = widget.winfo_class()
+    except tk.TclError:
+        return False
+    if cls in ("Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox"):
+        try:
+            state = str(widget.cget("state"))
+        except tk.TclError:
+            state = "normal"
+        return state not in ("disabled", "readonly")
+    # CustomTkinter wraps its inputs (CTkEntry / CTkTextbox); the inner tk
+    # widget usually holds focus, but match the wrapper name defensively.
+    return cls.endswith("Entry") or cls.endswith("Textbox")
+
+
 def _install_window_menubar(app, win: tk.Misc):
     """Attach the shared Window and Bookmarks menus to a non-case document
     view (a statute/rule reader), so it too can be bookmarked."""
@@ -532,6 +557,7 @@ class _CaseTabPage(ttk.Frame):
         if sequence and (
             str(sequence).startswith("<Control-")
             or str(sequence).startswith("<Command-")
+            or str(sequence).startswith("<KeyPress")  # bare-key accelerators
             or str(sequence) in ("<F3>", "<Shift-F3>", "<Escape>")
         ):
             def active_only(event, page=self, callback=func):
@@ -694,6 +720,44 @@ class _CaseTabsWindow:
             and top <= y < top + height
         )
 
+    def _tab_bounds(
+        self, index: int, x: int, y: int,
+    ) -> "Optional[tuple[int, int]]":
+        """The leftmost and rightmost pixel columns of tab *index* on row *y*.
+
+        ``ttk::notebook`` has no bbox subcommand: ``notebook.bbox(i)`` reaches
+        tkinter's ``Misc.bbox``, which is grid geometry, ignores *i*, and
+        reports (0, 0, 0, 0) for a notebook that has no grid slaves.  Tk's own
+        ``@x,y`` tab hit test is authoritative, so the edges are found by
+        binary searching it outward from a point known to be on the tab.
+        """
+        notebook = self.notebook
+
+        def on_tab(probe: int) -> bool:
+            try:
+                return notebook.index(f"@{probe},{y}") == index
+            except tk.TclError:
+                return False
+
+        if not on_tab(x):
+            return None
+        lo, hi = 0, x
+        while lo < hi:  # leftmost column still on this tab
+            mid = (lo + hi) // 2
+            if on_tab(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        left = lo
+        lo, hi = x, max(x, notebook.winfo_width() - 1)
+        while lo < hi:  # rightmost column still on this tab
+            mid = (lo + hi + 1) // 2
+            if on_tab(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return left, lo
+
     def _tab_close_page_at(
         self, x: int, y: int,
     ) -> "Optional[_CaseTabPage]":
@@ -701,10 +765,19 @@ class _CaseTabsWindow:
         if page is None:
             return None
         try:
-            bbox = self.notebook.bbox(self.notebook.index(page))
+            index = self.notebook.index(page)
         except (tk.TclError, ValueError):
             return None
-        return page if self._point_in_tab_close_box(bbox, x, y) else None
+        bounds = self._tab_bounds(index, x, y)
+        if bounds is None:
+            return None
+        left, right = bounds
+        # _page_at already proved the point is on this tab, so only the
+        # horizontal range is in question; the box is anchored to the row
+        # actually probed.
+        return page if self._point_in_tab_close_box(
+            (left, y, right - left + 1, 1), x, y,
+        ) else None
 
     def _set_tab_close_hover(
         self, page: "Optional[_CaseTabPage]",
@@ -1172,6 +1245,11 @@ def _ensure_case_tab_style(widget: tk.Misc) -> str:
         darkcolor="#dfe3ea",
         borderwidth=1,
         tabmargins=(10, 8, 10, 0),
+        # Anchor tabs to the top-left on every platform.  Windows themes
+        # already default to "nw", but the macOS aqua theme defaults to a
+        # centred tab row ("n"); forcing "nw" makes the tabs fill left to
+        # right there too without changing the Windows appearance.
+        tabposition="nw",
     )
     style.configure(
         tab_style,
@@ -5057,6 +5135,14 @@ class CourtListenerGUI:
                 bool(self._case_tabs_var.get())
             ),
         )
+        # Opinion viewers expose their (default-hidden) source bar here.
+        source_owner = getattr(view, "_source_bar_control", None)
+        if source_owner is not None and hasattr(source_owner, "_source_bar_var"):
+            menu.add_checkbutton(
+                label="Show Source Bar",
+                variable=source_owner._source_bar_var,
+                command=source_owner._toggle_source_bar_from_menu,
+            )
         menu.add_separator()
         menu.add_command(
             label="Close Current Tab" if isinstance(view, _CaseTabPage)
@@ -5285,6 +5371,11 @@ class CourtListenerGUI:
         db_menu.add_command(
             label="Rebuild Search Index", command=self._rebuild_db_index,
         )
+        # The same Bookmarks cascade the readers carry, so saved documents can
+        # be reopened straight from the main window.  The root window is not a
+        # document view, so this one lists the saved bookmarks without the
+        # "Bookmark This …" toggle the readers show first.
+        _add_bookmarks_cascade(menubar, self, self.root)
         self.root.bind("<Control-l>", lambda _e: self._show_statute_lookup())
         self.root.bind("<Control-s>", lambda _e: self._show_quick_lookup())
         self.root.bind("<Control-b>", lambda _e: self._open_brief())
@@ -14275,8 +14366,13 @@ class _ScholarTextWindow:
         entry_style = "Modern.TEntry" if _CTK_AVAILABLE else "TEntry"
         combo_style = "Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox"
 
+        # The source bar (a read-only field naming where this text came from)
+        # starts hidden; the Window menu's "Show Source Bar" item packs it in
+        # above the "Viewing" row via _apply_source_bar_visibility.
         url_frame = _ui_frame(win)
-        url_frame.pack(fill="x", padx=12, pady=(12, 0))
+        self._source_bar = url_frame
+        self._source_bar_var = tk.BooleanVar(value=False)
+        self._win._source_bar_control = self
         ttk.Label(url_frame, text="Source", style=muted_style).pack(side="left")
         initial_source = (
             self._primary_source_url or self._primary_source_label
@@ -14290,6 +14386,7 @@ class _ScholarTextWindow:
 
         # Part navigation: what you're viewing, and a selector to filter
         view_frame = _ui_frame(win)
+        self._view_frame = view_frame
         view_frame.pack(fill="x", padx=12, pady=(8, 0))
         ttk.Label(view_frame, text="Viewing", style=muted_style).pack(side="left")
         self._view_label_var = tk.StringVar(value="Full opinion")
@@ -14468,6 +14565,8 @@ class _ScholarTextWindow:
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
             win.bind(seq, lambda _e: self._zoom(-1))
         win.bind("<Control-0>", lambda _e: self._zoom(0))
+        # Bare "s" toggles the side panel, except while a text field has focus.
+        win.bind("<KeyPress-s>", self._toggle_details_shortcut)
         txt.bind(
             "<Control-MouseWheel>",
             lambda e: self._zoom(+1 if e.delta > 0 else -1) or "break",
@@ -17643,6 +17742,45 @@ class _ScholarTextWindow:
         self._apply_details_fonts()
         self._status_var.set(
             f"Side panel text: {self._details_fonts['body'].cget('size')} pt")
+
+    def _focused_widget(self):
+        """The widget holding keyboard focus in this window, or None."""
+        try:
+            return self._win.focus_get()
+        except (KeyError, tk.TclError):
+            return None
+
+    def _toggle_details_shortcut(self, event=None):
+        """Toggle the side panel from the bare "s" accelerator.
+
+        Ignored while focus is in a field that accepts typed text, so "s"
+        types normally in the Find bar and similar inputs.
+        """
+        if _widget_accepts_typing(self._focused_widget()):
+            return None
+        self._details_var.set(not self._details_var.get())
+        self._toggle_details()
+        return "break"
+
+    def _toggle_source_bar_from_menu(self) -> None:
+        """Apply the Window menu's "Show Source Bar" checkbutton, which Tk has
+        already flipped in _source_bar_var by the time this runs."""
+        self._apply_source_bar_visibility()
+
+    def _apply_source_bar_visibility(self) -> None:
+        """Show or hide the source bar to match _source_bar_var, keeping it
+        anchored above the "Viewing" row when shown."""
+        bar = getattr(self, "_source_bar", None)
+        if bar is None:
+            return
+        try:
+            if self._source_bar_var.get():
+                bar.pack(fill="x", padx=12, pady=(12, 0),
+                         before=self._view_frame)
+            else:
+                bar.pack_forget()
+        except tk.TclError:
+            pass
 
     def _toggle_details(self) -> None:
         if self._details_var.get():
@@ -22210,16 +22348,42 @@ class _StatuteWindow:
             except Exception:
                 pass
 
+    def _toggle_source_bar_from_menu(self) -> None:
+        """Apply the Window menu's "Show Source Bar" checkbutton, which Tk has
+        already flipped in _source_bar_var by the time this runs."""
+        self._apply_source_bar_visibility()
+
+    def _apply_source_bar_visibility(self) -> None:
+        """Show or hide the source display to match _source_bar_var, leaving
+        the § navigation buttons on the right in place."""
+        bar = getattr(self, "_source_bar", None)
+        if bar is None:
+            return
+        try:
+            if self._source_bar_var.get():
+                bar.pack(side="left", fill="x", expand=True)
+            else:
+                bar.pack_forget()
+        except tk.TclError:
+            pass
+
     def _build_ui(self) -> None:
         win = self._win
         muted_style = "ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel"
         entry_style = "Modern.TEntry" if _CTK_AVAILABLE else "TEntry"
         top = _ui_frame(win)
         top.pack(fill="x", padx=12, pady=(12, 0))
-        ttk.Label(top, text="Source", style=muted_style).pack(side="left")
+        # The source display (label + read-only URL) sits in its own frame so
+        # the Window menu's "Show Source Bar" toggle can hide it while leaving
+        # the § navigation buttons in place.  Hidden by default.
+        self._source_bar = _ui_frame(top)
+        self._source_bar_var = tk.BooleanVar(value=False)
+        self._win._source_bar_control = self
+        ttk.Label(self._source_bar, text="Source",
+                  style=muted_style).pack(side="left")
         self._src_var = tk.StringVar(value=self._doc.url)
-        ttk.Entry(top, textvariable=self._src_var, state="readonly",
-                  style=entry_style).pack(
+        ttk.Entry(self._source_bar, textvariable=self._src_var,
+                  state="readonly", style=entry_style).pack(
             side="left", fill="x", expand=True, padx=(8, 8)
         )
         _ui_button(
