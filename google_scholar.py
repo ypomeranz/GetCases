@@ -766,12 +766,13 @@ _SEP_DELIVERED_RE = re.compile(
 # Another role-less historical U.S. Reports form reverses the usual byline:
 #
 #   Separate opinion of MR. JUSTICE McREYNOLDS.
+#   The separate opinion of MR. JUSTICE McREYNOLDS.
 #
 # It is a definite opinion boundary, but "separate" alone does not establish
 # whether the writing concurs or dissents.  The role is resolved after all
 # boundaries are known, using the disposition and neighboring writings.
 _SEP_OF_RE = re.compile(
-    r"^\s*Separate\s+opinion\s+of\s+"
+    r"^\s*(?:The\s+)?Separate\s+opinion\s+of\s+"
     r"(?:MR\.\s+|MRS\.\s+|MS\.\s+)?(?:CHIEF\s+)?JUSTICE\s+"
     r"[A-Z][\w.'â€™-]+\s*[.:]?\s*$",
     re.IGNORECASE,
@@ -788,8 +789,11 @@ def _peek_sep_kind_evidence(
             continue
         # Role language after another byline belongs to that later judge, not
         # to the candidate being classified.
-        if (_BARE_SEP_HEADER_RE.match(t)
+        if ((len(t) <= 300 and _SEP_HEADER_RE.match(t)
+             and not _NOT_SEP_RE.search(t))
+                or _BARE_SEP_HEADER_RE.match(t)
                 or _JOINED_SEP_HEADER_RE.match(t)
+                or _SEP_DELIVERED_RE.match(t)
                 or _SEP_OF_RE.match(t)
                 or _OCR_JUSTICE_BYLINE_RE.match(t)):
             break
