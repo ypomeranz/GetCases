@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import html as _html
 import json
 import os
 import re
@@ -45,6 +46,7 @@ import threading
 import time
 import urllib.parse
 import zlib
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -58,7 +60,7 @@ from bluebook_names import (
     strip_related_case_note,
 )
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 # The ``opinions`` columns this release expects.  An index whose table differs
 # was written by another schema and is dropped and rebuilt (see
@@ -244,6 +246,107 @@ def _header_cites(blocks: list) -> list[str]:
     return out
 
 
+_MONTHS = (
+    "January|February|March|April|May|June|July|August|"
+    "September|October|November|December"
+)
+_FULL_DATE_RE = re.compile(
+    rf"\b({_MONTHS})\s+(\d{{1,2}}),?\s+((?:1[6-9]|20)\d{{2}})\b",
+    re.IGNORECASE,
+)
+_DOCKET_TOKEN_RE = re.compile(
+    r"\b(?:\d{1,3}[-\u2010-\u2015\u2212]\d{1,5}|"
+    r"\d{1,3}[A-Z]\d{1,5})\b",
+    re.IGNORECASE,
+)
+
+
+def _block_text_without_markers(block) -> str:
+    spans = getattr(block, "spans", None)
+    if spans is None:
+        return block.text()
+    return "".join(
+        span.text for span in spans
+        if not getattr(span, "pagenum", False)
+    )
+
+
+def _front_matter_text(blocks: list, *, centers_only: bool = False) -> str:
+    kinds = ("center",) if centers_only else ("center", "heading")
+    return "  ".join(
+        _block_text_without_markers(block)
+        for block in blocks[:16]
+        if getattr(block, "kind", None) in kinds
+    )
+
+
+def _iso_full_date(value: str) -> str:
+    m = _FULL_DATE_RE.search(value or "")
+    if not m:
+        return ""
+    try:
+        return datetime.strptime(
+            f"{m.group(1)} {m.group(2)} {m.group(3)}",
+            "%B %d %Y",
+        ).date().isoformat()
+    except ValueError:
+        return ""
+
+
+def _decision_date(blocks: list) -> str:
+    """Exact decision date printed in an opinion's front matter.
+
+    A labelled ``Decided``/``Filed`` date wins over argued and reargued dates.
+    Short orders often print only ``[May 4, 2026]`` or a bare centered date, so
+    those forms are conservative fallbacks.
+    """
+    header = _front_matter_text(blocks)
+    centers = _front_matter_text(blocks, centers_only=True)
+    labelled = re.search(
+        rf"\b(?:Decided|Filed|Released|Entered)\b[^A-Za-z0-9]{{0,20}}"
+        rf"((?:{_MONTHS})\s+\d{{1,2}},?\s+(?:1[6-9]|20)\d{{2}})\b",
+        header,
+        re.IGNORECASE,
+    )
+    if labelled:
+        return _iso_full_date(labelled.group(1))
+    bracketed = re.search(
+        rf"\[\s*((?:{_MONTHS})\s+\d{{1,2}},?\s+"
+        rf"(?:1[6-9]|20)\d{{2}})\s*\]",
+        header,
+        re.IGNORECASE,
+    )
+    if bracketed:
+        return _iso_full_date(bracketed.group(1))
+    dates = list(_FULL_DATE_RE.finditer(centers))
+    return _iso_full_date(dates[-1].group(0)) if dates else ""
+
+
+def _header_dockets(blocks: list) -> list[str]:
+    """Normalized Supreme Court docket tokens from the front matter."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _DOCKET_TOKEN_RE.finditer(_front_matter_text(blocks)):
+        docket = re.sub(
+            r"[-\u2010-\u2015\u2212]", "-", match.group(0)
+        ).upper()
+        if docket not in seen:
+            seen.add(docket)
+            out.append(docket)
+    return out
+
+
+def _court_from_header(blocks: list) -> str:
+    header = _front_matter_text(blocks)
+    if re.search(
+        r"\bSupreme Court of (?:the )?United States\b",
+        header,
+        re.IGNORECASE,
+    ):
+        return "scotus"
+    return ""
+
+
 def _caption_name(blocks: list) -> str:
     """Raw case name from the Scholar caption (a centered block with a 'v.'
     separator, or an 'In re'/'Ex parte' form).  Light, ``tkinter``-free cousin
@@ -361,7 +464,19 @@ def extract_record(
 
     parties = parties_from_name(name or raw_name)
 
-    date_filed = item.get("dateFiled") or item.get("date_filed") or ""
+    date_filed = str(
+        item.get("dateFiled") or item.get("date_filed") or ""
+    ).strip()
+    header_date = _decision_date(blocks)
+    header_court = _court_from_header(blocks)
+    # Scholar-only records otherwise retain just a year.  For SCOTUS, trust
+    # the opinion's own "Decided ..." line even when external metadata carries
+    # a later rehearing date.
+    if header_date and (
+        not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_filed)
+        or header_court == "scotus"
+    ):
+        date_filed = header_date
     year = date_filed[:4] if len(str(date_filed)) >= 4 else ""
     if not year:
         # Same ladder as the viewer's Bluebook year: page markers are
@@ -400,7 +515,7 @@ def extract_record(
 
     court = str(item.get("court_id") or "").strip().lower()
     if not court:
-        court = _court_from_cites(cites)
+        court = _court_from_cites(cites) or header_court
 
     return {
         "v": _SCHEMA_VERSION,
@@ -412,10 +527,60 @@ def extract_record(
         "court": court,
         "year": year,
         "date_filed": date_filed,
+        "dockets": _header_dockets(blocks),
         "added_at": time.time(),
         "source": item.get("source") or "scholar",
         "html_gz": _gz_pack(html),
     }
+
+
+def _record_html(record: dict) -> str:
+    packed = str(record.get("html_gz") or "")
+    return _gz_unpack(packed) if packed else str(record.get("html") or "")
+
+
+def _record_dockets(record: dict) -> set[str]:
+    stored = {
+        re.sub(r"[-\u2010-\u2015\u2212]", "-", str(value)).upper()
+        for value in (record.get("dockets") or [])
+        if value
+    }
+    if stored:
+        return stored
+    markup = _record_html(record)
+    return set(_header_dockets(_blocks(markup))) if markup else set()
+
+
+def _revision_shingles(record: dict, width: int = 7) -> set[tuple[str, ...]]:
+    """Word shingles used to recognize the reported version of saved text.
+
+    Reporter publication adds pagination, headnotes, and counsel material but
+    preserves the actual opinion.  Measuring containment against the shorter
+    version therefore stays high for a true revision and very low for a
+    different order or separate writing from the same docket.
+    """
+    markup = _record_html(record)
+    if not markup:
+        return set()
+    text = _html.unescape(re.sub(r"<[^>]+>", " ", markup))
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    if len(words) < width:
+        return set()
+    return {
+        tuple(words[index:index + width])
+        for index in range(len(words) - width + 1)
+    }
+
+
+def _revision_similarity(
+    left: dict, right: dict,
+    left_shingles: Optional[set[tuple[str, ...]]] = None,
+) -> float:
+    a = left_shingles if left_shingles is not None else _revision_shingles(left)
+    b = _revision_shingles(right)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +625,7 @@ class OpinionDB:
         self._db.row_factory = sqlite3.Row
         self._init_schema()
         self._sync_from_jsonl()
+        self._reconcile_scotus_revisions()
 
     # -- schema -------------------------------------------------------------
 
@@ -535,6 +701,8 @@ class OpinionDB:
                 CREATE INDEX IF NOT EXISTS ix_cite_sid ON citations(scholar_id);
                 CREATE INDEX IF NOT EXISTS ix_party ON parties(token);
                 CREATE INDEX IF NOT EXISTS ix_party_sid ON parties(scholar_id);
+                CREATE INDEX IF NOT EXISTS ix_opinion_date
+                    ON opinions(court, date_filed);
                 """
             )
             if self._get_meta("schema_version") is None:
@@ -684,6 +852,19 @@ class OpinionDB:
         parties = rec.get("parties")
         if parties is None:
             parties = parties_from_name(rec.get("name", ""))
+        date_filed = str(rec.get("date_filed") or "").strip()
+        header_date = _decision_date(blocks)
+        if header_date and (
+            not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_filed)
+            or _court_from_header(blocks) == "scotus"
+        ):
+            date_filed = header_date
+        year = str(rec.get("year") or "").strip()
+        if not year and date_filed:
+            year = date_filed[:4]
+        court = str(rec.get("court") or "").strip().lower()
+        if not court:
+            court = _court_from_cites(cites) or _court_from_header(blocks)
 
         self._db.execute(
             "INSERT OR REPLACE INTO opinions (scholar_id, url, name, court, year, "
@@ -691,8 +872,8 @@ class OpinionDB:
             "parties_json, added_at, source) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                sid, rec.get("url", ""), rec.get("name", ""), rec.get("court", ""),
-                rec.get("year", ""), rec.get("date_filed", ""),
+                sid, rec.get("url", ""), rec.get("name", ""), court,
+                year, date_filed,
                 int(offset), int(length),
                 json.dumps(cites, ensure_ascii=False),
                 json.dumps(parties, ensure_ascii=False),
@@ -713,6 +894,150 @@ class OpinionDB:
             self._db.execute(
                 "INSERT INTO parties (scholar_id, token) VALUES (?, ?)", (sid, tok)
             )
+
+    # -- reported-version reconciliation ----------------------------------
+
+    @staticmethod
+    def _reported_cites(raw) -> list[str]:
+        try:
+            values = json.loads(raw) if isinstance(raw, str) else (raw or [])
+        except Exception:
+            values = []
+        return [str(value) for value in values if _cite_key(str(value))]
+
+    def _revision_candidate(self, record: dict) -> Optional[str]:
+        """Unreported SCOTUS record superseded by *record*, if safely known.
+
+        Exact decision date narrows the pool; docket disagreement rejects a
+        candidate; and substantial seven-word-shingle containment proves that
+        the reported page preserves the same writing.  This keeps a concurrence,
+        dissent, or same-docket order from being mistaken for a revision.
+        """
+        if (
+            str(record.get("court") or "").lower() != "scotus"
+            or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}",
+                str(record.get("date_filed") or ""),
+            )
+            or not self._reported_cites(record.get("cites") or [])
+        ):
+            return None
+        sid = str(record.get("scholar_id") or "")
+        rows = self._db.execute(
+            "SELECT scholar_id, cites_json FROM opinions "
+            "WHERE court='scotus' AND date_filed=? AND scholar_id<>?",
+            (record["date_filed"], sid),
+        ).fetchall()
+        new_dockets = _record_dockets(record)
+        new_shingles = _revision_shingles(record)
+        best: tuple[float, str] | None = None
+        for row in rows:
+            if self._reported_cites(row["cites_json"]):
+                continue
+            old = self.stored_record(str(row["scholar_id"]))
+            if not old:
+                continue
+            old_dockets = _record_dockets(old)
+            if (
+                new_dockets and old_dockets
+                and not (new_dockets & old_dockets)
+            ):
+                continue
+            similarity = _revision_similarity(
+                record, old, left_shingles=new_shingles,
+            )
+            if similarity < 0.55:
+                continue
+            candidate = (similarity, str(row["scholar_id"]))
+            if best is None or candidate > best:
+                best = candidate
+        return best[1] if best else None
+
+    def _remove_jsonl_sids(self, scholar_ids: set[str]) -> bool:
+        """Remove known duplicate ids in one atomic rewrite."""
+        if not scholar_ids or not self.jsonl_path.exists():
+            return False
+        kept: list[str] = []
+        removed = 0
+        with open(self.jsonl_path, "r", encoding="utf-8") as source:
+            for line in source:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    sid = str(json.loads(stripped).get("scholar_id") or "")
+                except Exception:
+                    sid = ""
+                if sid in scholar_ids:
+                    removed += 1
+                else:
+                    kept.append(stripped)
+        if not removed:
+            return False
+        tmp = self.jsonl_path.with_suffix(f".{os.getpid()}.tmp")
+        with open(tmp, "w", encoding="utf-8") as target:
+            for line in kept:
+                target.write(line + "\n")
+        tmp.replace(self.jsonl_path)
+        self.rebuild_index()
+        return True
+
+    def _reconcile_scotus_revisions(self) -> None:
+        """Collapse already-stored unreported/reported SCOTUS revisions.
+
+        Schema v5 derives exact dates and the SCOTUS court from stored headers,
+        so old JSONL rows can be reconciled without changing their format.
+        """
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT scholar_id, date_filed, cites_json FROM opinions "
+                "WHERE court='scotus' AND length(date_filed)=10"
+            ).fetchall()
+            by_date: dict[str, list] = {}
+            for row in rows:
+                by_date.setdefault(str(row["date_filed"]), []).append(row)
+            remove: set[str] = set()
+            for dated in by_date.values():
+                reported = [
+                    row for row in dated
+                    if self._reported_cites(row["cites_json"])
+                ]
+                unreported = [
+                    row for row in dated
+                    if not self._reported_cites(row["cites_json"])
+                ]
+                if not reported or not unreported:
+                    continue
+                reported_records = [
+                    (
+                        row,
+                        self.stored_record(str(row["scholar_id"])),
+                    )
+                    for row in reported
+                ]
+                for old_row in unreported:
+                    old = self.stored_record(str(old_row["scholar_id"]))
+                    if not old:
+                        continue
+                    old_dockets = _record_dockets(old)
+                    best = 0.0
+                    for _new_row, new in reported_records:
+                        if not new:
+                            continue
+                        new_dockets = _record_dockets(new)
+                        if (
+                            old_dockets and new_dockets
+                            and not (old_dockets & new_dockets)
+                        ):
+                            continue
+                        best = max(best, _revision_similarity(new, old))
+                    if best >= 0.55:
+                        remove.add(str(old_row["scholar_id"]))
+            if remove and self._remove_jsonl_sids(remove):
+                print(
+                    f"[db] replaced {len(remove)} unreported Supreme Court "
+                    f"version(s) with their reported records"
+                )
 
     # -- writes -------------------------------------------------------------
 
@@ -745,10 +1070,23 @@ class OpinionDB:
     def add_opinion(
         self, url: str, html: str, item: Optional[dict] = None
     ) -> bool:
-        """Extract a record from a fetched Scholar opinion and add it."""
+        """Extract and store a fetched Scholar opinion.
+
+        A newly reported SCOTUS page replaces an older unreported Scholar id
+        only when date, docket, and substantial opinion text establish that it
+        is the same writing.
+        """
         rec = extract_record(url, html, item)
         if rec is None:
             return False
+        with self._lock:
+            old_sid = self._revision_candidate(rec)
+            if old_sid:
+                print(
+                    f"[db] replacing unreported Scholar opinion {old_sid} "
+                    f"with reported version {rec['scholar_id']}"
+                )
+                return self._rewrite_jsonl(old_sid, rec)
         return self.add(rec)
 
     def _rewrite_jsonl(self, sid: str, new_record: Optional[dict]) -> bool:

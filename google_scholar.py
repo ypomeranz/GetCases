@@ -277,6 +277,7 @@ class ScholarResult:
     url: str
     source: str = ""   # the green byline, e.g. "Supreme Court, 1973"
     snippet: str = ""
+    cited_by: int = 0  # Scholar's inexpensive result-page authority signal
 
 
 # A reporter citation ("410 U.S. 113", "529 NW 2d 155", "8 F.4th 557") for
@@ -1971,7 +1972,23 @@ class GoogleScholarFetcher:
             source = _WS_RE.sub(" ", gs_a.get_text()).strip() if gs_a else ""
             rs = div.find("div", class_="gs_rs")
             snippet = _WS_RE.sub(" ", rs.get_text()).strip() if rs else ""
-            out.append(ScholarResult(title=title, url=href, source=source, snippet=snippet))
+            cited_by = 0
+            for link in div.find_all("a"):
+                m = re.fullmatch(
+                    r"Cited by\s+(\d+)",
+                    _WS_RE.sub(" ", link.get_text()).strip(),
+                    re.IGNORECASE,
+                )
+                if m:
+                    cited_by = int(m.group(1))
+                    break
+            out.append(ScholarResult(
+                title=title,
+                url=href,
+                source=source,
+                snippet=snippet,
+                cited_by=cited_by,
+            ))
         if not out:
             # Markup changed?  Fall back to bare scholar_case anchors.
             for a in soup.find_all("a", href=True):
