@@ -69,7 +69,7 @@ class SlipArchiveParsingTests(unittest.TestCase):
             "24pdf/604us2r29_8nj9.pdf",
         )
 
-    def test_exact_docket_matches_across_unicode_dash_and_year_only_date(self):
+    def test_exact_docket_and_date_match_across_unicode_dash(self):
         record = scotus_recent.SlipOpinion(
             term="20",
             release="35",
@@ -90,21 +90,12 @@ class SlipArchiveParsingTests(unittest.TestCase):
             match = scotus_recent.find_slip_opinion(
                 name="Cedar Point Nursery v. Hassid",
                 docket="No. 20–107",
-                date_filed="2021-01-01",
+                date_filed="2021-06-23",
             )
 
         self.assertIs(match, record)
 
-    def test_name_without_year_or_docket_is_not_guessed(self):
-        with patch("scotus_recent.fetch_slip_opinions") as fetch:
-            match = scotus_recent.find_slip_opinion(
-                name="Smith v. United States"
-            )
-
-        self.assertIsNone(match)
-        fetch.assert_not_called()
-
-    def test_name_and_decision_year_can_match_when_docket_is_missing(self):
+    def test_exact_docket_is_rejected_when_decision_dates_differ(self):
         record = scotus_recent.SlipOpinion(
             term="24",
             release="67",
@@ -124,10 +115,57 @@ class SlipArchiveParsingTests(unittest.TestCase):
         ):
             match = scotus_recent.find_slip_opinion(
                 name="Goldey v. Fields",
-                date_filed="2025",
+                docket="24-809",
+                date_filed="2025-07-01",
+                citations=("606 U.S. 942",),
+            )
+
+        self.assertIsNone(match)
+
+    def test_name_without_year_or_docket_is_not_guessed(self):
+        with patch("scotus_recent.fetch_slip_opinions") as fetch:
+            match = scotus_recent.find_slip_opinion(
+                name="Smith v. United States"
+            )
+
+        self.assertIsNone(match)
+        fetch.assert_not_called()
+
+    def test_name_and_exact_decision_date_can_match_without_docket(self):
+        record = scotus_recent.SlipOpinion(
+            term="24",
+            release="67",
+            date="2025-06-30",
+            docket="24-809",
+            name="Goldey v. Fields",
+            opinion_url=(
+                "https://www.supremecourt.gov/opinions/"
+                "24pdf/606us2r67_8nka.pdf"
+            ),
+            citation="606 U.S. 942",
+        )
+
+        with patch(
+            "scotus_recent.fetch_slip_opinions",
+            side_effect=lambda term, **_kw: [record] if term == "24" else [],
+        ):
+            match = scotus_recent.find_slip_opinion(
+                name="Goldey v. Fields",
+                date_filed="2025-06-30",
             )
 
         self.assertIs(match, record)
+
+    def test_year_only_date_does_not_probe_archive(self):
+        with patch("scotus_recent.fetch_slip_opinions") as fetch:
+            match = scotus_recent.find_slip_opinion(
+                name="Goldey v. Fields",
+                docket="24-809",
+                date_filed="2025",
+            )
+
+        self.assertIsNone(match)
+        fetch.assert_not_called()
 
     def test_exact_us_reports_citation_matches_without_name(self):
         record = scotus_recent.SlipOpinion(
@@ -148,7 +186,7 @@ class SlipArchiveParsingTests(unittest.TestCase):
             side_effect=lambda term, **_kw: [record] if term == "24" else [],
         ):
             match = scotus_recent.find_slip_opinion(
-                date_filed="2025",
+                date_filed="2025-06-30",
                 citations=("606 U. S. 942",),
             )
 
@@ -156,9 +194,9 @@ class SlipArchiveParsingTests(unittest.TestCase):
 
 
 class SlipArchiveResolverTests(unittest.TestCase):
-    def test_saved_scholar_window_supplies_year_court_and_docket(self):
+    def test_saved_scholar_window_supplies_exact_date_court_and_docket(self):
         window = object.__new__(_ScholarTextWindow)
-        window._item = {}
+        window._item = {"dateFiled": "2021-06-21"}
         window._bb = {
             "name": "Cedar Point Nursery v. Hassid",
             "cite": "594 U.S. 139",
@@ -176,7 +214,7 @@ class SlipArchiveResolverTests(unittest.TestCase):
         item = window._pdf_item()
 
         self.assertEqual(item["court_id"], "scotus")
-        self.assertEqual(item["dateFiled"], "2021-01-01")
+        self.assertEqual(item["dateFiled"], "2021-06-23")
         self.assertEqual(item["docketNumber"], "20-107")
 
     def test_recent_scotus_helper_returns_archive_match(self):
@@ -192,7 +230,7 @@ class SlipArchiveResolverTests(unittest.TestCase):
         item = {
             "court_id": "scotus",
             "caseName": "Goldey v. Fields",
-            "dateFiled": "2025-01-01",
+            "dateFiled": "2025-06-30",
             "docketNumber": "24-809",
         }
 
@@ -206,6 +244,20 @@ class SlipArchiveResolverTests(unittest.TestCase):
         self.assertEqual(
             find.call_args.kwargs["citations"], ("606 U.S. 942",)
         )
+
+    def test_slip_helper_requires_an_exact_decision_date(self):
+        item = {
+            "court_id": "scotus",
+            "caseName": "Goldey v. Fields",
+            "dateFiled": "2025",
+            "docketNumber": "24-809",
+        }
+
+        with patch("scotus_recent.find_slip_opinion") as find:
+            url = _scotus_slip_pdf_url(item, ["606 U.S. 942"])
+
+        self.assertIsNone(url)
+        find.assert_not_called()
 
     def test_pre_2021_case_does_not_probe_slip_archive(self):
         item = {
@@ -221,11 +273,11 @@ class SlipArchiveResolverTests(unittest.TestCase):
         self.assertIsNone(url)
         find.assert_not_called()
 
-    def test_courtlistener_name_fallback_requires_year_and_docket(self):
+    def test_courtlistener_name_fallback_requires_date_and_docket(self):
         item = {
             "court_id": "scotus",
             "caseName": "Goldey v. Fields",
-            "dateFiled": "2025-01-01",
+            "dateFiled": "2025-06-30",
             "docketNumber": "24-809",
         }
         correct = {
@@ -238,6 +290,11 @@ class SlipArchiveResolverTests(unittest.TestCase):
                 "caseName": "Goldey v. Fields",
                 "dateFiled": "2024-06-30",
                 "docketNumber": "23-809",
+            },
+            {
+                "caseName": "Goldey v. Fields",
+                "dateFiled": "2025-07-01",
+                "docketNumber": "24-809",
             },
             {
                 "caseName": "Goldey v. Fields",
@@ -257,6 +314,27 @@ class SlipArchiveResolverTests(unittest.TestCase):
 
         self.assertIs(matched, correct)
 
+    def test_courtlistener_citation_fallback_rejects_different_date(self):
+        item = {
+            "court_id": "scotus",
+            "dateFiled": "2025-07-01",
+        }
+        merits_opinion = {
+            "caseName": "Goldey v. Fields",
+            "dateFiled": "2025-06-30",
+            "docketNumber": "24-809",
+        }
+
+        with patch(
+            "courtlistener_gui._cl_item_for_citation",
+            return_value=merits_opinion,
+        ):
+            matched = _courtlistener_pdf_fallback_item(
+                Mock(), item, ["606 U.S. 942"],
+            )
+
+        self.assertIsNone(matched)
+
     def test_resolver_uses_archive_only_after_existing_sources_miss(self):
         resolver = object.__new__(CourtListenerGUI)
         slip_url = (
@@ -266,7 +344,7 @@ class SlipArchiveResolverTests(unittest.TestCase):
         item = {
             "court_id": "scotus",
             "caseName": "Goldey v. Fields",
-            "dateFiled": "2025-01-01",
+            "dateFiled": "2025-06-30",
         }
 
         with (
@@ -292,7 +370,7 @@ class SlipArchiveResolverTests(unittest.TestCase):
         item = {
             "court_id": "scotus",
             "caseName": "Goldey v. Fields",
-            "dateFiled": "2025-01-01",
+            "dateFiled": "2025-06-30",
             "download_url": existing,
         }
 
@@ -314,7 +392,7 @@ class SlipArchiveResolverTests(unittest.TestCase):
         sparse = {
             "court_id": "scotus",
             "caseName": "Goldey v. Fields",
-            "dateFiled": "2025-01-01",
+            "dateFiled": "2025-06-30",
         }
         matched = {
             "court_id": "scotus",

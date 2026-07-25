@@ -7,7 +7,7 @@ This module fetches and parses that panel into :class:`RecentDecision` records,
 with a short-lived on-disk cache so the panel opens instantly and the site is
 polled at most a few times a day.  It also parses the Court's per-Term
 slip-opinion tables and safely matches a case by docket, reporter citation, or
-caption plus decision year.
+caption plus the exact decision date printed in the opinion.
 
 Headless and dependency-light (``requests`` + ``beautifulsoup4``, both already
 required by the app); no tkinter.  Run ``python -X utf8 scotus_recent.py`` for
@@ -346,11 +346,15 @@ def find_slip_opinion(
 ) -> Optional[SlipOpinion]:
     """Match a case to the Court's archived opinion PDF.
 
-    Exact docket and U.S.-Reports citation matches are conclusive.  Otherwise
-    a strong name match must agree with the decision year.  This deliberately
-    refuses a name-only match, because captions such as ``Smith v. United
-    States`` recur.
+    The exact decision date is required even when the docket or U.S.-Reports
+    citation matches.  A merits opinion and a later order or separate writing
+    can share the same docket, so identity metadata alone is not conclusive.
+    Within that date, docket, citation, or a strong caption match identifies
+    the archive row.
     """
+    parsed_date = _date_iso(date_filed)
+    if len(parsed_date) != 10:
+        return None
     terms = _candidate_terms(date_filed, docket)
     if not terms:
         return None
@@ -358,12 +362,12 @@ def find_slip_opinion(
     wanted_cites = {
         key for key in (_cite_key(str(c)) for c in citations) if key
     }
-    parsed_date = _date_iso(date_filed)
-    wanted_year = parsed_date[:4] if parsed_date[:4].isdigit() else ""
     scorer = name_scorer or _default_name_score
     rated: list[tuple[float, SlipOpinion]] = []
     for term in terms:
         for item in fetch_slip_opinions(term, session=session):
+            if item.date != parsed_date:
+                continue
             docket_match = bool(
                 wanted_dockets & _docket_tokens(item.docket)
             )
@@ -372,23 +376,12 @@ def find_slip_opinion(
             name_score = (
                 float(scorer(name, item.name)) if name and item.name else 0.0
             )
-            date_match = bool(
-                len(parsed_date) == 10 and item.date == parsed_date
-            )
-            year_match = bool(
-                wanted_year and item.date.startswith(wanted_year)
-            )
-            if not (
-                docket_match
-                or cite_match
-                or (name_score >= 0.65 and year_match)
-            ):
+            if not (docket_match or cite_match or name_score >= 0.65):
                 continue
             score = (
                 (1000.0 if docket_match else 0.0)
                 + (900.0 if cite_match else 0.0)
                 + name_score * 30.0
-                + (20.0 if date_match else 8.0 if year_match else 0.0)
             )
             rated.append((score, item))
     if not rated:

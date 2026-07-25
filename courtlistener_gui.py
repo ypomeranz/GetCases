@@ -2885,9 +2885,10 @@ def _item_docket_text(item: dict) -> str:
 def _scotus_slip_pdf_url(item: dict, cites: list[str]) -> Optional[str]:
     """Official archived slip-opinion PDF for a recent SCOTUS item.
 
-    The archive matcher uses docket first, then U.S.-Reports citation, then
-    caption plus decision year.  It is intentionally limited to decisions
-    after 2020 so an old case never causes archive probes.
+    The archive matcher requires the opinion's exact printed decision date,
+    then uses docket, U.S.-Reports citation, or caption to identify the row.
+    It is intentionally limited to decisions after 2020 so an old case never
+    causes archive probes.
     """
     court = str(item.get("court_id") or item.get("court") or "").lower()
     is_scotus = (
@@ -2899,20 +2900,12 @@ def _scotus_slip_pdf_url(item: dict, cites: list[str]) -> Optional[str]:
     date_filed = str(
         item.get("dateFiled") or item.get("date_filed") or ""
     )
-    year_match = re.match(r"(20\d{2})", date_filed)
-    year = int(year_match.group(1)) if year_match else 0
-    docket = _item_docket_text(item)
-    docket_years = {
-        2000 + int(token[:2])
-        for token in _scotus_docket_tokens(docket)
-        if token[:2].isdigit()
-    }
+    if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", date_filed):
+        return None
+    year = int(date_filed[:4])
     if year and year <= 2020:
         return None
-    if not year and not any(
-        docket_year >= 2020 for docket_year in docket_years
-    ):
-        return None
+    docket = _item_docket_text(item)
     name = re.sub(
         r"<[^>]+>", "",
         str(item.get("caseName") or item.get("case_name") or ""),
@@ -2953,19 +2946,26 @@ def _courtlistener_pdf_fallback_item(
         r"<[^>]+>", "",
         str(item.get("caseName") or item.get("case_name") or ""),
     ).strip()
+    date_filed = str(
+        item.get("dateFiled") or item.get("date_filed") or ""
+    )
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_filed):
+        return None
+    wanted_date = date_filed
     for cite in cites:
         try:
             target = _cl_item_for_citation(client, cite, name=name)
         except Exception:
             target = None
         if target:
+            target_date = str(
+                target.get("dateFiled") or target.get("date_filed") or ""
+            )
+            if target_date[:10] != wanted_date:
+                continue
             return target
     if not name:
         return None
-    date_filed = str(
-        item.get("dateFiled") or item.get("date_filed") or ""
-    )
-    wanted_year = date_filed[:4] if date_filed[:4].isdigit() else ""
     wanted_dockets = _scotus_docket_tokens(_item_docket_text(item))
     try:
         candidates = _cl_name_search(
@@ -2987,7 +2987,7 @@ def _courtlistener_pdf_fallback_item(
         candidate_date = str(
             candidate.get("dateFiled") or candidate.get("date_filed") or ""
         )
-        if wanted_year and candidate_date[:4] != wanted_year:
+        if candidate_date[:10] != wanted_date:
             continue
         candidate_dockets = _scotus_docket_tokens(
             _item_docket_text(candidate)
@@ -19411,12 +19411,18 @@ class _ScholarTextWindow:
         if self._is_scotus:
             # Saved Scholar opinions often have no CourtListener result object.
             # Preserve the metadata the archive fallback needs from the parsed
-            # opinion itself: court, decision year, and the "No. 24-123" line.
+            # opinion itself: court, exact decision date, and "No. 24-123".
             item["court_id"] = "scotus"
-            if not (item.get("dateFiled") or item.get("date_filed")):
-                year = str(self._bb.get("year") or "")
-                if year.isdigit():
-                    item["dateFiled"] = f"{year}-01-01"
+            try:
+                from opinion_db import decision_date_from_blocks
+                decision_date = decision_date_from_blocks(self._blocks)
+            except Exception:
+                decision_date = ""
+            if decision_date:
+                # The text in this window is the authority for which writing
+                # is loaded; overwrite search-result metadata that may describe
+                # another opinion or order on the same docket.
+                item["dateFiled"] = decision_date
             if not _scotus_docket_tokens(_item_docket_text(item)):
                 front_matter = " ".join(
                     b.text() for b in self._blocks[:16]
