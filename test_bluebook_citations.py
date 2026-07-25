@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import tkinter as tk
 import unittest
@@ -1420,6 +1421,62 @@ class ReporterEquivalenceTests(unittest.TestCase):
                 self.assertIn("The decree is affirmed.", rec["text"])
                 self.assertEqual(rec["name"], "The Nestor")
                 self.assertIsNone(db.get_by_scholar_id("no-such-id"))
+            finally:
+                db.close()
+
+    def test_index_from_an_older_schema_is_rebuilt_not_reused(self):
+        # CREATE TABLE IF NOT EXISTS leaves an existing table's columns alone,
+        # so an index written by an earlier release has to be dropped: reusing
+        # it rejected every insert and left the database reporting 0 opinions.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jsonl = root / "opinions.jsonl"
+            index = root / "opinions.db"
+            jsonl.write_text(json.dumps({
+                "scholar_id": "18",
+                "name": "The Nestor",
+                "cites": ["18 F. Cas. 9"],
+                "parties": ["nestor"],
+                "html_gz": _gz_pack("<p>The decree is affirmed.</p>"),
+            }) + "\n", encoding="utf-8")
+
+            # An index in the previous layout: the old html/text columns, no
+            # line pointer, stamped with the schema before this one.
+            legacy = sqlite3.connect(index)
+            legacy.executescript(
+                "CREATE TABLE opinions (scholar_id TEXT PRIMARY KEY, url TEXT,"
+                " name TEXT, court TEXT, year TEXT, date_filed TEXT,"
+                " html TEXT, text TEXT, cites_json TEXT, parties_json TEXT,"
+                " added_at REAL, source TEXT);"
+                "CREATE TABLE citations (scholar_id TEXT, vol INTEGER,"
+                " reporter TEXT, page INTEGER, raw TEXT);"
+                "CREATE TABLE parties (scholar_id TEXT, token TEXT);"
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);"
+                "INSERT INTO meta VALUES ('schema_version', '3');"
+            )
+            legacy.commit()
+            legacy.close()
+
+            db = OpinionDB(jsonl, index)
+            try:
+                self.assertEqual(db.count(), 1)          # not 0
+                columns = {
+                    r[1] for r in
+                    db._db.execute("PRAGMA table_info(opinions)").fetchall()
+                }
+                self.assertIn("line_offset", columns)
+                self.assertNotIn("html", columns)
+                self.assertIn("The decree is affirmed.",
+                              db.get_by_scholar_id("18")["html"])
+                # Storing a newly fetched opinion works after the upgrade.
+                self.assertTrue(db.add({
+                    "scholar_id": "19", "name": "Later Case",
+                    "cites": ["1 U.S. 1"], "parties": ["later"],
+                    "html_gz": _gz_pack("<p>Body.</p>"),
+                }))
+                self.assertEqual(
+                    [h["scholar_id"] for h in db.find("1 U.S. 1")], ["19"],
+                )
             finally:
                 db.close()
 

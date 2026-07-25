@@ -60,6 +60,16 @@ from bluebook_names import (
 
 _SCHEMA_VERSION = 4
 
+# The ``opinions`` columns this release expects.  An index whose table differs
+# was written by another schema and is dropped and rebuilt (see
+# ``_drop_outdated_tables``); the JSONL is the source of truth, so nothing is
+# lost by discarding it.
+_OPINION_COLUMNS = (
+    "scholar_id", "url", "name", "court", "year", "date_filed",
+    "line_offset", "line_length", "cites_json", "parties_json",
+    "added_at", "source",
+)
+
 # How much of an opinion's HTML the indexer expands.  It reads only the
 # caption — the reporter citations printed above the opinion, which older
 # records omit from their stored ``cites`` — so the body is never decompressed
@@ -453,8 +463,43 @@ class OpinionDB:
 
     # -- schema -------------------------------------------------------------
 
+    def _drop_outdated_tables(self) -> None:
+        """Discard derived tables left by an older release.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves an existing table's columns
+        alone, so an index built by an earlier schema would keep its old
+        layout and reject every insert.  Everything here is derived from the
+        JSONL, so an index that does not match the current schema is dropped
+        and rebuilt rather than migrated in place.
+        """
+        try:
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, "
+                "value TEXT)"
+            )
+            columns = {
+                row[1] for row in
+                self._db.execute("PRAGMA table_info(opinions)").fetchall()
+            }
+        except sqlite3.Error:
+            return
+        if not columns:
+            return  # no index yet: the CREATEs below make a current one
+        if (columns == set(_OPINION_COLUMNS)
+                and self._get_meta("schema_version") == str(_SCHEMA_VERSION)):
+            return
+        self._db.executescript(
+            "DROP TABLE IF EXISTS opinions;"
+            "DROP TABLE IF EXISTS citations;"
+            "DROP TABLE IF EXISTS parties;"
+        )
+        self._set_meta("jsonl_size", "-1")   # force the rebuild below
+        self._set_meta("jsonl_lines", "0")
+        self._db.commit()
+
     def _init_schema(self) -> None:
         with self._lock:
+            self._drop_outdated_tables()
             self._db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS opinions (
@@ -565,6 +610,8 @@ class OpinionDB:
                             json.loads(stripped.decode("utf-8")), pos, len(raw),
                         )
                         added += 1
+                    except sqlite3.Error:
+                        raise  # an index fault: let the caller rebuild
                     except Exception:
                         pass
                 pos += len(raw)
@@ -580,6 +627,7 @@ class OpinionDB:
                 "DELETE FROM opinions; DELETE FROM citations; DELETE FROM parties;"
             )
             lines = 0
+            skipped = 0
             if self.jsonl_path.exists():
                 # Binary mode: the index stores byte offsets into the JSONL.
                 with open(self.jsonl_path, "rb") as f:
@@ -593,9 +641,16 @@ class OpinionDB:
                                     pos, len(raw),
                                 )
                                 lines += 1
+                            except sqlite3.Error:
+                                # A fault in the index itself, not a bad line:
+                                # every record would fail the same way, so stop
+                                # instead of quietly building an empty index.
+                                raise
                             except Exception:
-                                pass
+                                skipped += 1
                         pos += len(raw)
+            if skipped:
+                print(f"[db] skipped {skipped} unreadable opinion line(s)")
             size = self.jsonl_path.stat().st_size if self.jsonl_path.exists() else 0
             self._set_meta("schema_version", str(_SCHEMA_VERSION))
             self._set_meta("jsonl_lines", str(lines))
