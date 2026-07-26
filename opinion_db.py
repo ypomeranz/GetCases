@@ -293,7 +293,7 @@ def _iso_full_date(value: str) -> str:
         return ""
 
 
-def _decision_date(blocks: list) -> str:
+def decision_date_from_blocks(blocks: list) -> str:
     """Exact decision date printed in an opinion's front matter.
 
     A labelled ``Decided``/``Filed`` date wins over argued and reargued dates.
@@ -467,7 +467,7 @@ def extract_record(
     date_filed = str(
         item.get("dateFiled") or item.get("date_filed") or ""
     ).strip()
-    header_date = _decision_date(blocks)
+    header_date = decision_date_from_blocks(blocks)
     header_court = _court_from_header(blocks)
     # Scholar-only records otherwise retain just a year.  For SCOTUS, trust
     # the opinion's own "Decided ..." line even when external metadata carries
@@ -853,7 +853,7 @@ class OpinionDB:
         if parties is None:
             parties = parties_from_name(rec.get("name", ""))
         date_filed = str(rec.get("date_filed") or "").strip()
-        header_date = _decision_date(blocks)
+        header_date = decision_date_from_blocks(blocks)
         if header_date and (
             not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_filed)
             or _court_from_header(blocks) == "scotus"
