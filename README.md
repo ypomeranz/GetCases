@@ -63,7 +63,7 @@ Results appear in the left treeview; click a row to preview the snippet.
 
 Double‑click a row to download the opinion as PDF (or .txt if no PDF is available).
 
-Click Google Scholar Text to fetch the full opinion from Google Scholar (often richer than CourtListener’s HTML).
+Click **Scholar** to fetch the full opinion from Google Scholar (often richer than CourtListener’s HTML); the button on the Scholar view reads **CourtListener** and switches back. Under a PDF both read **Text**.
 
 Quick Lookup (Ctrl+S)
 Instant citation lookup: paste a case citation (410 U.S. 113), a statute (42 USC 1983), a regulation (29 CFR 1614.105), or a Federal Rule (FRE 404), and open the source directly.
@@ -95,7 +95,7 @@ The app caches Google Scholar results and PDF downloads to speed up repeated loo
 
 For English Reports PDFs, if the app can’t fetch them directly, it will open a browser window for you to pass CloudFlare – once cleared, the PDF downloads automatically.
 
-All text viewers support copy with Bluebook citation (Ctrl+C / Cmd+C) – the copied text includes a properly formatted citation appended at the end. In a case viewer, **Edit citation…** lets you correct the base citation once; the correction is saved locally and reused while pinpoint pages continue to be added automatically.
+Ctrl+C / Cmd+C copies from a case viewer in whichever of three styles the **Copy** menu has selected: **Copy without citation**, **Copy with citation** (the default – the Bluebook citation, with its pinpoint page, appended below the text), or **Copy as quote**, which wraps the passage in double quotes, demotes the quotation marks inside it a level so the nesting reads correctly, and sets the citation one space after the closing quote the way a brief does. The choice is remembered between sessions. In a case viewer, **Edit citation…** lets you correct the base citation once; the correction is saved locally and reused while pinpoint pages continue to be added automatically.
 
 You can export opinions from the Export ▾ menu: as RTF (two‑column, with running heads) for word processors; as a print‑ready PDF typeset with LaTeX (single column, justified, Century Schoolbook, footnotes at the foot of the page that cites them, and a running head showing the reporter page range visible on each sheet) if a LaTeX installation (TeX Live, MiKTeX, or Tectonic) is available; or as Markdown with footnotes and star pagination preserved – offered automatically when LaTeX isn’t installed.
 

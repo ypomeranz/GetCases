@@ -422,11 +422,31 @@ def _add_bookmarks_cascade(menubar: tk.Menu, app, win: tk.Misc) -> None:
     menubar.add_cascade(label="Bookmarks", menu=bookmarks_menu)
 
 
-def _install_history_menubar(app, win: tk.Misc):
-    """Attach the shared History, Window and Bookmarks menus to case views."""
+def _add_copy_cascade(menubar: tk.Menu, reader) -> None:
+    """Append the "Copy" cascade: the three styles Ctrl-C can copy in, as radio
+    items so the one in force is visible.  Choosing one remembers it for next
+    session and, with text selected, copies right away."""
+    if reader is None or not hasattr(reader, "on_copy_mode_chosen"):
+        return
+    copy_menu = tk.Menu(menubar, tearoff=0)
+    for value, label in COPY_MODE_LABELS:
+        copy_menu.add_radiobutton(
+            label=label, value=value, variable=reader._copy_mode_var,
+            command=reader.on_copy_mode_chosen,
+        )
+    copy_menu.add_separator()
+    copy_menu.add_command(
+        label="Copy now\tCtrl+C", command=reader._copy_formatted)
+    menubar.add_cascade(label="Copy", menu=copy_menu)
+
+
+def _install_history_menubar(app, win: tk.Misc, reader=None):
+    """Attach the shared History, Window and Bookmarks menus to case views —
+    plus the Copy styles for a view that has them (an opinion reader)."""
     if app is None or not hasattr(app, "populate_history_menu"):
         return None
     menubar = tk.Menu(win)
+    _add_copy_cascade(menubar, reader)
     history_menu = tk.Menu(menubar, tearoff=0)
     try:
         history_menu.configure(
@@ -1742,6 +1762,38 @@ def _save_token_prompt_suppressed(suppress: bool) -> None:
     _save_config(data)
 
 
+# How Ctrl-C copies from an opinion reader.  The reader offers all three from
+# its "Copy" menu and remembers the last one across sessions.
+#
+#   plain  the selection alone
+#   cite   the selection with the Bluebook citation under it (the long-standing
+#          default, and what the old "Copy with citation" checkbox did)
+#   quote  the selection wrapped in double quotes with the citation one space
+#          after the closing quote — a quotation ready to drop into a brief
+COPY_MODES = ("plain", "cite", "quote")
+COPY_MODE_LABELS = (
+    ("plain", "Copy without citation"),
+    ("cite", "Copy with citation"),
+    ("quote", "Copy as quote"),
+)
+_DEFAULT_COPY_MODE = "cite"
+
+
+def _load_copy_mode() -> str:
+    """The copy style last chosen, defaulting to the historical behaviour."""
+    mode = _load_config().get("copy_mode")
+    return mode if mode in COPY_MODES else _DEFAULT_COPY_MODE
+
+
+def _save_copy_mode(mode: str) -> None:
+    if mode not in COPY_MODES:
+        return
+    data = _load_config()
+    data["copy_mode"] = mode
+    _save_config(data)
+
+
+
 def _verify_token(token: str) -> Optional[str]:
     """Try *token* against the API.  Returns ``None`` when it works, otherwise
     a one-line explanation fit for a dialog.  Called on a worker thread: the
@@ -2487,7 +2539,7 @@ def _case_law_pdf_choices_for_cites(
                         f"[case.law] could not match {expected_name!r} among "
                         f"{len(page_opinions)} opinions on the reporter page"
                     )
-                    # Preserve every sibling as a separate View PDF menu item.
+                    # Preserve every sibling as a separate PDF menu item.
                     # The source name could not safely choose, so the user must.
                     for i, opinion in enumerate(page_opinions, 1):
                         name = _case_law_opinion_name(opinion)
@@ -3420,7 +3472,7 @@ def _us_reports_cite_via_courtlistener(
     bears it (via :func:`_cl_item_for_citation`, which only accepts a cluster
     whose own citations include the one asked for), and that cluster's parallel
     citations carry the U.S. cite.  Returning it lets the caller pull the
-    official opinion scan behind the "View PDF" button."""
+    official opinion scan behind the "PDF" button."""
     if client is None:
         return None
     # A U.S. Reports cite is already in hand — the PDF paths can use it directly.
@@ -4928,7 +4980,10 @@ def _case_pdf_text_source(
                     if source_url.startswith("/"):
                         source_url = "https://www.courtlistener.com" + source_url
                     return _CasePdfTextSource(
-                        "courtlistener", "CourtListener Text",
+                        # Under a PDF there is only one text to switch to, so
+                        # the button says "Text" and leaves the bar its room;
+                        # source_label still names where it came from.
+                        "courtlistener", "Text",
                         "CourtListener", source_url, text, target,
                         parts or [], blocks or [], record,
                     )
@@ -4938,7 +4993,7 @@ def _case_pdf_text_source(
     if record is None:
         return None
     return _CasePdfTextSource(
-        "case_law", "static.case.law Text", "static.case.law",
+        "case_law", "Text", "static.case.law",
         record.json_url, record.text, record.item, [], [], record,
     )
 
@@ -9005,7 +9060,7 @@ class CourtListenerGUI:
         # Supreme Court Reporter ("S. Ct.") cite, not the "U.S." cite every
         # official-PDF path below keys on.  Ask CourtListener whether that
         # S. Ct. cite has a parallel U.S. Reports cite and, if so, try it too —
-        # that's what lets "View PDF" reach the official opinion scan.
+        # that's what lets "PDF" reach the official opinion scan.
         is_scotus = is_scotus or any(
             _US_CITE_RE.search(c) or _SCT_CITE_RE.search(c)
             for c in all_cites
@@ -9070,7 +9125,7 @@ class CourtListenerGUI:
 
         # 0.5. Non-SCOTUS: the Harvard CAP static.case.law copy.  Try every
         #      parallel cite before giving up; when more than one reporter scan
-        #      exists, keep all of them for the case window's View PDF menu.
+        #      exists, keep all of them for the case window's PDF menu.
         if not is_scotus:
             expected_name = re.sub(
                 r"<[^>]+>", "",
@@ -9489,7 +9544,7 @@ class CourtListenerGUI:
     ) -> None:
         """A Google Scholar opinion page failed to load (Google is flaky).  Show
         the CourtListener view located by the case's reporter citation and retry
-        the Scholar opinion in the background — the "Google Scholar Text" button
+        the Scholar opinion in the background — the "Scholar" button
         lights up if it comes through.  With no citation to locate the case on
         CourtListener, just retry Scholar and open it if it returns."""
         client = self._get_client() if self._token_var.get().strip() else None
@@ -9695,7 +9750,7 @@ class CourtListenerGUI:
           • first case matches CL    → show the Scholar text and we're done.
           • first case doesn't match → show the CourtListener text now, but
             keep hunting for a matching Scholar case in the background; if one
-            turns up the "Google Scholar Text" button lights up so the reader
+            turns up the "Scholar" button lights up so the reader
             can switch over.
 
         (Federal Appendix cases are handled by callers before this runs.)
@@ -10960,6 +11015,75 @@ def _scholar_result_cite(r) -> str:
         if m:
             cite = re.sub(r"\s+", " ", m.group(0))
     return cite or ""
+
+
+# Quotation marks, for the "copy as quote" style.  Text going inside a fresh
+# pair of double quotes has to have its own quotes demoted a level: the doubles
+# it contains become singles and the singles become doubles, so the nesting
+# reads correctly in the brief it is pasted into.
+_QUOTE_OPEN, _QUOTE_CLOSE = "\u201c", "\u201d"          # “ ”
+_SQUOTE_OPEN, _SQUOTE_CLOSE = "\u2018", "\u2019"        # ‘ ’
+
+
+class _QuoteFlipper:
+    """Swaps single and double quotation marks, one character at a time.
+
+    Stateful because of ``’``, which is both a closing single quote and an
+    apostrophe.  It is only flipped while a ``‘`` has a quotation open, so
+    "the Government’s brief" and "Ass’n" come through untouched while a genuine
+    nested ‘quotation’ is promoted.  Fed characters in reading order — the same
+    instance walks the plain text and the RTF, which is why it is a class and
+    not a function.
+    """
+
+    def __init__(self) -> None:
+        self._single_open = False
+
+    def flip(self, ch: str) -> str:
+        if ch == _SQUOTE_OPEN:
+            self._single_open = True
+            return _QUOTE_OPEN
+        if ch == _SQUOTE_CLOSE:
+            if not self._single_open:
+                return ch  # an apostrophe, not the end of a quotation
+            self._single_open = False
+            return _QUOTE_CLOSE
+        if ch == _QUOTE_OPEN:
+            return _SQUOTE_OPEN
+        if ch == _QUOTE_CLOSE:
+            return _SQUOTE_CLOSE
+        if ch == '"':
+            return "'"
+        return ch
+
+
+def _flip_quotes(text: str) -> str:
+    """Demote the quotation marks in *text* by one level (see _QuoteFlipper)."""
+    flipper = _QuoteFlipper()
+    return "".join(flipper.flip(ch) for ch in text)
+
+
+# A quotation mark in an RTF body: either a literal ASCII one or the ``\uNNNN?``
+# escape _rtf_escape writes for anything above ASCII.
+_RTF_QUOTE_TOKEN_RE = re.compile(r"\\u(-?\d+)\?|\"")
+
+
+def _flip_rtf_quotes(rtf: str) -> str:
+    """:func:`_flip_quotes` over an RTF fragment, leaving its markup alone.
+
+    The rich copy is the one that matters for a brief, so the flip has to reach
+    the escaped characters too.  Non-quote escapes pass through the flipper
+    unchanged, and control words never match the token pattern.
+    """
+    flipper = _QuoteFlipper()
+
+    def replace(m: "re.Match") -> str:
+        if m.group(1) is None:
+            return _rtf_escape(flipper.flip(m.group(0)))
+        cp = int(m.group(1))
+        return _rtf_escape(flipper.flip(chr(cp + 65536 if cp < 0 else cp)))
+
+    return _RTF_QUOTE_TOKEN_RE.sub(replace, rtf)
 
 
 def _rtf_escape(s: str) -> str:
@@ -14625,7 +14749,7 @@ class _ScholarTextWindow:
       • Export ▾ — RTF (two-column), PDF typeset with LaTeX (single column,
         bottom-of-page footnotes, reporter page range in the running head),
         or Markdown, each named after the Bluebook caption,
-      • View PDF — the official opinion PDF, shown in-app (Download PDF there),
+      • PDF — the official opinion PDF, shown in-app (Download PDF there),
       • a toggle to the CourtListener version of the text.
     """
 
@@ -14740,7 +14864,7 @@ class _ScholarTextWindow:
         self._pdf_holder: Optional[ttk.Frame] = None  # pane + parts strip
         self._pdf_url: Optional[str] = None
         self._pdf_bytes: Optional[bytes] = None
-        # Background-prefetched PDF (data, url) so "View PDF" is instant; set by
+        # Background-prefetched PDF (data, url) so "PDF" is instant; set by
         # _prefetch_pdf, consumed by _view_pdf.
         self._pdf_prefetch: Optional[tuple[bytes, str]] = None
         self._case_law_pdf_choices: list[_CaseLawPdfChoice] = []
@@ -14750,7 +14874,7 @@ class _ScholarTextWindow:
         self._us_reports_cite: str = ""
         self._pdf_prefetch_started = False
         # CourtListener text view: whether a PDF was located anywhere (None =
-        # still looking, True/False = found/not), gating its "View PDF" button.
+        # still looking, True/False = found/not), gating its "PDF" button.
         self._pdf_located: Optional[bool] = None
         self._pdf_locate_started = False
         if initial_pdf is not None:
@@ -14802,7 +14926,7 @@ class _ScholarTextWindow:
             self._refine_part_labels(self._parts)
         # Whether Google Scholar actually carries the opinion text (it usually
         # doesn't for Federal Appendix cases — they're scans only).  Gates the
-        # "Google Scholar Text" toggle while the PDF is showing.
+        # "Scholar"/"Text" toggle while the PDF is showing.
         self._scholar_has_text = (
             not self._cl_primary
             and len(re.sub(r"\s+", "", self._scholar_text or "")) >= 500
@@ -14817,7 +14941,12 @@ class _ScholarTextWindow:
                 else "Google Scholar Opinion Text"
             )
         )
-        self._history_menubar = _install_history_menubar(self._app, self._win)
+        # The copy style the Copy menu offers, seeded from the last session.
+        # Created before the menubar, which binds its radio items to this var.
+        self._copy_mode_var = tk.StringVar(
+            master=self._win, value=_load_copy_mode())
+        self._history_menubar = _install_history_menubar(
+            self._app, self._win, reader=self)
         # SCOTUS cases open the Oyez "Case details" panel by default (wired up
         # in _build_ui); widen the window by the panel's width so the opinion
         # text keeps its usual room with the panel added to the right of it.
@@ -14836,11 +14965,11 @@ class _ScholarTextWindow:
             self._render_cl_blocks()
         else:
             self._render_scholar()
-            # Warm the official PDF in the background so "View PDF" is instant.
+            # Warm the official PDF in the background so "PDF" is instant.
             # Suppressed when opened from the PDF brief viewer: a second PDF
             # being resolved/downloaded while that big pdfium view is live could
             # hang the app, so those cases open straight to the Scholar text and
-            # leave the PDF to the on-demand "View PDF" button.
+            # leave the PDF to the on-demand "PDF" button.
             if prefetch_pdf:
                 self._prefetch_pdf()
                 # Federal Appendix cases are scans, not text — open straight on
@@ -15167,26 +15296,26 @@ class _ScholarTextWindow:
             btn_frame, "Print…", command=self._print_pdf, width=86
         )
         self._toggle_btn = _ui_button(
-            btn_frame, "CourtListener Text", command=self._toggle_source,
-            primary=True, width=150,
+            btn_frame, "CourtListener", command=self._toggle_source,
+            primary=True, width=118,
         )
         self._toggle_btn.pack(side="right", padx=(6, 0))
-        # The CourtListener text view gets its own "View PDF" button (the
+        # The CourtListener text view gets its own "PDF" button (the
         # Scholar view reuses the toggle for that).  Packed in _render_cl_blocks
         # / _show_courtlistener, hidden elsewhere; enabled once a PDF is located.
         self._pdf_btn = _ui_button(
-            btn_frame, "View PDF", command=self._view_pdf, width=84
+            btn_frame, "PDF", command=self._view_pdf, width=64
         )
         try:
             self._pdf_btn.configure(state="disabled")
         except tk.TclError:
             pass
         # The Scholar text view's switch back to the CourtListener opinion (the
-        # mirror of CL's "Google Scholar Text" button).  Packed in
+        # mirror of CL's "Scholar" button).  Packed in
         # _render_scholar, hidden in the CL and PDF views.
         self._cl_btn = _ui_button(
-            btn_frame, "CourtListener Text", command=self._toggle_source,
-            width=150,
+            btn_frame, "CourtListener", command=self._toggle_source,
+            width=118,
         )
 
         # Size controls: text size in the reader, PDF zoom in the PDF view
@@ -15205,12 +15334,9 @@ class _ScholarTextWindow:
         _ui_checkbox(
             btn_frame, "Side panel", self._details_var, self._toggle_details,
         ).pack(side="left", padx=(0, 10))
-        # When checked (default), Ctrl-C appends the Bluebook citation (with the
-        # pin cite) to the copied text; unchecked, it copies the selection alone.
-        self._copy_with_cite = tk.BooleanVar(value=True)
-        _ui_checkbox(
-            btn_frame, "Copy with citation", self._copy_with_cite,
-        ).pack(side="left", padx=(0, 10))
+        # How Ctrl-C copies lives in the "Copy" menu at the top of the window
+        # rather than on this bar — three styles do not fit in a checkbox, and
+        # the bar has no room to spare.
         self._edit_citation_btn = _ui_button(
             btn_frame, "Edit citation…", command=self._edit_base_citation,
             width=108,
@@ -15218,7 +15344,7 @@ class _ScholarTextWindow:
         self._edit_citation_btn.pack(side="left", padx=(0, 10))
         self._justify_text = tk.BooleanVar(value=False)
         _ui_checkbox(
-            btn_frame, "Justify Opinion Text.", self._justify_text,
+            btn_frame, "Justify text", self._justify_text,
             self._on_justify_toggle,
         ).pack(side="left", padx=(0, 10))
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
@@ -15361,17 +15487,26 @@ class _ScholarTextWindow:
         except Exception:
             return ""
 
+    # (normal, compact) width per button label.  The labels name only what the
+    # button switches *to* — "Scholar", "CourtListener", "Text", "PDF" — which
+    # is what keeps a narrow window from crowding the controls off the bar.
+    _SOURCE_BUTTON_WIDTHS = {
+        "PDF": (64, 54),
+        "PDF ▾": (78, 66),
+        "No PDF": (78, 66),
+        "Text": (72, 60),
+        "Scholar": (92, 76),
+        "CourtListener": (118, 96),
+    }
+
     def _source_or_pdf_widths(self, button) -> tuple[int, int]:
         text = self._button_text(button)
-        if text.startswith("View PDF"):
-            return (96, 84) if "▾" in text else (84, 70)
-        if text == "No PDF":
-            return 84, 70
+        known = self._SOURCE_BUTTON_WIDTHS.get(text)
+        if known is not None:
+            return known
         if text.startswith("Finding PDF"):
             return 104, 90
-        if text == "Back to Text":
-            return 106, 88
-        return 150, 118
+        return 118, 96
 
     def _export_widths(self) -> tuple[int, int]:
         text = self._button_text(self._export_btn)
@@ -15389,7 +15524,7 @@ class _ScholarTextWindow:
             (self._print_btn, 86, 64),
             (self._toggle_btn, toggle_normal, toggle_small),
             (self._pdf_btn, pdf_normal, pdf_small),
-            (self._cl_btn, 150, 118),
+            (self._cl_btn, *self._source_or_pdf_widths(self._cl_btn)),
             (self._zoom_out_btn, 42, 34),
             (self._zoom_in_btn, 42, 34),
             (self._edit_citation_btn, 108, 88),
@@ -16798,7 +16933,7 @@ class _ScholarTextWindow:
         self._source_var.set(source)
         _style_ui_button(self._toggle_btn, primary=False)
         self._toggle_btn.configure(
-            text="Google Scholar Text", command=self._toggle_source,
+            text="Scholar", command=self._toggle_source,
             state="normal" if self._scholar_url else "disabled",
         )
         self._export_btn.configure(text="Export ▾", command=self._post_export_menu)
@@ -16821,7 +16956,7 @@ class _ScholarTextWindow:
         self._status_var.set(
             f"{char_count:,} characters | {self._primary_source_label} version"
         )
-        self._hide_cl_button()  # CL view uses the toggle for "Google Scholar Text"
+        self._hide_cl_button()  # CL view uses the toggle for "Scholar"
         self._show_pdf_button()
         self._finder.refresh()
         self._refresh_outline_panel()
@@ -16846,7 +16981,7 @@ class _ScholarTextWindow:
         self._source_var.set(source)
         _style_ui_button(self._toggle_btn, primary=False)
         self._toggle_btn.configure(
-            text="Google Scholar Text", command=self._toggle_source,
+            text="Scholar", command=self._toggle_source,
             state="normal" if self._scholar_url else "disabled",
         )
         self._export_btn.configure(text="Export ▾", command=self._post_export_menu)
@@ -17530,13 +17665,26 @@ class _ScholarTextWindow:
             return name.replace("'", "’")
         return (self._bb["name"] or "").replace("'", "’")
 
+    @staticmethod
+    def _citation_rtf(name: str, rest: str, inline: bool) -> str:
+        """The RTF for a citation, as its own paragraph or run on from the
+        text.  ``inline`` is the quotation style: the citation follows the
+        closing quote after a single space, the way a brief sets it."""
+        italic = "{\\i " + _rtf_escape(name) + "}" if name else ""
+        body = italic + _rtf_escape(rest)
+        if inline:
+            return " " + body
+        return "\\par\\pard\\sa120 " + body + "\\par\n"
+
     def _bluebook_citation(
         self, pin: Optional[str], writer: str = "",
         extra_parens: tuple[str, ...] = (),
+        inline: bool = False,
     ) -> tuple[str, str]:
         """Return (plain, rtf-fragment) forms of the Bluebook citation.
         `extra_parens` follow the writer parenthetical — e.g. "footnote
-        omitted" (Bluebook rule 5.2(d))."""
+        omitted" (Bluebook rule 5.2(d)).  ``inline`` runs the citation on from
+        the quotation instead of giving it a paragraph of its own."""
         edited = getattr(self, "_base_citation_override", "")
         if edited:
             suffixes = tuple(p for p in (writer, *extra_parens) if p)
@@ -17545,17 +17693,7 @@ class _ScholarTextWindow:
             name = name.replace("'", "’")
             rest = rest.replace("'", "’")
             plain = name + rest
-            if name:
-                rtf = (
-                    "\\par\\pard\\sa120 {\\i "
-                    + _rtf_escape(name)
-                    + "}"
-                    + _rtf_escape(rest)
-                    + "\\par\n"
-                )
-            else:
-                rtf = "\\par\\pard\\sa120 " + _rtf_escape(plain) + "\\par\n"
-            return plain, rtf
+            return plain, self._citation_rtf(name, rest, inline)
 
         bb = self._bb
         name = bb["name"]
@@ -17589,18 +17727,9 @@ class _ScholarTextWindow:
         name = name.replace("'", "’")
         rest = rest.replace("'", "’")
         if name:
-            plain = f"{name}{rest}"
-            rtf = (
-                "\\par\\pard\\sa120 {\\i "
-                + _rtf_escape(name)
-                + "}"
-                + _rtf_escape(rest)
-                + "\\par\n"
-            )
-        else:
-            plain = rest.lstrip(", ")
-            rtf = "\\par\\pard\\sa120 " + _rtf_escape(plain) + "\\par\n"
-        return plain, rtf
+            return f"{name}{rest}", self._citation_rtf(name, rest, inline)
+        plain = rest.lstrip(", ")
+        return plain, self._citation_rtf("", plain, inline)
 
     @staticmethod
     def _page_num_from(s: str) -> Optional[int]:
@@ -17731,6 +17860,25 @@ class _ScholarTextWindow:
     # Actions
     # ------------------------------------------------------------------
 
+    def copy_mode(self) -> str:
+        """The copy style in force — see :data:`COPY_MODES`."""
+        try:
+            mode = self._copy_mode_var.get()
+        except (AttributeError, tk.TclError):
+            return _DEFAULT_COPY_MODE
+        return mode if mode in COPY_MODES else _DEFAULT_COPY_MODE
+
+    def on_copy_mode_chosen(self) -> None:
+        """A Copy-menu item was picked: remember the style for next session,
+        and, when there is a selection, copy it that way straight away — the
+        reader chose the style in order to use it."""
+        _save_copy_mode(self.copy_mode())
+        try:
+            self._text.index("sel.first")
+        except tk.TclError:
+            return  # nothing selected; the choice was a preference only
+        self._copy_formatted()
+
     def _copy_formatted(self) -> None:
         txt = self._text
         try:
@@ -17739,10 +17887,11 @@ class _ScholarTextWindow:
         except tk.TclError:
             start, end = "1.0", "end-1c"
             selected = False
-        # The "Copy with citation" box (checked by default) gates whether the
-        # Bluebook citation is appended; unchecked, the selection is copied on
-        # its own (still richly, just without the citation).
-        with_cite = self._copy_with_cite.get()
+        # The Copy menu's three styles: the selection alone, the selection with
+        # the citation under it, or a brief-ready quotation.
+        mode = self.copy_mode()
+        quote = mode == "quote"
+        with_cite = mode in ("cite", "quote")
         plain_cite, rtf_cite = "", ""
         omit_tags: set[str] = set()
         n_omitted = 0
@@ -17755,8 +17904,8 @@ class _ScholarTextWindow:
         if with_cite:
             # The appended citation already carries the reporter-page pin.
             # Keeping inline ``*123`` markers in the quotation duplicates that
-            # pagination and interrupts the copied prose.  A plain copy (the
-            # checkbox unchecked) deliberately retains the markers.
+            # pagination and interrupts the copied prose.  A copy without a
+            # citation deliberately retains the markers.
             omit_tags.add("pagenum")
         if with_cite:
             # Pin cites and the writer parenthetical apply whenever the opinion
@@ -17791,20 +17940,40 @@ class _ScholarTextWindow:
             if n_omitted:
                 extras = ("footnote omitted" if n_omitted == 1
                           else "footnotes omitted",)
-            plain_cite, rtf_cite = self._bluebook_citation(pin, writer, extras)
+            plain_cite, rtf_cite = self._bluebook_citation(
+                pin, writer, extras, inline=quote)
         body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map(),
                             omit_tags=omit_tags)
-        rtf = _rtf_document(body + rtf_cite)
         plain = _plain_without_layout_chars(txt, start, end,
-                                            omit_tags=omit_tags).rstrip()
-        if plain_cite:
-            plain += "\n\n" + plain_cite + "\n"
+                                            omit_tags=omit_tags).strip()
+        if quote:
+            # A quotation: the passage's own quotation marks drop a level, the
+            # whole thing goes inside double quotes, and the citation follows
+            # the closing quote after one space.  The flip runs first, so the
+            # quotes added here are not themselves demoted.
+            body = _flip_rtf_quotes(body)
+            plain = _QUOTE_OPEN + _flip_quotes(plain) + _QUOTE_CLOSE
+            if plain_cite:
+                plain += " " + plain_cite
+            # The closing quote and the citation belong to the passage's last
+            # paragraph, so they go before the break the dump ends on.
+            closing = _rtf_escape(_QUOTE_CLOSE) + rtf_cite
+            tail = "\\par\n"
+            if body.endswith(tail):
+                body = body[:-len(tail)] + closing + tail
+            else:
+                body += closing
+            body = _rtf_escape(_QUOTE_OPEN) + body
+            rtf = _rtf_document(body)
+        else:
+            rtf = _rtf_document(body + rtf_cite)
+            if plain_cite:
+                plain += "\n\n" + plain_cite + "\n"
         how = _copy_rich_clipboard(self._win, rtf, plain)
         what = "selection" if selected else "full text"
-        self._status_var.set(
-            f"Copied {what} as {how}"
-            + ("; citation appended." if with_cite else ".")
-        )
+        styled = {"plain": ".", "cite": "; citation appended.",
+                  "quote": "; quoted with citation."}[mode]
+        self._status_var.set(f"Copied {what} as {how}{styled}")
 
     def _fn_link_map(self) -> dict[str, tuple[str, str]]:
         """Link tags that anchor footnote jumps, for RTF bookmarks."""
@@ -19290,7 +19459,7 @@ class _ScholarTextWindow:
         )
         if retry:
             # A Google Scholar link failed; keep retrying it and light up the
-            # new window's "Google Scholar Text" button if it comes through.
+            # new window's "Scholar" button if it comes through.
             win._retry_scholar_link(*retry)
 
     def _on_cl_link_error(self, msg: str) -> None:
@@ -19407,7 +19576,7 @@ class _ScholarTextWindow:
         """A Google Scholar opinion link failed — missing, flaky, or blocking.
         Show the CourtListener view now if the case can be located by citation
         or by name (else its case.law PDF), and keep retrying Google Scholar in
-        the background; if it comes through, the window's "Google Scholar Text"
+        the background; if it comes through, the window's "Scholar"
         button lights up so the reader can switch to it."""
         client = self._app._get_client()
         fetcher = self._app._get_scholar()
@@ -19547,7 +19716,7 @@ class _ScholarTextWindow:
     def _search_for_scholar_version(self, cl_text: Optional[str] = None) -> None:
         """The CourtListener text is showing because Google Scholar's first
         case didn't match; keep hunting for a matching Scholar opinion in the
-        background and, when one turns up, light up the "Google Scholar Text"
+        background and, when one turns up, light up the "Scholar"
         button so the reader can switch to it."""
         if not _SCHOLAR_AVAILABLE:
             return
@@ -19620,7 +19789,7 @@ class _ScholarTextWindow:
         if self._mode == "courtlistener":
             _style_ui_button(self._toggle_btn, primary=False)
             self._toggle_btn.configure(
-                text="Google Scholar Text", command=self._toggle_source,
+                text="Scholar", command=self._toggle_source,
                 state="normal",
             )
             char_count = len(self._cl_text or self._scholar_text or "")
@@ -19792,7 +19961,7 @@ class _ScholarTextWindow:
         return any(self._FED_APPX_RE.search(str(c)) for c in cites)
 
     # ------------------------------------------------------------------
-    # CourtListener-view "View PDF" button
+    # CourtListener-view "PDF" button
     # ------------------------------------------------------------------
 
     def _remember_resolved_pdf_info(self, item: dict) -> None:
@@ -19945,7 +20114,7 @@ class _ScholarTextWindow:
         try:
             if self._pdf_located is True or self._pdf_prefetch is not None:
                 choices = getattr(self, "_case_law_pdf_choices", []) or []
-                label = "View PDF ▾" if len(choices) > 1 else "View PDF"
+                label = "PDF ▾" if len(choices) > 1 else "PDF"
                 command = self._post_pdf_menu if len(choices) > 1 else self._view_pdf
                 _style_ui_button(btn, primary=True)
                 btn.configure(state="normal", text=label, command=command)
@@ -20221,12 +20390,12 @@ class _ScholarTextWindow:
         # Returning from the PDF goes back to whichever text view we came from:
         # the Scholar text, or — for a CourtListener-primary window — the CL text.
         if self._pre_pdf_mode == "courtlistener":
-            back_label, back_state = "Back to Text", "normal"
+            back_label, back_state = "Text", "normal"
         else:
-            # The "Google Scholar Text" toggle is disabled only for a Federal
+            # The "Text" toggle is disabled only for a Federal
             # Appendix case whose Scholar page has no opinion text (a scan-only
             # case); every other case keeps it active.
-            back_label = "Google Scholar Text"
+            back_label = "Text"
             back_state = ("disabled"
                           if self._fed_appx and not self._scholar_has_text
                           else "normal")
@@ -20328,12 +20497,12 @@ class _ScholarTextWindow:
         if self._pre_pdf_mode == "courtlistener":
             self._render_courtlistener_view()
         else:
-            self._render_scholar()  # restores label, combo and "View PDF"
+            self._render_scholar()  # restores label, combo and "PDF"
 
     def _on_pdf_error(self, msg: str) -> None:
         if self._pre_pdf_mode == "courtlistener" and self._mode != "pdf":
             # Failure came from the CL view's View PDF button — restore it
-            # rather than turning the Scholar toggle into a "View PDF".
+            # rather than turning the Scholar toggle into a "PDF".
             self._refresh_pdf_button()
         else:
             if not self._pdf_url:
