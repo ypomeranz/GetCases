@@ -138,6 +138,24 @@ class ShortCiteSpanTests(unittest.TestCase):
                 "Later, Carpenter, 585 U. S., at 312.")
         self.assertNotIn("Later", _spans(text)[1][0])
 
+    def test_lone_party_survives_an_unrelated_v_earlier_in_the_window(self):
+        # The page's own running head carries a "v.".  Reaching it would make
+        # the scan read "WESBY … Hunter" as one party name and give up, losing
+        # the name entirely.
+        text = ("Hunter v. Bryant, 502 U. S. 224, 228 (1991).\n"
+                "66 DISTRICT OF COLUMBIA v. WESBY\nOpinion of the Court\n"
+                "The rule was not clearly established because it was not "
+                "“settled law.” Hunter, 502 U. S., at 228.")
+        self.assertEqual(_spans(text)[-1],
+                         ("Hunter, 502 U. S., at 228",
+                          ("cite", "502 U.S. 224@228")))
+
+    def test_lone_party_after_a_quoted_sentence(self):
+        text = ("Riley v. California, 573 U. S. 373, 385 (2014). Data is "
+                "“stored on remote servers rather than on the device itself.” "
+                "Riley, 573 U. S., at 397.")
+        self.assertEqual(_spans(text)[-1][0], "Riley, 573 U. S., at 397")
+
 
 class StatuteSectionTests(unittest.TestCase):
     """Several sections cited at once become several links."""
@@ -199,6 +217,53 @@ class IdChainTests(unittest.TestCase):
         text = "See 841 F. Supp. 2d 20, 32 (DC 2012). Id., at 48. Id., at 32."
         for _t, (_kind, value) in _spans(text):
             self.assertLessEqual(value.count("@"), 1, value)
+
+    def test_id_looks_past_a_constitutional_citation(self):
+        # The Constitution has no pages, so "at 888" means the case before it.
+        text = ("United States v. Carpenter, 819 F. 3d 880, 884 (CA6 2016). "
+                "The records are not entitled to Fourth Amendment protection. "
+                "Id., at 888.")
+        self.assertEqual(_spans(text)[-1],
+                         ("Id., at 888", ("cite", "819 F. 3d 880@888")))
+
+    def test_id_looks_past_a_case_whose_reporter_lacks_the_page(self):
+        # 888 cannot be a page of 425 U. S. 435, but it is one of 819 F. 3d 880.
+        text = ("United States v. Carpenter, 819 F. 3d 880 (CA6 2016); "
+                "United States v. Miller, 425 U. S. 435 (1976). Id., at 888.")
+        self.assertEqual(_spans(text)[-1],
+                         ("Id., at 888", ("cite", "819 F. 3d 880@888")))
+
+    def test_id_still_prefers_the_nearest_workable_citation(self):
+        text = ("United States v. Carpenter, 819 F. 3d 880 (CA6 2016); "
+                "United States v. Miller, 425 U. S. 435 (1976). Id., at 442.")
+        self.assertEqual(_spans(text)[-1],
+                         ("Id., at 442", ("cite", "425 U.S. 435@442")))
+
+    def test_id_survives_a_paragraph_of_discussion_of_that_case(self):
+        text = ("United States v. Carpenter, 819 F. 3d 880 (CA6 2016). "
+                + "The court held that he lacked a reasonable expectation of "
+                  "privacy in the location information because he had shared "
+                  "it with his wireless carriers, which made the resulting "
+                  "business records ordinary third-party records. "
+                + "Id., at 888.")
+        self.assertEqual(_spans(text)[-1],
+                         ("Id., at 888", ("cite", "819 F. 3d 880@888")))
+
+    def test_an_intervening_record_cite_still_breaks_the_chain(self):
+        text = ("United States v. Carpenter, 819 F. 3d 880 (CA6 2016). "
+                "See J.A. 41. Id., at 888.")
+        self.assertNotIn("Id., at 888", [t for t, _a in _spans(text)])
+
+    def test_a_blank_line_still_breaks_the_chain(self):
+        text = ("United States v. Carpenter, 819 F. 3d 880 (CA6 2016).\n\n"
+                "Id., at 888.")
+        self.assertNotIn("Id., at 888", [t for t, _a in _spans(text)])
+
+    def test_a_distant_id_is_not_followed(self):
+        text = ("United States v. Carpenter, 819 F. 3d 880 (CA6 2016). "
+                + "The court discussed many other matters at length. " * 25
+                + "Id., at 888.")
+        self.assertNotIn("Id., at 888", [t for t, _a in _spans(text)])
 
 
 # ---------------------------------------------------------------------------

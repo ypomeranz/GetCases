@@ -661,11 +661,33 @@ class _CaseTabsWindow:
         self.win.bind("<Destroy>", self._on_destroy, add="+")
 
     def add_page(self, page: _CaseTabPage) -> None:
-        self._pages.append(page)
-        self.notebook.add(
-            page, text="Opinion", image=self._tab_close_image,
-            compound="right",
-        )
+        # A case opened from another one sits next to the tab it came from,
+        # the way browser tabs do: following a citation out of an opinion and
+        # landing at the far end of a long strip loses the thread.  The opener
+        # is whichever tab is active — the new page is selected below, so a
+        # chain of citations reads left to right.
+        end = len(self._pages)
+        at = end
+        opener = self.active_page()
+        if opener is not None:
+            try:
+                at = min(self.notebook.index(opener) + 1, end)
+            except tk.TclError:
+                pass
+        try:
+            self.notebook.insert(
+                at if at < end else "end", page, text="Opinion",
+                image=self._tab_close_image, compound="right",
+            )
+        except tk.TclError:
+            # A stale index (a tab closed underneath us) is never worth losing
+            # the page over — fall back to the end of the strip.
+            self.notebook.add(
+                page, text="Opinion", image=self._tab_close_image,
+                compound="right",
+            )
+            at = end
+        self._pages.insert(at, page)
         self.notebook.select(page)
         self.refresh_page(page)
 

@@ -240,6 +240,12 @@ _NAME_TRAIL = ",;:”\"’')]}"
 # running head or the tail of an earlier citation.
 _NAME_TOKEN_RE = re.compile(r"^[\"“'(]?(?:[A-Z]|\d+[A-Za-z])")
 
+# How much text before a citation can hold its name.  Long enough for the
+# worst real caption ("Liverpool, New York & Philadelphia S. S. Co. v.
+# Commissioners of Emigration") with line breaks, short enough that the scan
+# never reaches the running head of the page above.
+_NAME_LOOKBEHIND = 200
+
 # "In re Winship", "Ex parte Young", "Matter of Doe" — a case name with no
 # "v." in it, anchored to the end of the window before the citation.
 _NAME_NO_V_RE = re.compile(
@@ -261,7 +267,13 @@ def _case_name_start(
     requires a real "v." (or an "In re"-style) name, since a lone capitalized
     word before a full cite is far more often just prose.
     """
-    head = text[floor:cite_start]
+    # Only the text just before the citation can hold its name.  Bounding the
+    # window matters as much as the token rules: unbounded, the scan reaches
+    # into the page above and finds the "v." of the running head
+    # ("DISTRICT OF COLUMBIA v. WESBY"), which reads as a party name and
+    # swallows everything after it.
+    base = max(floor, cite_start - _NAME_LOOKBEHIND)
+    head = text[base:cite_start]
     # Bluebook always separates the name from the volume with a comma.
     tail = re.search(r",\s*$", head)
     if not tail:
@@ -272,25 +284,24 @@ def _case_name_start(
 
     nov = _NAME_NO_V_RE.search(head)
     if nov:
-        return floor + nov.start()
+        return base + nov.start()
 
     # The last "v." in the window opens the second party; everything after it
     # (up to the comma) is that party, everything before it the first.
-    vees = list(re.finditer(r"(?<=[\w.'’)\]])\s+v[s]?\.\s+", head))
-    if vees:
-        split = vees[-1]
+    left_end = None
+    for split in reversed(list(re.finditer(r"(?<=[\w.'’)\]])\s+v[s]?\.\s+", head))):
         right = head[split.end():]
-        if not right or len(right) > 70:
+        if right and len(right) <= 70 and all(_name_token_ok(t) for t in right.split()):
+            left_end = split.start()
+        break
+    lone = left_end is None
+    if lone:
+        # No "v." immediately before the cite.  A short form names one party
+        # ("Hunter, 502 U. S., at 228"), which is the only case where that is
+        # safe — before a *full* cite a lone capitalized word is usually prose.
+        if not single_party:
             return None
-        if not all(_name_token_ok(t) for t in right.split()):
-            return None
-        left_end = split.start()
-    elif single_party:
         left_end = len(head)
-    else:
-        return None
-
-    lone = single_party and not vees
     toks = list(re.finditer(r"\S+", head[:left_end]))
     i = len(toks)
     while i > 0:
@@ -325,7 +336,7 @@ def _case_name_start(
     start = toks[i].start()
     if left_end - start > 90:
         return None  # implausibly long for a case name — leave it alone
-    return floor + start
+    return base + start
 
 
 # ---------------------------------------------------------------------------
@@ -675,12 +686,28 @@ def _iter_short_cites(text: str) -> list[re.Match]:
     return matches
 
 
+# Prose between an "Id." and the citation it would refer to.  Past ID_NEAR_GAP
+# the reference is only followed when the page number itself corroborates it —
+# a court discussing a case for a paragraph and then writing "Id., at 888" is
+# ordinary, and 888 falling inside that reporter's pages is better evidence
+# than proximity.  Past ID_FAR_GAP even that is not enough: the discussion has
+# moved on.
+ID_NEAR_GAP = 240
+ID_FAR_GAP = 900
+
+
+def _id_chain_hard_broken(gap: str) -> bool:
+    """Signals that end an "Id." chain however the page number reads: a record
+    citation in between — in a brief that "Id." means the record, not the
+    authority — or a blank line, which starts a new discussion."""
+    return bool("\n\n" in gap or _RECORD_CITE_RE.search(gap))
+
+
 def _id_chain_broken(gap: str) -> bool:
     stripped = (gap or "").strip()
     return bool(stripped and (
-        len(stripped) > 240
-        or "\n\n" in gap
-        or _RECORD_CITE_RE.search(gap)
+        len(stripped) > ID_NEAR_GAP
+        or _id_chain_hard_broken(gap)
     ))
 
 
@@ -954,6 +981,44 @@ def _id_pin_in_range(base_cite: str, pin: str) -> bool:
     return start is not None and start <= n <= start + ID_PIN_WINDOW
 
 
+# How many citations back an "Id." will look when the nearest one cannot be
+# what it means.  Two or three intervening citations is already generous.
+ID_LOOKBACK = 4
+
+
+def _id_antecedent(
+    text: str, recent: list, pin: "str | None", start: int,
+) -> "tuple[str, str] | None":
+    """The citation an "Id., at *pin*" refers to, or ``None``.
+
+    Usually that is simply the last citation, but two things send the search
+    further back.  A constitutional citation is never it — the Constitution has
+    no pages, so "Id., at 888" after a reference to the Fourth Amendment means
+    the case cited before that.  Neither is a case whose reporter cannot hold
+    the page: if *pin* falls outside :data:`ID_PIN_WINDOW` of that citation's
+    first page, the page belongs to some earlier authority, so the one before
+    is tried, and so on.
+
+    *recent* is the citations seen so far as ``(action, end)``, oldest first.
+    """
+    if pin is None:
+        return None  # a bare "Id." names no page, and is never linked
+    for action, end in reversed(recent[-ID_LOOKBACK:]):
+        gap = len(text[end:start].strip())
+        if gap > ID_FAR_GAP:
+            break
+        if action[0] == "const":
+            continue  # unpaginated — "at N" cannot be pointing here
+        if action[0] == "cite":
+            if _id_pin_in_range(action[1], pin):
+                return ("cite", f"{action[1]}@{pin}")
+            continue  # that reporter has no such page — look further back
+        if gap > ID_NEAR_GAP:
+            break  # a statute has no page to corroborate the reference with
+        return action  # a statute/rule/regulation simply reopens
+    return None
+
+
 def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     """Scan `text` and return ``(start, end, action)`` for every citation that
     can be opened, in document order with overlaps resolved (first/longest
@@ -1075,7 +1140,9 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
                   for hm in RUNNING_HEAD_CITE_RE.finditer(text)]
     out: list[tuple[int, int, tuple[str, str]]] = []
     pos = 0
-    last_cite_action: tuple[str, str] | None = None
+    # Every citation linked so far as (action, end), oldest first — an "Id."
+    # may have to look past the nearest one to find what it means.
+    recent: list[tuple[tuple[str, str], int]] = []
     last_cite_end: int | None = None
     const_linked: set[int] = set()  # amendments already linked (prose dedup)
     for start, end, kind, m in matches:
@@ -1125,26 +1192,18 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
             action = ("cite", m)  # m is the pre-built "vol rep page@pin"
             cite_base = m.split("@")[0]
         elif kind == "idcite":
-            # "Id." → the last citation, but conservatively, because in a brief an
-            # "Id." often points at a record document rather than the cited
-            # authority.  A bare "Id." (no page) is never linked.  "Id. at N" links
-            # to the previous *case* only when N is plausibly a page of its reporter
-            # (within ID_PIN_WINDOW of its start); a far page is a record/appendix
-            # cite, left unlinked.  "Id. at N" after a statute/rule reopens that
-            # source.
-            la = last_cite_action
-            if la and last_cite_end is not None and _id_chain_broken(
+            # "Id." → the citation it refers back to, but conservatively:
+            # in a brief an "Id." often points at a record document rather than
+            # the cited authority.  A bare "Id." (no page) is never linked, and
+            # a run of intervening prose or record cites breaks the chain
+            # outright.  Which citation it means is _id_antecedent's job — not
+            # always the nearest one.
+            if last_cite_end is not None and _id_chain_hard_broken(
                 text[last_cite_end:start]
             ):
-                la = None
-            pin = m.group(1)
-            if not la or pin is None:
                 action = None
-            elif la[0] == "cite":
-                action = (("cite", f"{la[1]}@{pin}")
-                          if _id_pin_in_range(la[1], pin) else None)
             else:
-                action = la
+                action = _id_antecedent(text, recent, m.group(1), start)
         elif kind == "statestat":
             action = state_statutes.action_for(m)
         elif kind == "stat":
@@ -1174,13 +1233,13 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
                 )
             out.append((span_start, span_end, action))
             if kind in ("cite", "shortcite"):
-                last_cite_action = ("cite", cite_base)
+                recent.append((("cite", cite_base), span_end))
             elif kind != "idcite":
                 # An "Id." must not become the antecedent of the next "Id." —
                 # chaining its already-pinned value builds a malformed
                 # "410 U.S. 113@48@32".  Keep pointing at the real citation,
                 # as the opinion reader's own dispatch does.
-                last_cite_action = action
+                recent.append((action, span_end))
             last_cite_end = span_end
             pos = span_end
             continue
