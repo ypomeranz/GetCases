@@ -31,10 +31,10 @@ Go to CourtListener.com and create a free account.
 
 Once logged in, visit your API settings page and copy your API token.
 
-Launch the app – the first time you search, it will ask for the token.
-You can also enter it later via Settings → API Token… in the menu bar.
+Launch the app – with no token saved, it opens a setup dialog on startup that explains where to get one, offers a “Get a token…” button, and checks the token against the API before saving it. “Skip for now” dismisses it (everything except CourtListener still works), and “Don’t ask again” stops it from reappearing.
+You can enter or change the token at any time via Settings → API Token… in the menu bar.
 
-The token is stored locally (~/.config/courtlistener/config.json) and is used for all CourtListener API requests.
+The token is stored locally (~/.config/courtlistener/config.json) and is used for all CourtListener API requests. Setting COURTLISTENER_TOKEN in the environment overrides the saved token and suppresses the startup prompt.
 
 3. Run the application
 bash
@@ -100,7 +100,7 @@ All text viewers support copy with Bluebook citation (Ctrl+C / Cmd+C) – the co
 You can export opinions from the Export ▾ menu: as RTF (two‑column, with running heads) for word processors; as a print‑ready PDF typeset with LaTeX (single column, justified, Century Schoolbook, footnotes at the foot of the page that cites them, and a running head showing the reporter page range visible on each sheet) if a LaTeX installation (TeX Live, MiKTeX, or Tectonic) is available; or as Markdown with footnotes and star pagination preserved – offered automatically when LaTeX isn’t installed.
 
 Troubleshooting
-“Missing Token” – go to Settings → API Token… and paste your CourtListener token.
+“Missing Token” – answer Yes to enter your CourtListener token, or paste it later via Settings → API Token….
 
 Google Scholar not working – install beautifulsoup4 (pip install beautifulsoup4).
 

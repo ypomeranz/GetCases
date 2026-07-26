@@ -387,6 +387,11 @@ def _style_ui_button(button, primary: bool = False) -> None:
         pass
 
 
+def _ui_button_enable(button, enabled: bool) -> None:
+    """Enable or grey out a shared button (CTk and ttk agree on ``state``)."""
+    button.configure(state="normal" if enabled else "disabled")
+
+
 def _history_button(app, parent_frame):
     """The "History ▾" button case windows share: drops the app-wide list of
     the last 15 viewed cases (see ``CourtListenerGUI.record_case_view``).
@@ -1702,6 +1707,32 @@ def _save_token(token: str) -> None:
     data = _load_config()
     data["api_token"] = token
     _save_config(data)
+
+
+def _token_prompt_suppressed() -> bool:
+    """True once the user has told the startup token prompt to stay away."""
+    return bool(_load_config().get("suppress_token_prompt", False))
+
+
+def _save_token_prompt_suppressed(suppress: bool) -> None:
+    data = _load_config()
+    data["suppress_token_prompt"] = bool(suppress)
+    _save_config(data)
+
+
+def _verify_token(token: str) -> Optional[str]:
+    """Try *token* against the API.  Returns ``None`` when it works, otherwise
+    a one-line explanation fit for a dialog.  Called on a worker thread: the
+    courts endpoint is the cheapest authenticated call CourtListener has."""
+    try:
+        CourtListenerClient(api_token=token, timeout=15).list_courts(page_size=1)
+        return None
+    except CourtListenerError as exc:
+        if exc.status_code in (401, 403):
+            return "CourtListener rejected that token — check for a typo."
+        return f"CourtListener returned HTTP {exc.status_code}."
+    except Exception:
+        return "Couldn't reach CourtListener to check the token."
 
 
 def _default_spotlight_hotkey() -> str:
@@ -4946,6 +4977,10 @@ class CourtListenerGUI:
         # first lookup, so a search never arrives while the index is still
         # being built.  Deferred briefly so the window paints first.
         self.root.after(200, self._start_opinion_db_load)
+        # No CourtListener token yet?  Offer to enter one.  Deferred past
+        # main()'s withdraw() so the dialog can tell whether the root window is
+        # actually on screen.
+        self.root.after(300, self._prompt_for_token_if_missing)
 
     # ------------------------------------------------------------------
     # Case-view history (the "History ▾" dropdown on case windows)
@@ -8197,42 +8232,194 @@ class CourtListenerGUI:
         dlg.protocol("WM_DELETE_WINDOW", close)
         dlg.after(50, dlg.focus_force)
 
+    # ------------------------------------------------------------------
+    # CourtListener API token
+    # ------------------------------------------------------------------
+
+    _TOKEN_SIGNUP_URL = "https://www.courtlistener.com/sign-in/"
+
+    def _prompt_for_token_if_missing(self) -> None:
+        """First run: no token is saved anywhere, so offer to enter one now.
+
+        Without a token every CourtListener search and text fetch is dead, and
+        since the app starts hidden in the background there is nothing on
+        screen to hint at what is missing — the user would otherwise meet the
+        gap at their first search.  Skipped when a token is already in hand
+        (config file or COURTLISTENER_TOKEN) and once the user has ticked
+        "Don't ask again"."""
+        if self._token_var.get().strip() or _token_prompt_suppressed():
+            return
+        try:
+            self._show_token_dialog(first_run=True)
+        except tk.TclError:
+            pass
+
     def _show_settings_dialog(self) -> None:
+        self._show_token_dialog()
+
+    def _show_token_dialog(
+        self, first_run: bool = False, wait: bool = False,
+    ) -> None:
+        """The API-token editor, reached from Settings → API Token… and from
+        startup.  ``first_run`` turns it into a welcome pane: where to get a
+        token, a "Don't ask again" opt-out, and Skip in place of Cancel.
+        ``wait`` blocks until the dialog closes, for callers that want to go on
+        to use the token (main thread only).
+
+        The entry edits a dialog-local variable, so the app's live token
+        changes only once a token has been saved."""
         dlg = _ui_toplevel(self.root)
-        dlg.title("Settings")
-        dlg.geometry("480x210" if _CTK_AVAILABLE else "460x175")
+        dlg.title("CourtListener API Token" if first_run else "Settings")
+        if first_run:
+            dw, dh = (540, 400) if _CTK_AVAILABLE else (520, 350)
+        else:
+            dw, dh = (480, 240) if _CTK_AVAILABLE else (460, 205)
+        # Centre it ourselves: on the first run the root window is usually
+        # still withdrawn, so there is no parent for the WM to centre over.
+        _ax, _ay, _aw, _ah = _work_area(dlg)
+        dlg.geometry(
+            f"{dw}x{dh}+{_ax + max(0, (_aw - dw) // 2)}"
+            f"+{_ay + max(0, (_ah - dh) // 3)}"
+        )
         dlg.resizable(False, False)
+        # A withdrawn root — the default background start — must not become
+        # this dialog's master: window managers hide a transient whose master
+        # is hidden, which would leave the prompt invisible.
+        if not self._root_hidden:
+            dlg.transient(self.root)
         dlg.grab_set()
-        dlg.transient(self.root)
+
+        token_var = tk.StringVar(master=dlg, value=self._token_var.get())
+        status_var = tk.StringVar(master=dlg, value="")
+        suppress_var = tk.BooleanVar(master=dlg, value=False)
+        show_var = tk.BooleanVar(master=dlg, value=False)
+        checking = {"busy": False}
 
         outer = _ui_frame(dlg)
         outer.pack(fill="both", expand=True, padx=16, pady=14)
         _ui_label(outer, "CourtListener API Token", size=14, weight="bold",
                   anchor="w").pack(fill="x")
-        _ui_label(outer, "Used for CourtListener search and text retrieval.",
-                  size=11, muted=True, anchor="w").pack(fill="x", pady=(2, 10))
+        _ui_label(
+            outer,
+            "GetCases reads case law through CourtListener, which needs a\n"
+            "free API token.  Create an account, copy the token from your\n"
+            "profile's API page, and paste it below.\n\n"
+            "Skipping is fine — Google Scholar, the U.S. Code, the CFR, the\n"
+            "Constitution, and state statutes all work without a token."
+            if first_run else
+            "Used for CourtListener search and text retrieval.",
+            size=11, muted=True, anchor="w",
+        ).pack(fill="x", pady=(2, 10))
 
-        entry = _ui_entry(outer, textvariable=self._token_var, show="*")
+        entry = _ui_entry(outer, textvariable=token_var, show="*")
         entry.pack(fill="x")
-
-        show_var = tk.BooleanVar(value=False)
 
         def _toggle() -> None:
             entry.configure(show="" if show_var.get() else "*")
 
-        _ui_checkbox(outer, "Show token", show_var, _toggle).pack(
-            anchor="w", pady=(8, 0))
+        row = _ui_frame(outer)
+        row.pack(fill="x", pady=(8, 0))
+        _ui_checkbox(row, "Show token", show_var, _toggle).pack(side="left")
+        _ui_button(
+            row, "Get a token…", width=120,
+            command=lambda: webbrowser.open(self._TOKEN_SIGNUP_URL),
+        ).pack(side="right")
+
+        _ui_label(outer, textvariable=status_var, size=11, muted=True,
+                  anchor="w").pack(fill="x", pady=(8, 0))
+
+        if first_run:
+            _ui_checkbox(outer, "Don't ask again", suppress_var).pack(
+                anchor="w", pady=(6, 0))
+
+        def close() -> None:
+            if first_run and suppress_var.get():
+                _save_token_prompt_suppressed(True)
+            try:
+                dlg.grab_release()
+                dlg.destroy()
+            except tk.TclError:
+                pass
+
+        def commit(token: str) -> None:
+            self._token_var.set(token)
+            _save_token(token)
+            close()
+
+        def checked(token: str, error: Optional[str]) -> None:
+            checking["busy"] = False
+            try:
+                _ui_button_enable(save_btn, True)
+                entry.configure(state="normal")
+            except Exception:
+                return  # dialog closed under us
+            if error is None:
+                commit(token)
+                return
+            status_var.set(error)
+            # A token that didn't answer isn't necessarily wrong — the network
+            # may just be down — so offer to keep it rather than discard it.
+            if messagebox.askyesno(
+                "Token Not Verified", f"{error}\n\nSave it anyway?",
+                parent=dlg,
+            ):
+                commit(token)
+
+        def save() -> None:
+            if checking["busy"]:
+                return
+            token = token_var.get().strip()
+            if not token:
+                # An empty box is a skip, unless it clears a saved token —
+                # that is a deliberate "forget my token".
+                if self._token_var.get().strip():
+                    commit("")
+                else:
+                    close()
+                return
+            checking["busy"] = True
+            status_var.set("Checking the token with CourtListener…")
+            _ui_button_enable(save_btn, False)
+            entry.configure(state="disabled")  # commit what was checked
+
+            def run() -> None:
+                error = _verify_token(token)
+                try:
+                    self.root.after(0, lambda: checked(token, error))
+                except tk.TclError:
+                    pass
+
+            threading.Thread(target=run, daemon=True).start()
 
         btn_frame = _ui_frame(dlg)
         btn_frame.pack(fill="x", padx=16, pady=(0, 14))
-        _ui_button(
-            btn_frame, "Save & Close", primary=True, width=120,
-            command=lambda: (_save_token(self._token_var.get().strip()),
-                             dlg.destroy()),
-        ).pack(side="right")
-        _ui_button(btn_frame, "Cancel", command=dlg.destroy, width=88).pack(
-            side="right", padx=8
+        save_btn = _ui_button(
+            btn_frame, "Save & Close", primary=True, width=120, command=save,
         )
+        save_btn.pack(side="right")
+        _ui_button(
+            btn_frame, "Skip for now" if first_run else "Cancel",
+            command=close, width=110 if first_run else 88,
+        ).pack(side="right", padx=8)
+
+        dlg.bind("<Return>", lambda _e: save())
+        dlg.bind("<Escape>", lambda _e: close())
+        dlg.protocol("WM_DELETE_WINDOW", close)
+
+        def _raise() -> None:
+            try:
+                dlg.lift()
+                if sys.platform == "win32":
+                    self._win_force_foreground(dlg)
+                dlg.focus_force()
+                entry.focus_set()
+            except tk.TclError:
+                pass
+
+        dlg.after(50, _raise)
+
+        if wait:
+            self.root.wait_window(dlg)
 
     # ------------------------------------------------------------------
     # Court picker
@@ -8369,11 +8556,19 @@ class CourtListenerGUI:
     def _get_client(self) -> Optional[CourtListenerClient]:
         token = self._token_var.get().strip()
         if not token:
-            messagebox.showerror(
+            # Offer the entry dialog rather than only naming the menu it hides
+            # behind.  The dialog opens on the main thread (this runs from
+            # worker threads too) and this call still returns None — the token
+            # arrives too late for it, but the next lookup will have it.
+            if messagebox.askyesno(
                 "Missing Token",
-                "Please enter your CourtListener API token.\n\n"
-                "Go to Settings → API Token…",
-            )
+                "This needs a CourtListener API token.\n\n"
+                "Enter one now?",
+            ):
+                try:
+                    self.root.after(0, self._show_token_dialog)
+                except tk.TclError:
+                    pass
             return None
         if self._client is None or self._client._session.headers.get(
             "Authorization"
@@ -8405,12 +8600,16 @@ class CourtListenerGUI:
                 return
         else:
             client = None
-            messagebox.showwarning(
+            if messagebox.askyesno(
                 "No CourtListener Token",
-                "No CourtListener API token is set — CourtListener results will "
-                "be skipped.\n\nGoogle Scholar will still search.  Add a token "
-                "under Settings → API Token… to include CourtListener.",
-            )
+                "No CourtListener API token is set — CourtListener results "
+                "will be skipped.\n\nGoogle Scholar will still search.  "
+                "Enter a token now to include CourtListener?",
+            ):
+                self._show_token_dialog(wait=True)
+                token = self._token_var.get().strip()
+                if token:
+                    client = self._get_client()
 
         # CourtListener accepts space-separated court IDs; empty set = all
         court = " ".join(sorted(self._selected_courts)) or None
