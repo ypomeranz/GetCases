@@ -212,6 +212,30 @@ class StatuteSectionTests(unittest.TestCase):
         )
 
 
+class RecordCiteTests(unittest.TestCase):
+    """A bare "App." is the joint appendix, not a reporter."""
+
+    def test_bare_app_cite_is_not_a_case(self):
+        self.assertEqual(_spans("See 2 App. 136, 137."), [])
+
+    def test_bare_app_cite_is_not_an_id_antecedent(self):
+        # Linking it also handed the following "Id." the wrong case.
+        self.assertEqual(_spans("See 2 App. 136. Id., at 137."), [])
+
+    def test_reporters_containing_app_still_link(self):
+        for cite, want in [
+            ("12 Cal. App. 4th 55", "12 Cal. App. 4th 55"),
+            ("8 Wn. App. 22", "8 Wn. App. 22"),
+            ("44 Ohio App. 3d 12", "44 Ohio App. 3d 12"),
+            ("200 N.Y. App. Div. 3d 41", "200 N.Y. App. Div. 3d 41"),
+            ("700 F. App'x 100", "700 F. App'x 100"),
+            ("5 App. D.C. 12", "5 App. D.C. 12"),
+        ]:
+            with self.subTest(cite=cite):
+                found = _spans(f"Smith v. Jones, {cite}, 60 (1993).")
+                self.assertEqual(found[0][1], ("cite", f"{want}@60"))
+
+
 class IdChainTests(unittest.TestCase):
     def test_chained_id_does_not_stack_pin_pages(self):
         text = "See 841 F. Supp. 2d 20, 32 (DC 2012). Id., at 48. Id., at 32."

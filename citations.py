@@ -142,6 +142,14 @@ _NONCASE_REPORTERS = {
     # regex must not claim them first (a Scholar lookup by an E.R. cite lands
     # on an unrelated case).
     "engrep", "er",
+    # A *bare* "App." is the joint appendix, not a reporter — "2 App. 136" is
+    # a page of the record, and linking it sends the reader to an unrelated
+    # case (and gives a following "Id., at 137" the same wrong antecedent).
+    # _RECORD_CITE_RE already treats the word that way.  Only the bare form is
+    # excluded: the key drops punctuation and spacing, so the real reporters
+    # that contain "App." keep their own keys — "Cal. App. 4th" is calapp4th,
+    # "Wn. App." wnapp, "N.Y. App. Div." nyappdiv, "F. App'x" fappx.
+    "app",
 }
 _PLAIN_CASE_REPORTERS = {
     "alaska", "idaho", "iowa", "ohio", "utah", "vermont", "wyoming",
