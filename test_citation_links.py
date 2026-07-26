@@ -15,7 +15,7 @@ import pathlib
 import re
 import unittest
 
-from citations import detect_links
+from citations import _valid_case_reporter, detect_links
 
 
 def _spans(text: str):
@@ -312,6 +312,111 @@ class StatuteSectionTests(unittest.TestCase):
             [t for t, _a in _spans("See 18 U.S.C. § 1505, 1512.")],
             ["18 U.S.C. § 1505"],
         )
+
+
+class LawJournalTests(unittest.TestCase):
+    """A law review is cited in a reporter's shape but names no case."""
+
+    def test_journal_citations_are_not_linked(self):
+        for text in [
+            'M. Brady, Giving Personal Property Due Protection, '
+            '125 Yale L. J. 946, 985-987 (2016).',
+            "C. Reich, The New Property, 73 Yale L. J. 733 (1964).",
+            "F. Frankfurter, Some Reflections, 47 Harv. L. Rev. 527 (1934).",
+            "J. Doe, Something, 83 U. Chi. L. Rev. 1181, 1301 (2016).",
+            "J. Doe, Something, 90 Am. J. Int'l L. 12, 15 (1996).",
+            "Note, 100 Sup. Ct. Rev. 1 (2020).",
+            "J. Roe, Paper, 55 Duke L.J. 9 (2005).",
+            "K. Poe, Essay, 12 Harv. J.L. & Pub. Pol'y 3 (1989).",
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    [a for _t, a in _spans(text) if a[0] == "cite"], [])
+
+    def test_reporters_ending_in_j_still_link(self):
+        # The danger cases: a period or letter before the "J." means reporter.
+        for cite, want in [
+            ("100 N.J. 45", "100 N.J. 45"),            # New Jersey Reports
+            ("50 M.J. 100", "50 M.J. 100"),            # Military Justice
+            ("60 N.J.L. 200", "60 N.J.L. 200"),        # N.J. Law Reports
+            ("2 N.J. Super. 8", "2 N.J. Super. 8"),
+        ]:
+            with self.subTest(cite=cite):
+                found = _spans(f"See State v. Smith, {cite}, 50 (1985).")
+                self.assertEqual(found[0][1], ("cite", f"{want}@50"))
+
+    def test_a_journal_in_a_string_cite_does_not_take_the_case_with_it(self):
+        text = ("See Note, 47 Harv. L. Rev. 527; "
+                "Roe v. Wade, 410 U.S. 113, 152 (1973).")
+        self.assertEqual(
+            _spans(text),
+            [("Roe v. Wade, 410 U.S. 113, 152 (1973)",
+              ("cite", "410 U.S. 113@152"))],
+        )
+
+    def test_a_journal_is_not_an_id_antecedent(self):
+        text = ("Roe v. Wade, 410 U.S. 113 (1973). "
+                "See also Note, 47 Harv. L. Rev. 527. Id., at 152.")
+        self.assertEqual(_spans(text)[-1][1], ("cite", "410 U.S. 113@152"))
+
+
+class ReporterSweepTests(unittest.TestCase):
+    """The journal filter must not cost a single real reporter.
+
+    ``_valid_case_reporter`` gates the broad fallback that catches every state
+    and specialty reporter the narrow pattern does not name, so a marker chosen
+    to exclude law reviews has to be checked against the reporters themselves.
+    """
+
+    REPORTERS = (
+        # Federal and specialty
+        "U.S.", "U. S.", "S. Ct.", "L. Ed. 2d", "F.", "F.2d", "F. 3d", "F. 4th",
+        "F. App'x", "F. Supp.", "F. Supp. 2d", "F. Supp. 3d", "F. Cas.", "B.R.",
+        "Ct. Cl.", "Fed. Cl.", "Cl. Ct.", "T.C.", "Vet. App.", "M.J.", "C.M.A.",
+        "C.M.R.", "App. D.C.", "F.R.D.", "U.S.P.Q.",
+        # Regional
+        "A.", "A.2d", "A.3d", "P.", "P.2d", "P.3d", "N.E.", "N.E.2d", "N.E.3d",
+        "N.W.", "N.W.2d", "S.E.", "S.E.2d", "S.W.", "S.W.2d", "S.W.3d", "So.",
+        "So. 2d", "So. 3d", "Cal. Rptr.", "Cal. Rptr. 3d", "N.Y.S.2d",
+        # State — the "J." reporters are the ones the filter could break
+        "N.J.", "N.J. Super.", "N.J.L.", "N.J. Eq.", "N.Y.", "N.Y.2d",
+        "N.Y. App. Div.", "Ohio St. 3d", "Ohio App. 3d", "Ill. 2d",
+        "Ill. App. 3d", "Wis. 2d", "Wn. 2d", "Wn. App.", "Cal. App. 4th",
+        "Mass.", "Mass. App. Ct.", "Md.", "Md. App.", "Va.", "Va. App.",
+        "Tex. Crim. App.", "Ariz.", "Vt.", "Wyo.", "Conn.", "Conn. App.", "Me.",
+        "N.H.", "R.I.", "Del.", "Del. Ch.", "Pa.", "Pa. Super.", "Pa. Commw.",
+        "Mich.", "Mich. App.", "Minn.", "Mo.", "Mo. App.", "Neb.", "Nev.",
+        "N.M.", "N.C.", "N.C. App.", "N.D.", "Okla.", "Okla. Crim.", "Or.",
+        "Or. App.", "S.C.", "S.D.", "Tenn.", "Tenn. Crim. App.", "W. Va.",
+        "Kan.", "Kan. App. 2d", "Ky.", "La.", "La. App.", "Ga.", "Ga. App.",
+        "Fla.", "Ind.", "Ind. App.", "Colo.", "Colo. App.", "Mont.", "Haw.",
+        "D.C.", "Cal.", "Cal. 4th",
+        # Early federal and English
+        "Wall. Jr.", "Sumn.", "Curt.", "Ben.", "Gall.", "Low.", "Q.B.", "K.B.",
+        "Ch.", "A.C.", "Johns.", "Binn.",
+    )
+
+    JOURNALS = (
+        "Yale L. J.", "Yale L.J.", "Harv. L. Rev.", "Colum. L. Rev.",
+        "Stan. L. Rev.", "U. Chi. L. Rev.", "N.Y.U. L. Rev.", "Mich. L. Rev.",
+        "Va. L. Rev.", "Tex. L. Rev.", "Minn. L. Rev.", "Duke L.J.",
+        "Hastings L.J.", "Geo. Wash. L. Rev.", "B.U. L. Rev.",
+        "Notre Dame L. Rev.", "Wm. & Mary L. Rev.", "Cornell L. Rev.",
+        "Fordham L. Rev.", "Am. J. Int'l L.", "J. Legal Stud.",
+        "J. L. & Econ.", "Harv. J.L. & Pub. Pol'y", "Sup. Ct. Rev.",
+        "Cardozo Arts & Ent. L.J.", "Colum. Hum. Rts. L. Rev.", "Geo. L.J.",
+        "U. Pa. L. Rev.", "Nw. U. L. Rev.", "Emory L.J.", "Tul. L. Rev.",
+        "Vand. L. Rev.", "Wis. L. Rev.", "Ohio St. L.J.", "Ind. L.J.",
+        "Am. Crim. L. Rev.", "J. Crim. L. & Criminology",
+    )
+
+    def test_no_real_reporter_is_rejected(self):
+        lost = [r for r in self.REPORTERS if not _valid_case_reporter(r)]
+        self.assertEqual(lost, [], f"real reporters rejected: {lost}")
+
+    def test_every_journal_is_rejected(self):
+        kept = [j for j in self.JOURNALS if _valid_case_reporter(j)]
+        self.assertEqual(kept, [], f"journals still accepted: {kept}")
 
 
 class RecordCiteTests(unittest.TestCase):

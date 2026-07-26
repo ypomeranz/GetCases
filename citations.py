@@ -156,6 +156,29 @@ _PLAIN_CASE_REPORTERS = {
     "wl", "lexis",
 }
 
+# Law reviews are cited in exactly a reporter's shape — "125 Yale L. J. 946"
+# parses like "125 U. S. 946" — so the broad reporter fallback claims them and
+# offers the reader a case that was never decided.  These markers appear in
+# journal abbreviations and in no case reporter:
+#
+#   "L. Rev."  Harv. L. Rev., Colum. L. Rev., N.Y.U. L. Rev.
+#   "L. J."    Yale L. J., Duke L.J., Hastings L.J.
+#   "L.Q."     Law Quarterly
+#   "Rev."     Sup. Ct. Rev., Ann. Rev. — any remaining review
+#   "J."       Am. J. Int'l L., J. Legal Stud. — a *standalone* J.
+#
+# The last one carries all the risk, because several real reporters end in a
+# "J." that must survive: N.J. (New Jersey), M.J. (Military Justice), N.J.L.
+# (New Jersey Law Reports), Wall. Jr.  What separates them from a journal is
+# the character before the J — a period or letter there means reporter, a space
+# or nothing means journal — so the standalone alternative is written with a
+# lookbehind, and the "L. J." family is matched explicitly since its own J does
+# follow a period.  Case-sensitive: journal abbreviations are capitalized, and
+# the broad regex only ever hands us a capitalized token.
+_JOURNAL_REPORTER_RE = re.compile(
+    r"L\.\s?J\.|L\.\s?Rev\.|L\.\s?Q\.|\bRev\.|(?<![A-Za-z.])J\."
+)
+
 # Short-form citation: "Roe, 410 U.S., at 152" → volume, reporter, pin page.
 SHORT_CITE_RE = re.compile(
     r"\b(\d{1,4})\s+(" + REPORTER_ALT + r")\s*,?\s+at\s+(\d{1,5})\b")
@@ -623,6 +646,8 @@ def _valid_case_reporter(rep: str) -> bool:
     key = _loose_reporter_key(rep)
     if not key or key in _NONCASE_REPORTERS:
         return False
+    if _JOURNAL_REPORTER_RE.search(rep or ""):
+        return False  # a law review, not a reporter — no case to open
     if key in _PLAIN_CASE_REPORTERS or key.endswith("lexis"):
         return True
     return "." in (rep or "")
