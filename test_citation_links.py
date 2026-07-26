@@ -74,7 +74,7 @@ class CaseCiteSpanTests(unittest.TestCase):
 
     def test_explanatory_parenthetical_is_excluded(self):
         text = "Pringle, 540 U.S. 366, 372 (2003) (holding that totality controls)."
-        self.assertEqual(_spans(text)[0][0], "540 U.S. 366, 372 (2003)")
+        self.assertEqual(_spans(text)[0][0], "Pringle, 540 U.S. 366, 372 (2003)")
 
     def test_multi_word_party_names(self):
         text = ("The Court in District of Columbia v. Wesby, 583 U. S. 48, 57 "
@@ -113,15 +113,117 @@ class CaseCiteSpanTests(unittest.TestCase):
         self.assertEqual(_spans(text)[-1][0],
                          "White v. Pauly, 580 U. S. 73, 79 (2017)")
 
-    def test_additional_pin_pages_stay_in_the_span(self):
+    def test_additional_pin_pages_become_their_own_links(self):
+        # Each pin page opens the page the opinion actually pointed at, and the
+        # blue runs unbroken across both.
         text = "See Devenpeck v. Alford, 543 U. S. 146, 149, 155–156 (2004)."
-        self.assertEqual(_spans(text)[0][0],
-                         "Devenpeck v. Alford, 543 U. S. 146, 149, 155–156 (2004)")
+        self.assertEqual(
+            _spans(text),
+            [("Devenpeck v. Alford, 543 U. S. 146, 149",
+              ("cite", "543 U.S. 146@149")),
+             (", 155–156 (2004)", ("cite", "543 U.S. 146@155"))],
+        )
 
     def test_citation_wrapped_across_a_line_break(self):
         text = "relied on Maryland v.\nPringle, 540 U. S. 366, 371 (2003)."
         self.assertEqual(_spans(text)[0][0],
                          "Maryland v.\nPringle, 540 U. S. 366, 371 (2003)")
+
+
+class MultiplePinCiteTests(unittest.TestCase):
+    """A citation to several pages is several links, one per page."""
+
+    def test_second_pin_opens_the_second_page(self):
+        text = ('it concluded that the panel was "foreign or international". '
+                "5 F. 4th 216, 225, 228 (2021). We granted certiorari.")
+        self.assertEqual(
+            _spans(text),
+            [("5 F. 4th 216, 225", ("cite", "5 F. 4th 216@225")),
+             (", 228 (2021)", ("cite", "5 F. 4th 216@228"))],
+        )
+
+    def test_three_pin_pages(self):
+        text = "See 5 F. 4th 216, 225, 228, 231 (2021)."
+        self.assertEqual(
+            [a[1] for _t, a in _spans(text)],
+            ["5 F. 4th 216@225", "5 F. 4th 216@228", "5 F. 4th 216@231"],
+        )
+
+    def test_the_blue_runs_unbroken_across_the_segments(self):
+        # Each later segment starts at its own comma, so there is no black gap.
+        text = "See 5 F. 4th 216, 225, 228 (2021)."
+        spans = detect_links(text)
+        for (_s, prev_end, _a), (next_start, _e, _a2) in zip(spans, spans[1:]):
+            self.assertEqual(prev_end, next_start)
+
+    def test_a_parallel_cite_is_not_read_as_a_pin_page(self):
+        text = "See Smith v. Jones, 123 Mass. 556, 510 A.2d 562 (1986)."
+        self.assertNotIn("510", _spans(text)[0][0])
+
+    def test_short_cite_with_a_second_pin_page(self):
+        text = ("Intel Corp. v. Advanced Micro Devices, Inc., 542 U. S. 241, "
+                "258 (2004). It rendered reviewable rulings. "
+                "Intel, 542 U. S., at 254–255, 258.")
+        self.assertEqual(
+            _spans(text)[-2:],
+            [("Intel, 542 U. S., at 254–255", ("cite", "542 U.S. 241@254")),
+             (", 258", ("cite", "542 U.S. 241@258"))],
+        )
+
+
+class PageRangeTests(unittest.TestCase):
+    """A range is highlighted whole and opens at its first page."""
+
+    def test_short_cite_range_is_fully_highlighted(self):
+        for dash in ("-", "–", "—"):
+            with self.subTest(dash=dash):
+                text = ("Intel Corp. v. Advanced Micro Devices, Inc., "
+                        "542 U. S. 241, 258 (2004). "
+                        f"Intel, 542 U. S., at 254{dash}255.")
+                self.assertEqual(
+                    _spans(text)[-1],
+                    (f"Intel, 542 U. S., at 254{dash}255",
+                     ("cite", "542 U.S. 241@254")),
+                )
+
+    def test_full_cite_range_is_fully_highlighted(self):
+        text = "See Devenpeck v. Alford, 543 U. S. 146, 155–156 (2004)."
+        self.assertEqual(_spans(text)[0][0],
+                         "Devenpeck v. Alford, 543 U. S. 146, 155–156 (2004)")
+
+
+class ShortenedNameTests(unittest.TestCase):
+    """A string cite shortens the name but keeps the full citation."""
+
+    def test_lone_party_before_a_full_cite(self):
+        text = ("the Second Circuit had held otherwise. See National "
+                "Broadcasting Co., 165 F. 3d 184. But it still had to decide.")
+        self.assertEqual(_spans(text)[0][0],
+                         "National Broadcasting Co., 165 F. 3d 184")
+
+    def test_lone_party_inside_a_string_cite(self):
+        text = ("Compare Servotronics, Inc. v. Boeing Co., 954 F. 3d 209 "
+                "(CA4 2020); Abdul Latif, 939 F. 3d 710, with National "
+                "Broadcasting Co. v. Bear Stearns & Co., 165 F. 3d 184 "
+                "(CA2 1999).")
+        self.assertEqual(
+            [t for t, _a in _spans(text)],
+            ["Servotronics, Inc. v. Boeing Co., 954 F. 3d 209 (CA4 2020)",
+             "Abdul Latif, 939 F. 3d 710",
+             "National Broadcasting Co. v. Bear Stearns & Co., "
+             "165 F. 3d 184 (CA2 1999)"],
+        )
+
+    def test_prose_is_still_not_mistaken_for_a_name(self):
+        for text in [
+            "The court reached that conclusion. 165 F. 3d 184.",
+            "That violates the Fourth Amendment. 165 F. 3d 184.",
+            "See 165 F. 3d 184.",
+            "As we held in 165 F. 3d 184.",
+        ]:
+            with self.subTest(text=text):
+                found = _spans(text)
+                self.assertTrue(found[-1][0].startswith("165"), found)
 
 
 class ShortCiteSpanTests(unittest.TestCase):

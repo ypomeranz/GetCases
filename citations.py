@@ -210,8 +210,16 @@ RUNNING_HEAD_CITE_RE = re.compile(
 # is what keeps "(holding that the totality controls)" black.
 _COURT_YEAR_PAREN_RE = re.compile(r"\s*\((?:[^()]{0,60}?[\s.])?(?:1[6-9]|20)\d{2}\)")
 
-# Additional pin pages hanging off the first ("at 277, 280-281").
-_EXTRA_PIN_RE = re.compile(r",\s*\*?\d{1,6}(?:\s*[-–—]\s*\*?\d{1,6})?(?!\d|\s*[A-Z])")
+# A further pin page in the same citation ("216, 225, 228" — the ", 228").
+# Group 1 is the page it opens to; the range that may follow is highlighted but
+# not captured, since a range opens at its first page.
+_EXTRA_PIN_RE = re.compile(
+    r",\s*\*?(\d{1,6})(?:\s*[-–—]\s*\*?\d{1,6})?(?!\d|\s*[A-Z])")
+
+# The tail of a page range on a short cite.  SHORT_CITE_RE stops at the first
+# page ("542 U. S., at 254" out of "at 254–255"), so the rest of the range has
+# to be taken separately to finish the highlight.
+_RANGE_TAIL_RE = re.compile(r"\s*[-–—]\s*\*?\d{1,6}(?!\d)")
 
 # Lowercase words that sit *inside* a case name and must not end the backward
 # scan for one ("District of Columbia v. Wesby", "Rhode Island ex rel. …").
@@ -263,17 +271,20 @@ _NAME_NO_V_RE = re.compile(
 
 
 def _case_name_start(
-    text: str, cite_start: int, floor: int, *, single_party: bool = False,
-) -> "int | None":
+    text: str, cite_start: int, floor: int) -> "int | None":
     """Index where the case name introducing the citation at *cite_start*
     begins, or ``None`` when no name reads as one.
 
     The scan never crosses *floor* — the end of the last thing already linked,
     or of a running head — so a name can never swallow a neighbouring citation
-    or the page furniture above it.  ``single_party`` also accepts the one-name
-    form a short cite uses ("Carpenter, 585 U. S., at 312"); a full citation
-    requires a real "v." (or an "In re"-style) name, since a lone capitalized
-    word before a full cite is far more often just prose.
+    or the page furniture above it.
+
+    Both shapes of name count.  Most carry a "v." (or read "In re …"), but a
+    string cite shortens the name while keeping the full citation — "Abdul
+    Latif, 939 F. 3d 710", "National Broadcasting Co., 165 F. 3d 184" — so a
+    lone party is accepted too.  What keeps that from swallowing prose is the
+    same set of limits either way: the nearest comma bounds it, signal words
+    and sentence ends stop it, and it may not run past a few words.
     """
     # Only the text just before the citation can hold its name.  Bounding the
     # window matters as much as the token rules: unbounded, the scan reaches
@@ -302,13 +313,9 @@ def _case_name_start(
         if right and len(right) <= 70 and all(_name_token_ok(t) for t in right.split()):
             left_end = split.start()
         break
+    # No "v." immediately before the cite: read the shortened one-party form.
     lone = left_end is None
     if lone:
-        # No "v." immediately before the cite.  A short form names one party
-        # ("Hunter, 502 U. S., at 228"), which is the only case where that is
-        # safe — before a *full* cite a lone capitalized word is usually prose.
-        if not single_party:
-            return None
         left_end = len(head)
     toks = list(re.finditer(r"\S+", head[:left_end]))
     i = len(toks)
@@ -411,28 +418,48 @@ def _name_token_ok(tok: str) -> bool:
     return bool(_NAME_TOKEN_RE.match(tok)) or low in _NAME_CONNECTORS
 
 
-def _case_cite_span(
+def _case_cite_spans(
     text: str, start: int, end: int, floor: int, *, short: bool = False,
-) -> "tuple[int, int]":
-    """Grow the reporter-cite span ``(start, end)`` to the whole citation the
-    reader sees: case name, pin cite, and court/year parenthetical."""
-    name_start = _case_name_start(text, start, floor, single_party=short)
+) -> "list[tuple[int, int, str]]":
+    """The links the citation at ``(start, end)`` should produce, as
+    ``(span_start, span_end, pin)`` in document order.
+
+    A citation to one page is one link covering the whole thing a reader sees:
+    case name, reporter cite, pin cite, court/year parenthetical.  A citation to
+    *several* pages — "5 F. 4th 216, 225, 228 (2021)" — is that many links: the
+    name and first pin page open page 225, and each later page opens itself, so
+    following a pin cite lands where the opinion actually pointed.
+
+    ``pin`` is empty on the first segment, whose page the caller has already
+    worked into the citation it built (a short cite resolves its own pin through
+    the document index); later segments carry the page to open.
+    """
+    name_start = _case_name_start(text, start, floor)
     if name_start is not None:
         start = name_start
-    if not short:
-        # A short cite's own regex already ends at its pin page.
+    if short:
+        # SHORT_CITE_RE ends at the first page of a range; take the rest so the
+        # whole range is highlighted.  It still opens at that first page.
+        tail = _RANGE_TAIL_RE.match(text, end)
+        if tail:
+            end = tail.end()
+    else:
         pin = PINCITE_AFTER_RE.match(text, end)
         if pin:
             end = pin.end()
+    segments: list[list] = [[start, end, ""]]
     while True:
-        extra = _EXTRA_PIN_RE.match(text, end)
+        extra = _EXTRA_PIN_RE.match(text, segments[-1][1])
         if not extra:
             break
-        end = extra.end()
-    paren = _COURT_YEAR_PAREN_RE.match(text, end)
+        # The comma joins the new segment so the blue runs unbroken.
+        segments.append([extra.start(), extra.end(), extra.group(1)])
+    # The court/year parenthetical closes the citation, so it belongs to
+    # whichever segment it follows.
+    paren = _COURT_YEAR_PAREN_RE.match(text, segments[-1][1])
     if paren:
-        end = paren.end()
-    return start, end
+        segments[-1][1] = paren.end()
+    return [(s, e, pin) for s, e, pin in segments]
 
 
 def norm_reporter(rep: str) -> str:
@@ -1227,7 +1254,7 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         else:  # pragma: no cover - defensive
             action = None
         if action is not None:
-            span_start, span_end = start, end
+            span_end = end
             if kind in ("cite", "shortcite"):
                 # Blue the citation the reader sees, not just the reporter
                 # fragment the regex matched.  The name may not reach back past
@@ -1236,18 +1263,26 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
                 for hs, he in head_spans:
                     if he <= start:
                         floor = max(floor, he)
-                span_start, span_end = _case_cite_span(
+                segments = _case_cite_spans(
                     text, start, end, floor, short=(kind == "shortcite"),
                 )
-            out.append((span_start, span_end, action))
-            if kind in ("cite", "shortcite"):
+                for seg_start, seg_end, seg_pin in segments:
+                    # The first segment opens the page already folded into
+                    # *action*; each later pin cite opens its own page.
+                    out.append((seg_start, seg_end, (
+                        ("cite", f"{cite_base}@{seg_pin}") if seg_pin
+                        else action
+                    )))
+                span_end = segments[-1][1]
                 recent.append((("cite", cite_base), span_end))
-            elif kind != "idcite":
-                # An "Id." must not become the antecedent of the next "Id." —
-                # chaining its already-pinned value builds a malformed
-                # "410 U.S. 113@48@32".  Keep pointing at the real citation,
-                # as the opinion reader's own dispatch does.
-                recent.append((action, span_end))
+            else:
+                out.append((start, end, action))
+                if kind != "idcite":
+                    # An "Id." must not become the antecedent of the next
+                    # "Id." — chaining its already-pinned value builds a
+                    # malformed "410 U.S. 113@48@32".  Keep pointing at the
+                    # real citation, as the opinion reader's dispatch does.
+                    recent.append((action, span_end))
             last_cite_end = span_end
             pos = span_end
             continue
