@@ -14862,6 +14862,9 @@ class _ScholarTextWindow:
         self._mode = "courtlistener" if self._cl_primary else "scholar"
         self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
         self._pdf_holder: Optional[ttk.Frame] = None  # pane + parts strip
+        # The separate-opinions strip inside that holder, once the text layer
+        # has revealed the parts; toggled by the "Side panel" checkbox.
+        self._pdf_parts_nav: Optional[ttk.Frame] = None
         self._pdf_url: Optional[str] = None
         self._pdf_bytes: Optional[bytes] = None
         # Background-prefetched PDF (data, url) so "PDF" is instant; set by
@@ -15328,20 +15331,27 @@ class _ScholarTextWindow:
             btn_frame, "A+", command=lambda: self._zoom(+1), width=42
         )
         self._zoom_in_btn.pack(side="left", padx=(6, 10))
-        # On by default for Supreme Court cases (Oyez fills the panel); the
-        # window was widened to fit it.  _toggle_details is fired below.
-        self._details_var = tk.BooleanVar(value=self._is_scotus)
-        _ui_checkbox(
-            btn_frame, "Side panel", self._details_var, self._toggle_details,
-        ).pack(side="left", padx=(0, 10))
         # How Ctrl-C copies lives in the "Copy" menu at the top of the window
         # rather than on this bar — three styles do not fit in a checkbox, and
-        # the bar has no room to spare.
+        # the bar has no room to spare.  Edit citation sits before the two
+        # checkboxes so they read as a pair.
         self._edit_citation_btn = _ui_button(
             btn_frame, "Edit citation…", command=self._edit_base_citation,
             width=108,
         )
         self._edit_citation_btn.pack(side="left", padx=(0, 10))
+        # "Side panel" drives whichever panel the current view has on its right:
+        # the Oyez/outline details panel in a text view, the separate-opinions
+        # strip in the PDF view.  Each remembers its own setting (see
+        # _toggle_details), so hiding the strip over a PDF does not close the
+        # details panel waiting behind it.  On by default for Supreme Court
+        # cases, whose Oyez panel the window was widened to fit.
+        self._details_var = tk.BooleanVar(value=self._is_scotus)
+        self._details_on = self._is_scotus
+        self._pdf_parts_on = True
+        _ui_checkbox(
+            btn_frame, "Side panel", self._details_var, self._toggle_details,
+        ).pack(side="left", padx=(0, 10))
         self._justify_text = tk.BooleanVar(value=False)
         _ui_checkbox(
             btn_frame, "Justify text", self._justify_text,
@@ -15352,7 +15362,8 @@ class _ScholarTextWindow:
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
             win.bind(seq, lambda _e: self._zoom(-1))
         win.bind("<Control-0>", lambda _e: self._zoom(0))
-        # Bare "s" toggles the side panel, except while a text field has focus.
+        # Bare "s" toggles whichever side panel the current view has, except
+        # while a text field has focus.
         win.bind("<KeyPress-s>", self._toggle_details_shortcut)
         txt.bind(
             "<Control-MouseWheel>",
@@ -16292,6 +16303,7 @@ class _ScholarTextWindow:
                 prev_kind = part.kind
         txt.config(state="disabled")
         self._mode = "scholar"
+        self._sync_details_checkbox()  # back to the text view's own setting
         self._source_var.set(self._scholar_url)
         # From the Scholar view, offer the official PDF (the CourtListener text
         # is invariably worse, so it's no longer offered here).
@@ -16925,6 +16937,7 @@ class _ScholarTextWindow:
                 prev_kind = part.kind
         txt.config(state="disabled")
         self._mode = "courtlistener"
+        self._sync_details_checkbox()  # back to the text view's own setting
         source = self._primary_source_url or (
             "CourtListener (REST API)"
             if self._primary_source_kind == "courtlistener"
@@ -16973,6 +16986,7 @@ class _ScholarTextWindow:
         self._insert_plain_with_links(self._cl_text or "(no text)", ())
         txt.config(state="disabled")
         self._mode = "courtlistener"
+        self._sync_details_checkbox()  # back to the text view's own setting
         source = self._primary_source_url or (
             "CourtListener (assembled from the REST API)"
             if self._primary_source_kind == "courtlistener"
@@ -18595,7 +18609,9 @@ class _ScholarTextWindow:
             return None
 
     def _toggle_details_shortcut(self, event=None):
-        """Toggle the side panel from the bare "s" accelerator.
+        """Toggle the side panel from the bare "s" accelerator — the details
+        panel in a text view, the separate-opinions strip over a PDF, whichever
+        the current view has.
 
         Ignored while focus is in a field that accepts typed text, so "s"
         types normally in the Find bar and similar inputs.
@@ -18627,12 +18643,54 @@ class _ScholarTextWindow:
             pass
 
     def _toggle_details(self) -> None:
-        if self._details_var.get():
+        """Apply the "Side panel" checkbox to the current view's right-hand
+        panel, and remember the setting for that view.
+
+        The PDF view's panel is the separate-opinions strip, the text views' is
+        the details panel; they keep separate settings so switching views
+        restores what the reader last chose *there* rather than carrying one
+        view's preference into the other."""
+        on = self._details_var.get()
+        if self._mode == "pdf":
+            self._pdf_parts_on = on
+            self._apply_pdf_parts_visibility()
+            return
+        self._details_on = on
+        if on:
             self._details_panel().pack(side="right", fill="y",
                                        before=self._vsb)
             self._refresh_details_view()
         elif self._details_frame is not None:
             self._details_frame.pack_forget()
+
+    def _sync_details_checkbox(self) -> None:
+        """Point the "Side panel" checkbox at the setting for the view now
+        showing, without firing the toggle (nothing needs re-packing — the
+        view's own render put its panel in the right state)."""
+        try:
+            self._details_var.set(
+                self._pdf_parts_on if self._mode == "pdf" else self._details_on
+            )
+        except tk.TclError:
+            pass
+
+    def _apply_pdf_parts_visibility(self) -> None:
+        """Show or hide the PDF view's separate-opinions strip to match the
+        remembered setting.  A no-op until the strip exists — the text layer
+        has to be read before the opinions in it are known."""
+        nav = getattr(self, "_pdf_parts_nav", None)
+        if nav is None:
+            return
+        try:
+            if not nav.winfo_exists():
+                self._pdf_parts_nav = None
+                return
+            if self._pdf_parts_on:
+                nav.pack(side="right", fill="y", padx=(4, 0))
+            else:
+                nav.pack_forget()
+        except tk.TclError:
+            self._pdf_parts_nav = None
 
     def _details_mode(self) -> str:
         """The side panel's selected view: "case", "recent", "related" or
@@ -19216,7 +19274,7 @@ class _ScholarTextWindow:
     def _refresh_outline_panel(self) -> None:
         """Rebuild the outline after a re-render — its stored text indices
         go stale whenever the text is rebuilt (part switch, source toggle)."""
-        if (self._details_frame is not None and self._details_var.get()
+        if (self._details_frame is not None and self._details_on
                 and self._details_mode() == "outline"):
             self._show_outline()
 
@@ -20297,6 +20355,7 @@ class _ScholarTextWindow:
         if getattr(self, "_pdf_holder", None) is not None:
             self._pdf_holder.destroy()  # a previous PDF view left behind
             self._pdf_holder = None
+            self._pdf_parts_nav = None
             self._pdf_pane = None
         holder = ttk.Frame(self._win)
         try:
@@ -20318,6 +20377,8 @@ class _ScholarTextWindow:
         self._pdf_url = url
         self._pdf_bytes = data
         self._mode = "pdf"
+        # The checkbox now speaks for the PDF view's own panel.
+        self._sync_details_checkbox()
 
         # Extract the text layer in the background so text on the page can be
         # selected with the mouse and copied with Ctrl-C.  The find keys are
@@ -20358,9 +20419,12 @@ class _ScholarTextWindow:
                             )
                         p.enable_find(pages, bind_keys=False)
                         if len(sections) > 1:
-                            nav = _build_pdf_parts_nav(
+                            # Built now that the text layer has revealed the
+                            # separate opinions; shown only if the reader has
+                            # the side panel on for the PDF view.
+                            self._pdf_parts_nav = _build_pdf_parts_nav(
                                 self._pdf_holder, sections, p.scroll_to_page)
-                            nav.pack(side="right", fill="y", padx=(4, 0))
+                            self._apply_pdf_parts_visibility()
                         bits = []
                         n = sum(len(v) for v in links.values())
                         nq = sum(len(v) for pg, v in links.items()
@@ -20372,8 +20436,12 @@ class _ScholarTextWindow:
                                    if nq else "shown in blue")
                             )
                         if len(sections) > 1:
-                            bits.append(f"{len(sections)} opinion parts "
-                                        "listed on the right")
+                            bits.append(
+                                f"{len(sections)} opinion parts "
+                                + ("listed on the right"
+                                   if self._pdf_parts_on else
+                                   "— tick Side panel to list them")
+                            )
                         bits.append("drag to select text; Ctrl+C copies")
                         self._status_var.set("; ".join(bits) + ".")
                 except tk.TclError:
@@ -20489,6 +20557,7 @@ class _ScholarTextWindow:
         if holder is not None:
             holder.destroy()  # takes the pane and its parts strip with it
             self._pdf_holder = None
+            self._pdf_parts_nav = None
         elif self._pdf_pane is not None:
             self._pdf_pane.destroy()
         self._pdf_pane = None
