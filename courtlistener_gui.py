@@ -2124,8 +2124,16 @@ def _build_default_filename(item: dict) -> str:
         item.get("caseName") or item.get("case_name") or "opinion"
     ).strip())
 
-    # Best citation (U.S. Reports > S.Ct. > Federal Reporters > others)
-    citation_str = _pick_citation(item.get("citation", []))
+    # Best citation (U.S. Reports > S.Ct. > Federal Reporters > others).
+    # A U.S. Reports scan resolved for this case names its own volume and page
+    # (recorded by _resolve_pdf_url), and that is the citation to file it
+    # under — Google Scholar frequently gives a SCOTUS case only its S. Ct.
+    # cite, which _pick_citation would otherwise have to settle for even
+    # though the pages on screen are U.S. Reports pages.
+    citation_str = (
+        item.get("_us_reports_cite")
+        or _pick_citation(item.get("citation", []))
+    )
 
     # Year from date filed
     date_filed = item.get("dateFiled") or item.get("date_filed") or ""
@@ -2183,6 +2191,13 @@ def _named_temp_pdf_path(stem: str) -> str:
         if not os.path.exists(cand):
             return cand
     return base  # couldn't differentiate — overwrite the existing file
+
+
+def _normalized_us_cite(citation: str) -> str:
+    """The bare "583 U.S. 48" inside *citation*, or "" when it holds none.
+    Drops any pincite, parallel cite, or case name the string carries."""
+    m = _US_CITE_RE.search(citation or "")
+    return f"{m.group(1)} U.S. {m.group(2)}" if m else ""
 
 
 def _us_reports_loc_url(citation: str) -> Optional[str]:
@@ -8860,6 +8875,7 @@ class CourtListenerGUI:
         """
         storage_base = "https://storage.courtlistener.com/"
         item.pop("_case_law_pdf_choices", None)
+        item.pop("_us_reports_cite", None)
         skip_metadata_fallback = bool(
             item.get("_skip_pdf_metadata_fallback")
         )
@@ -8943,14 +8959,22 @@ class CourtListenerGUI:
                 (_try_loc, _try_govinfo) if loc_preferred
                 else (_try_govinfo, _try_loc)
             )
+            # Every path below keys on a U.S. Reports cite, so whichever one
+            # succeeds names the pages the reader is about to see.  Record it:
+            # a case reached through Google Scholar's S. Ct. text often carries
+            # no U.S. cite of its own, and the saved file should still be named
+            # for the reporter it was carved out of (see
+            # _build_default_filename).
             for source in sources:
                 url = source(cite)
                 if url is not None:
+                    item["_us_reports_cite"] = _normalized_us_cite(cite)
                     return url
             local_pdf = us_reports_pdf.extract_citation(cite)
             if local_pdf is not None:
                 url = local_pdf.as_uri()
                 print(f"[resolve] using local US Reports volume: {url}")
+                item["_us_reports_cite"] = _normalized_us_cite(cite)
                 return url
 
         # 0.5. Non-SCOTUS: the Harvard CAP static.case.law copy.  Try every
@@ -14629,6 +14653,10 @@ class _ScholarTextWindow:
         # _prefetch_pdf, consumed by _view_pdf.
         self._pdf_prefetch: Optional[tuple[bytes, str]] = None
         self._case_law_pdf_choices: list[_CaseLawPdfChoice] = []
+        # "583 U.S. 48" — the U.S. Reports cite whose scan the PDF view is
+        # showing, learned while resolving the URL.  Names saved/printed files
+        # even when this case reached us with only its S. Ct. cite.
+        self._us_reports_cite: str = ""
         self._pdf_prefetch_started = False
         # CourtListener text view: whether a PDF was located anywhere (None =
         # still looking, True/False = found/not), gating its "View PDF" button.
@@ -17735,6 +17763,20 @@ class _ScholarTextWindow:
             "court": bb["court"],
         }
 
+    def _pdf_filename_item(self) -> dict:
+        """:meth:`_filename_item` for the PDF on screen, which is filed under
+        the reporter it actually shows.  Google Scholar hands a SCOTUS case
+        only its S. Ct. cite often enough, and naming a U.S. Reports scan after
+        the Supreme Court Reporter misdescribes every page in it.  The text
+        exports keep :meth:`_filename_item` — they carry the Scholar text, and
+        its star pagination, not these pages."""
+        item = self._filename_item()
+        us_cite = getattr(self, "_us_reports_cite", "")
+        if us_cite and _is_us_reports_pdf(getattr(self, "_pdf_url", "") or ""):
+            item = dict(item)
+            item["_us_reports_cite"] = us_cite
+        return item
+
     def _export_section_list(self) -> list[tuple[str, str, str, str]]:
         """
         Sections for a full-document export, as (running-head label, start,
@@ -19662,9 +19704,16 @@ class _ScholarTextWindow:
     # CourtListener-view "View PDF" button
     # ------------------------------------------------------------------
 
-    def _remember_case_law_pdf_choices(self, item: dict) -> None:
+    def _remember_resolved_pdf_info(self, item: dict) -> None:
+        """Carry back what resolving the PDF URL discovered.  ``_pdf_item``
+        hands the resolver a *copy*, so anything it learned — the reporter
+        scans on offer, and the U.S. Reports cite of the pages it settled on —
+        has to be read off that copy here."""
         choices = item.get("_case_law_pdf_choices") or []
         self._case_law_pdf_choices = list(choices)
+        us_cite = item.get("_us_reports_cite") or ""
+        if us_cite:
+            self._us_reports_cite = us_cite
         self._post(self._refresh_pdf_button)
 
     def _post_pdf_menu(self) -> None:
@@ -19841,7 +19890,7 @@ class _ScholarTextWindow:
             url = None
             try:
                 url = self._app._resolve_pdf_url(client, item)
-                self._remember_case_law_pdf_choices(item)
+                self._remember_resolved_pdf_info(item)
             except Exception as exc:
                 print(f"[pdf] resolve failed: {exc}")
             if not url:
@@ -19899,7 +19948,7 @@ class _ScholarTextWindow:
         def run() -> None:
             try:
                 url = self._app._resolve_pdf_url(client, item)
-                self._remember_case_law_pdf_choices(item)
+                self._remember_resolved_pdf_info(item)
                 if not url:
                     return
                 fetched = _fetch_pdf_bytes(url, client=client, timeout=30)
@@ -19957,7 +20006,7 @@ class _ScholarTextWindow:
                     self._app._resolve_pdf_url(client, item)
                     if client is not None else None
                 )
-                self._remember_case_law_pdf_choices(item)
+                self._remember_resolved_pdf_info(item)
                 if not url:
                     self._post(self._on_pdf_error,
                                "No PDF is available for this opinion.")
@@ -20108,7 +20157,7 @@ class _ScholarTextWindow:
         data = getattr(self, "_pdf_bytes", None)
         if not data:
             return
-        default = _build_default_filename(self._filename_item())
+        default = _build_default_filename(self._pdf_filename_item())
         path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
@@ -20149,7 +20198,8 @@ class _ScholarTextWindow:
                 print(f"[pdf] header citation failed: {exc}")
         # Name the print file the same as "Download PDF" would, so a Save-As
         # from the viewer already carries the Bluebook citation.
-        path = _named_temp_pdf_path(_build_default_filename(self._filename_item()))
+        path = _named_temp_pdf_path(
+            _build_default_filename(self._pdf_filename_item()))
         try:
             if self._pdf_pane is not None:
                 self._pdf_pane.export_pdf(
@@ -20222,7 +20272,7 @@ class _ScholarTextWindow:
         def run() -> None:
             try:
                 url = self._app._resolve_pdf_url(client, item)
-                self._remember_case_law_pdf_choices(item)
+                self._remember_resolved_pdf_info(item)
             except Exception:
                 url = None
             self._post(self._after_resolve_for_browser, url)

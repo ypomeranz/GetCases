@@ -173,6 +173,248 @@ _RECORD_CITE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The Reporter of Decisions' running head, printed across the top of every
+# other page of a slip opinion or a bound-volume excerpt: "Cite as: 583 U. S.
+# 48 (2018)", or "Cite as: 609 U. S. ___ (2026)" before the volume is paged.
+# It cites the very opinion being read, so linking it only offers the reader a
+# trip back to where they already are — and, because the head sits between the
+# text of one page and the next, letting it register as a citation would also
+# hijack any "Id." that opens the following page.
+RUNNING_HEAD_CITE_RE = re.compile(
+    r"Cite\s+as\s*:\s*\d{1,4}\s+U\.\s?S\.\s+(?:\d{1,5}|_{2,})"
+    r"(?:\s*\(\s*\d{4}\s*\))?",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# How much text a case-citation link should cover
+# ---------------------------------------------------------------------------
+# The reporter cite ("534 U. S. 266") is what the regexes find, but a reader
+# sees one citation: "United States v. Arvizu, 534 U. S. 266, 277 (2002)".
+# The span is grown to that whole unit — name, reporter cite, pin cite, and the
+# court/year parenthetical — so the blue text matches the citation rather than
+# a fragment of it.  Explanatory parentheticals ("(plurality opinion)",
+# "(holding that …)") are left out: they are commentary, not the cite.
+
+# A parenthetical belongs to the citation when it *ends* in a year — "(2002)",
+# "(4th Cir. 2024)", "(D. Md. Apr. 30, 2015)".  Nothing else qualifies, which
+# is what keeps "(holding that the totality controls)" black.
+_COURT_YEAR_PAREN_RE = re.compile(r"\s*\((?:[^()]{0,60}?[\s.])?(?:1[6-9]|20)\d{2}\)")
+
+# Additional pin pages hanging off the first ("at 277, 280-281").
+_EXTRA_PIN_RE = re.compile(r",\s*\*?\d{1,6}(?:\s*[-–—]\s*\*?\d{1,6})?(?!\d|\s*[A-Z])")
+
+# Lowercase words that sit *inside* a case name and must not end the backward
+# scan for one ("District of Columbia v. Wesby", "Rhode Island ex rel. …").
+_NAME_CONNECTORS = frozenset({
+    "of", "the", "and", "for", "et", "al", "al.", "ex", "rel.", "rel",
+    "de", "del", "des", "du", "da", "dos", "la", "le", "van", "von",
+    "den", "der", "&", "on", "to",
+})
+
+# Words that can never begin a case name, so the scan stops before them even
+# though many are capitalized at the start of a sentence or signal phrase.
+_NAME_STOPPERS = frozenset({
+    "see", "cf", "cf.", "accord", "compare", "contra", "citing", "quoting",
+    "quoted", "e.g", "e.g.", "eg", "but", "also", "id", "id.", "ibid",
+    "ibid.", "supra", "infra", "in", "at", "from", "under", "with", "than",
+    "that", "since", "because", "overruled", "overruling", "rev'd", "aff'd",
+    "cert", "cert.", "denied", "granted", "citation", "citations", "omitted",
+    "quotation", "internal", "marks", "per", "curiam", "slip", "op", "op.",
+    "no", "no.", "nos.", "v", "v.", "vs", "vs.",
+})
+
+# An abbreviation a name may legitimately contain ("Mgmt.", "Corp.", "U.S.",
+# "R.R.", "E.").  Any *other* period-terminated word — "Amendment.",
+# "reversed." — is the end of the previous sentence, and stops the scan.
+_NAME_ABBREV_RE = re.compile(r"^(?:[A-Z][A-Za-z'’]{0,6}\.|(?:[A-Z]\.){1,4})$")
+
+# Punctuation that can trail a word without being part of it.  Stripped before
+# the sentence-end test, so a quotation's closing mark cannot hide the period
+# that ends it — 'Amendment."' is still the end of a sentence.
+_NAME_TRAIL = ",;:”\"’')]}"
+
+# A token that can sit inside a party name: capitalized, quoted, or a company
+# designation like "3M".  A bare number is not — that is a page number from a
+# running head or the tail of an earlier citation.
+_NAME_TOKEN_RE = re.compile(r"^[\"“'(]?(?:[A-Z]|\d+[A-Za-z])")
+
+# "In re Winship", "Ex parte Young", "Matter of Doe" — a case name with no
+# "v." in it, anchored to the end of the window before the citation.
+_NAME_NO_V_RE = re.compile(
+    r"(?:In\s+re|In\s+the\s+Matter\s+of|Ex\s+parte|Matter\s+of)\s+"
+    r"[A-Z][\w.,'’&()-]*(?:\s+[\w.,'’&()-]+){0,6}$"
+)
+
+
+def _case_name_start(
+    text: str, cite_start: int, floor: int, *, single_party: bool = False,
+) -> "int | None":
+    """Index where the case name introducing the citation at *cite_start*
+    begins, or ``None`` when no name reads as one.
+
+    The scan never crosses *floor* — the end of the last thing already linked,
+    or of a running head — so a name can never swallow a neighbouring citation
+    or the page furniture above it.  ``single_party`` also accepts the one-name
+    form a short cite uses ("Carpenter, 585 U. S., at 312"); a full citation
+    requires a real "v." (or an "In re"-style) name, since a lone capitalized
+    word before a full cite is far more often just prose.
+    """
+    head = text[floor:cite_start]
+    # Bluebook always separates the name from the volume with a comma.
+    tail = re.search(r",\s*$", head)
+    if not tail:
+        return None
+    head = head[:tail.start()]
+    if not head.strip():
+        return None
+
+    nov = _NAME_NO_V_RE.search(head)
+    if nov:
+        return floor + nov.start()
+
+    # The last "v." in the window opens the second party; everything after it
+    # (up to the comma) is that party, everything before it the first.
+    vees = list(re.finditer(r"(?<=[\w.'’)\]])\s+v[s]?\.\s+", head))
+    if vees:
+        split = vees[-1]
+        right = head[split.end():]
+        if not right or len(right) > 70:
+            return None
+        if not all(_name_token_ok(t) for t in right.split()):
+            return None
+        left_end = split.start()
+    elif single_party:
+        left_end = len(head)
+    else:
+        return None
+
+    lone = single_party and not vees
+    toks = list(re.finditer(r"\S+", head[:left_end]))
+    i = len(toks)
+    while i > 0:
+        tok = toks[i - 1].group(0)
+        low = tok.lower().strip(",;:")
+        if low in _NAME_STOPPERS:
+            break
+        if lone and i < len(toks) and tok.endswith(","):
+            # With no "v." to anchor it, the party is whatever follows the
+            # nearest comma — "Later, Carpenter, 585 U. S., at 312" cites
+            # Carpenter, not "Later, Carpenter".
+            break
+        if _NAME_TOKEN_RE.match(tok):
+            # A period ends the previous sentence unless it is an abbreviation
+            # a name could contain.
+            core = tok.rstrip(_NAME_TRAIL)
+            if core.endswith(".") and not _NAME_ABBREV_RE.match(core):
+                break
+            i -= 1
+            continue
+        if low in _NAME_CONNECTORS:
+            i -= 1
+            continue
+        break
+    # A name never *starts* with a connector ("of Columbia v. Wesby").
+    while i < len(toks) and toks[i].group(0).lower().strip(",;:") in _NAME_CONNECTORS:
+        i += 1
+    if i >= len(toks):
+        return None
+    if lone and len(toks) - i > 4:
+        return None  # a lone party is one or two words, not half a sentence
+    start = toks[i].start()
+    if left_end - start > 90:
+        return None  # implausibly long for a case name — leave it alone
+    return floor + start
+
+
+# ---------------------------------------------------------------------------
+# Statutes and regulations cited several sections at a time
+# ---------------------------------------------------------------------------
+# "18 U. S. C. §§ 1505, 1512, 1519" is three citations sharing one title, and
+# the section-symbol regexes stop at the first.  The rest are picked up here
+# and linked individually, each inheriting the title it was written under.
+# A *range* ("§§ 1505-1515") is deliberately not split: the whole range reads
+# as one citation and is highlighted as one, and the section group already
+# carries the dash, which load_section resolves to the opening provision.
+
+# ", 1512" / ", § 1512(b)" / ", 1614.106" — a bare section following the first,
+# optionally repeating the section symbol, with its own subsections.
+_MORE_SECTIONS_RE = re.compile(
+    r"(,\s*(?:and\s+)?|\s+and\s+)(?:§+\s*)?"
+    r"(\d+(?:\.\d+)?[a-zA-Z0-9]*(?:[-–—]\d+(?:\.\d+)?[a-zA-Z0-9]*)?)"
+    r"((?:\s?\((?:\d{1,3}|[ivxIVX]{2,4}|[a-zA-Z]{1,3})\))*)"
+)
+
+
+def _sibling_section_cites(
+    text: str, m: re.Match, dotted: bool,
+) -> list[tuple[int, int, str]]:
+    """Extra ``(start, end, spec)`` links for the sections listed after the
+    first in a multi-section citation.
+
+    *m* is a ``USC_CITE_RE``/``CFR_CITE_RE`` match and *dotted* says whether
+    that source numbers its sections with a dot (C.F.R. "1614.105") — the test
+    that keeps a plain pin cite or a date from being read as another section.
+    """
+    title = m.group(1)
+    plural = "§§" in m.group(0) or re.search(r"[Ss]ec(?:tions|s)\b", m.group(0))
+    out: list[tuple[int, int, str]] = []
+    pos = m.end()
+    while True:
+        nxt = _MORE_SECTIONS_RE.match(text, pos)
+        if not nxt:
+            break
+        section = nxt.group(2)
+        # C.F.R. sections always carry a part.section dot; a U.S.C. section
+        # never does.  Anything shaped the other way is a different animal —
+        # a pin cite, a year, a subsection — and ends the list.
+        if dotted != ("." in section):
+            break
+        # Without a plural section symbol ("§ 1505, 1512"), a following bare
+        # number is much more likely a pin cite or a date than a second
+        # section, so only an explicitly repeated "§" is trusted.
+        if not plural and "§" not in nxt.group(0):
+            break
+        subs = re.findall(r"\(([^)]+)\)", nxt.group(3) or "")
+        spec = (f"{title}:{section.replace('–', '-').replace('—', '-')}:"
+                f"{','.join(subs)}")
+        # The link covers the section itself, not the comma introducing it.
+        out.append((nxt.start() + len(nxt.group(1)), nxt.end(), spec))
+        pos = nxt.end()
+    return out
+
+
+def _name_token_ok(tok: str) -> bool:
+    low = tok.lower().strip(",;:")
+    if low in _NAME_STOPPERS:
+        return False
+    return bool(_NAME_TOKEN_RE.match(tok)) or low in _NAME_CONNECTORS
+
+
+def _case_cite_span(
+    text: str, start: int, end: int, floor: int, *, short: bool = False,
+) -> "tuple[int, int]":
+    """Grow the reporter-cite span ``(start, end)`` to the whole citation the
+    reader sees: case name, pin cite, and court/year parenthetical."""
+    name_start = _case_name_start(text, start, floor, single_party=short)
+    if name_start is not None:
+        start = name_start
+    if not short:
+        # A short cite's own regex already ends at its pin page.
+        pin = PINCITE_AFTER_RE.match(text, end)
+        if pin:
+            end = pin.end()
+    while True:
+        extra = _EXTRA_PIN_RE.match(text, end)
+        if not extra:
+            break
+        end = extra.end()
+    paren = _COURT_YEAR_PAREN_RE.match(text, end)
+    if paren:
+        end = paren.end()
+    return start, end
+
 
 def norm_reporter(rep: str) -> str:
     """Legacy reporter key, ignoring spacing/case (``U. S.`` == ``U.S.``).
@@ -787,8 +1029,12 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         matches.append((m.start(), m.end(), "cite", m))
     for m in us_code.USC_CITE_RE.finditer(text):
         matches.append((m.start(), m.end(), "usc", m))
+        for s, e, spec in _sibling_section_cites(text, m, dotted=False):
+            matches.append((s, e, "usc-spec", spec))
     for m in ecfr.CFR_CITE_RE.finditer(text):
         matches.append((m.start(), m.end(), "cfr", m))
+        for s, e, spec in _sibling_section_cites(text, m, dotted=True):
+            matches.append((s, e, "cfr-spec", spec))
     for m in fed_rules.RULE_CITE_RE.finditer(text):
         matches.append((m.start(), m.end(), "rule", m))
     for m in constitution.CONST_CITE_RE.finditer(text):
@@ -823,6 +1069,10 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
             matches.append((m.start(), m.end(), "stat", m))
 
     matches.sort(key=lambda t: (t[0], -t[1]))
+    # The running head cites the opinion in hand; skip anything inside it, and
+    # keep a name grab from reaching back through one into the page above.
+    head_spans = [(hm.start(), hm.end())
+                  for hm in RUNNING_HEAD_CITE_RE.finditer(text)]
     out: list[tuple[int, int, tuple[str, str]]] = []
     pos = 0
     last_cite_action: tuple[str, str] | None = None
@@ -831,6 +1081,8 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     for start, end, kind, m in matches:
         if start < pos:
             continue  # overlapping match — first/longest wins
+        if any(start < he and hs < end for hs, he in head_spans):
+            continue  # the reporter's running head, not a citation to follow
         action: tuple[str, str] | None
         cite_base = ""
         if kind == "cite":
@@ -848,6 +1100,9 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
             action = ("usc", us_code.cite_spec(m))
         elif kind == "cfr":
             action = ("cfr", ecfr.cite_spec(m))
+        elif kind in ("usc-spec", "cfr-spec"):
+            # A later section of a multi-section cite; m is the built spec.
+            action = (kind.split("-")[0], m)
         elif kind == "rule":
             action = ("rule", fed_rules.cite_spec(m))
         elif kind == "const":
@@ -905,12 +1160,30 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         else:  # pragma: no cover - defensive
             action = None
         if action is not None:
-            out.append((start, end, action))
+            span_start, span_end = start, end
+            if kind in ("cite", "shortcite"):
+                # Blue the citation the reader sees, not just the reporter
+                # fragment the regex matched.  The name may not reach back past
+                # anything already linked, or past a running head.
+                floor = pos
+                for hs, he in head_spans:
+                    if he <= start:
+                        floor = max(floor, he)
+                span_start, span_end = _case_cite_span(
+                    text, start, end, floor, short=(kind == "shortcite"),
+                )
+            out.append((span_start, span_end, action))
             if kind in ("cite", "shortcite"):
                 last_cite_action = ("cite", cite_base)
-            else:
+            elif kind != "idcite":
+                # An "Id." must not become the antecedent of the next "Id." —
+                # chaining its already-pinned value builds a malformed
+                # "410 U.S. 113@48@32".  Keep pointing at the real citation,
+                # as the opinion reader's own dispatch does.
                 last_cite_action = action
-            last_cite_end = end
+            last_cite_end = span_end
+            pos = span_end
+            continue
         pos = end
     return out
 
