@@ -11452,10 +11452,11 @@ def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PDF (LaTeX) + Markdown export.  Both writers share a formatting-preserving
-# dump of the reader's Tk Text widget (_dump_export_paragraphs) that mirrors
-# _dump_to_rtf's tag handling: on-screen justification fragments are dropped,
-# the hidden hyphenation originals are kept.
+# LaTeX export (typeset to PDF here, or saved as .tex to typeset elsewhere).
+# The writer works from a formatting-preserving dump of the reader's Tk Text
+# widget (_dump_export_paragraphs) that mirrors _dump_to_rtf's tag handling:
+# on-screen justification fragments are dropped, the hidden hyphenation
+# originals are kept.
 # ---------------------------------------------------------------------------
 
 
@@ -11503,7 +11504,7 @@ def _dump_export_paragraphs(
     fn_links: dict[str, tuple[str, str]],
 ) -> list[_ExpPara]:
     """Convert Tk Text ranges (with the Scholar window's tags) into styled
-    paragraphs — the shared source for the LaTeX and Markdown exports."""
+    paragraphs — the source the LaTeX export is written from."""
     paras: list[_ExpPara] = []
     for start, end in ranges:
         active: set[str] = set(txt.tag_names(start))
@@ -12026,77 +12027,6 @@ def _compile_latex(
             log = (proc.stdout or "") + (proc.stderr or "")
         lines = [ln for ln in log.splitlines() if ln.strip()]
         return False, "\n".join(lines[-15:])
-
-
-# Markdown escapes: emphasis/link specials always; list/quote/heading
-# markers only where they'd start a block.
-_MD_SPECIAL_RE = re.compile(r"([\\`*_\[\]])")
-_MD_LINE_START_RE = re.compile(r"^(\s*)([#>+\-])")
-_MD_ORDERED_RE = re.compile(r"^(\s*\d+)\.")
-
-
-def _md_escape(s: str) -> str:
-    return _MD_SPECIAL_RE.sub(r"\\\1", s)
-
-
-def _md_block_guard(s: str) -> str:
-    s = _MD_LINE_START_RE.sub(r"\1\\\2", s)
-    return _MD_ORDERED_RE.sub(r"\1\\.", s)
-
-
-def _md_run(run: _ExpRun, ref_ids: dict[str, str]) -> str:
-    """One styled run as Markdown.  `ref_ids` maps footnote anchor ids to
-    Markdown footnote ids ([^id])."""
-    if run.pagenum:
-        text = run.text
-        lead = text[: len(text) - len(text.lstrip())]
-        trail = text[len(text.rstrip()):]
-        return lead + "**" + _md_escape(text.strip()) + "**" + trail
-    if run.fnref:
-        rid = ref_ids.get(run.fnref)
-        if rid:
-            return f"[^{rid}]"
-        return "<sup>" + _md_escape(run.text.strip()) + "</sup>"
-    if run.fndef:
-        return "**" + _md_escape(run.text.strip()) + "**"
-    text = run.text
-    core = text.strip()
-    if not core or not (run.bold or run.italic or run.sup):
-        return _md_escape(text)
-    lead = text[: len(text) - len(text.lstrip())]
-    trail = text[len(text.rstrip()):]
-    core = _md_escape(core)
-    if run.bold and run.italic:
-        core = f"***{core}***"
-    elif run.bold:
-        core = f"**{core}**"
-    elif run.italic:
-        core = f"*{core}*"
-    if run.sup:
-        core = f"<sup>{core}</sup>"
-    return lead + core + trail
-
-
-def _md_paragraphs(
-    paras: list[_ExpPara], ref_ids: Optional[dict[str, str]] = None
-) -> list[str]:
-    """Paragraphs as Markdown blocks (no trailing newlines)."""
-    ref_ids = ref_ids or {}
-    blocks: list[str] = []
-    for p in paras:
-        if p.kind == "fnhead":
-            continue
-        body = "".join(_md_run(r, ref_ids) for r in p.runs).strip()
-        if not body:
-            continue
-        body = _md_block_guard(body)
-        if p.kind == "blockquote":
-            blocks.append("> " + body)
-        elif p.kind == "heading":
-            blocks.append("#### " + body)
-        else:
-            blocks.append(body)
-    return blocks
 
 
 def _copy_rich_clipboard(widget: tk.Misc, rtf: str, plain: str) -> str:
@@ -14748,7 +14678,8 @@ class _ScholarTextWindow:
         a Bluebook citation pin-cited from the star pagination,
       • Export ▾ — RTF (two-column), PDF typeset with LaTeX (single column,
         bottom-of-page footnotes, reporter page range in the running head),
-        or Markdown, each named after the Bluebook caption,
+        or that same document as editable .tex source, each named after the
+        Bluebook caption,
       • PDF — the official opinion PDF, shown in-app (Download PDF there),
       • a toggle to the CourtListener version of the text.
     """
@@ -15288,7 +15219,7 @@ class _ScholarTextWindow:
         self._btn_frame = btn_frame  # PDF/text panes pack just above this
         # (Copy-with-citation lives on Ctrl-C / Cmd-C; no button needed.)
         # In text view this drops the export menu (RTF / PDF via LaTeX /
-        # Markdown); in PDF view it becomes "Download PDF".
+        # .tex source); in PDF view it becomes "Download PDF".
         self._export_btn = _ui_button(
             btn_frame, "Export ▾", command=self._post_export_menu, width=104
         )
@@ -18162,7 +18093,7 @@ class _ScholarTextWindow:
             CourtListenerGUI._open_file(path)
 
     # ------------------------------------------------------------------
-    # PDF (LaTeX) and Markdown export
+    # LaTeX export: typeset to PDF, or saved as editable .tex
     # ------------------------------------------------------------------
 
     def _post_export_menu(self) -> None:
@@ -18172,8 +18103,8 @@ class _ScholarTextWindow:
                          command=self._export_rtf)
         menu.add_command(label="PDF (.pdf) — typeset with LaTeX…",
                          command=self._export_pdf_latex)
-        menu.add_command(label="Markdown (.md)…",
-                         command=self._export_markdown)
+        menu.add_command(label="LaTeX source (.tex) — edit, then typeset…",
+                         command=self._export_latex_source)
         btn = self._export_btn
         try:
             menu.tk_popup(btn.winfo_rootx(),
@@ -18213,7 +18144,7 @@ class _ScholarTextWindow:
         """
         The footnote-body regions inside a section, plus each note parsed
         into (anchor id, label, body paragraphs) with its leading marker
-        stripped — shared by the LaTeX and Markdown writers.
+        stripped — used by the LaTeX writer.
         """
         txt = self._text
         regions = sorted(
@@ -18338,10 +18269,11 @@ class _ScholarTextWindow:
                 "LaTeX Not Found",
                 "Exporting to PDF needs a LaTeX installation (pdflatex, "
                 "xelatex, lualatex or tectonic), and none was found on "
-                "this system.\n\nExport a Markdown (.md) file instead?",
+                "this system.\n\nSave the LaTeX source (.tex) instead?  It "
+                "will typeset anywhere LaTeX is installed.",
                 parent=self._win,
             ):
-                self._export_markdown()
+                self._export_latex_source()
             return
         tex = self._with_full_view(self._build_export_latex)
         default = _build_default_filename(self._filename_item())
@@ -18384,90 +18316,32 @@ class _ScholarTextWindow:
         ):
             CourtListenerGUI._open_file(path)
 
-    def _build_export_markdown(self) -> str:
-        """
-        The full opinion as Markdown: title and Bluebook citation up top, a
-        horizontal rule and heading before each separate opinion, bold
-        star-pagination markers inline, and footnotes as Markdown footnotes
-        ([^4]) collected at the end of the opinion that cites them.
-        """
-        txt = self._text
-        fn_links = self._fn_link_map()
-        case_line = self._bluebook_citation(None)[0]
-        sections = self._export_section_list()
-
-        blocks: list[str] = []
-        name = self._citation_name()
-        if name:
-            blocks.append("# " + _md_escape(name))
-            if case_line.startswith(name):
-                blocks.append("*" + _md_escape(name) + "*"
-                              + _md_escape(case_line[len(name):]))
-            else:
-                blocks.append(_md_escape(case_line))
-        elif case_line.rstrip("."):
-            blocks.append("# " + _md_escape(case_line.rstrip(".")))
-
-        used_ids: set[str] = set()
-        for i, (label, rs, rend, kind) in enumerate(sections):
-            regions, parsed = self._section_note_map(rs, rend, fn_links)
-            ref_ids: dict[str, str] = {}
-            defs: list[tuple[str, list[str]]] = []
-            leftovers: list[tuple[str, list[str]]] = []
-            for fid, note_label, paras in parsed:
-                note_blocks = _md_paragraphs(paras)
-                if not note_blocks:
-                    continue
-                if fid:
-                    base = re.sub(r"\W+", "", note_label) or "sym"
-                    rid, n = base, 2
-                    while rid in used_ids:
-                        rid = f"{base}-{n}"
-                        n += 1
-                    used_ids.add(rid)
-                    ref_ids[fid] = rid
-                    defs.append((rid, note_blocks))
-                else:
-                    leftovers.append((note_label, note_blocks))
-
-            if i:
-                blocks.append("---")
-                blocks.append("## " + _md_escape(label or kind.title()))
-            body_paras = _dump_export_paragraphs(
-                txt, _section_body_ranges(rs, rend, regions), fn_links
-            )
-            blocks.extend(_md_paragraphs(body_paras, ref_ids))
-            for rid, note_blocks in defs:
-                first = note_blocks[0]
-                cont = "".join(
-                    "\n\n    " + b.replace("\n", "\n    ")
-                    for b in note_blocks[1:]
-                )
-                blocks.append(f"[^{rid}]: {first}{cont}")
-            if leftovers:
-                blocks.append("**Footnotes**")
-                for note_label, note_blocks in leftovers:
-                    body = "\n\n".join(note_blocks)
-                    blocks.append(f"**{_md_escape(note_label)}.** {body}")
-        return "\n\n".join(blocks) + "\n"
-
-    def _export_markdown(self) -> None:
-        md = self._with_full_view(self._build_export_markdown)
+    def _export_latex_source(self) -> None:
+        """Save the LaTeX document the PDF export typesets, without typesetting
+        it.  Same source, so it builds to the same PDF — but the reader can edit
+        it first, and it needs no LaTeX installed here to be worth having."""
+        tex = self._with_full_view(self._build_export_latex)
         default = _build_default_filename(self._filename_item())
         path = filedialog.asksaveasfilename(
-            defaultextension=".md",
-            filetypes=[("Markdown", "*.md"), ("All files", "*.*")],
-            initialfile=f"{default}.md",
-            title="Export Opinion as Markdown",
+            defaultextension=".tex",
+            filetypes=[("LaTeX source", "*.tex"), ("All files", "*.*")],
+            initialfile=f"{default}.tex",
+            title="Export Opinion as LaTeX Source",
             parent=self._win,
         )
         if not path:
             return
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(md)
-        self._status_var.set(f"Exported Markdown: {path}")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(tex)
+        except OSError as exc:
+            self._status_var.set("LaTeX export failed.")
+            messagebox.showerror("Export Failed", str(exc), parent=self._win)
+            return
+        self._status_var.set(f"Exported LaTeX source: {path}")
         if messagebox.askyesno(
-            "Export Complete", f"Markdown saved to:\n{path}\n\nOpen it now?",
+            "Export Complete",
+            f"LaTeX source saved to:\n{path}\n\nOpen it now?",
             parent=self._win,
         ):
             CourtListenerGUI._open_file(path)
