@@ -2873,6 +2873,57 @@ def _case_law_json_case(cite: str) -> "Optional[tuple[str, str]]":
     return (record.text, record.citation) if record is not None else None
 
 
+# CAP writes the Supreme Court's abbreviation as "U.S."; the app's own id for
+# it is "scotus", which is also what gives the badge its accent colour.
+_CAP_SCOTUS_RE = re.compile(
+    r"^(?:U\.\s?S\.|Supreme Court of the United States)$", re.IGNORECASE)
+
+
+def _court_for_citation(client, cite: str, name: str = "") -> tuple[str, str]:
+    """``(court_id, badge label)`` for a citation whose court a search result
+    did not carry — ``("", "")`` when neither source knows it.
+
+    Some results arrive without a court at all: a Federal Appendix citation is
+    answered straight from static.case.law, and a Google Scholar hit may name
+    no court on its page.  Both sources here are keyed on the citation, so
+    neither can drift to a merely similar case.
+
+    CourtListener is asked first because it answers with the app's own court
+    id, which drives the badge's colour and label together.  CAP's per-case
+    JSON is the fallback: its ``name_abbreviation`` is already a Bluebook-style
+    label ("4th Cir.", "S.D.N.Y."), good enough to show even though it carries
+    no id of ours.
+    """
+    cite = (cite or "").split("@", 1)[0].strip()
+    if not cite:
+        return "", ""
+    if client is not None:
+        try:
+            item = _cl_item_for_citation(client, cite, name)
+        except Exception as exc:
+            print(f"[spot-court] CourtListener lookup failed for {cite!r}: {exc}")
+            item = None
+        cid = str((item or {}).get("court_id") or "").strip().lower()
+        if cid:
+            return cid, ""
+    try:
+        data = _case_law_metadata(cite) or {}
+    except Exception as exc:
+        print(f"[spot-court] case.law lookup failed for {cite!r}: {exc}")
+        return "", ""
+    court = data.get("court")
+    if not isinstance(court, dict):
+        return "", ""
+    label = str(
+        court.get("name_abbreviation") or court.get("name") or ""
+    ).strip()
+    if not label:
+        return "", ""
+    if _CAP_SCOTUS_RE.match(label):
+        return "scotus", ""
+    return "", label
+
+
 def _link_name(text: str) -> str:
     """The case name in a cited-case hyperlink's text ("Calder v. Bull, 3 Dall.
     386, 388 (1798)" → "Calder v. Bull"), or "" — used to locate the case on
@@ -6460,6 +6511,29 @@ class CourtListenerGUI:
             "name": name_lbl, "detail": detail_lbl, "modern": False,
         }
 
+    @staticmethod
+    def _spot_court_label(court_id: str) -> str:
+        """Badge text for a court id, or the placeholder when none is known."""
+        if court_id == "scotus":
+            return "SCOTUS"
+        if court_id == "engrep":
+            return "Eng. Rep."
+        if not court_id:
+            return "?"
+        return _COURT_BLUEBOOK.get(court_id, court_id.upper())
+
+    def _spot_set_badge(self, r: dict, court_id: str, label: str = "") -> None:
+        """Re-label a result's court badge, in either widget toolkit."""
+        text = label or self._spot_court_label(court_id)
+        color = self._spot_tier_color(court_id)
+        try:
+            if r["modern"]:
+                r["badge"].configure(text=text, fg_color=color)
+            else:
+                r["badge"].config(text=text, bg=color)
+        except tk.TclError:
+            pass
+
     def _spot_highlight_row(self, r: dict, selected: bool) -> None:
         """Colour a result row for the current keyboard/hover selection."""
         if r["modern"]:
@@ -6628,39 +6702,56 @@ class CourtListenerGUI:
                           if detail else source_label)
             return detail
 
-        def _promote_row(r: dict) -> None:
-            """Move a result to the first visible slot, preserving its widget."""
-            try:
-                index = result_rows.index(r)
-            except ValueError:
-                return
-            if index == 0:
-                return
-            try:
-                r["row"].pack_configure(before=result_rows[0]["row"])
-            except tk.TclError:
-                return
-            result_rows.pop(index)
-            result_rows.insert(0, r)
-            selected_idx[0] = -1
-
         def _replace_row(r: dict, cite: str, year: str, source_label: str,
-                         open_fn, *, promote: bool = False) -> None:
+                         open_fn) -> None:
             # A preferred source (Google Scholar) took over an already-shown
             # row: swap its opener and re-label the detail line.  Badge and name
-            # stay — it is the same case, so they already match.
+            # stay — it is the same case, so they already match.  The row does
+            # not move: it is the same case either way, and a row that shifts
+            # under the pointer is a misclick waiting to happen.
             r["open_fn"] = open_fn
             try:
                 r["detail"].configure(
                     text=_detail_text(cite, year, source_label))
             except tk.TclError:
                 pass
-            if promote:
-                _promote_row(r)
+
+        def _resolve_court(r: dict, cite: str, name: str) -> None:
+            """Fill in a result's court badge once someone can tell us it.
+
+            A result that arrives with no court — a Federal Appendix citation
+            answered from case.law, a Scholar hit whose page names none — shows
+            its placeholder immediately rather than waiting, and the badge is
+            filled in when the lookup lands.  Only the badge changes; the row
+            keeps its place.
+            """
+            def apply(cid: str, label: str) -> None:
+                if my_gen != self._spotlight_generation:
+                    return
+                self._spot_set_badge(r, cid, label)
+
+            def run() -> None:
+                cid = label = ""
+                try:
+                    client = (self._get_client()
+                              if self._token_var.get().strip() else None)
+                    cid, label = _court_for_citation(client, cite, name)
+                except Exception as exc:
+                    print(f"[spot-court] lookup failed for {cite!r}: {exc}")
+                # Always report back, even on a miss or a failure: the badge is
+                # showing a "looking" placeholder, and it must not sit there.
+                if not (cid or label):
+                    label = "?"
+                try:
+                    self.root.after(0, apply, cid, label)
+                except (tk.TclError, RuntimeError):
+                    pass
+
+            threading.Thread(target=run, daemon=True).start()
 
         def _add_result(bucket: str, court_id: str, name: str, cite: str,
                         year: str, source_label: str, open_fn,
-                        opinion_id: str = "", promote: bool = False) -> None:
+                        opinion_id: str = "") -> None:
             # Ignore results streaming in from a superseded search.
             if my_gen != self._spotlight_generation:
                 return
@@ -6686,7 +6777,7 @@ class CourtListenerGUI:
                     if _prefer_source(bucket, entry["bucket"]):
                         old_bucket = entry["bucket"]
                         _replace_row(entry["row"], cite, year, source_label,
-                                     open_fn, promote=promote)
+                                     open_fn)
                         entry["bucket"] = bucket
                         entry["row"]["bucket"] = bucket
                         if old_bucket != bucket:
@@ -6699,8 +6790,6 @@ class CourtListenerGUI:
                                 bucket_counts[bucket] = (
                                     bucket_counts.get(bucket, 0) + 1
                                 )
-                    elif promote:
-                        _promote_row(entry["row"])
                     entry["sig"]["cites"] |= sig["cites"]
                     entry["sig"]["series"] |= sig["series"]
                     entry["sig"]["court"] = entry["sig"]["court"] or sig["court"]
@@ -6716,35 +6805,14 @@ class CourtListenerGUI:
                     bucket, 99):
                 return
             if len(result_rows) >= max_rows:
-                if not promote:
-                    return
-                # A likely lead SCOTUS opinion should never lose a race to a
-                # slower source merely because ten streaming rows arrived
-                # first.  Evict the final row and reclaim its bucket slot.
-                victim = result_rows.pop()
-                shown[:] = [
-                    entry for entry in shown if entry["row"] is not victim
-                ]
-                victim_bucket = str(victim.get("bucket") or "")
-                if victim_bucket:
-                    bucket_counts[victim_bucket] = max(
-                        0, bucket_counts.get(victim_bucket, 0) - 1,
-                    )
-                try:
-                    victim["row"].destroy()
-                except tk.TclError:
-                    pass
+                return
 
-            # Append a fresh row at the bottom.  Rows are added in arrival order
-            # and never moved, so a result already on screen keeps its position
-            # while the dropdown grows downward to fit the new one.
-            court_abbr = _COURT_BLUEBOOK.get(
-                court_id, court_id.upper() if court_id else "?"
-            )
-            if court_id == "scotus":
-                court_abbr = "SCOTUS"
-            elif court_id == "engrep":
-                court_abbr = "Eng. Rep."
+            # Every result takes the highest free slot — the bottom of the list
+            # — and stays there.  Rows are never reordered once shown: a result
+            # the user is reaching for must not slide to a different rank
+            # because a slower source finally answered.
+            resolving = not court_id and bool(cite)
+            court_abbr = "…" if resolving else self._spot_court_label(court_id)
 
             display_name = name[:80] + ("…" if len(name) > 80 else "")
             detail = _detail_text(cite, year, source_label)
@@ -6760,8 +6828,10 @@ class CourtListenerGUI:
             shown.append({"sig": sig, "bucket": bucket, "row": r})
             if bucket:
                 bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
-            if promote:
-                _promote_row(r)
+            # No court on the result itself: the row is up already, so go and
+            # find one for the badge without holding anything back.
+            if resolving:
+                _resolve_court(r, cite, name)
 
             def on_click(_e=None, _r=r) -> None:
                 self._close_quick_popup()
@@ -6960,7 +7030,7 @@ class CourtListenerGUI:
                     results,
                     _BUCKET_CAPS["scholar"] + 2,
                 )
-            for result_index, r in enumerate(results):
+            for r in results:
                 court_id = _scholar_source_to_court_id(r.source)
                 year = _scholar_source_year(r.source)
                 # The case's own reporter citation sits in the source byline.
@@ -7003,7 +7073,6 @@ class CourtListenerGUI:
                     0, _add_result, "scholar", court_id, r.title, cite, year,
                     "Scholar", make_opener(),
                     _scholar_result_identity(r.url),
-                    result_index == 0 and court_id == _SCOTUS_COURT_ID,
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
