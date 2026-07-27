@@ -91,18 +91,28 @@ _ORD_ALT = _ord_alt()
 # ---------------------------------------------------------------------------
 _TAIL = (r"(?:\s*,?\s*(?:§|[Ss]ec(?:tion|\.)?)\s*\d+"
          r"(?:\s*,?\s*cls?\.?\s*\d+(?:\s*[\-–]\s*\d+)?)?)?")
-_ART_ROMAN = r"(?:VII|VI|V|IV|III|II|I)"
+# Roman numerals are matched case-sensitively even though the pattern as a
+# whole ignores case: lowercased, the numeral letters spell ordinary words, and
+# "the amendment did not" was being read as Amendment DID.  Nobody writes an
+# article or amendment number in lower case.
+_ROMAN_NUM = r"(?-i:[IVXLCDM]+)"
+_ART_ROMAN = r"(?-i:VII|VI|V|IV|III|II|I)"
 
+# Every alternative is anchored on both sides.  Without a boundary in front,
+# the "us" ending any number of words is read as "U. S." — "various
+# constitutional provisions" matched "us constitution" and linked the reader to
+# the Preamble.  Without one behind, "Constitution" matches inside
+# "constitutional", which is the same sentence's other half of the problem.
 CONST_CITE_RE = re.compile(
-    r"U\.?\s?S\.?\s+Const(?:itution|\.)"
+    r"\bU\.?\s?S\.?\s+Const(?:itution|\.)(?![A-Za-z])"
     r"(?:"
-    r"\s*,?\s*amend(?:ment)?\.?\s*(?:[IVXLCDM]+|\d+)" + _TAIL +
-    r"|\s*,?\s*art(?:icle)?\.?\s*(?:[IVXLCDM]+|\d+)" + _TAIL +
+    r"\s*,?\s*amend(?:ment)?\.?\s*(?:" + _ROMAN_NUM + r"|\d+)" + _TAIL +
+    r"|\s*,?\s*art(?:icle)?\.?\s*(?:" + _ROMAN_NUM + r"|\d+)" + _TAIL +
     r"|\s*,?\s*(?:pmbl\.?|preamble)"
     r")?"
-    r"|" + _ORD_ALT + r"\s+Amendment(?:['’]s)?"
-    r"|Amendment\s+(?:[IVXLCDM]+|\d+)" + _TAIL +
-    r"|Article\s+" + _ART_ROMAN + r"\b" + _TAIL,
+    r"|\b" + _ORD_ALT + r"\s+Amendments?(?:['’]s?)?\b"
+    r"|\bAmendment\s+(?:" + _ROMAN_NUM + r"|\d+)\b" + _TAIL +
+    r"|\bArticle\s+(?:" + _ART_ROMAN + r")\b" + _TAIL,
     re.IGNORECASE,
 )
 

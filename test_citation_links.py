@@ -523,6 +523,62 @@ class RecordCiteTests(unittest.TestCase):
                 self.assertEqual(found[0][1], ("cite", f"{want}@60"))
 
 
+class ConstitutionCiteTests(unittest.TestCase):
+    """A constitutional cite has to be a whole word at both ends.
+
+    In Dobbs the word "constitutional" opened a page, and the page before it
+    ended in a word ending "-us".  Joined by the newline the extractor puts
+    between pages, "…dangerous\\nconstitutional…" read as "U. S. Constitution"
+    and linked the reader to the Preamble.
+    """
+
+    def _consts(self, text):
+        return [text[s:e] for s, e, a in detect_links(text) if a[0] == "const"]
+
+    def test_constitution_inside_constitutional_is_not_a_cite(self):
+        self.assertEqual(self._consts("no state constitutional right"), [])
+
+    def test_a_word_ending_in_us_across_a_page_break_is_not_us_const(self):
+        for lead in ("dangerous", "various", "previous", "thus"):
+            with self.subTest(lead=lead):
+                self.assertEqual(
+                    self._consts(f"that is {lead}\nconstitutional analysis"), [])
+
+    def test_lower_case_words_are_not_roman_numerals(self):
+        # "[IVXLCDM]+" under IGNORECASE reads "did" as Amendment DID.
+        for text in ("the amendment did not signal an expansion",
+                     "the amendment im proposing",
+                     "the article iv wanted"):
+            with self.subTest(text=text):
+                self.assertEqual(self._consts(text), [])
+
+    def test_the_ordinary_forms_still_link(self):
+        for text, spec in [
+            ("U.S. Const. amend. XIV", "amend:14:"),
+            ("U. S. Const. amend. XIV, § 1", "amend:14:1"),
+            ("U.S. Const. art. I, § 8, cl. 3", "art:1:8"),
+            ("U.S. Const. pmbl.", "pmbl:0:"),
+            ("the Fourteenth Amendment", "amend:14:"),
+            ("the Fourth Amendment's protections", "amend:4:"),
+            ("Amendment XIV", "amend:14:"),
+            ("Article III", "art:3:"),
+        ]:
+            with self.subTest(text=text):
+                found = [(text[s:e], a) for s, e, a in detect_links(text)
+                         if a[0] == "const"]
+                self.assertEqual(len(found), 1, found)
+                self.assertEqual(found[0][1], ("const", spec))
+
+    def test_a_plural_amendment_still_links(self):
+        # "the Fifth and Fourteenth Amendments" is ordinary prose; the closing
+        # word boundary must not exclude the "s".
+        found = [(t, a) for t, a in
+                 _spans("under the Fifth and Fourteenth Amendments")
+                 if a[0] == "const"]
+        self.assertEqual(found,
+                         [("Fourteenth Amendments", ("const", "amend:14:"))])
+
+
 class IdChainTests(unittest.TestCase):
     def test_chained_id_does_not_stack_pin_pages(self):
         text = "See 841 F. Supp. 2d 20, 32 (DC 2012). Id., at 48. Id., at 32."
