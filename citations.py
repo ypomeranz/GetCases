@@ -301,6 +301,22 @@ _NAME_NO_V_RE = re.compile(
 )
 
 
+def _closes_parenthetical(tok: str) -> bool:
+    """True when *tok* shuts a parenthetical that opened in an earlier word.
+
+    A parenthetical between two citations belongs to the first one, not to the
+    second one's name.  Casey's syllabus reads "…462 U. S. 416 (Akron I), and
+    Thornburgh v. American College…"; without this the backward scan walks
+    through "and" and "I)," and starts the Thornburgh name at "(Akron", so the
+    two links run into each other on the page.
+
+    A parenthetical that opens and closes inside one word — a name's own
+    acronym, "…Gynecologists (ACOG), 476 U. S. 747" — is left alone.
+    """
+    core = tok.rstrip(",;:”\"’'")
+    return core.endswith(")") and "(" not in core
+
+
 def _mostly_italic(text: str, italic, lo: int, hi: int) -> bool:
     """True when the letters in ``text[lo:hi]`` are set in an italic face.
 
@@ -378,6 +394,8 @@ def _case_name_start(
             # With no "v." to anchor it, the party is whatever follows the
             # nearest comma — "Later, Carpenter, 585 U. S., at 312" cites
             # Carpenter, not "Later, Carpenter".
+            break
+        if _closes_parenthetical(tok):
             break
         if _NAME_TOKEN_RE.match(tok):
             # A period ends the previous sentence unless it is an abbreviation

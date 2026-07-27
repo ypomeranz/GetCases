@@ -226,6 +226,48 @@ class ShortenedNameTests(unittest.TestCase):
                 self.assertTrue(found[-1][0].startswith("165"), found)
 
 
+class ParentheticalBeforeANameTests(unittest.TestCase):
+    """A parenthetical between two cites belongs to the first one.
+
+    From Casey's syllabus: "…462 U. S. 416 (Akron I), and Thornburgh v.
+    American College…".  The backward name scan walked through "and" and
+    "I)," and began the Thornburgh name at "(Akron", so the second link
+    started where the first one ended and the two ran together on the page.
+    """
+
+    CASEY = ("It was expressly reaffirmed in Akron v. Akron Center for "
+             "Reproductive Health, Inc., 462 U. S. 416 (Akron I), and "
+             "Thornburgh v. American College of Obstetricians and "
+             "Gynecologists, 476 U. S. 747; and, in Webster v. Reproductive "
+             "Health Services, 492 U. S. 490, a majority either voted to "
+             "reaffirm.")
+
+    def test_the_two_cites_do_not_run_together(self):
+        self.assertEqual(
+            [t for t, _a in _spans(self.CASEY)],
+            ["Akron v. Akron Center for Reproductive Health, Inc., "
+             "462 U. S. 416",
+             "Thornburgh v. American College of Obstetricians and "
+             "Gynecologists, 476 U. S. 747",
+             "Webster v. Reproductive Health Services, 492 U. S. 490"],
+        )
+
+    def test_a_judge_parenthetical_is_not_part_of_the_next_name(self):
+        text = ("Carpenter v. United States, 585 U. S. 296 (2018). "
+                "See id., at 400 (Gorsuch, J.); Carpenter, 585 U. S., at 311.")
+        self.assertEqual(_spans(text)[-1][0], "Carpenter, 585 U. S., at 311")
+
+    def test_a_names_own_acronym_is_still_part_of_it(self):
+        # "(ACOG)" opens and closes inside one word, so it is the name's own
+        # short form rather than the previous citation's parenthetical.
+        text = ("See Thornburgh v. American College of Obstetricians (ACOG), "
+                "476 U. S. 747, 750 (1986).")
+        self.assertEqual(
+            _spans(text)[0][0],
+            "Thornburgh v. American College of Obstetricians (ACOG), "
+            "476 U. S. 747, 750 (1986)")
+
+
 class ShortCiteSpanTests(unittest.TestCase):
     def test_short_cite_keeps_name_and_pin(self):
         text = ("Carpenter v. United States, 585 U. S. 296, 311 (2018). "

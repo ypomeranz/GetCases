@@ -177,6 +177,11 @@ def _ui_font(size: int, weight: str = "normal"):
     return ("TkDefaultFont", size, "bold" if weight == "bold" else "normal")
 
 
+# The modifier a keyboard shortcut is spelled with in menu labels.  Tk keeps
+# Control and Command apart, so anything that shows one has to bind it too.
+_ACCEL = "Cmd" if sys.platform == "darwin" else "Ctrl"
+
+
 def _bind_recursive(widget, sequence: str, handler) -> None:
     """Bind *handler* for *sequence* on *widget* and all of its descendants.
 
@@ -436,7 +441,7 @@ def _add_copy_cascade(menubar: tk.Menu, reader) -> None:
         )
     copy_menu.add_separator()
     copy_menu.add_command(
-        label="Copy now\tCtrl+C", command=reader._copy_formatted)
+        label=f"Copy now\t{_ACCEL}+C", command=reader._copy_formatted)
     menubar.add_cascade(label="Copy", menu=copy_menu)
 
 
@@ -5768,7 +5773,7 @@ class CourtListenerGUI:
         lookup_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Look Up", menu=lookup_menu)
         lookup_menu.add_command(
-            label="U.S. Code / C.F.R. Section…", accelerator="Ctrl+L",
+            label="U.S. Code / C.F.R. Section…", accelerator=f"{_ACCEL}+L",
             command=self._show_statute_lookup,
         )
         lookup_menu.add_command(
@@ -5776,7 +5781,7 @@ class CourtListenerGUI:
             command=self._show_citation_list_dialog,
         )
         lookup_menu.add_command(
-            label="Quick Look Up (case or statute)…", accelerator="Ctrl+S",
+            label="Quick Look Up (case or statute)…", accelerator=f"{_ACCEL}+S",
             command=self._show_quick_lookup,
         )
         lookup_menu.add_command(
@@ -5786,7 +5791,7 @@ class CourtListenerGUI:
         brief_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Brief", menu=brief_menu)
         brief_menu.add_command(
-            label="Open Brief (highlight citations)…", accelerator="Ctrl+B",
+            label="Open Brief (highlight citations)…", accelerator=f"{_ACCEL}+B",
             command=self._open_brief,
         )
         brief_menu.add_command(
@@ -5819,9 +5824,14 @@ class CourtListenerGUI:
         # document view, so this one lists the saved bookmarks without the
         # "Bookmark This …" toggle the readers show first.
         _add_bookmarks_cascade(menubar, self, self.root)
-        self.root.bind("<Control-l>", lambda _e: self._show_statute_lookup())
-        self.root.bind("<Control-s>", lambda _e: self._show_quick_lookup())
-        self.root.bind("<Control-b>", lambda _e: self._open_brief())
+        # The Mac modifier is Cmd, and Tk keeps the two apart — the same
+        # reason Ctrl-F alone never opened the find bar there (_bind_find_keys).
+        for key, command in (("l", self._show_statute_lookup),
+                             ("s", self._show_quick_lookup),
+                             ("b", self._open_brief)):
+            self.root.bind(f"<Control-{key}>", lambda _e, c=command: c())
+            if sys.platform == "darwin":
+                self.root.bind(f"<Command-{key}>", lambda _e, c=command: c())
 
         # --- Search frame ---
         search_frame = ttk.LabelFrame(self.root, text="Search", padding=6)
@@ -12331,13 +12341,43 @@ def _find_scholar_for_item(
     return None, cl_text, f"best candidate similarity {best_sim:.0%}"
 
 
+def _bind_find_keys(win: tk.Misc, open_cb, next_cb, prev_cb) -> None:
+    """Bind the find accelerators a reader would actually press.
+
+    Ctrl-F / F3 / Shift-F3 everywhere.  On macOS the find key is Cmd-F, not
+    Ctrl-F, and Tk does not fold the two — a Ctrl-F-only binding leaves a Mac
+    keyboard with no way into the find bar at all — so Cmd-F and the Mac
+    find-again pair Cmd-G / Cmd-Shift-G are bound alongside it.
+    """
+    def wrap(cb):
+        def handler(_e=None):
+            cb()
+            return "break"
+        return handler
+
+    win.bind("<Control-f>", wrap(open_cb))
+    win.bind("<F3>", wrap(next_cb))
+    win.bind("<Shift-F3>", wrap(prev_cb))
+    if sys.platform == "darwin":
+        win.bind("<Command-f>", wrap(open_cb))
+        win.bind("<Command-g>", wrap(next_cb))
+        # Shift turns the keysym into "G"; bind both spellings so the pattern
+        # matches whichever the Tk build reports.
+        win.bind("<Command-Shift-G>", wrap(prev_cb))
+        win.bind("<Command-Shift-g>", wrap(prev_cb))
+
+
 class _TextFinder:
     """Ctrl-F find bar for a Text widget: highlights every match, steps
     through them with Enter / Shift+Enter (also F3 / Shift+F3), and
-    closes with Escape.  Case-insensitive plain-text search."""
+    closes with Escape.  Case-insensitive plain-text search.
+
+    ``bind_keys=False`` leaves the find accelerators alone, for a window that
+    shows more than one kind of view and has to route them itself (the opinion
+    reader, which switches between this text view and a PDF pane)."""
 
     def __init__(self, win: tk.Misc, txt: tk.Text,
-                 before_widget: tk.Misc) -> None:
+                 before_widget: tk.Misc, bind_keys: bool = True) -> None:
         self._win, self._txt = win, txt
         self._before = before_widget
         self._visible = False
@@ -12366,9 +12406,9 @@ class _TextFinder:
         self._entry.bind("<Shift-Return>", lambda _e: self.step(-1))
         self._entry.bind("<KeyRelease>", self._on_key)
         self._entry.bind("<Escape>", lambda _e: self.close())
-        win.bind("<Control-f>", lambda _e: self.open() or "break")
-        win.bind("<F3>", lambda _e: self.step(+1))
-        win.bind("<Shift-F3>", lambda _e: self.step(-1))
+        if bind_keys:
+            _bind_find_keys(win, self.open,
+                            lambda: self.step(+1), lambda: self.step(-1))
         win.bind("<Escape>", lambda _e: self.close() if self._visible
                  else None)
 
@@ -13934,9 +13974,10 @@ class _PdfPane(ttk.Frame):
         and mouse text selection (drag to select, Ctrl-C to copy).  A no-op
         when ``pages`` is empty (a scan with no text layer).
 
-        ``bind_keys=False`` skips binding Ctrl-F/F3 on the containing window
-        — for panes embedded in a window whose find keys already belong to
-        its text view (the opinion reader) — while selection, which binds
+        ``bind_keys=False`` skips binding the find accelerators on the
+        containing window — for panes embedded in a window that routes those
+        keys itself, because it also has a text view to search (the opinion
+        reader; see ``_ScholarTextWindow._find_open``) — while selection, which binds
         only on the pane's own canvas, stays on."""
         if not pages:
             return
@@ -13944,10 +13985,9 @@ class _PdfPane(ttk.Frame):
         self._enable_selection()
         if not bind_keys:
             return
-        top = self.winfo_toplevel()
-        top.bind("<Control-f>", lambda _e: self._open_find())
-        top.bind("<F3>", lambda _e: self._find_step(1))
-        top.bind("<Shift-F3>", lambda _e: self._find_step(-1))
+        _bind_find_keys(self.winfo_toplevel(), self._open_find,
+                        lambda: self._find_step(1),
+                        lambda: self._find_step(-1))
 
     def has_find(self) -> bool:
         return bool(self._search_pages)
@@ -14124,6 +14164,7 @@ class _PdfPane(ttk.Frame):
         c.bind("<Button-1>", self._on_sel_press, add="+")
         c.bind("<B1-Motion>", self._on_sel_drag, add="+")
         c.bind("<Control-c>", self._copy_selection, add="+")
+        c.bind("<Command-c>", self._copy_selection, add="+")   # macOS
 
     def _on_sel_press(self, event) -> None:
         # Take keyboard focus so Ctrl-C reaches the canvas binding.
@@ -15416,7 +15457,12 @@ class _ScholarTextWindow:
         txt.tag_configure("jumpflash", background="#fff2a8")
         txt.tag_configure(self._JUSTIFY_PAD_TAG)
         txt.tag_configure(self._JUSTIFY_HIDE_TAG, elide=True)
-        self._finder = _TextFinder(win, txt, text_frame)
+        # This window shows either the text view or a PDF pane, so the find
+        # keys are routed by _find_open/_find_step rather than owned by either.
+        self._finder = _TextFinder(win, txt, text_frame, bind_keys=False)
+        _bind_find_keys(win, self._find_open,
+                        lambda: self._find_step(+1),
+                        lambda: self._find_step(-1))
 
         btn_frame = _ui_frame(win)
         btn_frame.pack(fill="x", padx=12, pady=(2, 10))
@@ -15694,6 +15740,36 @@ class _ScholarTextWindow:
                 self._view_label.configure(text_color=color)
         except tk.TclError:
             pass
+
+    def _find_pane(self) -> Optional["_PdfPane"]:
+        """The PDF pane, when the PDF is what's on screen and it has a text
+        layer to search — otherwise None, meaning find belongs to the text
+        view."""
+        p = self._pdf_pane
+        if self._mode != "pdf" or p is None:
+            return None
+        try:
+            if not (p.winfo_exists() and p.has_find()):
+                return None
+        except tk.TclError:
+            return None
+        return p
+
+    def _find_open(self) -> None:
+        """Ctrl-F / Cmd-F: search whichever view the reader is looking at."""
+        pane = self._find_pane()
+        if pane is not None:
+            self._finder.close()
+            pane._open_find()
+        else:
+            self._finder.open()
+
+    def _find_step(self, delta: int) -> None:
+        pane = self._find_pane()
+        if pane is not None:
+            pane._find_step(delta)
+        else:
+            self._finder.step(delta)
 
     def _zoom(self, delta: int) -> None:
         """In the reader, grow/shrink every font (delta 0 resets to default);
@@ -20503,6 +20579,7 @@ class _ScholarTextWindow:
             self._on_pdf_error(str(exc))
             return
         # Swap the text view for the PDF pane (kept above the button row).
+        self._finder.close()   # its bar anchors to the frame about to go away
         self._text_frame.pack_forget()
         holder.pack(fill="both", expand=True, padx=8, pady=4,
                     before=self._btn_frame)
@@ -20578,7 +20655,8 @@ class _ScholarTextWindow:
                                    if self._pdf_parts_on else
                                    "— tick Side panel to list them")
                             )
-                        bits.append("drag to select text; Ctrl+C copies")
+                        bits.append(f"{_ACCEL}-F searches the page; drag to "
+                                    f"select text ({_ACCEL}+C copies)")
                         self._status_var.set("; ".join(bits) + ".")
                 except tk.TclError:
                     pass
@@ -22094,7 +22172,7 @@ class _SlipOpinionWindow:
         if len(sections) > 1:
             bits.append(f"{len(sections)} opinion parts")
         if pages:
-            bits.append("Ctrl-F to search; drag to select text")
+            bits.append(f"{_ACCEL}-F to search; drag to select text")
         self._status_var.set("; ".join(bits) or "Slip opinion loaded.")
 
     def _build_nav(self, sections: list) -> None:
@@ -23285,7 +23363,8 @@ class _LinkedPdfWindow:
                "right-click for the browser." if n
                else "No citations detected in this PDF's text layer.")
         if has_text:
-            msg += "    Ctrl-F searches; drag selects text (Ctrl+C copies)."
+            msg += (f"    {_ACCEL}-F searches; drag selects text "
+                    f"({_ACCEL}+C copies).")
         self._status_var.set(msg)
 
     def _open_cite(self, action: tuple, snippet: str) -> None:
