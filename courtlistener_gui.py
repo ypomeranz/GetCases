@@ -13170,6 +13170,9 @@ class _PdfPane(ttk.Frame):
     _PAD = 12        # vertical gap between pages (px)
     _SCROLL_PX = 60  # wheel-notch scroll distance (px); canvas uses 1px units
     _MARGIN = 18     # small even margin drawn around the cropped page (px)
+    # Kept above a line scrolled to mid-page, so the reader can see the tail of
+    # what precedes it and knows they are not at the top of the page.
+    _LINE_LEAD_IN = 28
     _BBOX_SCALE = 0.6   # low-res render scale used to detect the content box
     _INK_THRESH = 185   # grayscale < this counts as "ink" (ignores scan bg)
     _PROFILE_MIN = 2    # min avg ink (0-255) for a row/col to count as content
@@ -13657,13 +13660,29 @@ class _PdfPane(ttk.Frame):
             cb(*hit)
         return "break"
 
-    def scroll_to_page(self, i: int) -> None:
-        """Scroll so page *i* starts at the top of the view."""
+    def _page_point_y(self, i: int, y_pt: float) -> float:
+        """Canvas y of the PDF-point height *y_pt* on page *i* — the vertical
+        half of :meth:`_rect_to_canvas`, for callers with a height but no box."""
+        y, _slot_h, frac, scale = self._slots[i]
+        _fl, ft, _fr, _fb = frac
+        _w_pt, h_pt, _ = self._meta[i]
+        return y + self._margin + scale * h_pt * (1.0 - ft) - scale * y_pt
+
+    def scroll_to_page(self, i: int, y_pt: "Optional[float]" = None) -> None:
+        """Scroll so page *i* starts at the top of the view, or — given *y_pt*,
+        a height on that page in PDF points — so the line at that height does.
+        A little of what precedes it is left showing, so the reader can see
+        they have landed inside the page rather than at its top."""
         if not (0 <= i < len(self._slots)) or self._content_h <= 0:
             return
+        top = self._slots[i][0] - self._PAD
+        if y_pt is not None:
+            try:
+                top = self._page_point_y(i, y_pt) - self._LINE_LEAD_IN
+            except (IndexError, TypeError, ValueError):
+                pass
         try:
-            self._canvas.yview_moveto(
-                max(0.0, (self._slots[i][0] - self._PAD) / self._content_h))
+            self._canvas.yview_moveto(max(0.0, top / self._content_h))
         except tk.TclError:
             pass
         self._render_visible()
@@ -14796,6 +14815,10 @@ class _ScholarTextWindow:
         # The separate-opinions strip inside that holder, once the text layer
         # has revealed the parts; toggled by the "Side panel" checkbox.
         self._pdf_parts_nav: Optional[ttk.Frame] = None
+        # Footnote extents are bracketed by Tk marks (see _fn_region_mark);
+        # this keeps their names unique across re-renders.
+        self._fn_mark_seq = 0
+        self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
         self._pdf_url: Optional[str] = None
         self._pdf_bytes: Optional[bytes] = None
         # Background-prefetched PDF (data, url) so "PDF" is instant; set by
@@ -15967,14 +15990,13 @@ class _ScholarTextWindow:
     def _render_footnotes(self, footnotes: list, part_tag: Optional[str]) -> None:
         """Insert a part's footnote blocks, recording each note's rendered
         region and number so copied selections can be pin-cited (page n.N)."""
-        txt = self._text
-        open_region: Optional[list] = None  # [start_index, note_number, page]
+        open_region: Optional[list] = None  # [start_mark, note_number, page]
 
         def close_region() -> None:
             nonlocal open_region
             if open_region is not None:
                 self._fn_regions.append(
-                    (open_region[0], txt.index("end-1c"),
+                    (open_region[0], self._fn_region_mark("end", "end-1c"),
                      open_region[1], open_region[2])
                 )
                 open_region = None
@@ -16006,7 +16028,8 @@ class _ScholarTextWindow:
                 self._fn_text[last_fid] += " " + body
             if num:
                 close_region()
-                open_region = [txt.index("end-1c"), num, page]
+                open_region = [self._fn_region_mark("start", "end-1c"),
+                               num, page]
             self._insert_block(block, part_tag)
         close_region()
 
@@ -16178,7 +16201,7 @@ class _ScholarTextWindow:
         self._link_actions.clear()
         self._fn_text.clear()
         self._fnref_pages: dict[str, Optional[int]] = {}
-        self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
+        self._reset_fn_regions()  # unsets the marks the old notes used
         self._part_regions: list[tuple[str, str, int]] = []
         self._rendered_parts = self._parts  # parts list _part_regions indexes
         self._scroll_part: Optional[int] = None
@@ -16824,7 +16847,7 @@ class _ScholarTextWindow:
         self._link_actions.clear()
         self._fn_text.clear()
         self._fnref_pages: dict[str, Optional[int]] = {}
-        self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
+        self._reset_fn_regions()  # unsets the marks the old notes used
         self._part_regions: list[tuple[str, str, int]] = []
         self._rendered_parts = parts  # parts list _part_regions indexes
         self._scroll_part: Optional[int] = None
@@ -17925,6 +17948,64 @@ class _ScholarTextWindow:
         return {t: a for t, a in self._link_actions.items()
                 if a[0] in ("fnref", "fndef")}
 
+    # Footnote bookkeeping has to survive justification.  Padding spaces and
+    # soft hyphens are inserted into the text every time the window is resized,
+    # which shifts every character index recorded after them — so a position
+    # noted while rendering points somewhere else by the time it is used.  Tags
+    # and marks both move with the characters around them, and are used instead:
+    # a marker's own link tag locates it, and a note's extent is bracketed by a
+    # pair of marks.
+
+    def _fn_region_mark(self, side: str, index: str) -> str:
+        """A uniquely named mark at *index* bracketing a footnote's text.
+
+        The gravities keep text inserted at either edge *inside* the note: a
+        start mark stays left of it, an end mark stays right of it.
+        """
+        name = f"__fnreg_{side}_{self._fn_mark_seq}"
+        self._fn_mark_seq += 1
+        txt = self._text
+        try:
+            txt.mark_set(name, index)
+            txt.mark_gravity(name, "left" if side == "start" else "right")
+        except tk.TclError:
+            return index  # marks unavailable — the raw index is still better
+        return name
+
+    def _reset_fn_regions(self) -> None:
+        """Drop the recorded notes and the marks bracketing them, before a
+        re-render lays the text out again."""
+        txt = getattr(self, "_text", None)
+        for region in getattr(self, "_fn_regions", []) or []:
+            for name in region[:2]:
+                if isinstance(name, str) and name.startswith("__fnreg_"):
+                    try:
+                        txt.mark_unset(name)
+                    except (AttributeError, tk.TclError):
+                        pass
+        self._fn_regions = []
+
+    def _fn_marker_pos(self, side: str, fid: str) -> Optional[str]:
+        """Where a footnote's marker sits now: the in-text reference
+        (``side="fnref"``) or the number heading its note (``"fndef"``).
+
+        Read from the marker's own link tag, which Tk keeps on the same
+        characters however the text is re-laid-out, rather than from the index
+        recorded when it was rendered."""
+        txt = self._text
+        for tag, (tag_side, tag_fid) in self._fn_link_map().items():
+            if tag_side != side or tag_fid != fid:
+                continue
+            try:
+                ranges = txt.tag_ranges(tag)
+            except tk.TclError:
+                continue
+            if ranges:
+                return str(ranges[0])
+        # Never rendered as a link: fall back to the recorded index.
+        stored = self._fn_ref_pos if side == "fnref" else self._fn_def_pos
+        return stored.get(fid)
+
     def _omitted_footnote_tags(self, start: str, end: str) -> tuple[set[str], int]:
         """Footnote-reference marker tags inside [start, end) whose notes a
         quote-ready copy omits, with the count of distinct omitted notes.
@@ -17933,7 +18014,6 @@ class _ScholarTextWindow:
         footnote body (a note citing another note) are left alone."""
         txt = self._text
         fn_regions = getattr(self, "_fn_regions", []) or []
-        def_pos = getattr(self, "_fn_def_pos", {}) or {}
         omit: set[str] = set()
         fids: set[str] = set()
         for tag, (side, fid) in self._fn_link_map().items():
@@ -17948,7 +18028,7 @@ class _ScholarTextWindow:
                 if any(txt.compare(rs, ">=", fr[0])
                        and txt.compare(rs, "<", fr[1]) for fr in fn_regions):
                     continue  # marker sits inside a note body
-                body_pos = def_pos.get(fid)
+                body_pos = self._fn_marker_pos("fndef", fid)
                 if body_pos and txt.compare(body_pos, ">=", start) \
                         and txt.compare(body_pos, "<", end):
                     continue  # the note itself is selected too
@@ -19248,12 +19328,12 @@ class _ScholarTextWindow:
             return
         kind, value = action
         if kind == "fnref":
-            pos = self._fn_def_pos.get(value)
+            pos = self._fn_marker_pos("fndef", value)
             if pos:
                 self._jump_to(pos)
             return
         if kind == "fndef":
-            pos = self._fn_ref_pos.get(value)
+            pos = self._fn_marker_pos("fnref", value)
             if pos:
                 self._jump_to(pos)
             return
@@ -21533,11 +21613,16 @@ _PDF_PART_COLORS = {
 def _build_pdf_parts_nav(parent, sections: list, goto) -> ttk.Frame:
     """A slim strip listing a PDF's detected opinion parts (from
     slip_opinion.detect_sections), each colored by kind; clicking a label
-    calls ``goto(start_page)``.  The caller packs the returned frame."""
+    calls ``goto(page, y_pt)``.  The caller packs the returned frame.
+
+    A part that opens partway down a page — the previous opinion running on
+    above it — carries the height of its opening line, and the click goes
+    there rather than to the top of the page (see ``SlipSection.start_at``)."""
     nav = ttk.Frame(parent, padding=(6, 4))
     ttk.Label(nav, text="Parts", font=("TkDefaultFont", 9, "bold"),
               anchor="w").pack(fill="x", pady=(2, 4))
     for sec in sections:
+        target = getattr(sec, "start_at", None) or (sec.start_page, None)
         lbl = tk.Label(
             nav, text=sec.label, anchor="w", justify="left",
             wraplength=150, cursor="hand2",
@@ -21545,8 +21630,8 @@ def _build_pdf_parts_nav(parent, sections: list, goto) -> ttk.Frame:
             font=("TkDefaultFont", 9, "underline"),
         )
         lbl.pack(fill="x", pady=2)
-        lbl.bind("<Button-1>", lambda _e, p=sec.start_page: goto(p))
-        page_no = tk.Label(nav, text=f"p. {sec.start_page + 1}",
+        lbl.bind("<Button-1>", lambda _e, t=target: goto(*t))
+        page_no = tk.Label(nav, text=f"p. {target[0] + 1}",
                            anchor="w", foreground="#999999",
                            font=("TkDefaultFont", 8))
         page_no.pack(fill="x", padx=(8, 0))
@@ -21839,9 +21924,9 @@ class _SlipOpinionWindow:
         nav.pack(side="right", fill="y", padx=(0, 8), pady=4)
         self._nav = nav
 
-    def _goto_page(self, page: int) -> None:
+    def _goto_page(self, page: int, y_pt: Optional[float] = None) -> None:
         if self._pane is not None:
-            self._pane.scroll_to_page(page)
+            self._pane.scroll_to_page(page, y_pt)
 
     # -- citation dispatch ----------------------------------------------------
 
