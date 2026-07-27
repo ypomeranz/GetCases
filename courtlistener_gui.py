@@ -11570,6 +11570,206 @@ def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Front matter: what a report prints ahead of the opinion of the Court — the
+# syllabus and headnotes, and in the early volumes the reporter's statement of
+# the case and the arguments of counsel.  A full-document export gives it a
+# section, and a running head, of its own when the text says what it is.
+#
+# The parts' own labels can't decide this.  Google Scholar's header part is
+# called "Header & Syllabus" whenever the opinion carries an attribution line
+# — including for the many older U.S. Reports pages that print no syllabus at
+# all, only the counsel listings — and when an early opinion opens "The
+# opinion of the court was delivered by MARSHALL, Ch. J." the segmenter can
+# sweep the whole opinion into the header instead.  So the text itself is read.
+# ---------------------------------------------------------------------------
+
+
+# Front-matter section headings, as the reports and CAP's headmatter write
+# them.  Only these name a section: a "Counsel" or "History" heading marks
+# matter that rides along with the rest, never a reason to break the page.
+_FRONT_MATTER_HEADINGS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"^syllabus\b", re.IGNORECASE), "Syllabus"),
+    (re.compile(r"^head\s?notes?\b", re.IGNORECASE), "Headnotes"),
+    (re.compile(r"^statement\s+of\s+the\s+case\b", re.IGNORECASE),
+     "Statement of the Case"),
+    (re.compile(r"^arguments?\b", re.IGNORECASE), "Argument of Counsel"),
+    (re.compile(r"^summary\b", re.IGNORECASE), "Summary"),
+)
+# One-line front matter every report prints above an opinion: the docket
+# number, the argument and decision dates, how the case arrived, the panel,
+# and the fields CourtListener supplies as metadata.  A caption made of these
+# belongs on the opinion's own first page, not on a page of its own.
+_FM_ROUTINE_RE = re.compile(
+    r"^(?:Nos?\.\s|Docket\b|Argued\b|Reargued\b|Submitted\b|Decided\b|Filed\b"
+    r"|Released\b|Signed\b|Before\b|Judges:|Attorneys:|Syllabus\b|Headnotes\b"
+    r"|(?:ON\s+)?(?:WRITS?\s+OF\s+)?CERTIORARI\b|ON\s+WRITS?\b|ON\s+PETITION\b"
+    r"|ON\s+APPLICATION\b|APPEALS?\s+FROM\b|ON\s+APPEAL\b|APPEAL\s+FROM\b"
+    r"|ERROR\s+TO\b|CERTIFICATE\b|CERTIFIED\b|MOTION\b)",
+    re.IGNORECASE,
+)
+# Counsel listings, in the house styles the reports use for them.
+_FM_COUNSEL_RE = re.compile(
+    r"\bamic(?:us|i)\s+curiae\b|\bre?argued\s+the\s+cause\b"
+    r"|\bon\s+(?:the\s+)?briefs?\b|\bfiled\s+a\s+brief\b"
+    r"|\bbriefs?\s+(?:of|for|was|were)\b|\bcounsel\s+(?:of\s+record|for)\b"
+    r"|\bof\s+counsel\b|\bpro\s+se\b|\bpro\s+hac\s+vice\b"
+    r"|\battorneys?\s+(?:at\s+law|for)\b|\bwith\s+whom\s+.{0,90}\bwere?\s+on\b"
+    r"|\bsubmitted\s+(?:on\s+)?(?:the\s+)?brief",
+    re.IGNORECASE,
+)
+# …and their shape when the phrasing gives nothing away: a name, a firm and a
+# city, closing with the party appeared for ("Robert L. Byer, Duane Morris,
+# L.L.P., Pittsburgh, for Ford Motor Company.").
+_FM_COUNSEL_LINE_RE = re.compile(
+    r",\s*(?:Counsel\s+)?for\s+[^.]{0,120}\.?\s*$", re.IGNORECASE,
+)
+_FM_FOR_PARTY_RE = re.compile(
+    r"\bfor\s+(?:the\s+)?(?:plaintiffs?|defendants?|appellants?|appellees?"
+    r"|petitioners?|respondents?|movants?|intervenors?|applicants?"
+    r"|the\s+United\s+States)\b",
+    re.IGNORECASE,
+)
+# The syllabus' closing line-up ("ROBERTS, C. J., delivered the opinion of the
+# Court, in which THOMAS … joined.  KAVANAUGH, J., filed a concurring
+# opinion.") — the reporter's, not the opinion's own byline.
+_FM_LINEUP_RE = re.compile(
+    r"\bin\s+which\s+.{0,240}?\bjoin(?:ed|s)?\b"
+    r"|\bfiled\s+(?:a|an)\s+(?:concurring|dissenting|separate|opinion)"
+    r"|\btook\s+no\s+part\s+in\s+the\s+(?:consideration|decision)\b"
+    r"|\bfor\s+a\s+unanimous\s+Court\b",
+    re.IGNORECASE,
+)
+# The line that opens an opinion of the court, in its several house styles.
+_FM_ATTRIB_RE = re.compile(
+    r"\bdeliver(?:ed|s)\s+the\s+(?:\w+\s+){0,3}opinion\b"
+    r"|\b(?:opinion|judgment)\s+of\s+the\s+court\s+(?:was|were|is)\s+delivered\b"
+    r"|\bannounced\s+the\s+judgment\b",
+    re.IGNORECASE,
+)
+# A byline or opinion heading standing alone as a whole line — nothing after
+# the name.  The oral arguments the early reports print are full of "MR.
+# JUSTICE HARLAN.  Does that apply to revenue cases?", which is a question
+# from the bench, not the opening of an opinion.
+_FM_BYLINE_RE = re.compile(
+    r"(?:OPINION(?:\s+OF\s+THE\s+COURT)?"
+    r"|PER\s+CURIAM"
+    r"|(?:MR\.|MRS\.|MS\.)?\s*(?:CHIEF\s+)?JUSTICE\s+[A-Z][\w.'’-]+"
+    r"|[A-Z][\w.'’-]+,\s*(?:C\.\s*)?J"
+    r"|[A-Z][\w.'’ -]{0,40},\s*(?:Chief\s+|Senior\s+|Circuit\s+|District\s+)*Judge)"
+    r"\s*[.:]?\s*$",
+    re.IGNORECASE,
+)
+# A syllabus in prose, for the pages that print no heading over it: the held
+# paragraph, and the pin cites to the opinion the syllabus summarizes.
+_FM_SYLLABUS_PROSE_RE = re.compile(
+    r"^Held\b[:.,]|^Held\s+that\b|\bPp?\.\s*\d+[-–—]\d+", re.IGNORECASE,
+)
+# Counsel arguing, as the early reports report it.
+_FM_ARGUMENT_PROSE_RE = re.compile(
+    r"\bfor\s+the\s+(?:plaintiffs?|defendants?)\s+in\s+error\b"
+    r"|\bin\s+support\s+of\s+the\s+(?:motion|rule|petition)\b"
+    r"|\bon\s+the\s+part\s+of\s+the\s+(?:plaintiff|defendant|appellant|appellee)\b"
+    r"|\b(?:contended|insisted|argued|urged)\s+(?:that|for)\b",
+    re.IGNORECASE,
+)
+_FM_STAR_PREFIX_RE = re.compile(r"^(?:\*\d+\s*)+")
+
+#: How long a line naming the party it appeared for can be and still read as
+#: a counsel listing rather than prose that happens to mention a party.
+_FM_COUNSEL_MAX_CHARS = 400
+#: Front matter under a heading of its own still needs some text under it…
+_FM_MIN_NAMED_CHARS = 400
+#: …and front matter recognized only from its prose needs rather more.
+_FM_MIN_CHARS = 900
+#: Text past an opinion's opening line that means the opinion is in here.
+_FM_OPINION_TAIL = 600
+
+
+def _front_matter_section_label(parts: list) -> str:
+    """The running-head label for the front matter in *parts* — "Syllabus",
+    "Headnotes", "Statement of the Case", "Argument of Counsel" — or "" when
+    it is only a caption, or when the opinion itself was segmented into it.
+
+    Prose the report prints as a matter of course — the docket line, the
+    dates, how the case arrived, the counsel and amici listings, the
+    syllabus' closing line-up — doesn't count toward the bulk that earns a
+    page: a Supreme Court header of nothing but counsel listings can run
+    several thousand characters (Copperweld's is 4,000) without a word of
+    syllabus in it.
+    """
+    rows: list[tuple[str, str]] = []
+    for part in parts:
+        for block in part.blocks:
+            text = _FM_STAR_PREFIX_RE.sub(
+                "", " ".join(block.text().split())
+            ).strip()
+            if text:
+                rows.append((block.kind, text))
+
+    names: list[str] = []
+    named_at: Optional[int] = None      # where the front matter names itself
+    opinion_at: Optional[int] = None    # where an opinion appears to open
+    syllabus_prose = argument_prose = False
+    weights: list[int] = []             # per row, 0 for the routine ones
+    for i, (kind, text) in enumerate(rows):
+        short = len(text) <= 60
+        if short:
+            for pattern, name in _FRONT_MATTER_HEADINGS:
+                if pattern.match(text):
+                    if name not in names:
+                        names.append(name)
+                    if named_at is None:
+                        named_at = i
+                    break
+        # A line the report prints as a matter of course is never an opinion
+        # opening, whatever it looks like: the panel line "Before SYKES,
+        # Chief Judge." has a byline's shape and none of its meaning.
+        if opinion_at is None and not _FM_ROUTINE_RE.match(text) and (
+            _FM_ATTRIB_RE.search(text)
+            or (short and _FM_BYLINE_RE.fullmatch(text))
+        ):
+            opinion_at = i
+        if _FM_SYLLABUS_PROSE_RE.search(text):
+            syllabus_prose = True
+            if named_at is None:
+                named_at = i
+        if _FM_ARGUMENT_PROSE_RE.search(text):
+            argument_prose = True
+        routine = (
+            kind in ("center", "heading")
+            or _FM_ROUTINE_RE.match(text)
+            or _FM_COUNSEL_RE.search(text)
+            or _FM_COUNSEL_LINE_RE.search(text)
+            or (len(text) <= _FM_COUNSEL_MAX_CHARS
+                and _FM_FOR_PARTY_RE.search(text))
+            or _FM_LINEUP_RE.search(text)
+        )
+        weights.append(0 if routine else len(text))
+
+    # An opinion never opens before the front matter has named itself: a
+    # byline out in front of any syllabus heading, with the bulk of the
+    # section behind it, means segmentation swept the opinion in here (as it
+    # does for Dartmouth College, whose "The opinion of the court was
+    # delivered by MARSHALL, Ch. J." reads nothing like a modern byline), and
+    # there is no front matter to lift out.  Once a syllabus has begun, the
+    # attributions inside it are the reporter's own ("Justice GORSUCH
+    # delivered the opinion of the Court with respect to Parts I, II-A …,
+    # concluding that …" — Ramos), and prove nothing.
+    if (opinion_at is not None and (named_at is None or opinion_at < named_at)
+            and sum(weights[opinion_at + 1:]) > _FM_OPINION_TAIL):
+        return ""
+    substantive = sum(weights)
+    if names and substantive >= _FM_MIN_NAMED_CHARS:
+        return " & ".join(names[:2])
+    if substantive >= _FM_MIN_CHARS:
+        if syllabus_prose:
+            return "Syllabus"
+        if argument_prose:
+            return "Argument of Counsel"
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # LaTeX export (typeset to PDF here, or saved as .tex to typeset elsewhere).
 # The writer works from a formatting-preserving dump of the reader's Tk Text
 # widget (_dump_export_paragraphs) that mirrors _dump_to_rtf's tag handling:
@@ -19002,9 +19202,11 @@ class _ScholarTextWindow:
     def _export_section_list(self) -> list[tuple[str, str, str, str]]:
         """
         Sections for a full-document export, as (running-head label, start,
-        end, kind): the header and majority share the first section, then
-        each concurrence/dissent follows as its own.  Without parts (a plain
-        text view) the whole widget is one section.
+        end, kind): front matter the report names — a syllabus, headnotes,
+        the arguments of counsel — leads as a section of its own, the header
+        and majority share the next one, and each concurrence/dissent follows
+        as its own.  Without parts (a plain text view) the whole widget is
+        one section.
         """
         txt = self._text
         parts = getattr(self, "_rendered_parts", None) or self._parts
@@ -19022,6 +19224,25 @@ class _ScholarTextWindow:
 
         # (author label, start, end, kind)
         sections: list[tuple[str, str, str, str]] = []
+        # A syllabus (or, in the early reports, the statement of the case and
+        # the arguments of counsel) leads on a page of its own, under its own
+        # running head, the way the reports print it.  An opinion has to
+        # follow it here: a run of header parts with nothing after it is the
+        # whole document, and then there is no front for it to be in front of.
+        head_run = 0
+        while (head_run < len(main_regions)
+               and parts[main_regions[head_run][2]].kind == "header"):
+            head_run += 1
+        front_label = ""
+        if 0 < head_run < len(main_regions):
+            front_label = _front_matter_section_label(
+                [parts[pi] for _rs, _rend, pi in main_regions[:head_run]]
+            )
+        if front_label:
+            front_regions = main_regions[:head_run]
+            main_regions = main_regions[head_run:]
+            sections.append((front_label, front_regions[0][0],
+                             front_regions[-1][1], "frontmatter"))
         if main_regions:
             maj = next(
                 (parts[pi] for _rs, _re, pi in main_regions
@@ -19039,12 +19260,13 @@ class _ScholarTextWindow:
     def _build_export_rtf(self) -> str:
         """
         Two-column RTF of the full opinion, one section per separate
-        opinion: the header and majority share the first section, and each
-        concurrence/dissent starts a new page (numbering continues).  Every
-        section carries a running head with the Bluebook citation and the
-        opinion's author, and a page-number footer.  The running head is
-        coloured by opinion kind (dissent red, concurrence green); the body
-        text is black.
+        opinion: front matter the report names (a syllabus, the arguments of
+        counsel) leads, the header and majority share the next section, and
+        each concurrence/dissent starts a new page (numbering continues).
+        Every section carries a page-number footer and a running head with
+        the Bluebook citation and the opinion's author — or the front
+        matter's name.  The running head is coloured by opinion kind
+        (dissent red, concurrence green); the body text is black.
         """
         txt = self._text
         case_line = self._bluebook_citation(None)[0].rstrip(".")
@@ -19198,7 +19420,8 @@ class _ScholarTextWindow:
         Century Schoolbook (or the closest installed face), footnotes at
         the bottom of the page that cites them, star pagination kept inline
         and echoed as a reporter page range in the running head, a page
-        number in the footer, and each separate opinion starting on a fresh
+        number in the footer, and each separate opinion — and any front
+        matter the report names, such as the syllabus — starting on a fresh
         page under its own running head.
         """
         txt = self._text
