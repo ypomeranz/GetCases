@@ -632,6 +632,59 @@ class AlignmentTests(unittest.TestCase):
         ]
         self.assertEqual(us_reports_cite_from_pdf(pages), "607 U.S. 7")
 
+    def test_a_reporters_note_trailing_the_opinion_is_not_a_failed_page(self):
+        # A draft reporter appends a "Reporter's Note" that constitutes no
+        # part of the opinion and matches nothing in it.  Requiring the last
+        # physical sheet to match took the page switching and the pin cites
+        # down with it — Bost v. Illinois State Bd. of Elections, 607 U. S.
+        # 71, is 36 pages of opinion and one of that note.
+        body = [
+            "The candidates challenged the procedure for counting mail-in "
+            "ballots received after election day in this matter.",
+            "We consider whether those candidates have standing to maintain "
+            "their suit against the board of elections here.",
+            "Reputational harms are classic Article III injuries and are "
+            "concrete for those whose jobs depend on public support.",
+        ]
+        source = build_plain_text_source(" ".join(body), "607 U. S. 71")
+        pages = [_page([line]) for line in body]
+        pages.append(_page([
+            "Reporter's Note",
+            "The attached opinion has been revised to reflect the usual "
+            "publication and citation style of the United States Reports.",
+            "The syllabus has been prepared by the Reporter of Decisions and "
+            "constitutes no part of the opinion of the Court.",
+        ]))
+        location_map = align_opinion_locations(
+            source, pages, pdf_cite="607 U. S. 71", us_cite="607 U. S. 71")
+
+        self.assertTrue(location_map.navigation_ready)
+        self.assertEqual(location_map.copy_cite, "607 U. S. 71")
+        self.assertEqual(
+            [b.reporter_page for b in location_map.boundaries], [71, 72, 73])
+
+    def test_losing_the_opinions_own_last_pages_is_still_a_failure(self):
+        # The tail allowance must not paper over an alignment that really did
+        # lose the end of the opinion: there, the source's own end is
+        # uncovered, and that is what the allowance turns on.
+        body = [
+            "The candidates challenged the procedure for counting mail-in "
+            "ballots received after election day in this matter.",
+            "We consider whether those candidates have standing to maintain "
+            "their suit against the board of elections here.",
+        ]
+        tail = (" The remainder of this opinion runs on at considerable "
+                "length about entirely unrelated statutory questions, none "
+                "of which appears anywhere among the pages supplied, and it "
+                "continues in that vein for a good while yet.") * 3
+        source = build_plain_text_source(" ".join(body) + tail, "607 U. S. 71")
+        pages = [_page([line]) for line in body]
+        pages.append(_page(["Reporter's Note", "no part of the opinion"]))
+        location_map = align_opinion_locations(
+            source, pages, pdf_cite="607 U. S. 71", us_cite="607 U. S. 71")
+
+        self.assertFalse(location_map.copy_ready)
+
     def test_a_pdf_that_prints_no_reporter_citation_yields_none(self):
         pages = [_page(["CLARK v. SWEENEY (2025) - per curiam",
                         "his right to trial by an impartial jury."])]

@@ -574,6 +574,11 @@ def us_reports_cite_from_pdf(pdf_pages: Iterable) -> str:
     return ""
 
 
+#: Pages of the Reporter's own apparatus that may trail an opinion without
+#: matching any of it: the "Reporter's Note" a draft reporter appends, and
+#: the blank leaf that can follow it.
+_TRAILING_APPARATUS_PAGES = 2
+
 #: Words a matched run needs before it may anchor a page.  A run of one or
 #: two ordinary words — "and", "of the" — matches all over an opinion and
 #: says nothing about where the page sits.  The reporter prints counsel and
@@ -1232,15 +1237,35 @@ def align_opinion_locations(
         )
     else:
         last_page = page_count - 1
+
+        def reaches_last_page(seen) -> bool:
+            """Whether *seen* carries the alignment to the end of the opinion.
+
+            A draft reporter appends a "Reporter's Note" — it constitutes no
+            part of the opinion, as it says itself, and so matches nothing in
+            the text.  Insisting the last physical sheet match would veto the
+            alignment of every opinion published that way, taking the page
+            switching and the pin cites with it.  A short unmatched tail is
+            allowed instead, but only when the source's own end was covered:
+            an alignment that really did lose the last pages of the opinion
+            fails that test.
+            """
+            if not seen:
+                return False
+            if seen[-1] == last_page:
+                return True
+            return (last_page - seen[-1] <= _TRAILING_APPARATUS_PAGES
+                    and source_edges_covered)
+
         exact_ready = bool(
             len(exact_pages) >= 2
             and exact_pages[0] == 0
-            and exact_pages[-1] == last_page
+            and reaches_last_page(exact_pages)
         )
         fuzzy_ready = bool(
             len(matched_pdf_pages) >= 2
             and matched_pdf_pages[0] == 0
-            and matched_pdf_pages[-1] == last_page
+            and reaches_last_page(matched_pdf_pages)
             and physical_coverage >= 0.20
             and source_edges_covered
             and text_coverage >= 0.18

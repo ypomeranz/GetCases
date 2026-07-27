@@ -19445,11 +19445,32 @@ class _ScholarTextWindow:
         exports keep :meth:`_filename_item` — they carry the Scholar text, and
         its star pagination, not these pages."""
         item = self._filename_item()
-        us_cite = getattr(self, "_us_reports_cite", "")
-        if us_cite and _is_us_reports_pdf(getattr(self, "_pdf_url", "") or ""):
+        us_cite = self._shown_us_reports_cite()
+        if us_cite:
             item = dict(item)
             item["_us_reports_cite"] = us_cite
         return item
+
+    def _shown_us_reports_cite(self) -> str:
+        """The U.S. Reports citation the PDF on screen actually prints.
+
+        A draft reporter reaches us from the Court's opinions page like any
+        slip, so its URL says nothing about the reporter — what makes it a
+        U.S. Reports scan is the pagination the Reporter of Decisions put in
+        it, which the analysis reads off its running heads.  For everything
+        else the URL still decides.
+        """
+        key = getattr(self, "_active_pdf_analysis_key", None)
+        cache = getattr(self, "_pdf_analysis_cache", None) or {}
+        printed = _normalized_us_cite(
+            str((cache.get(key) or {}).get("pdf_cite") or "") if key else ""
+        )
+        if printed:
+            return printed
+        us_cite = getattr(self, "_us_reports_cite", "")
+        if us_cite and _is_us_reports_pdf(getattr(self, "_pdf_url", "") or ""):
+            return us_cite
+        return ""
 
     def _export_section_list(self) -> list[tuple[str, str, str, str]]:
         """
