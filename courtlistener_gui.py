@@ -10596,6 +10596,12 @@ _PARTY_ABBR_SUFFIXES = {
     "co", "cos", "corp", "corps", "inc", "ltd", "llc", "llp", "lp", "lllp",
     "plc", "pc", "pa", "pllc", "na", "sa", "ag", "nv", "bros",
 }
+# One letter and a period: an initial, whether it stands in a person's name
+# or is a letter of a spaced initialism ("A. A. R. P.").
+_SINGLE_INITIAL_RE = re.compile(r"[A-Za-z]\.")
+# The same dotted abbreviation repeated back to back, as consolidated
+# captions leave it ("United States U.S. U.S.").
+_REPEATED_ABBREV_RE = re.compile(r"\b((?:[A-Za-z]+\.)+)(\s+\1)+")
 
 
 def _party_ends_in_abbrev(s: str) -> bool:
@@ -10607,6 +10613,11 @@ def _party_ends_in_abbrev(s: str) -> bool:
         return False
     last = parts[-1]
     if "." in last[:-1]:  # an internal period → initialism (L.L.C., N.A.)
+        return True
+    # A lone initial closing the name — the last letter of a spaced
+    # initialism ("A. A. R. P."), or a person's middle initial ("John Q.").
+    # A single letter is never a word a sentence ended on.
+    if _SINGLE_INITIAL_RE.fullmatch(last):
         return True
     return last.rstrip(".").replace("’", "'").lower() in _PARTY_ABBR_SUFFIXES
 
@@ -10782,8 +10793,15 @@ def _caption_party(s: str) -> str:
     s = s.strip().lstrip(".;").rstrip(";").strip()
     s = re.sub(r"\s+et\s+als?\.?$", "", s, flags=re.IGNORECASE).strip()
     # Repeated dotted abbreviations from consolidated captions ("United
-    # States U.S. U.S.") collapse to the first occurrence.
-    s = re.sub(r"\b((?:[A-Za-z]+\.)+)(\s+\1)+", r"\1", s)
+    # States U.S. U.S.") collapse to the first occurrence.  A doubled *single*
+    # initial is not one of those — it is the name: the anonymized applicants
+    # in "A. A. R. P. v. Trump" and "W. M. M. v. Trump" lose their case if
+    # the second letter goes, and so does "J. J. Smith".
+    s = _REPEATED_ABBREV_RE.sub(
+        lambda m: (m.group(0) if _SINGLE_INITIAL_RE.fullmatch(m.group(1))
+                   else m.group(1)),
+        s,
+    )
     s = re.sub(r"\b([Uu]nited\s+[Ss]tates)(?:\s+U\.?S\.?A?\.?)+", r"\1", s)
     # Drop a stray trailing period, but keep an entity abbreviation's period
     # ("Acme Co.", "Foo Corp.", "Bar Inc.").
@@ -15316,6 +15334,9 @@ class _ScholarTextWindow:
     _JUSTIFY_HARD_BREAK_EXTRA_SPACES = 4
     _JUSTIFY_PAD_TAG = "justify-pad"
     _JUSTIFY_HIDE_TAG = "justify-hide"
+    # Characters to read past a display line when the next word is all that
+    # is wanted.  The longest word in the U.S. Reports is well under this.
+    _JUSTIFY_LOOKAHEAD = 80
     _HYPHEN_MIN_WORD = 7
     _HYPHEN_MIN_PREFIX = 2
     _HYPHEN_MIN_SUFFIX = 3
@@ -16343,6 +16364,10 @@ class _ScholarTextWindow:
 
     def _reset_location_render_marks(self) -> None:
         """Discard marks belonging to the old rendering before replacing it."""
+        # The old rendering's justification goes with it: the text about to be
+        # deleted takes the padding along, so the next pass must not decide
+        # the wrap is unchanged and skip its work.
+        self._justified_key = None
         self._clear_location_map_marks()
         txt = getattr(self, "_text", None)
         for name in getattr(self, "_location_block_mark_names", []) or []:
@@ -17466,6 +17491,7 @@ class _ScholarTextWindow:
 
     def _clear_justification(self) -> None:
         txt = self._text
+        self._justified_key = None   # the padding is going: it must be redone
         try:
             old_state = str(txt.cget("state"))
         except tk.TclError:
@@ -17486,20 +17512,19 @@ class _ScholarTextWindow:
 
     def _line_has_any_tag(self, start: str, end: str, names: tuple[str, ...]) -> bool:
         txt = self._text
-        for name in names:
-            if name in txt.tag_names(start):
+        wanted = set(names)
+        # One tag_names call per index, not one per name: this runs for every
+        # display line of the opinion (twice, counting the hyphenation check).
+        if wanted.intersection(txt.tag_names(start)):
+            return True
+        try:
+            before_end = txt.index(f"{end} -1c")
+            if (txt.compare(before_end, ">=", start)
+                    and wanted.intersection(txt.tag_names(before_end))):
                 return True
-            try:
-                before_end = txt.index(f"{end} -1c")
-                if (txt.compare(before_end, ">=", start)
-                        and name in txt.tag_names(before_end)):
-                    return True
-            except tk.TclError:
-                pass
-            ranges = txt.tag_nextrange(name, start, end)
-            if ranges:
-                return True
-        return False
+        except tk.TclError:
+            pass
+        return any(txt.tag_nextrange(name, start, end) for name in names)
 
     def _hyphen_points(self, word: str) -> list[int]:
         """Conservative English-ish syllable break candidates for layout only."""
@@ -17554,6 +17579,19 @@ class _ScholarTextWindow:
                     points.append(point)
         return sorted(set(points))
 
+    def _short_lookahead(self, index: str) -> str:
+        """The end of a window just wide enough to hold the next word.
+
+        The two places that read forward from a display line want one word,
+        but "lineend" is the end of the whole *logical* line — a reporter
+        paragraph, thousands of characters — and both run once per display
+        line, so asking for the paragraph each time pulls it out of Tk over
+        and over."""
+        txt = self._text
+        line_end = txt.index(f"{index} lineend")
+        window = txt.index(f"{index}+{self._JUSTIFY_LOOKAHEAD}c")
+        return line_end if txt.compare(window, ">", line_end) else window
+
     def _hyphenate_next_word(self, line_end: str, used: float, width: int,
                              space_px: int) -> bool:
         """Borrow a syllable-like prefix from the next wrapped word.
@@ -17565,7 +17603,7 @@ class _ScholarTextWindow:
         txt = self._text
         try:
             scan = txt.index("__justify_next")
-            line_limit = txt.index(f"{scan} lineend")
+            line_limit = self._short_lookahead(scan)
         except tk.TclError:
             return False
         following = txt.get(scan, line_limit)
@@ -17610,11 +17648,11 @@ class _ScholarTextWindow:
         txt.mark_gravity("__justify_next", "right")
         return True
 
-    def _pad_display_line_to_margin(self, start: str, end: str, used: float,
-                                    width: int, space_px: int) -> None:
+    def _pad_display_line_to_margin(self, start: str, line_text: str,
+                                    used: float, width: int,
+                                    space_px: int) -> None:
         """Apply the original extra-space justification to one display line."""
         txt = self._text
-        line_text = txt.get(start, end)
         space_offsets = [
             m.start() for m in re.finditer(r"(?<=\S) (?=\S)", line_text)
         ]
@@ -17649,7 +17687,7 @@ class _ScholarTextWindow:
         next_start = txt.index(f"{line_end} +1c")
         if txt.compare(next_start, ">=", "end-1c"):
             return False  # nothing follows: last line of the document
-        next_text = txt.get(next_start, f"{next_start} lineend")
+        next_text = txt.get(next_start, self._short_lookahead(next_start))
         if not next_text.strip():
             return False  # a blank line ends the paragraph: this is its last line
         first_word = next_text.split(None, 1)[0]
@@ -17671,12 +17709,26 @@ class _ScholarTextWindow:
             return
         try:
             txt.config(state="normal")
-            self._clear_justification()
             txt.update_idletasks()
             width = txt.winfo_width() - int(txt.cget("padx")) * 2 - 4
             if width <= 100:
                 return
+            # Nothing that leaves the wrap width and the body font alone can
+            # move a line break, so a taller window, the page-number gutter
+            # appearing beside the text, or the side panel opening does not
+            # need the opinion justified again.
+            key = (width, getattr(self, "_base_size", None))
+            if key == getattr(self, "_justified_key", None):
+                return
+            self._clear_justification()
             space_px = max(self._fonts["base"].measure(" "), 1)
+            # Pass 1 records what each line needs rather than padding it on
+            # the spot.  Every insert invalidates the display metrics of the
+            # whole logical line it lands in, and a reporter paragraph runs
+            # to dozens of display lines, so padding as we go has Tk re-wrap
+            # the paragraph from its start once per line of it — quadratic,
+            # and seconds of it on a long opinion.
+            pending: list[tuple[str, str, float]] = []
             idx = "1.0"
             while txt.compare(idx, "<", "end-1c"):
                 try:
@@ -17714,13 +17766,19 @@ class _ScholarTextWindow:
                             line_end, used, width, space_px):
                         try:
                             line_end = txt.index(f"{idx} display lineend")
-                            used = self._fonts["base"].measure(
-                                txt.get(idx, line_end))
+                            line_text = txt.get(idx, line_end)
+                            used = self._fonts["base"].measure(line_text)
                         except tk.TclError:
                             pass
-                    self._pad_display_line_to_margin(
-                        idx, line_end, used, width, space_px)
+                    pending.append((idx, line_text, used))
                 idx = txt.index("__justify_next")
+            # Pass 2, from the bottom up: an insert only ever moves text after
+            # it, so working backwards leaves every index recorded above it
+            # still pointing where it did.
+            for start, line_text, used in reversed(pending):
+                self._pad_display_line_to_margin(
+                    start, line_text, used, width, space_px)
+            self._justified_key = key
         finally:
             try:
                 txt.config(state=old_state)

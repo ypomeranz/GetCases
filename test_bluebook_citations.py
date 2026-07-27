@@ -442,6 +442,49 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
         self.assertEqual(name, "The “Scotland.”")
         self.assertEqual(abbreviate_case_name(name), "The Scotland")
 
+    def test_a_doubled_initial_survives_the_repeated_abbreviation_collapse(self):
+        # A.A.R.P. v. Trump, 605 U.S. 246 (2025): the applicants are
+        # anonymized to initials, and the reporter spaces them out.  The
+        # collapse that folds a consolidated caption's repeated abbreviation
+        # ("United States U.S. U.S.") used to read "A. A." as one of those
+        # and hand back "A.R.P." — the wrong party, and a Bluebook cite to a
+        # case that does not exist.
+        blocks = [
+            Block("center", [Span("145 S.Ct. 1364 (2025)")]),
+            Block("center", [Span(
+                "A. A. R. P., et al. v. Donald J. TRUMP, President of the "
+                "United States, et al."
+            )]),
+            Block("center", [Span("Supreme Court of United States.")]),
+        ]
+
+        name = _scholar_caption_name(blocks)
+
+        self.assertEqual(name, "A. A. R. P. v. Trump")
+        self.assertEqual(abbreviate_case_name(name), "A.A.R.P. v. Trump")
+
+    def test_a_doubled_initial_survives_for_the_companion_case(self):
+        # W.M.M. v. Trump, 606 U.S. ___ (2025), argued the same term.
+        blocks = [Block("center", [Span(
+            "W. M. M., et al. v. Donald J. TRUMP, President of the United "
+            "States, et al."
+        )])]
+
+        self.assertEqual(
+            abbreviate_case_name(_scholar_caption_name(blocks)),
+            "W.M.M. v. Trump",
+        )
+
+    def test_a_consolidated_captions_repeated_abbreviation_still_collapses(self):
+        blocks = [Block("center", [Span(
+            "ACME OIL CO. v. UNITED STATES of America U.S. U.S."
+        )])]
+
+        self.assertEqual(
+            _scholar_caption_name(blocks),
+            "Acme Oil Co. v. United States of America U.S.",
+        )
+
     def test_lowercase_words_do_not_end_a_procedural_case_name(self):
         blocks = [Block("center", [Span(
             "IN RE TITLE, BALLOT TITLE & SUBMISSION CLAUSE FOR 2015-2016 #156"
