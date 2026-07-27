@@ -1247,6 +1247,57 @@ class OpinionDatabaseSpotlightTests(unittest.TestCase):
 
         self.assertEqual([h["scholar_id"] for h in hits], ["9"])
 
+    def test_a_common_party_only_match_is_dropped(self):
+        # Only "United States" matches "Foo Industries v. United States" — the
+        # distinctive party did not.  In the wide search this is a last-resort
+        # filler; in Spotlight, where three rows sit beside live results, it is
+        # noise and is dropped.
+        rows = [
+            {"scholar_id": "1", "name": "United States v. Wong Kim Ark",
+             "cite": "1 U.S. 1", "cites": ["1 U.S. 1"],
+             "court": "scotus", "year": "1898", "url": "u1"},
+            {"scholar_id": "2", "name": "Massachusetts v. EPA",
+             "cite": "2 U.S. 2", "cites": ["2 U.S. 2"],
+             "court": "scotus", "year": "2007", "url": "u2"},
+        ]
+        hits = _opinion_db_spotlight_results(
+            self.DB(rows), "Foo Industries v. United States", limit=3)
+        self.assertEqual(hits, [])
+
+    def test_a_state_only_match_is_dropped(self):
+        rows = [
+            {"scholar_id": "1", "name": "Arizona v. Gant",
+             "cite": "1 U.S. 1", "cites": ["1 U.S. 1"],
+             "court": "scotus", "year": "2009", "url": "u1"},
+        ]
+        hits = _opinion_db_spotlight_results(
+            self.DB(rows), "Miranda v. Arizona", limit=3)
+        self.assertEqual(hits, [])
+
+    def test_a_distinctive_one_party_match_still_shows(self):
+        # "Carpenter" is distinctive, so a one-sided match on it is kept even
+        # though the second party did not match.
+        rows = [
+            {"scholar_id": "1", "name": "Carpenter v. Koch",
+             "cite": "1 U.S. 1", "cites": ["1 U.S. 1"],
+             "court": "scotus", "year": "2018", "url": "u1"},
+        ]
+        hits = _opinion_db_spotlight_results(
+            self.DB(rows), "Carpenter v. United States", limit=3)
+        self.assertEqual([h["scholar_id"] for h in hits], ["1"])
+
+    def test_a_full_two_party_match_with_a_common_party_still_shows(self):
+        # "United States" as one side of a genuine two-party match still counts
+        # (tier 3) — this filter only drops matches on a common party *alone*.
+        rows = [
+            {"scholar_id": "1", "name": "United States v. Nixon",
+             "cite": "1 U.S. 1", "cites": ["1 U.S. 1"],
+             "court": "scotus", "year": "1974", "url": "u1"},
+        ]
+        hits = _opinion_db_spotlight_results(
+            self.DB(rows), "United States v. Nixon", limit=3)
+        self.assertEqual([h["scholar_id"] for h in hits], ["1"])
+
 
 class SpotlightCitationDetectionTests(unittest.TestCase):
     def test_early_federal_reporter_uses_shared_normalization(self):

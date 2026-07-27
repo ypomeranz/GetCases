@@ -715,6 +715,21 @@ class _CaseTabsWindow:
         self._pages.insert(at, page)
         self.notebook.select(page)
         self.refresh_page(page)
+        # A tab opened from Spotlight (or any citation followed while this
+        # window sat behind others or minimized) has to be seen: surface the
+        # window.  When it is already the front window this is a no-op.
+        self.surface()
+
+    def surface(self) -> None:
+        """Bring this tab window to the front, un-minimizing if need be."""
+        try:
+            self.win.deiconify()   # no-op unless the window was minimized
+            self.win.lift()
+            if sys.platform == "win32":
+                self.app._win_force_foreground(self.win)
+            self.win.focus_force()
+        except tk.TclError:
+            pass
 
     def remove_page(self, page: _CaseTabPage) -> None:
         if page not in self._pages:
@@ -4338,6 +4353,9 @@ def _opinion_db_spotlight_results(db, query: str,
     already completed.  Name searches reuse the CourtListener match tiers and
     jurisdiction-hint parser; reporter citations keep the database's exact
     citation lookup order and merely receive the court tie-break.
+
+    A match on a frequent party name alone (tier 0) does not count here — see
+    the filter below.
     """
     q = re.sub(r"\s+", " ", query or "").strip()
     if not q or db is None:
@@ -4367,7 +4385,13 @@ def _opinion_db_spotlight_results(db, query: str,
         else:
             tier = _match_tier(name_query, cand_name)
             score = _name_match_score(name_query, cand_name)
-            if tier < 0 or score < _NAME_MATCH_MIN:
+            # Tier 0 — the only party that matched is a frequent name (a
+            # state, "United States", a generic government plaintiff) — is
+            # dropped outright here, not kept as a last-resort filler the way
+            # the wider search keeps it.  Spotlight shows three rows beside
+            # live results, and a shelf of unrelated "United States v. …" is
+            # worse than a short list: nothing else in the query matched.
+            if tier < 1 or score < _NAME_MATCH_MIN:
                 continue
         scored.append((
             tier, score, _spotlight_court_priority(court_id),
@@ -18484,17 +18508,32 @@ class _ScholarTextWindow:
         stripped — used by the LaTeX writer.
         """
         txt = self._text
-        regions = sorted(
+        # A region's endpoints are Tk *marks* (see _fn_region_mark), not raw
+        # "line.char" indices, so _tk_ix cannot parse them and neither can the
+        # caller's _section_body_ranges.  Resolve each through the widget once,
+        # here, and hand back regions whose endpoints are real indices — the
+        # note bodies are still dumped from the live marks first, so a mark
+        # that has drifted is read where it actually sits.
+        def canon(index: str) -> str:
+            try:
+                return str(txt.index(index))
+            except tk.TclError:
+                return index
+
+        lo, hi = _tk_ix(canon(sec_start)), _tk_ix(canon(sec_end))
+        in_section = sorted(
             (r for r in getattr(self, "_fn_regions", []) or []
-             if _tk_ix(sec_start) <= _tk_ix(r[0]) < _tk_ix(sec_end)),
-            key=lambda r: _tk_ix(r[0]),
+             if lo <= _tk_ix(canon(r[0])) < hi),
+            key=lambda r: _tk_ix(canon(r[0])),
         )
+        regions: list = []
         parsed: list[tuple[str, str, list[_ExpPara]]] = []
-        for nrs, nre, num, _page in regions:
+        for nrs, nre, num, page in in_section:
             paras = _dump_export_paragraphs(txt, [(nrs, nre)], fn_links)
             fid, disp = _strip_note_marker(paras)
             label = (num or disp).strip().strip("[]").rstrip(".") or "*"
             parsed.append((fid, label, paras))
+            regions.append((canon(nrs), canon(nre), num, page))
         return regions, parsed
 
     def _build_export_latex(self) -> str:
