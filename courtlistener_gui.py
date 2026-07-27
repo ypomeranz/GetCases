@@ -177,6 +177,11 @@ def _ui_font(size: int, weight: str = "normal"):
     return ("TkDefaultFont", size, "bold" if weight == "bold" else "normal")
 
 
+# The modifier a keyboard shortcut is spelled with in menu labels.  Tk keeps
+# Control and Command apart, so anything that shows one has to bind it too.
+_ACCEL = "Cmd" if sys.platform == "darwin" else "Ctrl"
+
+
 def _bind_recursive(widget, sequence: str, handler) -> None:
     """Bind *handler* for *sequence* on *widget* and all of its descendants.
 
@@ -387,6 +392,11 @@ def _style_ui_button(button, primary: bool = False) -> None:
         pass
 
 
+def _ui_button_enable(button, enabled: bool) -> None:
+    """Enable or grey out a shared button (CTk and ttk agree on ``state``)."""
+    button.configure(state="normal" if enabled else "disabled")
+
+
 def _history_button(app, parent_frame):
     """The "History ▾" button case windows share: drops the app-wide list of
     the last 15 viewed cases (see ``CourtListenerGUI.record_case_view``).
@@ -417,11 +427,31 @@ def _add_bookmarks_cascade(menubar: tk.Menu, app, win: tk.Misc) -> None:
     menubar.add_cascade(label="Bookmarks", menu=bookmarks_menu)
 
 
-def _install_history_menubar(app, win: tk.Misc):
-    """Attach the shared History, Window and Bookmarks menus to case views."""
+def _add_copy_cascade(menubar: tk.Menu, reader) -> None:
+    """Append the "Copy" cascade: the three styles Ctrl-C can copy in, as radio
+    items so the one in force is visible.  Choosing one remembers it for next
+    session and, with text selected, copies right away."""
+    if reader is None or not hasattr(reader, "on_copy_mode_chosen"):
+        return
+    copy_menu = tk.Menu(menubar, tearoff=0)
+    for value, label in COPY_MODE_LABELS:
+        copy_menu.add_radiobutton(
+            label=label, value=value, variable=reader._copy_mode_var,
+            command=reader.on_copy_mode_chosen,
+        )
+    copy_menu.add_separator()
+    copy_menu.add_command(
+        label=f"Copy now\t{_ACCEL}+C", command=reader._copy_formatted)
+    menubar.add_cascade(label="Copy", menu=copy_menu)
+
+
+def _install_history_menubar(app, win: tk.Misc, reader=None):
+    """Attach the shared History, Window and Bookmarks menus to case views —
+    plus the Copy styles for a view that has them (an opinion reader)."""
     if app is None or not hasattr(app, "populate_history_menu"):
         return None
     menubar = tk.Menu(win)
+    _add_copy_cascade(menubar, reader)
     history_menu = tk.Menu(menubar, tearoff=0)
     try:
         history_menu.configure(
@@ -656,13 +686,50 @@ class _CaseTabsWindow:
         self.win.bind("<Destroy>", self._on_destroy, add="+")
 
     def add_page(self, page: _CaseTabPage) -> None:
-        self._pages.append(page)
-        self.notebook.add(
-            page, text="Opinion", image=self._tab_close_image,
-            compound="right",
-        )
+        # A case opened from another one sits next to the tab it came from,
+        # the way browser tabs do: following a citation out of an opinion and
+        # landing at the far end of a long strip loses the thread.  The opener
+        # is whichever tab is active — the new page is selected below, so a
+        # chain of citations reads left to right.
+        end = len(self._pages)
+        at = end
+        opener = self.active_page()
+        if opener is not None:
+            try:
+                at = min(self.notebook.index(opener) + 1, end)
+            except tk.TclError:
+                pass
+        try:
+            self.notebook.insert(
+                at if at < end else "end", page, text="Opinion",
+                image=self._tab_close_image, compound="right",
+            )
+        except tk.TclError:
+            # A stale index (a tab closed underneath us) is never worth losing
+            # the page over — fall back to the end of the strip.
+            self.notebook.add(
+                page, text="Opinion", image=self._tab_close_image,
+                compound="right",
+            )
+            at = end
+        self._pages.insert(at, page)
         self.notebook.select(page)
         self.refresh_page(page)
+        # A tab opened from Spotlight (or any citation followed while this
+        # window sat behind others or minimized) has to be seen: surface the
+        # window.  When it is already the front window this is a no-op.
+        self.surface()
+
+    def surface(self) -> None:
+        """Bring this tab window to the front, un-minimizing if need be."""
+        try:
+            self.win.deiconify()   # no-op unless the window was minimized
+            self.win.lift()
+            if sys.platform == "win32":
+                self.app._win_force_foreground(self.win)
+            self.win.focus_force()
+        except tk.TclError:
+            pass
 
     def remove_page(self, page: _CaseTabPage) -> None:
         if page not in self._pages:
@@ -1704,6 +1771,64 @@ def _save_token(token: str) -> None:
     _save_config(data)
 
 
+def _token_prompt_suppressed() -> bool:
+    """True once the user has told the startup token prompt to stay away."""
+    return bool(_load_config().get("suppress_token_prompt", False))
+
+
+def _save_token_prompt_suppressed(suppress: bool) -> None:
+    data = _load_config()
+    data["suppress_token_prompt"] = bool(suppress)
+    _save_config(data)
+
+
+# How Ctrl-C copies from an opinion reader.  The reader offers all three from
+# its "Copy" menu and remembers the last one across sessions.
+#
+#   plain  the selection alone
+#   cite   the selection with the Bluebook citation under it (the long-standing
+#          default, and what the old "Copy with citation" checkbox did)
+#   quote  the selection wrapped in double quotes with the citation one space
+#          after the closing quote — a quotation ready to drop into a brief
+COPY_MODES = ("plain", "cite", "quote")
+COPY_MODE_LABELS = (
+    ("plain", "Copy without citation"),
+    ("cite", "Copy with citation"),
+    ("quote", "Copy as quote"),
+)
+_DEFAULT_COPY_MODE = "cite"
+
+
+def _load_copy_mode() -> str:
+    """The copy style last chosen, defaulting to the historical behaviour."""
+    mode = _load_config().get("copy_mode")
+    return mode if mode in COPY_MODES else _DEFAULT_COPY_MODE
+
+
+def _save_copy_mode(mode: str) -> None:
+    if mode not in COPY_MODES:
+        return
+    data = _load_config()
+    data["copy_mode"] = mode
+    _save_config(data)
+
+
+
+def _verify_token(token: str) -> Optional[str]:
+    """Try *token* against the API.  Returns ``None`` when it works, otherwise
+    a one-line explanation fit for a dialog.  Called on a worker thread: the
+    courts endpoint is the cheapest authenticated call CourtListener has."""
+    try:
+        CourtListenerClient(api_token=token, timeout=15).list_courts(page_size=1)
+        return None
+    except CourtListenerError as exc:
+        if exc.status_code in (401, 403):
+            return "CourtListener rejected that token — check for a typo."
+        return f"CourtListener returned HTTP {exc.status_code}."
+    except Exception:
+        return "Couldn't reach CourtListener to check the token."
+
+
 def _default_spotlight_hotkey() -> str:
     return "<ctrl>+<space>" if sys.platform == "darwin" else "<ctrl>+<space>"
 
@@ -1781,7 +1906,14 @@ _LOC_CUTOFF = 542
 # GPO's GovInfo edition; GovInfo is used only when LOC hasn't the volume/page.
 _LOC_PREFERRED_MAX = 501
 _GOVINFO_MAX = 583
-_US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
+# A U.S. Reports citation.  The space in "U. S." is not optional in practice —
+# it is how the Court itself sets the reporter, and how CourtListener and
+# Google Scholar hand it over — so it is tolerated here.  Without that,
+# "601 U. S. 124" fell through every path keyed on this pattern (the GovInfo
+# and LOC URLs, the "we already have a U.S. cite" test, the cite recorded for
+# the saved file name) while us_reports_pdf's own laxer pattern still found the
+# scan, which is how a U.S. Reports PDF came to be saved under its S. Ct. cite.
+_US_CITE_RE = re.compile(r"(\d+)\s+U\.\s?S\.\s+(\d+)")
 
 # The Supreme Court Reporter ("93 S. Ct. 705", or "S.Ct." closed up as Google
 # Scholar prints it).  Only SCOTUS opinions carry this reporter, so a match is a
@@ -2093,8 +2225,16 @@ def _build_default_filename(item: dict) -> str:
         item.get("caseName") or item.get("case_name") or "opinion"
     ).strip())
 
-    # Best citation (U.S. Reports > S.Ct. > Federal Reporters > others)
-    citation_str = _pick_citation(item.get("citation", []))
+    # Best citation (U.S. Reports > S.Ct. > Federal Reporters > others).
+    # A U.S. Reports scan resolved for this case names its own volume and page
+    # (recorded by _resolve_pdf_url), and that is the citation to file it
+    # under — Google Scholar frequently gives a SCOTUS case only its S. Ct.
+    # cite, which _pick_citation would otherwise have to settle for even
+    # though the pages on screen are U.S. Reports pages.
+    citation_str = (
+        item.get("_us_reports_cite")
+        or _pick_citation(item.get("citation", []))
+    )
 
     # Year from date filed
     date_filed = item.get("dateFiled") or item.get("date_filed") or ""
@@ -2152,6 +2292,13 @@ def _named_temp_pdf_path(stem: str) -> str:
         if not os.path.exists(cand):
             return cand
     return base  # couldn't differentiate — overwrite the existing file
+
+
+def _normalized_us_cite(citation: str) -> str:
+    """The bare "583 U.S. 48" inside *citation*, or "" when it holds none.
+    Drops any pincite, parallel cite, or case name the string carries."""
+    m = _US_CITE_RE.search(citation or "")
+    return f"{m.group(1)} U.S. {m.group(2)}" if m else ""
 
 
 def _us_reports_loc_url(citation: str) -> Optional[str]:
@@ -2419,7 +2566,7 @@ def _case_law_pdf_choices_for_cites(
                         f"[case.law] could not match {expected_name!r} among "
                         f"{len(page_opinions)} opinions on the reporter page"
                     )
-                    # Preserve every sibling as a separate View PDF menu item.
+                    # Preserve every sibling as a separate PDF menu item.
                     # The source name could not safely choose, so the user must.
                     for i, opinion in enumerate(page_opinions, 1):
                         name = _case_law_opinion_name(opinion)
@@ -2805,6 +2952,57 @@ def _case_law_json_case(cite: str) -> "Optional[tuple[str, str]]":
     return (record.text, record.citation) if record is not None else None
 
 
+# CAP writes the Supreme Court's abbreviation as "U.S."; the app's own id for
+# it is "scotus", which is also what gives the badge its accent colour.
+_CAP_SCOTUS_RE = re.compile(
+    r"^(?:U\.\s?S\.|Supreme Court of the United States)$", re.IGNORECASE)
+
+
+def _court_for_citation(client, cite: str, name: str = "") -> tuple[str, str]:
+    """``(court_id, badge label)`` for a citation whose court a search result
+    did not carry — ``("", "")`` when neither source knows it.
+
+    Some results arrive without a court at all: a Federal Appendix citation is
+    answered straight from static.case.law, and a Google Scholar hit may name
+    no court on its page.  Both sources here are keyed on the citation, so
+    neither can drift to a merely similar case.
+
+    CourtListener is asked first because it answers with the app's own court
+    id, which drives the badge's colour and label together.  CAP's per-case
+    JSON is the fallback: its ``name_abbreviation`` is already a Bluebook-style
+    label ("4th Cir.", "S.D.N.Y."), good enough to show even though it carries
+    no id of ours.
+    """
+    cite = (cite or "").split("@", 1)[0].strip()
+    if not cite:
+        return "", ""
+    if client is not None:
+        try:
+            item = _cl_item_for_citation(client, cite, name)
+        except Exception as exc:
+            print(f"[spot-court] CourtListener lookup failed for {cite!r}: {exc}")
+            item = None
+        cid = str((item or {}).get("court_id") or "").strip().lower()
+        if cid:
+            return cid, ""
+    try:
+        data = _case_law_metadata(cite) or {}
+    except Exception as exc:
+        print(f"[spot-court] case.law lookup failed for {cite!r}: {exc}")
+        return "", ""
+    court = data.get("court")
+    if not isinstance(court, dict):
+        return "", ""
+    label = str(
+        court.get("name_abbreviation") or court.get("name") or ""
+    ).strip()
+    if not label:
+        return "", ""
+    if _CAP_SCOTUS_RE.match(label):
+        return "scotus", ""
+    return "", label
+
+
 def _link_name(text: str) -> str:
     """The case name in a cited-case hyperlink's text ("Calder v. Bull, 3 Dall.
     386, 388 (1798)" → "Calder v. Bull"), or "" — used to locate the case on
@@ -3151,6 +3349,82 @@ def _special_citation_ranges(
     return merged
 
 
+def _text_opinion_link_ranges(parts) -> dict[int, list]:
+    """Whole-opinion citation links mapped back to each rendered block.
+
+    PDF opinions already run :func:`citations.detect_links` over the complete
+    text layer, which is what lets an ``Id.`` see an antecedent in an earlier
+    paragraph and lets a multi-pin cite produce one link per page.  Text
+    opinions used to scan each formatting span independently instead.  Build a
+    logical full-opinion stream here, retain a character map for every block,
+    and return block-relative ranges that the styled renderer can apply.
+
+    A single newline separates paragraphs so an ``Id.`` opening the next
+    paragraph can still refer back (as it does in Giancola).  Part and
+    body/footnote boundaries use a blank line to stop an antecedent from
+    leaking into a different writing or note apparatus.
+    """
+    chunks: list[str] = []
+    italic: list[bool] = []
+    block_offsets: list[tuple[int, int, int]] = []
+    cursor = 0
+
+    def add(text: str, slanted: bool = False) -> None:
+        nonlocal cursor
+        chunks.append(text)
+        italic.extend([slanted] * len(text))
+        cursor += len(text)
+
+    for pi, part in enumerate(parts or []):
+        if pi:
+            add("\n\n")
+        groups = (
+            list(getattr(part, "blocks", None) or []),
+            list(getattr(part, "footnotes", None) or []),
+        )
+        wrote_group = False
+        for group in groups:
+            if not group:
+                continue
+            if wrote_group:
+                add("\n\n")
+            for bi, block in enumerate(group):
+                if bi:
+                    add("\n")
+                start = cursor
+                for span in getattr(block, "spans", None) or []:
+                    text = str(getattr(span, "text", "") or "")
+                    add(text, bool(getattr(span, "italic", False)))
+                block_offsets.append((id(block), start, cursor))
+            wrote_group = True
+
+    if not block_offsets:
+        return {}
+    text = "".join(chunks)
+    try:
+        detected = detect_brief_links(text, italic=italic)
+    except Exception:
+        return {}  # retain the span-by-span legacy path on detector failure
+
+    out: dict[int, list] = {
+        block_id: [] for block_id, _start, _end in block_offsets
+    }
+    oi = 0
+    for start, end, action in detected:
+        while oi < len(block_offsets) and block_offsets[oi][2] <= start:
+            oi += 1
+        j = oi
+        while j < len(block_offsets) and block_offsets[j][1] < end:
+            block_id, block_start, block_end = block_offsets[j]
+            lo, hi = max(start, block_start), min(end, block_end)
+            if lo < hi:
+                out[block_id].append(
+                    (lo - block_start, hi - block_start, action)
+                )
+            j += 1
+    return out
+
+
 def _item_from_cluster(cluster: dict) -> dict:
     """A search-result-shaped item from a citation-lookup OpinionCluster,
     carrying just the fields the result rows and PDF resolver need."""
@@ -3301,7 +3575,7 @@ def _us_reports_cite_via_courtlistener(
     bears it (via :func:`_cl_item_for_citation`, which only accepts a cluster
     whose own citations include the one asked for), and that cluster's parallel
     citations carry the U.S. cite.  Returning it lets the caller pull the
-    official opinion scan behind the "View PDF" button."""
+    official opinion scan behind the "PDF" button."""
     if client is None:
         return None
     # A U.S. Reports cite is already in hand — the PDF paths can use it directly.
@@ -4155,6 +4429,9 @@ def _opinion_db_spotlight_results(db, query: str,
     already completed.  Name searches reuse the CourtListener match tiers and
     jurisdiction-hint parser; reporter citations keep the database's exact
     citation lookup order and merely receive the court tie-break.
+
+    A match on a frequent party name alone (tier 0) does not count here — see
+    the filter below.
     """
     q = re.sub(r"\s+", " ", query or "").strip()
     if not q or db is None:
@@ -4184,7 +4461,13 @@ def _opinion_db_spotlight_results(db, query: str,
         else:
             tier = _match_tier(name_query, cand_name)
             score = _name_match_score(name_query, cand_name)
-            if tier < 0 or score < _NAME_MATCH_MIN:
+            # Tier 0 — the only party that matched is a frequent name (a
+            # state, "United States", a generic government plaintiff) — is
+            # dropped outright here, not kept as a last-resort filler the way
+            # the wider search keeps it.  Spotlight shows three rows beside
+            # live results, and a shelf of unrelated "United States v. …" is
+            # worse than a short list: nothing else in the query matched.
+            if tier < 1 or score < _NAME_MATCH_MIN:
                 continue
         scored.append((
             tier, score, _spotlight_court_priority(court_id),
@@ -4809,7 +5092,10 @@ def _case_pdf_text_source(
                     if source_url.startswith("/"):
                         source_url = "https://www.courtlistener.com" + source_url
                     return _CasePdfTextSource(
-                        "courtlistener", "CourtListener Text",
+                        # Under a PDF there is only one text to switch to, so
+                        # the button says "Text" and leaves the bar its room;
+                        # source_label still names where it came from.
+                        "courtlistener", "Text",
                         "CourtListener", source_url, text, target,
                         parts or [], blocks or [], record,
                     )
@@ -4819,7 +5105,7 @@ def _case_pdf_text_source(
     if record is None:
         return None
     return _CasePdfTextSource(
-        "case_law", "static.case.law Text", "static.case.law",
+        "case_law", "Text", "static.case.law",
         record.json_url, record.text, record.item, [], [], record,
     )
 
@@ -4946,6 +5232,10 @@ class CourtListenerGUI:
         # first lookup, so a search never arrives while the index is still
         # being built.  Deferred briefly so the window paints first.
         self.root.after(200, self._start_opinion_db_load)
+        # No CourtListener token yet?  Offer to enter one.  Deferred past
+        # main()'s withdraw() so the dialog can tell whether the root window is
+        # actually on screen.
+        self.root.after(300, self._prompt_for_token_if_missing)
 
     # ------------------------------------------------------------------
     # Case-view history (the "History ▾" dropdown on case windows)
@@ -5583,7 +5873,7 @@ class CourtListenerGUI:
         lookup_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Look Up", menu=lookup_menu)
         lookup_menu.add_command(
-            label="U.S. Code / C.F.R. Section…", accelerator="Ctrl+L",
+            label="U.S. Code / C.F.R. Section…", accelerator=f"{_ACCEL}+L",
             command=self._show_statute_lookup,
         )
         lookup_menu.add_command(
@@ -5591,7 +5881,7 @@ class CourtListenerGUI:
             command=self._show_citation_list_dialog,
         )
         lookup_menu.add_command(
-            label="Quick Look Up (case or statute)…", accelerator="Ctrl+S",
+            label="Quick Look Up (case or statute)…", accelerator=f"{_ACCEL}+S",
             command=self._show_quick_lookup,
         )
         lookup_menu.add_command(
@@ -5601,7 +5891,7 @@ class CourtListenerGUI:
         brief_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Brief", menu=brief_menu)
         brief_menu.add_command(
-            label="Open Brief (highlight citations)…", accelerator="Ctrl+B",
+            label="Open Brief (highlight citations)…", accelerator=f"{_ACCEL}+B",
             command=self._open_brief,
         )
         brief_menu.add_command(
@@ -5634,9 +5924,14 @@ class CourtListenerGUI:
         # document view, so this one lists the saved bookmarks without the
         # "Bookmark This …" toggle the readers show first.
         _add_bookmarks_cascade(menubar, self, self.root)
-        self.root.bind("<Control-l>", lambda _e: self._show_statute_lookup())
-        self.root.bind("<Control-s>", lambda _e: self._show_quick_lookup())
-        self.root.bind("<Control-b>", lambda _e: self._open_brief())
+        # The Mac modifier is Cmd, and Tk keeps the two apart — the same
+        # reason Ctrl-F alone never opened the find bar there (_bind_find_keys).
+        for key, command in (("l", self._show_statute_lookup),
+                             ("s", self._show_quick_lookup),
+                             ("b", self._open_brief)):
+            self.root.bind(f"<Control-{key}>", lambda _e, c=command: c())
+            if sys.platform == "darwin":
+                self.root.bind(f"<Command-{key}>", lambda _e, c=command: c())
 
         # --- Search frame ---
         search_frame = ttk.LabelFrame(self.root, text="Search", padding=6)
@@ -6388,6 +6683,29 @@ class CourtListenerGUI:
             "name": name_lbl, "detail": detail_lbl, "modern": False,
         }
 
+    @staticmethod
+    def _spot_court_label(court_id: str) -> str:
+        """Badge text for a court id, or the placeholder when none is known."""
+        if court_id == "scotus":
+            return "SCOTUS"
+        if court_id == "engrep":
+            return "Eng. Rep."
+        if not court_id:
+            return "?"
+        return _COURT_BLUEBOOK.get(court_id, court_id.upper())
+
+    def _spot_set_badge(self, r: dict, court_id: str, label: str = "") -> None:
+        """Re-label a result's court badge, in either widget toolkit."""
+        text = label or self._spot_court_label(court_id)
+        color = self._spot_tier_color(court_id)
+        try:
+            if r["modern"]:
+                r["badge"].configure(text=text, fg_color=color)
+            else:
+                r["badge"].config(text=text, bg=color)
+        except tk.TclError:
+            pass
+
     def _spot_highlight_row(self, r: dict, selected: bool) -> None:
         """Colour a result row for the current keyboard/hover selection."""
         if r["modern"]:
@@ -6556,39 +6874,56 @@ class CourtListenerGUI:
                           if detail else source_label)
             return detail
 
-        def _promote_row(r: dict) -> None:
-            """Move a result to the first visible slot, preserving its widget."""
-            try:
-                index = result_rows.index(r)
-            except ValueError:
-                return
-            if index == 0:
-                return
-            try:
-                r["row"].pack_configure(before=result_rows[0]["row"])
-            except tk.TclError:
-                return
-            result_rows.pop(index)
-            result_rows.insert(0, r)
-            selected_idx[0] = -1
-
         def _replace_row(r: dict, cite: str, year: str, source_label: str,
-                         open_fn, *, promote: bool = False) -> None:
+                         open_fn) -> None:
             # A preferred source (Google Scholar) took over an already-shown
             # row: swap its opener and re-label the detail line.  Badge and name
-            # stay — it is the same case, so they already match.
+            # stay — it is the same case, so they already match.  The row does
+            # not move: it is the same case either way, and a row that shifts
+            # under the pointer is a misclick waiting to happen.
             r["open_fn"] = open_fn
             try:
                 r["detail"].configure(
                     text=_detail_text(cite, year, source_label))
             except tk.TclError:
                 pass
-            if promote:
-                _promote_row(r)
+
+        def _resolve_court(r: dict, cite: str, name: str) -> None:
+            """Fill in a result's court badge once someone can tell us it.
+
+            A result that arrives with no court — a Federal Appendix citation
+            answered from case.law, a Scholar hit whose page names none — shows
+            its placeholder immediately rather than waiting, and the badge is
+            filled in when the lookup lands.  Only the badge changes; the row
+            keeps its place.
+            """
+            def apply(cid: str, label: str) -> None:
+                if my_gen != self._spotlight_generation:
+                    return
+                self._spot_set_badge(r, cid, label)
+
+            def run() -> None:
+                cid = label = ""
+                try:
+                    client = (self._get_client()
+                              if self._token_var.get().strip() else None)
+                    cid, label = _court_for_citation(client, cite, name)
+                except Exception as exc:
+                    print(f"[spot-court] lookup failed for {cite!r}: {exc}")
+                # Always report back, even on a miss or a failure: the badge is
+                # showing a "looking" placeholder, and it must not sit there.
+                if not (cid or label):
+                    label = "?"
+                try:
+                    self.root.after(0, apply, cid, label)
+                except (tk.TclError, RuntimeError):
+                    pass
+
+            threading.Thread(target=run, daemon=True).start()
 
         def _add_result(bucket: str, court_id: str, name: str, cite: str,
                         year: str, source_label: str, open_fn,
-                        opinion_id: str = "", promote: bool = False) -> None:
+                        opinion_id: str = "") -> None:
             # Ignore results streaming in from a superseded search.
             if my_gen != self._spotlight_generation:
                 return
@@ -6614,7 +6949,7 @@ class CourtListenerGUI:
                     if _prefer_source(bucket, entry["bucket"]):
                         old_bucket = entry["bucket"]
                         _replace_row(entry["row"], cite, year, source_label,
-                                     open_fn, promote=promote)
+                                     open_fn)
                         entry["bucket"] = bucket
                         entry["row"]["bucket"] = bucket
                         if old_bucket != bucket:
@@ -6627,8 +6962,6 @@ class CourtListenerGUI:
                                 bucket_counts[bucket] = (
                                     bucket_counts.get(bucket, 0) + 1
                                 )
-                    elif promote:
-                        _promote_row(entry["row"])
                     entry["sig"]["cites"] |= sig["cites"]
                     entry["sig"]["series"] |= sig["series"]
                     entry["sig"]["court"] = entry["sig"]["court"] or sig["court"]
@@ -6644,35 +6977,14 @@ class CourtListenerGUI:
                     bucket, 99):
                 return
             if len(result_rows) >= max_rows:
-                if not promote:
-                    return
-                # A likely lead SCOTUS opinion should never lose a race to a
-                # slower source merely because ten streaming rows arrived
-                # first.  Evict the final row and reclaim its bucket slot.
-                victim = result_rows.pop()
-                shown[:] = [
-                    entry for entry in shown if entry["row"] is not victim
-                ]
-                victim_bucket = str(victim.get("bucket") or "")
-                if victim_bucket:
-                    bucket_counts[victim_bucket] = max(
-                        0, bucket_counts.get(victim_bucket, 0) - 1,
-                    )
-                try:
-                    victim["row"].destroy()
-                except tk.TclError:
-                    pass
+                return
 
-            # Append a fresh row at the bottom.  Rows are added in arrival order
-            # and never moved, so a result already on screen keeps its position
-            # while the dropdown grows downward to fit the new one.
-            court_abbr = _COURT_BLUEBOOK.get(
-                court_id, court_id.upper() if court_id else "?"
-            )
-            if court_id == "scotus":
-                court_abbr = "SCOTUS"
-            elif court_id == "engrep":
-                court_abbr = "Eng. Rep."
+            # Every result takes the highest free slot — the bottom of the list
+            # — and stays there.  Rows are never reordered once shown: a result
+            # the user is reaching for must not slide to a different rank
+            # because a slower source finally answered.
+            resolving = not court_id and bool(cite)
+            court_abbr = "…" if resolving else self._spot_court_label(court_id)
 
             display_name = name[:80] + ("…" if len(name) > 80 else "")
             detail = _detail_text(cite, year, source_label)
@@ -6688,8 +7000,10 @@ class CourtListenerGUI:
             shown.append({"sig": sig, "bucket": bucket, "row": r})
             if bucket:
                 bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
-            if promote:
-                _promote_row(r)
+            # No court on the result itself: the row is up already, so go and
+            # find one for the badge without holding anything back.
+            if resolving:
+                _resolve_court(r, cite, name)
 
             def on_click(_e=None, _r=r) -> None:
                 self._close_quick_popup()
@@ -6888,7 +7202,7 @@ class CourtListenerGUI:
                     results,
                     _BUCKET_CAPS["scholar"] + 2,
                 )
-            for result_index, r in enumerate(results):
+            for r in results:
                 court_id = _scholar_source_to_court_id(r.source)
                 year = _scholar_source_year(r.source)
                 # The case's own reporter citation sits in the source byline.
@@ -6931,7 +7245,6 @@ class CourtListenerGUI:
                     0, _add_result, "scholar", court_id, r.title, cite, year,
                     "Scholar", make_opener(),
                     _scholar_result_identity(r.url),
-                    result_index == 0 and court_id == _SCOTUS_COURT_ID,
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
@@ -8197,42 +8510,194 @@ class CourtListenerGUI:
         dlg.protocol("WM_DELETE_WINDOW", close)
         dlg.after(50, dlg.focus_force)
 
+    # ------------------------------------------------------------------
+    # CourtListener API token
+    # ------------------------------------------------------------------
+
+    _TOKEN_SIGNUP_URL = "https://www.courtlistener.com/sign-in/"
+
+    def _prompt_for_token_if_missing(self) -> None:
+        """First run: no token is saved anywhere, so offer to enter one now.
+
+        Without a token every CourtListener search and text fetch is dead, and
+        since the app starts hidden in the background there is nothing on
+        screen to hint at what is missing — the user would otherwise meet the
+        gap at their first search.  Skipped when a token is already in hand
+        (config file or COURTLISTENER_TOKEN) and once the user has ticked
+        "Don't ask again"."""
+        if self._token_var.get().strip() or _token_prompt_suppressed():
+            return
+        try:
+            self._show_token_dialog(first_run=True)
+        except tk.TclError:
+            pass
+
     def _show_settings_dialog(self) -> None:
+        self._show_token_dialog()
+
+    def _show_token_dialog(
+        self, first_run: bool = False, wait: bool = False,
+    ) -> None:
+        """The API-token editor, reached from Settings → API Token… and from
+        startup.  ``first_run`` turns it into a welcome pane: where to get a
+        token, a "Don't ask again" opt-out, and Skip in place of Cancel.
+        ``wait`` blocks until the dialog closes, for callers that want to go on
+        to use the token (main thread only).
+
+        The entry edits a dialog-local variable, so the app's live token
+        changes only once a token has been saved."""
         dlg = _ui_toplevel(self.root)
-        dlg.title("Settings")
-        dlg.geometry("480x210" if _CTK_AVAILABLE else "460x175")
+        dlg.title("CourtListener API Token" if first_run else "Settings")
+        if first_run:
+            dw, dh = (540, 400) if _CTK_AVAILABLE else (520, 350)
+        else:
+            dw, dh = (480, 240) if _CTK_AVAILABLE else (460, 205)
+        # Centre it ourselves: on the first run the root window is usually
+        # still withdrawn, so there is no parent for the WM to centre over.
+        _ax, _ay, _aw, _ah = _work_area(dlg)
+        dlg.geometry(
+            f"{dw}x{dh}+{_ax + max(0, (_aw - dw) // 2)}"
+            f"+{_ay + max(0, (_ah - dh) // 3)}"
+        )
         dlg.resizable(False, False)
+        # A withdrawn root — the default background start — must not become
+        # this dialog's master: window managers hide a transient whose master
+        # is hidden, which would leave the prompt invisible.
+        if not self._root_hidden:
+            dlg.transient(self.root)
         dlg.grab_set()
-        dlg.transient(self.root)
+
+        token_var = tk.StringVar(master=dlg, value=self._token_var.get())
+        status_var = tk.StringVar(master=dlg, value="")
+        suppress_var = tk.BooleanVar(master=dlg, value=False)
+        show_var = tk.BooleanVar(master=dlg, value=False)
+        checking = {"busy": False}
 
         outer = _ui_frame(dlg)
         outer.pack(fill="both", expand=True, padx=16, pady=14)
         _ui_label(outer, "CourtListener API Token", size=14, weight="bold",
                   anchor="w").pack(fill="x")
-        _ui_label(outer, "Used for CourtListener search and text retrieval.",
-                  size=11, muted=True, anchor="w").pack(fill="x", pady=(2, 10))
+        _ui_label(
+            outer,
+            "GetCases reads case law through CourtListener, which needs a\n"
+            "free API token.  Create an account, copy the token from your\n"
+            "profile's API page, and paste it below.\n\n"
+            "Skipping is fine — Google Scholar, the U.S. Code, the CFR, the\n"
+            "Constitution, and state statutes all work without a token."
+            if first_run else
+            "Used for CourtListener search and text retrieval.",
+            size=11, muted=True, anchor="w",
+        ).pack(fill="x", pady=(2, 10))
 
-        entry = _ui_entry(outer, textvariable=self._token_var, show="*")
+        entry = _ui_entry(outer, textvariable=token_var, show="*")
         entry.pack(fill="x")
-
-        show_var = tk.BooleanVar(value=False)
 
         def _toggle() -> None:
             entry.configure(show="" if show_var.get() else "*")
 
-        _ui_checkbox(outer, "Show token", show_var, _toggle).pack(
-            anchor="w", pady=(8, 0))
+        row = _ui_frame(outer)
+        row.pack(fill="x", pady=(8, 0))
+        _ui_checkbox(row, "Show token", show_var, _toggle).pack(side="left")
+        _ui_button(
+            row, "Get a token…", width=120,
+            command=lambda: webbrowser.open(self._TOKEN_SIGNUP_URL),
+        ).pack(side="right")
+
+        _ui_label(outer, textvariable=status_var, size=11, muted=True,
+                  anchor="w").pack(fill="x", pady=(8, 0))
+
+        if first_run:
+            _ui_checkbox(outer, "Don't ask again", suppress_var).pack(
+                anchor="w", pady=(6, 0))
+
+        def close() -> None:
+            if first_run and suppress_var.get():
+                _save_token_prompt_suppressed(True)
+            try:
+                dlg.grab_release()
+                dlg.destroy()
+            except tk.TclError:
+                pass
+
+        def commit(token: str) -> None:
+            self._token_var.set(token)
+            _save_token(token)
+            close()
+
+        def checked(token: str, error: Optional[str]) -> None:
+            checking["busy"] = False
+            try:
+                _ui_button_enable(save_btn, True)
+                entry.configure(state="normal")
+            except Exception:
+                return  # dialog closed under us
+            if error is None:
+                commit(token)
+                return
+            status_var.set(error)
+            # A token that didn't answer isn't necessarily wrong — the network
+            # may just be down — so offer to keep it rather than discard it.
+            if messagebox.askyesno(
+                "Token Not Verified", f"{error}\n\nSave it anyway?",
+                parent=dlg,
+            ):
+                commit(token)
+
+        def save() -> None:
+            if checking["busy"]:
+                return
+            token = token_var.get().strip()
+            if not token:
+                # An empty box is a skip, unless it clears a saved token —
+                # that is a deliberate "forget my token".
+                if self._token_var.get().strip():
+                    commit("")
+                else:
+                    close()
+                return
+            checking["busy"] = True
+            status_var.set("Checking the token with CourtListener…")
+            _ui_button_enable(save_btn, False)
+            entry.configure(state="disabled")  # commit what was checked
+
+            def run() -> None:
+                error = _verify_token(token)
+                try:
+                    self.root.after(0, lambda: checked(token, error))
+                except tk.TclError:
+                    pass
+
+            threading.Thread(target=run, daemon=True).start()
 
         btn_frame = _ui_frame(dlg)
         btn_frame.pack(fill="x", padx=16, pady=(0, 14))
-        _ui_button(
-            btn_frame, "Save & Close", primary=True, width=120,
-            command=lambda: (_save_token(self._token_var.get().strip()),
-                             dlg.destroy()),
-        ).pack(side="right")
-        _ui_button(btn_frame, "Cancel", command=dlg.destroy, width=88).pack(
-            side="right", padx=8
+        save_btn = _ui_button(
+            btn_frame, "Save & Close", primary=True, width=120, command=save,
         )
+        save_btn.pack(side="right")
+        _ui_button(
+            btn_frame, "Skip for now" if first_run else "Cancel",
+            command=close, width=110 if first_run else 88,
+        ).pack(side="right", padx=8)
+
+        dlg.bind("<Return>", lambda _e: save())
+        dlg.bind("<Escape>", lambda _e: close())
+        dlg.protocol("WM_DELETE_WINDOW", close)
+
+        def _raise() -> None:
+            try:
+                dlg.lift()
+                if sys.platform == "win32":
+                    self._win_force_foreground(dlg)
+                dlg.focus_force()
+                entry.focus_set()
+            except tk.TclError:
+                pass
+
+        dlg.after(50, _raise)
+
+        if wait:
+            self.root.wait_window(dlg)
 
     # ------------------------------------------------------------------
     # Court picker
@@ -8369,11 +8834,19 @@ class CourtListenerGUI:
     def _get_client(self) -> Optional[CourtListenerClient]:
         token = self._token_var.get().strip()
         if not token:
-            messagebox.showerror(
+            # Offer the entry dialog rather than only naming the menu it hides
+            # behind.  The dialog opens on the main thread (this runs from
+            # worker threads too) and this call still returns None — the token
+            # arrives too late for it, but the next lookup will have it.
+            if messagebox.askyesno(
                 "Missing Token",
-                "Please enter your CourtListener API token.\n\n"
-                "Go to Settings → API Token…",
-            )
+                "This needs a CourtListener API token.\n\n"
+                "Enter one now?",
+            ):
+                try:
+                    self.root.after(0, self._show_token_dialog)
+                except tk.TclError:
+                    pass
             return None
         if self._client is None or self._client._session.headers.get(
             "Authorization"
@@ -8405,12 +8878,16 @@ class CourtListenerGUI:
                 return
         else:
             client = None
-            messagebox.showwarning(
+            if messagebox.askyesno(
                 "No CourtListener Token",
-                "No CourtListener API token is set — CourtListener results will "
-                "be skipped.\n\nGoogle Scholar will still search.  Add a token "
-                "under Settings → API Token… to include CourtListener.",
-            )
+                "No CourtListener API token is set — CourtListener results "
+                "will be skipped.\n\nGoogle Scholar will still search.  "
+                "Enter a token now to include CourtListener?",
+            ):
+                self._show_token_dialog(wait=True)
+                token = self._token_var.get().strip()
+                if token:
+                    client = self._get_client()
 
         # CourtListener accepts space-separated court IDs; empty set = all
         court = " ".join(sorted(self._selected_courts)) or None
@@ -8661,6 +9138,7 @@ class CourtListenerGUI:
         """
         storage_base = "https://storage.courtlistener.com/"
         item.pop("_case_law_pdf_choices", None)
+        item.pop("_us_reports_cite", None)
         skip_metadata_fallback = bool(
             item.get("_skip_pdf_metadata_fallback")
         )
@@ -8699,7 +9177,7 @@ class CourtListenerGUI:
         # Supreme Court Reporter ("S. Ct.") cite, not the "U.S." cite every
         # official-PDF path below keys on.  Ask CourtListener whether that
         # S. Ct. cite has a parallel U.S. Reports cite and, if so, try it too —
-        # that's what lets "View PDF" reach the official opinion scan.
+        # that's what lets "PDF" reach the official opinion scan.
         is_scotus = is_scotus or any(
             _US_CITE_RE.search(c) or _SCT_CITE_RE.search(c)
             for c in all_cites
@@ -8744,19 +9222,27 @@ class CourtListenerGUI:
                 (_try_loc, _try_govinfo) if loc_preferred
                 else (_try_govinfo, _try_loc)
             )
+            # Every path below keys on a U.S. Reports cite, so whichever one
+            # succeeds names the pages the reader is about to see.  Record it:
+            # a case reached through Google Scholar's S. Ct. text often carries
+            # no U.S. cite of its own, and the saved file should still be named
+            # for the reporter it was carved out of (see
+            # _build_default_filename).
             for source in sources:
                 url = source(cite)
                 if url is not None:
+                    item["_us_reports_cite"] = _normalized_us_cite(cite)
                     return url
             local_pdf = us_reports_pdf.extract_citation(cite)
             if local_pdf is not None:
                 url = local_pdf.as_uri()
                 print(f"[resolve] using local US Reports volume: {url}")
+                item["_us_reports_cite"] = _normalized_us_cite(cite)
                 return url
 
         # 0.5. Non-SCOTUS: the Harvard CAP static.case.law copy.  Try every
         #      parallel cite before giving up; when more than one reporter scan
-        #      exists, keep all of them for the case window's View PDF menu.
+        #      exists, keep all of them for the case window's PDF menu.
         if not is_scotus:
             expected_name = re.sub(
                 r"<[^>]+>", "",
@@ -9175,7 +9661,7 @@ class CourtListenerGUI:
     ) -> None:
         """A Google Scholar opinion page failed to load (Google is flaky).  Show
         the CourtListener view located by the case's reporter citation and retry
-        the Scholar opinion in the background — the "Google Scholar Text" button
+        the Scholar opinion in the background — the "Scholar" button
         lights up if it comes through.  With no citation to locate the case on
         CourtListener, just retry Scholar and open it if it returns."""
         client = self._get_client() if self._token_var.get().strip() else None
@@ -9381,7 +9867,7 @@ class CourtListenerGUI:
           • first case matches CL    → show the Scholar text and we're done.
           • first case doesn't match → show the CourtListener text now, but
             keep hunting for a matching Scholar case in the background; if one
-            turns up the "Google Scholar Text" button lights up so the reader
+            turns up the "Scholar" button lights up so the reader
             can switch over.
 
         (Federal Appendix cases are handled by callers before this runs.)
@@ -10648,6 +11134,75 @@ def _scholar_result_cite(r) -> str:
     return cite or ""
 
 
+# Quotation marks, for the "copy as quote" style.  Text going inside a fresh
+# pair of double quotes has to have its own quotes demoted a level: the doubles
+# it contains become singles and the singles become doubles, so the nesting
+# reads correctly in the brief it is pasted into.
+_QUOTE_OPEN, _QUOTE_CLOSE = "\u201c", "\u201d"          # “ ”
+_SQUOTE_OPEN, _SQUOTE_CLOSE = "\u2018", "\u2019"        # ‘ ’
+
+
+class _QuoteFlipper:
+    """Swaps single and double quotation marks, one character at a time.
+
+    Stateful because of ``’``, which is both a closing single quote and an
+    apostrophe.  It is only flipped while a ``‘`` has a quotation open, so
+    "the Government’s brief" and "Ass’n" come through untouched while a genuine
+    nested ‘quotation’ is promoted.  Fed characters in reading order — the same
+    instance walks the plain text and the RTF, which is why it is a class and
+    not a function.
+    """
+
+    def __init__(self) -> None:
+        self._single_open = False
+
+    def flip(self, ch: str) -> str:
+        if ch == _SQUOTE_OPEN:
+            self._single_open = True
+            return _QUOTE_OPEN
+        if ch == _SQUOTE_CLOSE:
+            if not self._single_open:
+                return ch  # an apostrophe, not the end of a quotation
+            self._single_open = False
+            return _QUOTE_CLOSE
+        if ch == _QUOTE_OPEN:
+            return _SQUOTE_OPEN
+        if ch == _QUOTE_CLOSE:
+            return _SQUOTE_CLOSE
+        if ch == '"':
+            return "'"
+        return ch
+
+
+def _flip_quotes(text: str) -> str:
+    """Demote the quotation marks in *text* by one level (see _QuoteFlipper)."""
+    flipper = _QuoteFlipper()
+    return "".join(flipper.flip(ch) for ch in text)
+
+
+# A quotation mark in an RTF body: either a literal ASCII one or the ``\uNNNN?``
+# escape _rtf_escape writes for anything above ASCII.
+_RTF_QUOTE_TOKEN_RE = re.compile(r"\\u(-?\d+)\?|\"")
+
+
+def _flip_rtf_quotes(rtf: str) -> str:
+    """:func:`_flip_quotes` over an RTF fragment, leaving its markup alone.
+
+    The rich copy is the one that matters for a brief, so the flip has to reach
+    the escaped characters too.  Non-quote escapes pass through the flipper
+    unchanged, and control words never match the token pattern.
+    """
+    flipper = _QuoteFlipper()
+
+    def replace(m: "re.Match") -> str:
+        if m.group(1) is None:
+            return _rtf_escape(flipper.flip(m.group(0)))
+        cp = int(m.group(1))
+        return _rtf_escape(flipper.flip(chr(cp + 65536 if cp < 0 else cp)))
+
+    return _RTF_QUOTE_TOKEN_RE.sub(replace, rtf)
+
+
 def _rtf_escape(s: str) -> str:
     out: list[str] = []
     for ch in s:
@@ -11014,10 +11569,11 @@ def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PDF (LaTeX) + Markdown export.  Both writers share a formatting-preserving
-# dump of the reader's Tk Text widget (_dump_export_paragraphs) that mirrors
-# _dump_to_rtf's tag handling: on-screen justification fragments are dropped,
-# the hidden hyphenation originals are kept.
+# LaTeX export (typeset to PDF here, or saved as .tex to typeset elsewhere).
+# The writer works from a formatting-preserving dump of the reader's Tk Text
+# widget (_dump_export_paragraphs) that mirrors _dump_to_rtf's tag handling:
+# on-screen justification fragments are dropped, the hidden hyphenation
+# originals are kept.
 # ---------------------------------------------------------------------------
 
 
@@ -11065,7 +11621,7 @@ def _dump_export_paragraphs(
     fn_links: dict[str, tuple[str, str]],
 ) -> list[_ExpPara]:
     """Convert Tk Text ranges (with the Scholar window's tags) into styled
-    paragraphs — the shared source for the LaTeX and Markdown exports."""
+    paragraphs — the source the LaTeX export is written from."""
     paras: list[_ExpPara] = []
     for start, end in ranges:
         active: set[str] = set(txt.tag_names(start))
@@ -11590,77 +12146,6 @@ def _compile_latex(
         return False, "\n".join(lines[-15:])
 
 
-# Markdown escapes: emphasis/link specials always; list/quote/heading
-# markers only where they'd start a block.
-_MD_SPECIAL_RE = re.compile(r"([\\`*_\[\]])")
-_MD_LINE_START_RE = re.compile(r"^(\s*)([#>+\-])")
-_MD_ORDERED_RE = re.compile(r"^(\s*\d+)\.")
-
-
-def _md_escape(s: str) -> str:
-    return _MD_SPECIAL_RE.sub(r"\\\1", s)
-
-
-def _md_block_guard(s: str) -> str:
-    s = _MD_LINE_START_RE.sub(r"\1\\\2", s)
-    return _MD_ORDERED_RE.sub(r"\1\\.", s)
-
-
-def _md_run(run: _ExpRun, ref_ids: dict[str, str]) -> str:
-    """One styled run as Markdown.  `ref_ids` maps footnote anchor ids to
-    Markdown footnote ids ([^id])."""
-    if run.pagenum:
-        text = run.text
-        lead = text[: len(text) - len(text.lstrip())]
-        trail = text[len(text.rstrip()):]
-        return lead + "**" + _md_escape(text.strip()) + "**" + trail
-    if run.fnref:
-        rid = ref_ids.get(run.fnref)
-        if rid:
-            return f"[^{rid}]"
-        return "<sup>" + _md_escape(run.text.strip()) + "</sup>"
-    if run.fndef:
-        return "**" + _md_escape(run.text.strip()) + "**"
-    text = run.text
-    core = text.strip()
-    if not core or not (run.bold or run.italic or run.sup):
-        return _md_escape(text)
-    lead = text[: len(text) - len(text.lstrip())]
-    trail = text[len(text.rstrip()):]
-    core = _md_escape(core)
-    if run.bold and run.italic:
-        core = f"***{core}***"
-    elif run.bold:
-        core = f"**{core}**"
-    elif run.italic:
-        core = f"*{core}*"
-    if run.sup:
-        core = f"<sup>{core}</sup>"
-    return lead + core + trail
-
-
-def _md_paragraphs(
-    paras: list[_ExpPara], ref_ids: Optional[dict[str, str]] = None
-) -> list[str]:
-    """Paragraphs as Markdown blocks (no trailing newlines)."""
-    ref_ids = ref_ids or {}
-    blocks: list[str] = []
-    for p in paras:
-        if p.kind == "fnhead":
-            continue
-        body = "".join(_md_run(r, ref_ids) for r in p.runs).strip()
-        if not body:
-            continue
-        body = _md_block_guard(body)
-        if p.kind == "blockquote":
-            blocks.append("> " + body)
-        elif p.kind == "heading":
-            blocks.append("#### " + body)
-        else:
-            blocks.append(body)
-    return blocks
-
-
 def _copy_rich_clipboard(widget: tk.Misc, rtf: str, plain: str) -> str:
     """
     Put *rtf* on the system clipboard (with *plain* as fallback where the
@@ -11956,13 +12441,43 @@ def _find_scholar_for_item(
     return None, cl_text, f"best candidate similarity {best_sim:.0%}"
 
 
+def _bind_find_keys(win: tk.Misc, open_cb, next_cb, prev_cb) -> None:
+    """Bind the find accelerators a reader would actually press.
+
+    Ctrl-F / F3 / Shift-F3 everywhere.  On macOS the find key is Cmd-F, not
+    Ctrl-F, and Tk does not fold the two — a Ctrl-F-only binding leaves a Mac
+    keyboard with no way into the find bar at all — so Cmd-F and the Mac
+    find-again pair Cmd-G / Cmd-Shift-G are bound alongside it.
+    """
+    def wrap(cb):
+        def handler(_e=None):
+            cb()
+            return "break"
+        return handler
+
+    win.bind("<Control-f>", wrap(open_cb))
+    win.bind("<F3>", wrap(next_cb))
+    win.bind("<Shift-F3>", wrap(prev_cb))
+    if sys.platform == "darwin":
+        win.bind("<Command-f>", wrap(open_cb))
+        win.bind("<Command-g>", wrap(next_cb))
+        # Shift turns the keysym into "G"; bind both spellings so the pattern
+        # matches whichever the Tk build reports.
+        win.bind("<Command-Shift-G>", wrap(prev_cb))
+        win.bind("<Command-Shift-g>", wrap(prev_cb))
+
+
 class _TextFinder:
     """Ctrl-F find bar for a Text widget: highlights every match, steps
     through them with Enter / Shift+Enter (also F3 / Shift+F3), and
-    closes with Escape.  Case-insensitive plain-text search."""
+    closes with Escape.  Case-insensitive plain-text search.
+
+    ``bind_keys=False`` leaves the find accelerators alone, for a window that
+    shows more than one kind of view and has to route them itself (the opinion
+    reader, which switches between this text view and a PDF pane)."""
 
     def __init__(self, win: tk.Misc, txt: tk.Text,
-                 before_widget: tk.Misc) -> None:
+                 before_widget: tk.Misc, bind_keys: bool = True) -> None:
         self._win, self._txt = win, txt
         self._before = before_widget
         self._visible = False
@@ -11991,9 +12506,9 @@ class _TextFinder:
         self._entry.bind("<Shift-Return>", lambda _e: self.step(-1))
         self._entry.bind("<KeyRelease>", self._on_key)
         self._entry.bind("<Escape>", lambda _e: self.close())
-        win.bind("<Control-f>", lambda _e: self.open() or "break")
-        win.bind("<F3>", lambda _e: self.step(+1))
-        win.bind("<Shift-F3>", lambda _e: self.step(-1))
+        if bind_keys:
+            _bind_find_keys(win, self.open,
+                            lambda: self.step(+1), lambda: self.step(-1))
         win.bind("<Escape>", lambda _e: self.close() if self._visible
                  else None)
 
@@ -12112,6 +12627,10 @@ class _TextFinder:
 # and crash the app when a case link was clicked from the PDF brief viewer.
 _PDFIUM_LOCK = pdfium_lock.PDFIUM_LOCK
 _PDF_HEADER_RE = re.compile(br"%PDF-\d")
+
+# Bit 7 of a PDF font descriptor's flags (PDF 1.7 §9.8.2, Table 123): the face
+# is italic.  Case names are set in italic and the prose around them is not.
+_FONT_FLAG_ITALIC = 1 << 6
 _PDF_LINK_ATTR_RE = re.compile(
     r"""(?is)\b(?:href|src|data|data-url)=["']([^"']+)["']"""
 )
@@ -12217,7 +12736,11 @@ def _fetch_pdf_bytes(
 ) -> "Optional[tuple[bytes, str]]":
     """Fetch *url* as a PDF, following a small HTML wrapper if necessary.
     file:// URLs (opinions extracted from local US Reports volumes) are read
-    straight from disk."""
+    straight from disk.
+
+    A preliminary print's "Page Proof Pending Publication" stamp is taken out
+    here, so every path downstream — the viewer, the printer, Download PDF —
+    gets the clean document."""
     queue = [url]
     seen: set[str] = set()
     while queue and len(seen) < max_hops:
@@ -12234,7 +12757,7 @@ def _fetch_pdf_bytes(
                 print(f"[pdf] local file read failed ({exc}): {cur}")
                 continue
             if data is not None:
-                return data, cur
+                return _strip_page_proof_watermark(data), cur
             continue
         resp = _pdf_get(cur, client=client, timeout=timeout)
         resp.raise_for_status()
@@ -12243,11 +12766,140 @@ def _fetch_pdf_bytes(
             resp.content, resp.headers.get("Content-Encoding", ""))
         data = _normalize_pdf_bytes(content)
         if data is not None:
-            return data, final_url
+            return _strip_page_proof_watermark(data), final_url
         for nxt in _pdf_link_candidates_from_html(content, final_url):
             if nxt not in seen and nxt not in queue:
                 queue.append(nxt)
     return None
+
+
+# The Reporter of Decisions stamps every page of a preliminary print with a
+# grey diagonal "Page Proof Pending Publication".  It is a real page object,
+# not part of the opinion, and it muddies the text on screen and drinks ink in
+# print — so it is taken out of the document as soon as it is fetched.
+_PAGE_PROOF_RE = re.compile(r"page\s*proof\s*pending\s*publication",
+                            re.IGNORECASE)
+
+
+def _text_obj_string(obj, textpage) -> str:
+    """The text a pdfium text object draws, or "" if it cannot be read."""
+    import ctypes
+
+    import pypdfium2.raw as C
+
+    try:
+        buf = ctypes.create_string_buffer(512)
+        n = C.FPDFTextObj_GetText(
+            obj, textpage, ctypes.cast(buf, ctypes.POINTER(ctypes.c_ushort)),
+            512,
+        )
+        if not n:
+            return ""
+        return bytes(buf[:n * 2]).decode("utf-16-le", "replace").rstrip("\x00")
+    except Exception:
+        return ""
+
+
+def _is_page_proof_object(obj, textpage, depth: int = 0) -> bool:
+    """True for the watermark: a text object drawing the phrase, or a form
+    whose contents are *entirely* such objects.  Requiring the whole form to
+    be watermark keeps a form that also carries opinion text from being
+    dropped along with it."""
+    import pypdfium2.raw as C
+
+    try:
+        kind = C.FPDFPageObj_GetType(obj)
+    except Exception:
+        return False
+    if kind == C.FPDF_PAGEOBJ_TEXT:
+        return bool(_PAGE_PROOF_RE.search(_text_obj_string(obj, textpage)))
+    if kind == C.FPDF_PAGEOBJ_FORM and depth < 3:
+        try:
+            n = C.FPDFFormObj_CountObjects(obj)
+        except Exception:
+            return False
+        return bool(n) and all(
+            _is_page_proof_object(C.FPDFFormObj_GetObject(obj, i),
+                                  textpage, depth + 1)
+            for i in range(n)
+        )
+    return False
+
+
+def _strip_page_proof_watermark(data: bytes) -> bytes:
+    """Return *data* with the "Page Proof Pending Publication" watermark
+    removed from every page, or *data* unchanged when there is none.
+
+    Cheap on the overwhelming majority of PDFs: a preliminary print carries the
+    stamp on every page, so the first page decides whether to look at the rest.
+    Any failure returns the original bytes — a watermark is a blemish, losing
+    the opinion is not.
+    """
+    import io
+
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as C
+
+    try:
+        with _PDFIUM_LOCK:
+            doc = pdfium.PdfDocument(data, autoclose=False)
+    except Exception:
+        return data
+    try:
+        with _PDFIUM_LOCK:
+            if not len(doc):
+                return data
+            first = doc[0]
+            try:
+                tp = first.get_textpage()
+                try:
+                    stamped = bool(_PAGE_PROOF_RE.search(tp.get_text_range()))
+                finally:
+                    tp.close()
+            finally:
+                first.close()
+            if not stamped:
+                return data
+
+            removed = 0
+            for i in range(len(doc)):
+                page = doc[i]
+                try:
+                    tp = page.get_textpage()
+                    try:
+                        victims = [
+                            obj for obj in (
+                                C.FPDFPage_GetObject(page, k)
+                                for k in range(C.FPDFPage_CountObjects(page))
+                            )
+                            if _is_page_proof_object(obj, tp)
+                        ]
+                    finally:
+                        tp.close()
+                    for obj in victims:
+                        if C.FPDFPage_RemoveObject(page, obj):
+                            C.FPDFPageObj_Destroy(obj)
+                            removed += 1
+                    if victims:
+                        C.FPDFPage_GenerateContent(page)
+                finally:
+                    page.close()
+            if not removed:
+                return data
+            buf = io.BytesIO()
+            doc.save(buf)
+            out = buf.getvalue()
+        print(f"[pdf] removed {removed} page-proof watermarks")
+        return out if out.startswith(b"%PDF") else data
+    except Exception as exc:
+        print(f"[pdf] watermark removal failed ({exc}); keeping the original")
+        return data
+    finally:
+        try:
+            with _PDFIUM_LOCK:
+                doc.close()
+        except Exception:
+            pass
 
 
 def _page_has_scan_background(page) -> bool:
@@ -12473,10 +13125,20 @@ def _union_line_runs(boxes: list) -> list:
 
 
 def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
-    """Extract a PDF's text layer as ``[[(char, box_or_None), …], …]`` — one
-    list per page, each a parallel run of characters and their glyph boxes
-    ``(left, bottom, right, top)`` in PDF points (``None`` for a char with no
-    usable box, e.g. a line break).
+    """The character/box data alone — see :func:`_extract_pdf_text_and_style`."""
+    return _extract_pdf_text_and_style(pdf_bytes)[0]
+
+
+def _extract_pdf_text_and_style(pdf_bytes: bytes) -> "tuple[list, list]":
+    """Extract a PDF's text layer, as ``(pages, italics)``.
+
+    ``pages`` is ``[[(char, box_or_None), …], …]`` — one list per page, each a
+    parallel run of characters and their glyph boxes ``(left, bottom, right,
+    top)`` in PDF points (``None`` for a char with no usable box, e.g. a line
+    break).  ``italics`` is the same shape with a bool per character, true where
+    the glyph is set in an italic face: case names are italicised and the prose
+    around them is not, which is what tells a citation from a sentence that
+    merely ends in a capitalised word.
 
     Runs on a background thread: it loads its *own* pdfium document (never the
     pane's), touches no tk objects, and returns plain data.  Every PDFium call is
@@ -12489,13 +13151,23 @@ def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
         doc = pdfium.PdfDocument(pdf_bytes)
     try:
         pages: list = []
+        italics: list = []
         try:
             with _PDFIUM_LOCK:
                 n_pages = len(doc)
         except Exception:
-            return []
+            return [], []
+        import ctypes
+
+        import pypdfium2.raw as C
+
+        # The font descriptor's italic bit.  Only the flags are wanted, so the
+        # name buffer is as small as the call will accept.
+        name_buf = ctypes.create_string_buffer(4)
+        font_flags = ctypes.c_int(0)
         for pi in range(n_pages):
             chars: list = []
+            slants: list = []
             with _PDFIUM_LOCK:
                 page = doc[pi]
                 try:
@@ -12515,20 +13187,32 @@ def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
                             except Exception:
                                 bx = None
                             chars.append((ch, bx))
+                            try:
+                                font_flags.value = 0
+                                C.FPDFText_GetFontInfo(
+                                    tp.raw, i, name_buf, 4,
+                                    ctypes.byref(font_flags),
+                                )
+                                slants.append(
+                                    bool(font_flags.value & _FONT_FLAG_ITALIC))
+                            except Exception:
+                                slants.append(False)
                     finally:
                         tp.close()
                 except Exception:
                     chars = []
+                    slants = []
                 finally:
                     page.close()
             pages.append(chars)
-        return pages
+            italics.append(slants)
+        return pages, italics
     finally:
         with _PDFIUM_LOCK:
             doc.close()
 
 
-def _citation_links_from_pages(pages: list) -> dict:
+def _citation_links_from_pages(pages: list, italics: "Optional[list]" = None) -> dict:
     """Build the per-page clickable-citation rectangles from extracted page char
     data (see :func:`_extract_pdf_text_pages`).  Pure — no PDFium, no tk — so it
     is cheap to run on the worker right after extraction:
@@ -12541,15 +13225,20 @@ def _citation_links_from_pages(pages: list) -> dict:
     lines (or pages) becomes one rectangle per line."""
     parts: list = []               # global text pieces
     gmap: list = []                # global index -> (page, local) or (None, None)
+    slants: list = []              # global index -> is the glyph italic
     for pi, chars in enumerate(pages):
+        page_italics = italics[pi] if italics and pi < len(italics) else ()
         for li, (ch, _bx) in enumerate(chars):
             parts.append(ch)
             gmap.append((pi, li))
+            slants.append(li < len(page_italics) and bool(page_italics[li]))
         parts.append("\n")          # page separator (keeps words from fusing)
         gmap.append((None, None))
+        slants.append(False)
     text = "".join(parts)
     try:
-        links = detect_brief_links(text)
+        links = detect_brief_links(
+            text, italic=slants if italics is not None else None)
     except Exception:
         return {}
 
@@ -12573,11 +13262,11 @@ def _citation_links_from_pages(pages: list) -> dict:
 def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
     """Convenience wrapper: extract a PDF's text and return its citation
     rectangles (see :func:`_citation_links_from_pages`)."""
-    return _citation_links_from_pages(_extract_pdf_text_pages(pdf_bytes))
+    return _citation_links_from_pages(*_extract_pdf_text_and_style(pdf_bytes))
 
 
 def _citation_links_from_visible_pdf_text(
-    pdf_bytes: bytes, pages: list,
+    pdf_bytes: bytes, pages: list, italics: "Optional[list]" = None,
 ) -> "tuple[dict, set[int]]":
     """Citation rectangles for the whole document, plus the page indexes
     whose text layer is OCR over a scan.  OCR glyph boxes land imprecisely,
@@ -12589,7 +13278,7 @@ def _citation_links_from_visible_pdf_text(
     except Exception as exc:
         print(f"[pdf-links] OCR scan check failed: {exc}")
         ocr_pages = set()
-    return _citation_links_from_pages(pages), ocr_pages
+    return _citation_links_from_pages(pages, italics), ocr_pages
 
 
 # ---------------------------------------------------------------------------
@@ -12802,6 +13491,9 @@ class _PdfPane(ttk.Frame):
     _PAD = 12        # vertical gap between pages (px)
     _SCROLL_PX = 60  # wheel-notch scroll distance (px); canvas uses 1px units
     _MARGIN = 18     # small even margin drawn around the cropped page (px)
+    # Kept above a line scrolled to mid-page, so the reader can see the tail of
+    # what precedes it and knows they are not at the top of the page.
+    _LINE_LEAD_IN = 28
     _BBOX_SCALE = 0.6   # low-res render scale used to detect the content box
     _INK_THRESH = 185   # grayscale < this counts as "ink" (ignores scan bg)
     _PROFILE_MIN = 2    # min avg ink (0-255) for a row/col to count as content
@@ -13289,13 +13981,29 @@ class _PdfPane(ttk.Frame):
             cb(*hit)
         return "break"
 
-    def scroll_to_page(self, i: int) -> None:
-        """Scroll so page *i* starts at the top of the view."""
+    def _page_point_y(self, i: int, y_pt: float) -> float:
+        """Canvas y of the PDF-point height *y_pt* on page *i* — the vertical
+        half of :meth:`_rect_to_canvas`, for callers with a height but no box."""
+        y, _slot_h, frac, scale = self._slots[i]
+        _fl, ft, _fr, _fb = frac
+        _w_pt, h_pt, _ = self._meta[i]
+        return y + self._margin + scale * h_pt * (1.0 - ft) - scale * y_pt
+
+    def scroll_to_page(self, i: int, y_pt: "Optional[float]" = None) -> None:
+        """Scroll so page *i* starts at the top of the view, or — given *y_pt*,
+        a height on that page in PDF points — so the line at that height does.
+        A little of what precedes it is left showing, so the reader can see
+        they have landed inside the page rather than at its top."""
         if not (0 <= i < len(self._slots)) or self._content_h <= 0:
             return
+        top = self._slots[i][0] - self._PAD
+        if y_pt is not None:
+            try:
+                top = self._page_point_y(i, y_pt) - self._LINE_LEAD_IN
+            except (IndexError, TypeError, ValueError):
+                pass
         try:
-            self._canvas.yview_moveto(
-                max(0.0, (self._slots[i][0] - self._PAD) / self._content_h))
+            self._canvas.yview_moveto(max(0.0, top / self._content_h))
         except tk.TclError:
             pass
         self._render_visible()
@@ -13366,9 +14074,10 @@ class _PdfPane(ttk.Frame):
         and mouse text selection (drag to select, Ctrl-C to copy).  A no-op
         when ``pages`` is empty (a scan with no text layer).
 
-        ``bind_keys=False`` skips binding Ctrl-F/F3 on the containing window
-        — for panes embedded in a window whose find keys already belong to
-        its text view (the opinion reader) — while selection, which binds
+        ``bind_keys=False`` skips binding the find accelerators on the
+        containing window — for panes embedded in a window that routes those
+        keys itself, because it also has a text view to search (the opinion
+        reader; see ``_ScholarTextWindow._find_open``) — while selection, which binds
         only on the pane's own canvas, stays on."""
         if not pages:
             return
@@ -13376,10 +14085,9 @@ class _PdfPane(ttk.Frame):
         self._enable_selection()
         if not bind_keys:
             return
-        top = self.winfo_toplevel()
-        top.bind("<Control-f>", lambda _e: self._open_find())
-        top.bind("<F3>", lambda _e: self._find_step(1))
-        top.bind("<Shift-F3>", lambda _e: self._find_step(-1))
+        _bind_find_keys(self.winfo_toplevel(), self._open_find,
+                        lambda: self._find_step(1),
+                        lambda: self._find_step(-1))
 
     def has_find(self) -> bool:
         return bool(self._search_pages)
@@ -13556,6 +14264,7 @@ class _PdfPane(ttk.Frame):
         c.bind("<Button-1>", self._on_sel_press, add="+")
         c.bind("<B1-Motion>", self._on_sel_drag, add="+")
         c.bind("<Control-c>", self._copy_selection, add="+")
+        c.bind("<Command-c>", self._copy_selection, add="+")   # macOS
 
     def _on_sel_press(self, event) -> None:
         # Take keyboard focus so Ctrl-C reaches the canvas binding.
@@ -14310,8 +15019,9 @@ class _ScholarTextWindow:
         a Bluebook citation pin-cited from the star pagination,
       • Export ▾ — RTF (two-column), PDF typeset with LaTeX (single column,
         bottom-of-page footnotes, reporter page range in the running head),
-        or Markdown, each named after the Bluebook caption,
-      • View PDF — the official opinion PDF, shown in-app (Download PDF there),
+        or that same document as editable .tex source, each named after the
+        Bluebook caption,
+      • PDF — the official opinion PDF, shown in-app (Download PDF there),
       • a toggle to the CourtListener version of the text.
     """
 
@@ -14424,15 +15134,26 @@ class _ScholarTextWindow:
         self._mode = "courtlistener" if self._cl_primary else "scholar"
         self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
         self._pdf_holder: Optional[ttk.Frame] = None  # pane + parts strip
+        # The separate-opinions strip inside that holder, once the text layer
+        # has revealed the parts; toggled by the "Side panel" checkbox.
+        self._pdf_parts_nav: Optional[ttk.Frame] = None
+        # Footnote extents are bracketed by Tk marks (see _fn_region_mark);
+        # this keeps their names unique across re-renders.
+        self._fn_mark_seq = 0
+        self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
         self._pdf_url: Optional[str] = None
         self._pdf_bytes: Optional[bytes] = None
-        # Background-prefetched PDF (data, url) so "View PDF" is instant; set by
+        # Background-prefetched PDF (data, url) so "PDF" is instant; set by
         # _prefetch_pdf, consumed by _view_pdf.
         self._pdf_prefetch: Optional[tuple[bytes, str]] = None
         self._case_law_pdf_choices: list[_CaseLawPdfChoice] = []
+        # "583 U.S. 48" — the U.S. Reports cite whose scan the PDF view is
+        # showing, learned while resolving the URL.  Names saved/printed files
+        # even when this case reached us with only its S. Ct. cite.
+        self._us_reports_cite: str = ""
         self._pdf_prefetch_started = False
         # CourtListener text view: whether a PDF was located anywhere (None =
-        # still looking, True/False = found/not), gating its "View PDF" button.
+        # still looking, True/False = found/not), gating its "PDF" button.
         self._pdf_located: Optional[bool] = None
         self._pdf_locate_started = False
         if initial_pdf is not None:
@@ -14455,6 +15176,10 @@ class _ScholarTextWindow:
         # WL/LEXIS cite → RECAP spec, built over the whole opinion so a docket
         # printed once also powers links on later short-form occurrences.
         self._recap_spec_index: dict[str, str] = {}
+        # Whole-opinion citation detections mapped back to styled source blocks.
+        # The key makes part-only re-renders reuse the same document scan.
+        self._text_link_cache_key: tuple[int, ...] = ()
+        self._text_block_links: dict[int, list] = {}
         # The most recently emitted citation's action — a case ("cite", base),
         # a statute ("usc"/"cfr"/"rule"/"const"/"statpdf"/…), etc. — so an "Id."
         # links back to whatever was last cited.  Reset per render.
@@ -14484,7 +15209,7 @@ class _ScholarTextWindow:
             self._refine_part_labels(self._parts)
         # Whether Google Scholar actually carries the opinion text (it usually
         # doesn't for Federal Appendix cases — they're scans only).  Gates the
-        # "Google Scholar Text" toggle while the PDF is showing.
+        # "Scholar"/"Text" toggle while the PDF is showing.
         self._scholar_has_text = (
             not self._cl_primary
             and len(re.sub(r"\s+", "", self._scholar_text or "")) >= 500
@@ -14499,7 +15224,12 @@ class _ScholarTextWindow:
                 else "Google Scholar Opinion Text"
             )
         )
-        self._history_menubar = _install_history_menubar(self._app, self._win)
+        # The copy style the Copy menu offers, seeded from the last session.
+        # Created before the menubar, which binds its radio items to this var.
+        self._copy_mode_var = tk.StringVar(
+            master=self._win, value=_load_copy_mode())
+        self._history_menubar = _install_history_menubar(
+            self._app, self._win, reader=self)
         # SCOTUS cases open the Oyez "Case details" panel by default (wired up
         # in _build_ui); widen the window by the panel's width so the opinion
         # text keeps its usual room with the panel added to the right of it.
@@ -14518,11 +15248,11 @@ class _ScholarTextWindow:
             self._render_cl_blocks()
         else:
             self._render_scholar()
-            # Warm the official PDF in the background so "View PDF" is instant.
+            # Warm the official PDF in the background so "PDF" is instant.
             # Suppressed when opened from the PDF brief viewer: a second PDF
             # being resolved/downloaded while that big pdfium view is live could
             # hang the app, so those cases open straight to the Scholar text and
-            # leave the PDF to the on-demand "View PDF" button.
+            # leave the PDF to the on-demand "PDF" button.
             if prefetch_pdf:
                 self._prefetch_pdf()
                 # Federal Appendix cases are scans, not text — open straight on
@@ -14831,14 +15561,19 @@ class _ScholarTextWindow:
         txt.tag_configure("jumpflash", background="#fff2a8")
         txt.tag_configure(self._JUSTIFY_PAD_TAG)
         txt.tag_configure(self._JUSTIFY_HIDE_TAG, elide=True)
-        self._finder = _TextFinder(win, txt, text_frame)
+        # This window shows either the text view or a PDF pane, so the find
+        # keys are routed by _find_open/_find_step rather than owned by either.
+        self._finder = _TextFinder(win, txt, text_frame, bind_keys=False)
+        _bind_find_keys(win, self._find_open,
+                        lambda: self._find_step(+1),
+                        lambda: self._find_step(-1))
 
         btn_frame = _ui_frame(win)
         btn_frame.pack(fill="x", padx=12, pady=(2, 10))
         self._btn_frame = btn_frame  # PDF/text panes pack just above this
         # (Copy-with-citation lives on Ctrl-C / Cmd-C; no button needed.)
         # In text view this drops the export menu (RTF / PDF via LaTeX /
-        # Markdown); in PDF view it becomes "Download PDF".
+        # .tex source); in PDF view it becomes "Download PDF".
         self._export_btn = _ui_button(
             btn_frame, "Export ▾", command=self._post_export_menu, width=104
         )
@@ -14849,26 +15584,26 @@ class _ScholarTextWindow:
             btn_frame, "Print…", command=self._print_pdf, width=86
         )
         self._toggle_btn = _ui_button(
-            btn_frame, "CourtListener Text", command=self._toggle_source,
-            primary=True, width=150,
+            btn_frame, "CourtListener", command=self._toggle_source,
+            primary=True, width=118,
         )
         self._toggle_btn.pack(side="right", padx=(6, 0))
-        # The CourtListener text view gets its own "View PDF" button (the
+        # The CourtListener text view gets its own "PDF" button (the
         # Scholar view reuses the toggle for that).  Packed in _render_cl_blocks
         # / _show_courtlistener, hidden elsewhere; enabled once a PDF is located.
         self._pdf_btn = _ui_button(
-            btn_frame, "View PDF", command=self._view_pdf, width=84
+            btn_frame, "PDF", command=self._view_pdf, width=64
         )
         try:
             self._pdf_btn.configure(state="disabled")
         except tk.TclError:
             pass
         # The Scholar text view's switch back to the CourtListener opinion (the
-        # mirror of CL's "Google Scholar Text" button).  Packed in
+        # mirror of CL's "Scholar" button).  Packed in
         # _render_scholar, hidden in the CL and PDF views.
         self._cl_btn = _ui_button(
-            btn_frame, "CourtListener Text", command=self._toggle_source,
-            width=150,
+            btn_frame, "CourtListener", command=self._toggle_source,
+            width=118,
         )
 
         # Size controls: text size in the reader, PDF zoom in the PDF view
@@ -14881,26 +15616,30 @@ class _ScholarTextWindow:
             btn_frame, "A+", command=lambda: self._zoom(+1), width=42
         )
         self._zoom_in_btn.pack(side="left", padx=(6, 10))
-        # On by default for Supreme Court cases (Oyez fills the panel); the
-        # window was widened to fit it.  _toggle_details is fired below.
-        self._details_var = tk.BooleanVar(value=self._is_scotus)
-        _ui_checkbox(
-            btn_frame, "Side panel", self._details_var, self._toggle_details,
-        ).pack(side="left", padx=(0, 10))
-        # When checked (default), Ctrl-C appends the Bluebook citation (with the
-        # pin cite) to the copied text; unchecked, it copies the selection alone.
-        self._copy_with_cite = tk.BooleanVar(value=True)
-        _ui_checkbox(
-            btn_frame, "Copy with citation", self._copy_with_cite,
-        ).pack(side="left", padx=(0, 10))
+        # How Ctrl-C copies lives in the "Copy" menu at the top of the window
+        # rather than on this bar — three styles do not fit in a checkbox, and
+        # the bar has no room to spare.  Edit citation sits before the two
+        # checkboxes so they read as a pair.
         self._edit_citation_btn = _ui_button(
             btn_frame, "Edit citation…", command=self._edit_base_citation,
             width=108,
         )
         self._edit_citation_btn.pack(side="left", padx=(0, 10))
+        # "Side panel" drives whichever panel the current view has on its right:
+        # the Oyez/outline details panel in a text view, the separate-opinions
+        # strip in the PDF view.  Each remembers its own setting (see
+        # _toggle_details), so hiding the strip over a PDF does not close the
+        # details panel waiting behind it.  On by default for Supreme Court
+        # cases, whose Oyez panel the window was widened to fit.
+        self._details_var = tk.BooleanVar(value=self._is_scotus)
+        self._details_on = self._is_scotus
+        self._pdf_parts_on = True
+        _ui_checkbox(
+            btn_frame, "Side panel", self._details_var, self._toggle_details,
+        ).pack(side="left", padx=(0, 10))
         self._justify_text = tk.BooleanVar(value=False)
         _ui_checkbox(
-            btn_frame, "Justify Opinion Text.", self._justify_text,
+            btn_frame, "Justify text", self._justify_text,
             self._on_justify_toggle,
         ).pack(side="left", padx=(0, 10))
         for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
@@ -14908,7 +15647,8 @@ class _ScholarTextWindow:
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
             win.bind(seq, lambda _e: self._zoom(-1))
         win.bind("<Control-0>", lambda _e: self._zoom(0))
-        # Bare "s" toggles the side panel, except while a text field has focus.
+        # Bare "s" toggles whichever side panel the current view has, except
+        # while a text field has focus.
         win.bind("<KeyPress-s>", self._toggle_details_shortcut)
         txt.bind(
             "<Control-MouseWheel>",
@@ -15043,17 +15783,26 @@ class _ScholarTextWindow:
         except Exception:
             return ""
 
+    # (normal, compact) width per button label.  The labels name only what the
+    # button switches *to* — "Scholar", "CourtListener", "Text", "PDF" — which
+    # is what keeps a narrow window from crowding the controls off the bar.
+    _SOURCE_BUTTON_WIDTHS = {
+        "PDF": (64, 54),
+        "PDF ▾": (78, 66),
+        "No PDF": (78, 66),
+        "Text": (72, 60),
+        "Scholar": (92, 76),
+        "CourtListener": (118, 96),
+    }
+
     def _source_or_pdf_widths(self, button) -> tuple[int, int]:
         text = self._button_text(button)
-        if text.startswith("View PDF"):
-            return (96, 84) if "▾" in text else (84, 70)
-        if text == "No PDF":
-            return 84, 70
+        known = self._SOURCE_BUTTON_WIDTHS.get(text)
+        if known is not None:
+            return known
         if text.startswith("Finding PDF"):
             return 104, 90
-        if text == "Back to Text":
-            return 106, 88
-        return 150, 118
+        return 118, 96
 
     def _export_widths(self) -> tuple[int, int]:
         text = self._button_text(self._export_btn)
@@ -15071,7 +15820,7 @@ class _ScholarTextWindow:
             (self._print_btn, 86, 64),
             (self._toggle_btn, toggle_normal, toggle_small),
             (self._pdf_btn, pdf_normal, pdf_small),
-            (self._cl_btn, 150, 118),
+            (self._cl_btn, *self._source_or_pdf_widths(self._cl_btn)),
             (self._zoom_out_btn, 42, 34),
             (self._zoom_in_btn, 42, 34),
             (self._edit_citation_btn, 108, 88),
@@ -15095,6 +15844,36 @@ class _ScholarTextWindow:
                 self._view_label.configure(text_color=color)
         except tk.TclError:
             pass
+
+    def _find_pane(self) -> Optional["_PdfPane"]:
+        """The PDF pane, when the PDF is what's on screen and it has a text
+        layer to search — otherwise None, meaning find belongs to the text
+        view."""
+        p = self._pdf_pane
+        if self._mode != "pdf" or p is None:
+            return None
+        try:
+            if not (p.winfo_exists() and p.has_find()):
+                return None
+        except tk.TclError:
+            return None
+        return p
+
+    def _find_open(self) -> None:
+        """Ctrl-F / Cmd-F: search whichever view the reader is looking at."""
+        pane = self._find_pane()
+        if pane is not None:
+            self._finder.close()
+            pane._open_find()
+        else:
+            self._finder.open()
+
+    def _find_step(self, delta: int) -> None:
+        pane = self._find_pane()
+        if pane is not None:
+            pane._find_step(delta)
+        else:
+            self._finder.step(delta)
 
     def _zoom(self, delta: int) -> None:
         """In the reader, grow/shrink every font (delta 0 resets to default);
@@ -15245,7 +16024,8 @@ class _ScholarTextWindow:
             self._fn_tip = None
 
     def _insert_span(self, span, block_tags: tuple, neutral: bool = False,
-                     link_tag: Optional[str] = None) -> None:
+                     link_tag: Optional[str] = None,
+                     detect_plain: bool = True) -> None:
         txt = self._text
         tags = list(block_tags)
         if span.pagenum:
@@ -15295,8 +16075,14 @@ class _ScholarTextWindow:
             tags += ["citelink", link_tag]
             txt.insert("end", span.text, tuple(tags))
             return
-        # Plain text: make recognizable citations clickable
-        self._insert_plain_with_links(span.text, tuple(tags))
+        # Plain text: make recognizable citations clickable.  A block covered
+        # by the whole-opinion scan has already reconciled every overlap and
+        # deliberately unlinked authority, so do not run the legacy per-span
+        # detector over its leftover pieces.
+        if detect_plain:
+            self._insert_plain_with_links(span.text, tuple(tags))
+        else:
+            txt.insert("end", span.text, tuple(tags))
 
     def _scholar_link_action(self, full_text: str, href: str) -> tuple[str, str]:
         """The click action for a Google Scholar case hyperlink whose text is
@@ -15569,17 +16355,44 @@ class _ScholarTextWindow:
             if re.search(r"[A-Za-z0-9]", tail):
                 self._pending_id = None
 
+    def _insert_text_with_document_links(self, text: str, tags: tuple) -> None:
+        """Insert an unstyled opinion through the whole-document detector.
+
+        Parsed text opinions use :func:`_text_opinion_link_ranges` so their
+        formatting survives.  CourtListener's rare plain-text fallback is
+        already one contiguous string, so apply those ranges directly.  If
+        the shared detector ever fails, retain the older local implementation
+        rather than preventing the opinion from rendering.
+        """
+        try:
+            ranges = detect_brief_links(text)
+        except Exception:
+            self._insert_plain_with_links(text, tags)
+            return
+        pos = 0
+        for start, end, action in ranges:
+            if start < pos:
+                continue
+            if start > pos:
+                self._text.insert("end", text[pos:start], tags)
+            link_tag = self._new_link(action)
+            self._text.insert(
+                "end", text[start:end], tags + ("citelink", link_tag)
+            )
+            pos = end
+        if pos < len(text):
+            self._text.insert("end", text[pos:], tags)
+
     def _render_footnotes(self, footnotes: list, part_tag: Optional[str]) -> None:
         """Insert a part's footnote blocks, recording each note's rendered
         region and number so copied selections can be pin-cited (page n.N)."""
-        txt = self._text
-        open_region: Optional[list] = None  # [start_index, note_number, page]
+        open_region: Optional[list] = None  # [start_mark, note_number, page]
 
         def close_region() -> None:
             nonlocal open_region
             if open_region is not None:
                 self._fn_regions.append(
-                    (open_region[0], txt.index("end-1c"),
+                    (open_region[0], self._fn_region_mark("end", "end-1c"),
                      open_region[1], open_region[2])
                 )
                 open_region = None
@@ -15611,7 +16424,8 @@ class _ScholarTextWindow:
                 self._fn_text[last_fid] += " " + body
             if num:
                 close_region()
-                open_region = [txt.index("end-1c"), num, page]
+                open_region = [self._fn_region_mark("start", "end-1c"),
+                               num, page]
             self._insert_block(block, part_tag)
         close_region()
 
@@ -15635,18 +16449,32 @@ class _ScholarTextWindow:
                        "".join(s.text for s in block.spans if not s.pagenum)).strip()
             )
         )
-        # English Reports, Federal Appendix, and unpublished federal opinions
-        # render as one of our links, replacing any Scholar link inside it.
-        link_ranges = _special_citation_ranges(
-            block.spans, self._recap_spec_index)
+        # Parts-aware text views use the same whole-document detector as PDFs,
+        # mapped back to this block.  Besides overriding Scholar links where
+        # our destination is better, this preserves cross-paragraph short/Id.
+        # context and gives every pin page its own link.
+        scanned = id(block) in self._text_block_links
+        link_ranges = self._text_block_links.get(id(block), [])
+        if not scanned:
+            # Legacy fallback for an ad-hoc block that was not part of the
+            # prepared document scan.
+            link_ranges = _special_citation_ranges(
+                block.spans, self._recap_spec_index)
         if link_ranges:
-            self._insert_spans_with_links(block, block_tags, neutral, link_ranges)
+            self._insert_spans_with_links(
+                block, block_tags, neutral, link_ranges,
+                detect_plain=not scanned,
+            )
         else:
-            self._insert_spans_grouped(block.spans, block_tags, neutral)
+            self._insert_spans_grouped(
+                block.spans, block_tags, neutral,
+                detect_plain=not scanned,
+            )
         self._text.insert("end", "\n\n", block_tags)
 
     def _insert_spans_grouped(self, spans, block_tags: tuple,
-                              neutral: bool) -> None:
+                              neutral: bool,
+                              detect_plain: bool = True) -> None:
         """Render a block's spans, giving every span of one Google Scholar case
         hyperlink — which Scholar often splits across italic/roman runs ("<i>
         Calder</i> v. <i>Bull,</i> 3 Dall. 386") — a single shared click action
@@ -15669,14 +16497,19 @@ class _ScholarTextWindow:
                 )
                 for s in spans[i:j]:
                     self._insert_span(s, block_tags, neutral=neutral,
-                                      link_tag=link_tag)
+                                      link_tag=link_tag,
+                                      detect_plain=detect_plain)
                 i = j
             else:
-                self._insert_span(spans[i], block_tags, neutral=neutral)
+                self._insert_span(
+                    spans[i], block_tags, neutral=neutral,
+                    detect_plain=detect_plain,
+                )
                 i += 1
 
     def _insert_spans_with_links(self, block, block_tags: tuple,
-                                 neutral: bool, ranges: list) -> None:
+                                 neutral: bool, ranges: list,
+                                 detect_plain: bool = True) -> None:
         """Render a block whose text contains citation runs we link ourselves
         (English Reports → CommonLII scan, Federal Appendix → case.law PDF): text
         inside a run gets one shared link (Scholar links dropped); everything
@@ -15689,7 +16522,10 @@ class _ScholarTextWindow:
             pos = s_end
             # Page/footnote markers never overlap a citation run — render whole.
             if span.pagenum or span.fnref or span.fndef or not span.text:
-                self._insert_span(span, block_tags, neutral=neutral)
+                self._insert_span(
+                    span, block_tags, neutral=neutral,
+                    detect_plain=detect_plain,
+                )
                 continue
             cur = s_start
             while cur < s_end:
@@ -15701,7 +16537,8 @@ class _ScholarTextWindow:
                     seg = span.text[cur - s_start: nxt - s_start]
                     if seg:
                         self._insert_span(_dc_replace(span, text=seg),
-                                          block_tags, neutral=neutral)
+                                          block_tags, neutral=neutral,
+                                          detect_plain=detect_plain)
                     cur = nxt
                 else:
                     rs, re_, action = ranges[ri]
@@ -15727,10 +16564,29 @@ class _ScholarTextWindow:
             tags.append("underline")
         tags += ["citelink", link_tag]
         self._text.insert("end", text, tuple(tags))
-        # A following "Id." should resolve to this E.R. case, not the last
-        # plain-text cite.
-        self._last_cite_action = self._link_actions.get(
-            link_tag, self._last_cite_action)
+        # Preserve a clean antecedent for the legacy fallback.  Pin-specific
+        # links must not produce a later "base@23@24" chain.
+        action = self._link_actions.get(link_tag)
+        if action and action[0] == "cite":
+            self._last_cite_action = ("cite", action[1].split("@", 1)[0])
+        elif action:
+            self._last_cite_action = action
+
+    def _prepare_text_link_ranges(self, parts) -> None:
+        """Cache one whole-document citation scan for repeated part renders."""
+        block_ids = tuple(
+            id(block)
+            for part in parts or []
+            for group in (
+                getattr(part, "blocks", None) or [],
+                getattr(part, "footnotes", None) or [],
+            )
+            for block in group
+        )
+        if block_ids == self._text_link_cache_key:
+            return
+        self._text_link_cache_key = block_ids
+        self._text_block_links = _text_opinion_link_ranges(parts)
 
     def _clear_part_region_marks(self) -> None:
         txt = getattr(self, "_text", None)
@@ -15783,7 +16639,7 @@ class _ScholarTextWindow:
         self._link_actions.clear()
         self._fn_text.clear()
         self._fnref_pages: dict[str, Optional[int]] = {}
-        self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
+        self._reset_fn_regions()  # unsets the marks the old notes used
         self._part_regions: list[tuple[str, str, int]] = []
         self._rendered_parts = self._parts  # parts list _part_regions indexes
         self._scroll_part: Optional[int] = None
@@ -15793,6 +16649,7 @@ class _ScholarTextWindow:
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(self._scholar_text)
         self._recap_spec_index = _recap_spec_index(self._scholar_text)
+        self._prepare_text_link_ranges(self._parts)
         self._last_cite_action = None
         self._pending_id = None
         self._const_linked = set()
@@ -15839,6 +16696,7 @@ class _ScholarTextWindow:
                 prev_kind = part.kind
         txt.config(state="disabled")
         self._mode = "scholar"
+        self._sync_details_checkbox()  # back to the text view's own setting
         self._source_var.set(self._scholar_url)
         # From the Scholar view, offer the official PDF (the CourtListener text
         # is invariably worse, so it's no longer offered here).
@@ -16428,7 +17286,7 @@ class _ScholarTextWindow:
         self._link_actions.clear()
         self._fn_text.clear()
         self._fnref_pages: dict[str, Optional[int]] = {}
-        self._fn_regions: list[tuple[str, str, str, Optional[int]]] = []
+        self._reset_fn_regions()  # unsets the marks the old notes used
         self._part_regions: list[tuple[str, str, int]] = []
         self._rendered_parts = parts  # parts list _part_regions indexes
         self._scroll_part: Optional[int] = None
@@ -16440,11 +17298,14 @@ class _ScholarTextWindow:
             self._scholar_text or self._cl_text or "")
         self._recap_spec_index = _recap_spec_index(
             self._scholar_text or self._cl_text or "")
+        self._prepare_text_link_ranges(parts)
         self._last_cite_action = None
         self._pending_id = None
         self._const_linked = set()
         if not parts:
-            self._insert_plain_with_links(self._cl_text or "(no text)", ())
+            self._insert_text_with_document_links(
+                self._cl_text or "(no text)", ()
+            )
         else:
             if self._current_part is None:
                 shown = list(enumerate(parts))
@@ -16472,6 +17333,7 @@ class _ScholarTextWindow:
                 prev_kind = part.kind
         txt.config(state="disabled")
         self._mode = "courtlistener"
+        self._sync_details_checkbox()  # back to the text view's own setting
         source = self._primary_source_url or (
             "CourtListener (REST API)"
             if self._primary_source_kind == "courtlistener"
@@ -16480,7 +17342,7 @@ class _ScholarTextWindow:
         self._source_var.set(source)
         _style_ui_button(self._toggle_btn, primary=False)
         self._toggle_btn.configure(
-            text="Google Scholar Text", command=self._toggle_source,
+            text="Scholar", command=self._toggle_source,
             state="normal" if self._scholar_url else "disabled",
         )
         self._export_btn.configure(text="Export ▾", command=self._post_export_menu)
@@ -16503,7 +17365,7 @@ class _ScholarTextWindow:
         self._status_var.set(
             f"{char_count:,} characters | {self._primary_source_label} version"
         )
-        self._hide_cl_button()  # CL view uses the toggle for "Google Scholar Text"
+        self._hide_cl_button()  # CL view uses the toggle for "Scholar"
         self._show_pdf_button()
         self._finder.refresh()
         self._refresh_outline_panel()
@@ -16517,9 +17379,12 @@ class _ScholarTextWindow:
         txt = self._text
         txt.config(state="normal")
         txt.delete("1.0", "end")
-        self._insert_plain_with_links(self._cl_text or "(no text)", ())
+        self._insert_text_with_document_links(
+            self._cl_text or "(no text)", ()
+        )
         txt.config(state="disabled")
         self._mode = "courtlistener"
+        self._sync_details_checkbox()  # back to the text view's own setting
         source = self._primary_source_url or (
             "CourtListener (assembled from the REST API)"
             if self._primary_source_kind == "courtlistener"
@@ -16528,7 +17393,7 @@ class _ScholarTextWindow:
         self._source_var.set(source)
         _style_ui_button(self._toggle_btn, primary=False)
         self._toggle_btn.configure(
-            text="Google Scholar Text", command=self._toggle_source,
+            text="Scholar", command=self._toggle_source,
             state="normal" if self._scholar_url else "disabled",
         )
         self._export_btn.configure(text="Export ▾", command=self._post_export_menu)
@@ -17212,13 +18077,26 @@ class _ScholarTextWindow:
             return name.replace("'", "’")
         return (self._bb["name"] or "").replace("'", "’")
 
+    @staticmethod
+    def _citation_rtf(name: str, rest: str, inline: bool) -> str:
+        """The RTF for a citation, as its own paragraph or run on from the
+        text.  ``inline`` is the quotation style: the citation follows the
+        closing quote after a single space, the way a brief sets it."""
+        italic = "{\\i " + _rtf_escape(name) + "}" if name else ""
+        body = italic + _rtf_escape(rest)
+        if inline:
+            return " " + body
+        return "\\par\\pard\\sa120 " + body + "\\par\n"
+
     def _bluebook_citation(
         self, pin: Optional[str], writer: str = "",
         extra_parens: tuple[str, ...] = (),
+        inline: bool = False,
     ) -> tuple[str, str]:
         """Return (plain, rtf-fragment) forms of the Bluebook citation.
         `extra_parens` follow the writer parenthetical — e.g. "footnote
-        omitted" (Bluebook rule 5.2(d))."""
+        omitted" (Bluebook rule 5.2(d)).  ``inline`` runs the citation on from
+        the quotation instead of giving it a paragraph of its own."""
         edited = getattr(self, "_base_citation_override", "")
         if edited:
             suffixes = tuple(p for p in (writer, *extra_parens) if p)
@@ -17227,17 +18105,7 @@ class _ScholarTextWindow:
             name = name.replace("'", "’")
             rest = rest.replace("'", "’")
             plain = name + rest
-            if name:
-                rtf = (
-                    "\\par\\pard\\sa120 {\\i "
-                    + _rtf_escape(name)
-                    + "}"
-                    + _rtf_escape(rest)
-                    + "\\par\n"
-                )
-            else:
-                rtf = "\\par\\pard\\sa120 " + _rtf_escape(plain) + "\\par\n"
-            return plain, rtf
+            return plain, self._citation_rtf(name, rest, inline)
 
         bb = self._bb
         name = bb["name"]
@@ -17271,18 +18139,9 @@ class _ScholarTextWindow:
         name = name.replace("'", "’")
         rest = rest.replace("'", "’")
         if name:
-            plain = f"{name}{rest}"
-            rtf = (
-                "\\par\\pard\\sa120 {\\i "
-                + _rtf_escape(name)
-                + "}"
-                + _rtf_escape(rest)
-                + "\\par\n"
-            )
-        else:
-            plain = rest.lstrip(", ")
-            rtf = "\\par\\pard\\sa120 " + _rtf_escape(plain) + "\\par\n"
-        return plain, rtf
+            return f"{name}{rest}", self._citation_rtf(name, rest, inline)
+        plain = rest.lstrip(", ")
+        return plain, self._citation_rtf("", plain, inline)
 
     @staticmethod
     def _page_num_from(s: str) -> Optional[int]:
@@ -17413,6 +18272,25 @@ class _ScholarTextWindow:
     # Actions
     # ------------------------------------------------------------------
 
+    def copy_mode(self) -> str:
+        """The copy style in force — see :data:`COPY_MODES`."""
+        try:
+            mode = self._copy_mode_var.get()
+        except (AttributeError, tk.TclError):
+            return _DEFAULT_COPY_MODE
+        return mode if mode in COPY_MODES else _DEFAULT_COPY_MODE
+
+    def on_copy_mode_chosen(self) -> None:
+        """A Copy-menu item was picked: remember the style for next session,
+        and, when there is a selection, copy it that way straight away — the
+        reader chose the style in order to use it."""
+        _save_copy_mode(self.copy_mode())
+        try:
+            self._text.index("sel.first")
+        except tk.TclError:
+            return  # nothing selected; the choice was a preference only
+        self._copy_formatted()
+
     def _copy_formatted(self) -> None:
         txt = self._text
         try:
@@ -17421,10 +18299,11 @@ class _ScholarTextWindow:
         except tk.TclError:
             start, end = "1.0", "end-1c"
             selected = False
-        # The "Copy with citation" box (checked by default) gates whether the
-        # Bluebook citation is appended; unchecked, the selection is copied on
-        # its own (still richly, just without the citation).
-        with_cite = self._copy_with_cite.get()
+        # The Copy menu's three styles: the selection alone, the selection with
+        # the citation under it, or a brief-ready quotation.
+        mode = self.copy_mode()
+        quote = mode == "quote"
+        with_cite = mode in ("cite", "quote")
         plain_cite, rtf_cite = "", ""
         omit_tags: set[str] = set()
         n_omitted = 0
@@ -17437,8 +18316,8 @@ class _ScholarTextWindow:
         if with_cite:
             # The appended citation already carries the reporter-page pin.
             # Keeping inline ``*123`` markers in the quotation duplicates that
-            # pagination and interrupts the copied prose.  A plain copy (the
-            # checkbox unchecked) deliberately retains the markers.
+            # pagination and interrupts the copied prose.  A copy without a
+            # citation deliberately retains the markers.
             omit_tags.add("pagenum")
         if with_cite:
             # Pin cites and the writer parenthetical apply whenever the opinion
@@ -17473,25 +18352,106 @@ class _ScholarTextWindow:
             if n_omitted:
                 extras = ("footnote omitted" if n_omitted == 1
                           else "footnotes omitted",)
-            plain_cite, rtf_cite = self._bluebook_citation(pin, writer, extras)
+            plain_cite, rtf_cite = self._bluebook_citation(
+                pin, writer, extras, inline=quote)
         body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map(),
                             omit_tags=omit_tags)
-        rtf = _rtf_document(body + rtf_cite)
         plain = _plain_without_layout_chars(txt, start, end,
-                                            omit_tags=omit_tags).rstrip()
-        if plain_cite:
-            plain += "\n\n" + plain_cite + "\n"
+                                            omit_tags=omit_tags).strip()
+        if quote:
+            # A quotation: the passage's own quotation marks drop a level, the
+            # whole thing goes inside double quotes, and the citation follows
+            # the closing quote after one space.  The flip runs first, so the
+            # quotes added here are not themselves demoted.
+            body = _flip_rtf_quotes(body)
+            plain = _QUOTE_OPEN + _flip_quotes(plain) + _QUOTE_CLOSE
+            if plain_cite:
+                plain += " " + plain_cite
+            # The closing quote and the citation belong to the passage's last
+            # paragraph, so they go before the break the dump ends on.
+            closing = _rtf_escape(_QUOTE_CLOSE) + rtf_cite
+            tail = "\\par\n"
+            if body.endswith(tail):
+                body = body[:-len(tail)] + closing + tail
+            else:
+                body += closing
+            body = _rtf_escape(_QUOTE_OPEN) + body
+            rtf = _rtf_document(body)
+        else:
+            rtf = _rtf_document(body + rtf_cite)
+            if plain_cite:
+                plain += "\n\n" + plain_cite + "\n"
         how = _copy_rich_clipboard(self._win, rtf, plain)
         what = "selection" if selected else "full text"
-        self._status_var.set(
-            f"Copied {what} as {how}"
-            + ("; citation appended." if with_cite else ".")
-        )
+        styled = {"plain": ".", "cite": "; citation appended.",
+                  "quote": "; quoted with citation."}[mode]
+        self._status_var.set(f"Copied {what} as {how}{styled}")
 
     def _fn_link_map(self) -> dict[str, tuple[str, str]]:
         """Link tags that anchor footnote jumps, for RTF bookmarks."""
         return {t: a for t, a in self._link_actions.items()
                 if a[0] in ("fnref", "fndef")}
+
+    # Footnote bookkeeping has to survive justification.  Padding spaces and
+    # soft hyphens are inserted into the text every time the window is resized,
+    # which shifts every character index recorded after them — so a position
+    # noted while rendering points somewhere else by the time it is used.  Tags
+    # and marks both move with the characters around them, and are used instead:
+    # a marker's own link tag locates it, and a note's extent is bracketed by a
+    # pair of marks.
+
+    def _fn_region_mark(self, side: str, index: str) -> str:
+        """A uniquely named mark at *index* bracketing a footnote's text.
+
+        Both marks use left gravity.  In particular, a finished note's end
+        sits at ``end-1c``, the same boundary where the full-opinion renderer
+        appends the next part.  Right gravity there would make the note grow
+        across the following concurrence or dissent.  Reflow edits within the
+        note still move the marks with their surrounding text.
+        """
+        name = f"__fnreg_{side}_{self._fn_mark_seq}"
+        self._fn_mark_seq += 1
+        txt = self._text
+        try:
+            txt.mark_set(name, index)
+            txt.mark_gravity(name, "left")
+        except tk.TclError:
+            return index  # marks unavailable — the raw index is still better
+        return name
+
+    def _reset_fn_regions(self) -> None:
+        """Drop the recorded notes and the marks bracketing them, before a
+        re-render lays the text out again."""
+        txt = getattr(self, "_text", None)
+        for region in getattr(self, "_fn_regions", []) or []:
+            for name in region[:2]:
+                if isinstance(name, str) and name.startswith("__fnreg_"):
+                    try:
+                        txt.mark_unset(name)
+                    except (AttributeError, tk.TclError):
+                        pass
+        self._fn_regions = []
+
+    def _fn_marker_pos(self, side: str, fid: str) -> Optional[str]:
+        """Where a footnote's marker sits now: the in-text reference
+        (``side="fnref"``) or the number heading its note (``"fndef"``).
+
+        Read from the marker's own link tag, which Tk keeps on the same
+        characters however the text is re-laid-out, rather than from the index
+        recorded when it was rendered."""
+        txt = self._text
+        for tag, (tag_side, tag_fid) in self._fn_link_map().items():
+            if tag_side != side or tag_fid != fid:
+                continue
+            try:
+                ranges = txt.tag_ranges(tag)
+            except tk.TclError:
+                continue
+            if ranges:
+                return str(ranges[0])
+        # Never rendered as a link: fall back to the recorded index.
+        stored = self._fn_ref_pos if side == "fnref" else self._fn_def_pos
+        return stored.get(fid)
 
     def _omitted_footnote_tags(self, start: str, end: str) -> tuple[set[str], int]:
         """Footnote-reference marker tags inside [start, end) whose notes a
@@ -17501,7 +18461,6 @@ class _ScholarTextWindow:
         footnote body (a note citing another note) are left alone."""
         txt = self._text
         fn_regions = getattr(self, "_fn_regions", []) or []
-        def_pos = getattr(self, "_fn_def_pos", {}) or {}
         omit: set[str] = set()
         fids: set[str] = set()
         for tag, (side, fid) in self._fn_link_map().items():
@@ -17516,7 +18475,7 @@ class _ScholarTextWindow:
                 if any(txt.compare(rs, ">=", fr[0])
                        and txt.compare(rs, "<", fr[1]) for fr in fn_regions):
                     continue  # marker sits inside a note body
-                body_pos = def_pos.get(fid)
+                body_pos = self._fn_marker_pos("fndef", fid)
                 if body_pos and txt.compare(body_pos, ">=", start) \
                         and txt.compare(body_pos, "<", end):
                     continue  # the note itself is selected too
@@ -17535,6 +18494,20 @@ class _ScholarTextWindow:
             "court_id": "scotus" if not bb["court"] else "",
             "court": bb["court"],
         }
+
+    def _pdf_filename_item(self) -> dict:
+        """:meth:`_filename_item` for the PDF on screen, which is filed under
+        the reporter it actually shows.  Google Scholar hands a SCOTUS case
+        only its S. Ct. cite often enough, and naming a U.S. Reports scan after
+        the Supreme Court Reporter misdescribes every page in it.  The text
+        exports keep :meth:`_filename_item` — they carry the Scholar text, and
+        its star pagination, not these pages."""
+        item = self._filename_item()
+        us_cite = getattr(self, "_us_reports_cite", "")
+        if us_cite and _is_us_reports_pdf(getattr(self, "_pdf_url", "") or ""):
+            item = dict(item)
+            item["_us_reports_cite"] = us_cite
+        return item
 
     def _export_section_list(self) -> list[tuple[str, str, str, str]]:
         """
@@ -17647,7 +18620,7 @@ class _ScholarTextWindow:
             CourtListenerGUI._open_file(path)
 
     # ------------------------------------------------------------------
-    # PDF (LaTeX) and Markdown export
+    # LaTeX export: typeset to PDF, or saved as editable .tex
     # ------------------------------------------------------------------
 
     def _post_export_menu(self) -> None:
@@ -17657,8 +18630,8 @@ class _ScholarTextWindow:
                          command=self._export_rtf)
         menu.add_command(label="PDF (.pdf) — typeset with LaTeX…",
                          command=self._export_pdf_latex)
-        menu.add_command(label="Markdown (.md)…",
-                         command=self._export_markdown)
+        menu.add_command(label="LaTeX source (.tex) — edit, then typeset…",
+                         command=self._export_latex_source)
         btn = self._export_btn
         try:
             menu.tk_popup(btn.winfo_rootx(),
@@ -17698,20 +18671,35 @@ class _ScholarTextWindow:
         """
         The footnote-body regions inside a section, plus each note parsed
         into (anchor id, label, body paragraphs) with its leading marker
-        stripped — shared by the LaTeX and Markdown writers.
+        stripped — used by the LaTeX writer.
         """
         txt = self._text
-        regions = sorted(
+        # A region's endpoints are Tk *marks* (see _fn_region_mark), not raw
+        # "line.char" indices, so _tk_ix cannot parse them and neither can the
+        # caller's _section_body_ranges.  Resolve each through the widget once,
+        # here, and hand back regions whose endpoints are real indices — the
+        # note bodies are still dumped from the live marks first, so a mark
+        # that has drifted is read where it actually sits.
+        def canon(index: str) -> str:
+            try:
+                return str(txt.index(index))
+            except tk.TclError:
+                return index
+
+        lo, hi = _tk_ix(canon(sec_start)), _tk_ix(canon(sec_end))
+        in_section = sorted(
             (r for r in getattr(self, "_fn_regions", []) or []
-             if _tk_ix(sec_start) <= _tk_ix(r[0]) < _tk_ix(sec_end)),
-            key=lambda r: _tk_ix(r[0]),
+             if lo <= _tk_ix(canon(r[0])) < hi),
+            key=lambda r: _tk_ix(canon(r[0])),
         )
+        regions: list = []
         parsed: list[tuple[str, str, list[_ExpPara]]] = []
-        for nrs, nre, num, _page in regions:
+        for nrs, nre, num, page in in_section:
             paras = _dump_export_paragraphs(txt, [(nrs, nre)], fn_links)
             fid, disp = _strip_note_marker(paras)
             label = (num or disp).strip().strip("[]").rstrip(".") or "*"
             parsed.append((fid, label, paras))
+            regions.append((canon(nrs), canon(nre), num, page))
         return regions, parsed
 
     def _build_export_latex(self) -> str:
@@ -17823,10 +18811,11 @@ class _ScholarTextWindow:
                 "LaTeX Not Found",
                 "Exporting to PDF needs a LaTeX installation (pdflatex, "
                 "xelatex, lualatex or tectonic), and none was found on "
-                "this system.\n\nExport a Markdown (.md) file instead?",
+                "this system.\n\nSave the LaTeX source (.tex) instead?  It "
+                "will typeset anywhere LaTeX is installed.",
                 parent=self._win,
             ):
-                self._export_markdown()
+                self._export_latex_source()
             return
         tex = self._with_full_view(self._build_export_latex)
         default = _build_default_filename(self._filename_item())
@@ -17869,90 +18858,32 @@ class _ScholarTextWindow:
         ):
             CourtListenerGUI._open_file(path)
 
-    def _build_export_markdown(self) -> str:
-        """
-        The full opinion as Markdown: title and Bluebook citation up top, a
-        horizontal rule and heading before each separate opinion, bold
-        star-pagination markers inline, and footnotes as Markdown footnotes
-        ([^4]) collected at the end of the opinion that cites them.
-        """
-        txt = self._text
-        fn_links = self._fn_link_map()
-        case_line = self._bluebook_citation(None)[0]
-        sections = self._export_section_list()
-
-        blocks: list[str] = []
-        name = self._citation_name()
-        if name:
-            blocks.append("# " + _md_escape(name))
-            if case_line.startswith(name):
-                blocks.append("*" + _md_escape(name) + "*"
-                              + _md_escape(case_line[len(name):]))
-            else:
-                blocks.append(_md_escape(case_line))
-        elif case_line.rstrip("."):
-            blocks.append("# " + _md_escape(case_line.rstrip(".")))
-
-        used_ids: set[str] = set()
-        for i, (label, rs, rend, kind) in enumerate(sections):
-            regions, parsed = self._section_note_map(rs, rend, fn_links)
-            ref_ids: dict[str, str] = {}
-            defs: list[tuple[str, list[str]]] = []
-            leftovers: list[tuple[str, list[str]]] = []
-            for fid, note_label, paras in parsed:
-                note_blocks = _md_paragraphs(paras)
-                if not note_blocks:
-                    continue
-                if fid:
-                    base = re.sub(r"\W+", "", note_label) or "sym"
-                    rid, n = base, 2
-                    while rid in used_ids:
-                        rid = f"{base}-{n}"
-                        n += 1
-                    used_ids.add(rid)
-                    ref_ids[fid] = rid
-                    defs.append((rid, note_blocks))
-                else:
-                    leftovers.append((note_label, note_blocks))
-
-            if i:
-                blocks.append("---")
-                blocks.append("## " + _md_escape(label or kind.title()))
-            body_paras = _dump_export_paragraphs(
-                txt, _section_body_ranges(rs, rend, regions), fn_links
-            )
-            blocks.extend(_md_paragraphs(body_paras, ref_ids))
-            for rid, note_blocks in defs:
-                first = note_blocks[0]
-                cont = "".join(
-                    "\n\n    " + b.replace("\n", "\n    ")
-                    for b in note_blocks[1:]
-                )
-                blocks.append(f"[^{rid}]: {first}{cont}")
-            if leftovers:
-                blocks.append("**Footnotes**")
-                for note_label, note_blocks in leftovers:
-                    body = "\n\n".join(note_blocks)
-                    blocks.append(f"**{_md_escape(note_label)}.** {body}")
-        return "\n\n".join(blocks) + "\n"
-
-    def _export_markdown(self) -> None:
-        md = self._with_full_view(self._build_export_markdown)
+    def _export_latex_source(self) -> None:
+        """Save the LaTeX document the PDF export typesets, without typesetting
+        it.  Same source, so it builds to the same PDF — but the reader can edit
+        it first, and it needs no LaTeX installed here to be worth having."""
+        tex = self._with_full_view(self._build_export_latex)
         default = _build_default_filename(self._filename_item())
         path = filedialog.asksaveasfilename(
-            defaultextension=".md",
-            filetypes=[("Markdown", "*.md"), ("All files", "*.*")],
-            initialfile=f"{default}.md",
-            title="Export Opinion as Markdown",
+            defaultextension=".tex",
+            filetypes=[("LaTeX source", "*.tex"), ("All files", "*.*")],
+            initialfile=f"{default}.tex",
+            title="Export Opinion as LaTeX Source",
             parent=self._win,
         )
         if not path:
             return
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(md)
-        self._status_var.set(f"Exported Markdown: {path}")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(tex)
+        except OSError as exc:
+            self._status_var.set("LaTeX export failed.")
+            messagebox.showerror("Export Failed", str(exc), parent=self._win)
+            return
+        self._status_var.set(f"Exported LaTeX source: {path}")
         if messagebox.askyesno(
-            "Export Complete", f"Markdown saved to:\n{path}\n\nOpen it now?",
+            "Export Complete",
+            f"LaTeX source saved to:\n{path}\n\nOpen it now?",
             parent=self._win,
         ):
             CourtListenerGUI._open_file(path)
@@ -18094,7 +19025,9 @@ class _ScholarTextWindow:
             return None
 
     def _toggle_details_shortcut(self, event=None):
-        """Toggle the side panel from the bare "s" accelerator.
+        """Toggle the side panel from the bare "s" accelerator — the details
+        panel in a text view, the separate-opinions strip over a PDF, whichever
+        the current view has.
 
         Ignored while focus is in a field that accepts typed text, so "s"
         types normally in the Find bar and similar inputs.
@@ -18126,12 +19059,54 @@ class _ScholarTextWindow:
             pass
 
     def _toggle_details(self) -> None:
-        if self._details_var.get():
+        """Apply the "Side panel" checkbox to the current view's right-hand
+        panel, and remember the setting for that view.
+
+        The PDF view's panel is the separate-opinions strip, the text views' is
+        the details panel; they keep separate settings so switching views
+        restores what the reader last chose *there* rather than carrying one
+        view's preference into the other."""
+        on = self._details_var.get()
+        if self._mode == "pdf":
+            self._pdf_parts_on = on
+            self._apply_pdf_parts_visibility()
+            return
+        self._details_on = on
+        if on:
             self._details_panel().pack(side="right", fill="y",
                                        before=self._vsb)
             self._refresh_details_view()
         elif self._details_frame is not None:
             self._details_frame.pack_forget()
+
+    def _sync_details_checkbox(self) -> None:
+        """Point the "Side panel" checkbox at the setting for the view now
+        showing, without firing the toggle (nothing needs re-packing — the
+        view's own render put its panel in the right state)."""
+        try:
+            self._details_var.set(
+                self._pdf_parts_on if self._mode == "pdf" else self._details_on
+            )
+        except tk.TclError:
+            pass
+
+    def _apply_pdf_parts_visibility(self) -> None:
+        """Show or hide the PDF view's separate-opinions strip to match the
+        remembered setting.  A no-op until the strip exists — the text layer
+        has to be read before the opinions in it are known."""
+        nav = getattr(self, "_pdf_parts_nav", None)
+        if nav is None:
+            return
+        try:
+            if not nav.winfo_exists():
+                self._pdf_parts_nav = None
+                return
+            if self._pdf_parts_on:
+                nav.pack(side="right", fill="y", padx=(4, 0))
+            else:
+                nav.pack_forget()
+        except tk.TclError:
+            self._pdf_parts_nav = None
 
     def _details_mode(self) -> str:
         """The side panel's selected view: "case", "recent", "related" or
@@ -18715,7 +19690,7 @@ class _ScholarTextWindow:
     def _refresh_outline_panel(self) -> None:
         """Rebuild the outline after a re-render — its stored text indices
         go stale whenever the text is rebuilt (part switch, source toggle)."""
-        if (self._details_frame is not None and self._details_var.get()
+        if (self._details_frame is not None and self._details_on
                 and self._details_mode() == "outline"):
             self._show_outline()
 
@@ -18815,12 +19790,12 @@ class _ScholarTextWindow:
             return
         kind, value = action
         if kind == "fnref":
-            pos = self._fn_def_pos.get(value)
+            pos = self._fn_marker_pos("fndef", value)
             if pos:
                 self._jump_to(pos)
             return
         if kind == "fndef":
-            pos = self._fn_ref_pos.get(value)
+            pos = self._fn_marker_pos("fnref", value)
             if pos:
                 self._jump_to(pos)
             return
@@ -18958,7 +19933,7 @@ class _ScholarTextWindow:
         )
         if retry:
             # A Google Scholar link failed; keep retrying it and light up the
-            # new window's "Google Scholar Text" button if it comes through.
+            # new window's "Scholar" button if it comes through.
             win._retry_scholar_link(*retry)
 
     def _on_cl_link_error(self, msg: str) -> None:
@@ -19075,7 +20050,7 @@ class _ScholarTextWindow:
         """A Google Scholar opinion link failed — missing, flaky, or blocking.
         Show the CourtListener view now if the case can be located by citation
         or by name (else its case.law PDF), and keep retrying Google Scholar in
-        the background; if it comes through, the window's "Google Scholar Text"
+        the background; if it comes through, the window's "Scholar"
         button lights up so the reader can switch to it."""
         client = self._app._get_client()
         fetcher = self._app._get_scholar()
@@ -19215,7 +20190,7 @@ class _ScholarTextWindow:
     def _search_for_scholar_version(self, cl_text: Optional[str] = None) -> None:
         """The CourtListener text is showing because Google Scholar's first
         case didn't match; keep hunting for a matching Scholar opinion in the
-        background and, when one turns up, light up the "Google Scholar Text"
+        background and, when one turns up, light up the "Scholar"
         button so the reader can switch to it."""
         if not _SCHOLAR_AVAILABLE:
             return
@@ -19288,7 +20263,7 @@ class _ScholarTextWindow:
         if self._mode == "courtlistener":
             _style_ui_button(self._toggle_btn, primary=False)
             self._toggle_btn.configure(
-                text="Google Scholar Text", command=self._toggle_source,
+                text="Scholar", command=self._toggle_source,
                 state="normal",
             )
             char_count = len(self._cl_text or self._scholar_text or "")
@@ -19460,12 +20435,19 @@ class _ScholarTextWindow:
         return any(self._FED_APPX_RE.search(str(c)) for c in cites)
 
     # ------------------------------------------------------------------
-    # CourtListener-view "View PDF" button
+    # CourtListener-view "PDF" button
     # ------------------------------------------------------------------
 
-    def _remember_case_law_pdf_choices(self, item: dict) -> None:
+    def _remember_resolved_pdf_info(self, item: dict) -> None:
+        """Carry back what resolving the PDF URL discovered.  ``_pdf_item``
+        hands the resolver a *copy*, so anything it learned — the reporter
+        scans on offer, and the U.S. Reports cite of the pages it settled on —
+        has to be read off that copy here."""
         choices = item.get("_case_law_pdf_choices") or []
         self._case_law_pdf_choices = list(choices)
+        us_cite = item.get("_us_reports_cite") or ""
+        if us_cite:
+            self._us_reports_cite = us_cite
         self._post(self._refresh_pdf_button)
 
     def _post_pdf_menu(self) -> None:
@@ -19606,7 +20588,7 @@ class _ScholarTextWindow:
         try:
             if self._pdf_located is True or self._pdf_prefetch is not None:
                 choices = getattr(self, "_case_law_pdf_choices", []) or []
-                label = "View PDF ▾" if len(choices) > 1 else "View PDF"
+                label = "PDF ▾" if len(choices) > 1 else "PDF"
                 command = self._post_pdf_menu if len(choices) > 1 else self._view_pdf
                 _style_ui_button(btn, primary=True)
                 btn.configure(state="normal", text=label, command=command)
@@ -19642,7 +20624,7 @@ class _ScholarTextWindow:
             url = None
             try:
                 url = self._app._resolve_pdf_url(client, item)
-                self._remember_case_law_pdf_choices(item)
+                self._remember_resolved_pdf_info(item)
             except Exception as exc:
                 print(f"[pdf] resolve failed: {exc}")
             if not url:
@@ -19700,7 +20682,7 @@ class _ScholarTextWindow:
         def run() -> None:
             try:
                 url = self._app._resolve_pdf_url(client, item)
-                self._remember_case_law_pdf_choices(item)
+                self._remember_resolved_pdf_info(item)
                 if not url:
                     return
                 fetched = _fetch_pdf_bytes(url, client=client, timeout=30)
@@ -19758,7 +20740,7 @@ class _ScholarTextWindow:
                     self._app._resolve_pdf_url(client, item)
                     if client is not None else None
                 )
-                self._remember_case_law_pdf_choices(item)
+                self._remember_resolved_pdf_info(item)
                 if not url:
                     self._post(self._on_pdf_error,
                                "No PDF is available for this opinion.")
@@ -19789,6 +20771,7 @@ class _ScholarTextWindow:
         if getattr(self, "_pdf_holder", None) is not None:
             self._pdf_holder.destroy()  # a previous PDF view left behind
             self._pdf_holder = None
+            self._pdf_parts_nav = None
             self._pdf_pane = None
         holder = ttk.Frame(self._win)
         try:
@@ -19801,6 +20784,7 @@ class _ScholarTextWindow:
             self._on_pdf_error(str(exc))
             return
         # Swap the text view for the PDF pane (kept above the button row).
+        self._finder.close()   # its bar anchors to the frame about to go away
         self._text_frame.pack_forget()
         holder.pack(fill="both", expand=True, padx=8, pady=4,
                     before=self._btn_frame)
@@ -19810,6 +20794,8 @@ class _ScholarTextWindow:
         self._pdf_url = url
         self._pdf_bytes = data
         self._mode = "pdf"
+        # The checkbox now speaks for the PDF view's own panel.
+        self._sync_details_checkbox()
 
         # Extract the text layer in the background so text on the page can be
         # selected with the mouse and copied with Ctrl-C.  The find keys are
@@ -19817,7 +20803,7 @@ class _ScholarTextWindow:
         # finder — so only the pane-local selection is enabled.
         def extract_text(d=data, p=pane) -> None:
             try:
-                pages = _extract_pdf_text_pages(d)
+                pages, italics = _extract_pdf_text_and_style(d)
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
                 return
@@ -19826,7 +20812,8 @@ class _ScholarTextWindow:
             if not any(pages or []):
                 return  # scan-only PDF: no text layer to select
             try:
-                links, quiet = _citation_links_from_visible_pdf_text(d, pages)
+                links, quiet = _citation_links_from_visible_pdf_text(
+                    d, pages, italics)
             except Exception as exc:
                 print(f"[pdf-links] citation scan failed: {exc}")
             # The separate opinions (Syllabus, Opinion of the Court, each
@@ -19850,9 +20837,12 @@ class _ScholarTextWindow:
                             )
                         p.enable_find(pages, bind_keys=False)
                         if len(sections) > 1:
-                            nav = _build_pdf_parts_nav(
+                            # Built now that the text layer has revealed the
+                            # separate opinions; shown only if the reader has
+                            # the side panel on for the PDF view.
+                            self._pdf_parts_nav = _build_pdf_parts_nav(
                                 self._pdf_holder, sections, p.scroll_to_page)
-                            nav.pack(side="right", fill="y", padx=(4, 0))
+                            self._apply_pdf_parts_visibility()
                         bits = []
                         n = sum(len(v) for v in links.values())
                         nq = sum(len(v) for pg, v in links.items()
@@ -19864,9 +20854,14 @@ class _ScholarTextWindow:
                                    if nq else "shown in blue")
                             )
                         if len(sections) > 1:
-                            bits.append(f"{len(sections)} opinion parts "
-                                        "listed on the right")
-                        bits.append("drag to select text; Ctrl+C copies")
+                            bits.append(
+                                f"{len(sections)} opinion parts "
+                                + ("listed on the right"
+                                   if self._pdf_parts_on else
+                                   "— tick Side panel to list them")
+                            )
+                        bits.append(f"{_ACCEL}-F searches the page; drag to "
+                                    f"select text ({_ACCEL}+C copies)")
                         self._status_var.set("; ".join(bits) + ".")
                 except tk.TclError:
                     pass
@@ -19882,12 +20877,12 @@ class _ScholarTextWindow:
         # Returning from the PDF goes back to whichever text view we came from:
         # the Scholar text, or — for a CourtListener-primary window — the CL text.
         if self._pre_pdf_mode == "courtlistener":
-            back_label, back_state = "Back to Text", "normal"
+            back_label, back_state = "Text", "normal"
         else:
-            # The "Google Scholar Text" toggle is disabled only for a Federal
+            # The "Text" toggle is disabled only for a Federal
             # Appendix case whose Scholar page has no opinion text (a scan-only
             # case); every other case keeps it active.
-            back_label = "Google Scholar Text"
+            back_label = "Text"
             back_state = ("disabled"
                           if self._fed_appx and not self._scholar_has_text
                           else "normal")
@@ -19909,7 +20904,7 @@ class _ScholarTextWindow:
         data = getattr(self, "_pdf_bytes", None)
         if not data:
             return
-        default = _build_default_filename(self._filename_item())
+        default = _build_default_filename(self._pdf_filename_item())
         path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
@@ -19950,7 +20945,8 @@ class _ScholarTextWindow:
                 print(f"[pdf] header citation failed: {exc}")
         # Name the print file the same as "Download PDF" would, so a Save-As
         # from the viewer already carries the Bluebook citation.
-        path = _named_temp_pdf_path(_build_default_filename(self._filename_item()))
+        path = _named_temp_pdf_path(
+            _build_default_filename(self._pdf_filename_item()))
         try:
             if self._pdf_pane is not None:
                 self._pdf_pane.export_pdf(
@@ -19980,6 +20976,7 @@ class _ScholarTextWindow:
         if holder is not None:
             holder.destroy()  # takes the pane and its parts strip with it
             self._pdf_holder = None
+            self._pdf_parts_nav = None
         elif self._pdf_pane is not None:
             self._pdf_pane.destroy()
         self._pdf_pane = None
@@ -19988,12 +20985,12 @@ class _ScholarTextWindow:
         if self._pre_pdf_mode == "courtlistener":
             self._render_courtlistener_view()
         else:
-            self._render_scholar()  # restores label, combo and "View PDF"
+            self._render_scholar()  # restores label, combo and "PDF"
 
     def _on_pdf_error(self, msg: str) -> None:
         if self._pre_pdf_mode == "courtlistener" and self._mode != "pdf":
             # Failure came from the CL view's View PDF button — restore it
-            # rather than turning the Scholar toggle into a "View PDF".
+            # rather than turning the Scholar toggle into a "PDF".
             self._refresh_pdf_button()
         else:
             if not self._pdf_url:
@@ -20023,7 +21020,7 @@ class _ScholarTextWindow:
         def run() -> None:
             try:
                 url = self._app._resolve_pdf_url(client, item)
-                self._remember_case_law_pdf_choices(item)
+                self._remember_resolved_pdf_info(item)
             except Exception:
                 url = None
             self._post(self._after_resolve_for_browser, url)
@@ -20607,7 +21604,7 @@ class _PdfWindow:
         # text selection (Ctrl-C copies) when the PDF carries text.
         def extract_text(d=data, p=pane) -> None:
             try:
-                pages = _extract_pdf_text_pages(d)
+                pages, italics = _extract_pdf_text_and_style(d)
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
                 return
@@ -20618,7 +21615,7 @@ class _PdfWindow:
             if self._is_case:
                 try:
                     links, quiet = _citation_links_from_visible_pdf_text(
-                        d, pages)
+                        d, pages, italics)
                 except Exception as exc:
                     print(f"[pdf-links] citation scan failed: {exc}")
 
@@ -21081,11 +22078,16 @@ _PDF_PART_COLORS = {
 def _build_pdf_parts_nav(parent, sections: list, goto) -> ttk.Frame:
     """A slim strip listing a PDF's detected opinion parts (from
     slip_opinion.detect_sections), each colored by kind; clicking a label
-    calls ``goto(start_page)``.  The caller packs the returned frame."""
+    calls ``goto(page, y_pt)``.  The caller packs the returned frame.
+
+    A part that opens partway down a page — the previous opinion running on
+    above it — carries the height of its opening line, and the click goes
+    there rather than to the top of the page (see ``SlipSection.start_at``)."""
     nav = ttk.Frame(parent, padding=(6, 4))
     ttk.Label(nav, text="Parts", font=("TkDefaultFont", 9, "bold"),
               anchor="w").pack(fill="x", pady=(2, 4))
     for sec in sections:
+        target = getattr(sec, "start_at", None) or (sec.start_page, None)
         lbl = tk.Label(
             nav, text=sec.label, anchor="w", justify="left",
             wraplength=150, cursor="hand2",
@@ -21093,8 +22095,8 @@ def _build_pdf_parts_nav(parent, sections: list, goto) -> ttk.Frame:
             font=("TkDefaultFont", 9, "underline"),
         )
         lbl.pack(fill="x", pady=2)
-        lbl.bind("<Button-1>", lambda _e, p=sec.start_page: goto(p))
-        page_no = tk.Label(nav, text=f"p. {sec.start_page + 1}",
+        lbl.bind("<Button-1>", lambda _e, t=target: goto(*t))
+        page_no = tk.Label(nav, text=f"p. {target[0] + 1}",
                            anchor="w", foreground="#999999",
                            font=("TkDefaultFont", 8))
         page_no.pack(fill="x", padx=(8, 0))
@@ -21337,17 +22339,17 @@ class _SlipOpinionWindow:
         """Worker: extract the text layer once; build citation links and the
         section list from it."""
         try:
-            pages = _extract_pdf_text_pages(data)
+            pages, italics = _extract_pdf_text_and_style(data)
         except Exception as exc:
             print(f"[slip] text extraction failed: {exc}")
-            pages = []
+            pages, italics = [], []
         links: dict = {}
         quiet: set = set()
         sections: list = []
         if pages:
             try:
                 links, quiet = _citation_links_from_visible_pdf_text(
-                    data, pages)
+                    data, pages, italics)
             except Exception as exc:
                 print(f"[slip] citation scan failed: {exc}")
             try:
@@ -21375,7 +22377,7 @@ class _SlipOpinionWindow:
         if len(sections) > 1:
             bits.append(f"{len(sections)} opinion parts")
         if pages:
-            bits.append("Ctrl-F to search; drag to select text")
+            bits.append(f"{_ACCEL}-F to search; drag to select text")
         self._status_var.set("; ".join(bits) or "Slip opinion loaded.")
 
     def _build_nav(self, sections: list) -> None:
@@ -21387,9 +22389,9 @@ class _SlipOpinionWindow:
         nav.pack(side="right", fill="y", padx=(0, 8), pady=4)
         self._nav = nav
 
-    def _goto_page(self, page: int) -> None:
+    def _goto_page(self, page: int, y_pt: Optional[float] = None) -> None:
         if self._pane is not None:
-            self._pane.scroll_to_page(page)
+            self._pane.scroll_to_page(page, y_pt)
 
     # -- citation dispatch ----------------------------------------------------
 
@@ -22533,9 +23535,10 @@ class _LinkedPdfWindow:
 
     def _scan(self) -> None:
         try:
-            pages = _extract_pdf_text_pages(self._bytes)   # one extraction pass
+            # one extraction pass, text and styling together
+            pages, italics = _extract_pdf_text_and_style(self._bytes)
             links, quiet = _citation_links_from_visible_pdf_text(
-                self._bytes, pages)
+                self._bytes, pages, italics)
         except Exception as exc:
             self._post(self._scan_failed, str(exc))
             return
@@ -22565,7 +23568,8 @@ class _LinkedPdfWindow:
                "right-click for the browser." if n
                else "No citations detected in this PDF's text layer.")
         if has_text:
-            msg += "    Ctrl-F searches; drag selects text (Ctrl+C copies)."
+            msg += (f"    {_ACCEL}-F searches; drag selects text "
+                    f"({_ACCEL}+C copies).")
         self._status_var.set(msg)
 
     def _open_cite(self, action: tuple, snippet: str) -> None:

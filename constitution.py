@@ -81,7 +81,7 @@ _ORD_ALT = _ord_alt()
 # Matched forms (case-insensitive), with the cited section/clause folded into
 # the link span so the whole "art. I, § 8, cl. 3" highlights as one link:
 #   * Bluebook:  "U.S. Const. art. I, § 8, cl. 3", "U.S. Const. amend. XIV, § 1",
-#                "U.S. Const. amend. I", "U.S. Const. pmbl.", "U.S. Constitution"
+#                "U. S. Const., Amdt. 1", "U.S. Const. pmbl."
 #   * Prose amendment:  "First Amendment" … "Twenty-seventh Amendment",
 #                       "Amendment XIV", "Amendment 14"
 #   * Prose article:    "Article I" … "Article VII" (+ optional ", § 8")
@@ -91,18 +91,50 @@ _ORD_ALT = _ord_alt()
 # ---------------------------------------------------------------------------
 _TAIL = (r"(?:\s*,?\s*(?:§|[Ss]ec(?:tion|\.)?)\s*\d+"
          r"(?:\s*,?\s*cls?\.?\s*\d+(?:\s*[\-–]\s*\d+)?)?)?")
-_ART_ROMAN = r"(?:VII|VI|V|IV|III|II|I)"
-
-CONST_CITE_RE = re.compile(
-    r"U\.?\s?S\.?\s+Const(?:itution|\.)"
+# Roman numerals are matched case-sensitively even though the pattern as a
+# whole ignores case: lowercased, the numeral letters spell ordinary words, and
+# "the amendment did not" was being read as Amendment DID.  Nobody writes an
+# article or amendment number in lower case.
+_ROMAN_NUM = r"(?-i:[IVXLCDM]+)"
+_ART_ROMAN = r"(?-i:VII|VI|V|IV|III|II|I)"
+# How the subdivision is spelled.  The Court's own reporter writes "Amdt." and
+# "Amdts." ("U. S. Const., Amdt. 1"), the Bluebook "amend."; both appear, and
+# either can be plural in a string of them.
+_AMEND_WORD = r"(?:amend(?:ment)?s?|amdts?)\.?"
+_ART_WORD = r"(?:art(?:icle)?s?)\.?"
+_SUBDIVISION = (
     r"(?:"
-    r"\s*,?\s*amend(?:ment)?\.?\s*(?:[IVXLCDM]+|\d+)" + _TAIL +
-    r"|\s*,?\s*art(?:icle)?\.?\s*(?:[IVXLCDM]+|\d+)" + _TAIL +
+    r"\s*,?\s*" + _AMEND_WORD + r"\s*(?:" + _ROMAN_NUM + r"|\d+)" + _TAIL +
+    r"|\s*,?\s*" + _ART_WORD + r"\s*(?:" + _ROMAN_NUM + r"|\d+)" + _TAIL +
     r"|\s*,?\s*(?:pmbl\.?|preamble)"
-    r")?"
-    r"|" + _ORD_ALT + r"\s+Amendment(?:['’]s)?"
-    r"|Amendment\s+(?:[IVXLCDM]+|\d+)" + _TAIL +
-    r"|Article\s+" + _ART_ROMAN + r"\b" + _TAIL,
+    r")"
+)
+
+# Every alternative is anchored on both sides.  Without a boundary in front,
+# the "us" ending any number of words is read as "U. S." — "various
+# constitutional provisions" matched "us constitution" and linked the reader to
+# the Preamble.  Without one behind, "Constitution" matches inside
+# "constitutional", which is the same sentence's other half of the problem.
+#
+# The subdivision is required, not optional: a bare "the U.S. Constitution" is
+# prose about the document, not a citation to any part of it, and linking it to
+# the Preamble sends the reader somewhere the writer never pointed.  A reader
+# who does want the document itself can type it into the lookup box, which
+# parse_query still accepts.
+CONST_CITE_RE = re.compile(
+    r"\bU\.?\s?S\.?\s+Const(?:itution|\.)(?![A-Za-z])" + _SUBDIVISION +
+    r"|\b" + _ORD_ALT + r"\s+Amendments?(?:['’]s?)?\b"
+    r"|\bAmendment\s+(?:" + _ROMAN_NUM + r"|\d+)\b" + _TAIL +
+    r"|\bArticle\s+(?:" + _ART_ROMAN + r")\b" + _TAIL,
+    re.IGNORECASE,
+)
+
+# The whole document, with no part named.  Never a link in running prose (see
+# above), but a fair thing to type into the lookup box, where it opens at the
+# Preamble.
+_WHOLE_CONST_RE = re.compile(
+    r"\b(?:U\.?\s?S\.?|United\s+States)\s+Const(?:itution|\.)(?![A-Za-z])"
+    r"|\bthe\s+Constitution\b",
     re.IGNORECASE,
 )
 
@@ -125,11 +157,11 @@ def _spec_parts(text: str) -> tuple[str, int, str] | None:
         if n:
             return ("amend", n, "")
 
-    m = re.search(r"amend(?:ment)?\.?\s*([IVXLCDM]+|\d+)", s, re.IGNORECASE)
+    m = re.search(_AMEND_WORD + r"\s*([IVXLCDM]+|\d+)", s, re.IGNORECASE)
     if m:
         return ("amend", _to_int(m.group(1)), sec)
 
-    m = re.search(r"art(?:icle)?\.?\s*([IVXLCDM]+|\d+)", s, re.IGNORECASE)
+    m = re.search(_ART_WORD + r"\s*([IVXLCDM]+|\d+)", s, re.IGNORECASE)
     if m:
         n = _to_int(m.group(1))
         if 1 <= n <= 7:
@@ -169,6 +201,11 @@ def parse_query(text: str) -> tuple[str, str] | None:
     m = CONST_CITE_RE.match(text)
     if m and m.end() >= len(text.rstrip(" .")):
         return ("const", cite_spec(m))
+    # "U.S. Constitution" on its own: not a link in running prose, but a
+    # sensible thing to type, and the Preamble is where the document starts.
+    m = _WHOLE_CONST_RE.match(text)
+    if m and m.end() >= len(text.rstrip(" .")):
+        return ("const", "pmbl:0:")
     return None
 
 
@@ -1134,6 +1171,10 @@ if __name__ == "__main__":
         ("Article I, Section 8", "art:1:8"),
         ("U.S. Const. pmbl.", "pmbl:0:"),
         ("Amendment XIV", "amend:14:"),
+        # The Court's reporter spells it "Amdt.", not "amend."
+        ("U. S. Const., Amdt. 1", "amend:1:"),
+        ("U. S. Const., Amdts. 5, 14", "amend:5:"),
+        ("U. S. Const., Art. III, § 2", "art:3:2"),
     ]
     for text, want in cases:
         m = CONST_CITE_RE.search(text)
@@ -1143,7 +1184,10 @@ if __name__ == "__main__":
 
     # --- must NOT match ---
     for text in ["Article 9 of the UCC", "the agreement's article",
-                 "Constitutional Convention"]:
+                 "Constitutional Convention",
+                 # No part named: prose about the document, not a citation.
+                 "U.S. Constitution", "the U. S. Constitution guarantees",
+                 "adhere to the Constitution and to its meaning"]:
         m = CONST_CITE_RE.search(text)
         check(m is None, f"no match in {text!r} (got {m.group(0) if m else None!r})")
 
@@ -1167,5 +1211,10 @@ if __name__ == "__main__":
     check(parse_query("14th Amendment") == ("const", "amend:14:"),
           "query 14th Amendment")
     check(parse_query("Article III") == ("const", "art:3:"), "query Article III")
+    check(parse_query("U. S. Const., Amdt. 1") == ("const", "amend:1:"),
+          "query Amdt. 1")
+    # Not a link in prose, but typing it should still open the document.
+    check(parse_query("U.S. Constitution") == ("const", "pmbl:0:"),
+          "query the whole Constitution")
 
     raise SystemExit(1 if failed else 0)

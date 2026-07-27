@@ -161,6 +161,12 @@ class SlipSection:
     label: str        # display label ("Opinion of the Court", "Thomas, J., concurring")
     kind: str         # syllabus | majority | concurrence | dissent | separate
     start_page: int   # 0-based page index the part begins on
+    # Where the part actually opens when that is partway down a page — the
+    # tail of the previous opinion still above it — as ``(page index, y in PDF
+    # points)`` of its opening attribution line.  ``None`` when the part opens
+    # at the top of ``start_page``, or when the page is set in columns, where a
+    # height names a line in each of them and so names none.
+    start_at: "tuple[int, float] | None" = None
 
 
 def _title_name(surname_caps: str) -> str:
@@ -497,6 +503,68 @@ def _line_name_attribution(page_lines: list, li: int, head: "_Head"):
     return None
 
 
+def is_single_column(chars: list) -> bool:
+    """True when a page's glyphs form one text block rather than two columns.
+
+    Two columns leave an empty gutter running down the middle that no glyph
+    crosses.  It matters because a height on the page names one line in a
+    single column but a line in *each* column otherwise — so scrolling to a
+    height is only meaningful here.
+    """
+    boxes = [b for _c, b in chars if b is not None]
+    if len(boxes) < 40:
+        return True  # too little on the page to be set in columns
+    x0 = min(b[0] for b in boxes)
+    x1 = max(b[2] for b in boxes)
+    width = x1 - x0
+    if width <= 0:
+        return True
+    # Merge the glyph x-spans, then look for a gap between them wide enough to
+    # be a gutter and central enough to be *the* gutter.
+    spans = sorted((b[0], b[2]) for b in boxes)
+    cur_end = spans[0][1]
+    lo, hi = x0 + width * 0.3, x0 + width * 0.7
+    for start, end in spans[1:]:
+        if start > cur_end:
+            if (start - cur_end >= width * 0.04
+                    and lo <= (cur_end + start) / 2 <= hi):
+                return False
+            cur_end = end
+        else:
+            cur_end = max(cur_end, end)
+    return True
+
+
+def _attribution_start(pages: list, page_lines: list, pg: int, li: int):
+    """``(page, y)`` of the attribution line at *(pg, li)* when the part it
+    opens starts partway down the page, else ``None``.
+
+    Nothing is gained by naming a height for a part that opens at the top of
+    its page — the page top is already where the reader lands — and a height
+    on a two-column page would be ambiguous, so both give ``None``.
+    """
+    try:
+        lines = page_lines[pg]
+        line = lines[li]
+    except (IndexError, TypeError):
+        return None
+    above = lines[:li]
+    # A divider rule above means the page opens the part: what precedes the
+    # attribution is the part's own caption block, not another opinion's tail,
+    # and the page top is already the right place to land.
+    if any(_DIVIDER_RE.match(ln.text) for ln in above):
+        return None
+    # Nor is a running head alone "leftover of a previous opinion".
+    if len([ln for ln in above if not _PUNCT_LINE_RE.match(ln.text)]) <= 2:
+        return None
+    try:
+        if not is_single_column(pages[pg]):
+            return None
+    except (IndexError, TypeError):
+        return None
+    return (pg, line.y)
+
+
 def _find_attribution_near(page_lines: list, pi: int, head=None,
                            used: "set | None" = None):
     """The opening attribution proving a separate opinion starts on page *pi*
@@ -625,15 +693,17 @@ def _finalize(sec: dict) -> SlipSection:
         att_kind, _n, att_phrase = sec["att"]
         role = att_phrase or {"dissent": "dissenting",
                               "concurrence": "concurring"}.get(att_kind, "")
+    start_at = sec.get("start_at")
     if not role:
         return SlipSection(f"Opinion of {names}, {marker}", "separate",
-                           sec["start"])
+                           sec["start"], start_at)
     kind_out = ("dissent" if "dissenting" in role
                 else "concurrence" if "concurring" in role else "separate")
-    return SlipSection(f"{names}, {marker}, {role}", kind_out, sec["start"])
+    return SlipSection(f"{names}, {marker}, {role}", kind_out,
+                       sec["start"], start_at)
 
 
-def _merge_heads(heads: list, page_lines: list) -> list[dict]:
+def _merge_heads(heads: list, page_lines: list, pages: list) -> list[dict]:
     """Group the per-page parsed heads into contiguous sections, absorbing
     OCR variation and gating each new separate opinion on its opening
     attribution — a page whose head garbles into a *new* justice name mid-
@@ -670,6 +740,10 @@ def _merge_heads(heads: list, page_lines: list) -> list[dict]:
             for k in range(3):
                 used.add((apg, ali + k))
             cur = _new_sec(h, pi, att)
+            # The attribution is the opinion's first line.  When it sits
+            # partway down a page, that line — not the page top — is where
+            # the reader wants to land.
+            cur["start_at"] = _attribution_start(pages, page_lines, apg, ali)
             secs.append(cur)
     return secs
 
@@ -794,7 +868,8 @@ def detect_sections(pages: list) -> list[SlipSection]:
     # attribution scan (reporter scans have no heads at all).
     head_pages = sum(1 for h in heads if h is not None)
     if head_pages >= min(2, len(page_lines)):
-        sections = [_finalize(s) for s in _merge_heads(heads, page_lines)]
+        sections = [_finalize(s)
+                    for s in _merge_heads(heads, page_lines, pages)]
     else:
         sections = [_finalize_attribution(s)
                     for s in _sections_from_attributions(pages)]

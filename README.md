@@ -31,10 +31,10 @@ Go to CourtListener.com and create a free account.
 
 Once logged in, visit your API settings page and copy your API token.
 
-Launch the app – the first time you search, it will ask for the token.
-You can also enter it later via Settings → API Token… in the menu bar.
+Launch the app – with no token saved, it opens a setup dialog on startup that explains where to get one, offers a “Get a token…” button, and checks the token against the API before saving it. “Skip for now” dismisses it (everything except CourtListener still works), and “Don’t ask again” stops it from reappearing.
+You can enter or change the token at any time via Settings → API Token… in the menu bar.
 
-The token is stored locally (~/.config/courtlistener/config.json) and is used for all CourtListener API requests.
+The token is stored locally (~/.config/courtlistener/config.json) and is used for all CourtListener API requests. Setting COURTLISTENER_TOKEN in the environment overrides the saved token and suppresses the startup prompt.
 
 3. Run the application
 bash
@@ -63,7 +63,7 @@ Results appear in the left treeview; click a row to preview the snippet.
 
 Double‑click a row to download the opinion as PDF (or .txt if no PDF is available).
 
-Click Google Scholar Text to fetch the full opinion from Google Scholar (often richer than CourtListener’s HTML).
+Click **Scholar** to fetch the full opinion from Google Scholar (often richer than CourtListener’s HTML); the button on the Scholar view reads **CourtListener** and switches back. Under a PDF both read **Text**.
 
 Quick Lookup (Ctrl+S)
 Instant citation lookup: paste a case citation (410 U.S. 113), a statute (42 USC 1983), a regulation (29 CFR 1614.105), or a Federal Rule (FRE 404), and open the source directly.
@@ -95,12 +95,12 @@ The app caches Google Scholar results and PDF downloads to speed up repeated loo
 
 For English Reports PDFs, if the app can’t fetch them directly, it will open a browser window for you to pass CloudFlare – once cleared, the PDF downloads automatically.
 
-All text viewers support copy with Bluebook citation (Ctrl+C / Cmd+C) – the copied text includes a properly formatted citation appended at the end. In a case viewer, **Edit citation…** lets you correct the base citation once; the correction is saved locally and reused while pinpoint pages continue to be added automatically.
+Ctrl+C / Cmd+C copies from a case viewer in whichever of three styles the **Copy** menu has selected: **Copy without citation**, **Copy with citation** (the default – the Bluebook citation, with its pinpoint page, appended below the text), or **Copy as quote**, which wraps the passage in double quotes, demotes the quotation marks inside it a level so the nesting reads correctly, and sets the citation one space after the closing quote the way a brief does. The choice is remembered between sessions. In a case viewer, **Edit citation…** lets you correct the base citation once; the correction is saved locally and reused while pinpoint pages continue to be added automatically.
 
-You can export opinions from the Export ▾ menu: as RTF (two‑column, with running heads) for word processors; as a print‑ready PDF typeset with LaTeX (single column, justified, Century Schoolbook, footnotes at the foot of the page that cites them, and a running head showing the reporter page range visible on each sheet) if a LaTeX installation (TeX Live, MiKTeX, or Tectonic) is available; or as Markdown with footnotes and star pagination preserved – offered automatically when LaTeX isn’t installed.
+You can export opinions from the Export ▾ menu: as RTF (two‑column, with running heads) for word processors; as a print‑ready PDF typeset with LaTeX (single column, justified, Century Schoolbook, footnotes at the foot of the page that cites them, and a running head showing the reporter page range visible on each sheet) if a LaTeX installation (TeX Live, MiKTeX, or Tectonic) is available; or as **.tex source** – the same document the PDF export typesets, saved unbuilt so you can edit it first. The .tex export needs no LaTeX installed here, and is offered automatically if you ask for the PDF on a machine without an engine.
 
 Troubleshooting
-“Missing Token” – go to Settings → API Token… and paste your CourtListener token.
+“Missing Token” – answer Yes to enter your CourtListener token, or paste it later via Settings → API Token….
 
 Google Scholar not working – install beautifulsoup4 (pip install beautifulsoup4).
 

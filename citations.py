@@ -142,11 +142,47 @@ _NONCASE_REPORTERS = {
     # regex must not claim them first (a Scholar lookup by an E.R. cite lands
     # on an unrelated case).
     "engrep", "er",
+    # A *bare* "App." is the joint appendix, not a reporter — "2 App. 136" is
+    # a page of the record, and linking it sends the reader to an unrelated
+    # case (and gives a following "Id., at 137" the same wrong antecedent).
+    # _RECORD_CITE_RE already treats the word that way.  Only the bare form is
+    # excluded: the key drops punctuation and spacing, so the real reporters
+    # that contain "App." keep their own keys — "Cal. App. 4th" is calapp4th,
+    # "Wn. App." wnapp, "N.Y. App. Div." nyappdiv, "F. App'x" fappx.
+    "app",
 }
 _PLAIN_CASE_REPORTERS = {
     "alaska", "idaho", "iowa", "ohio", "utah", "vermont", "wyoming",
     "wl", "lexis",
 }
+
+# Law reviews are cited in exactly a reporter's shape — "125 Yale L. J. 946"
+# parses like "125 U. S. 946" — so the broad reporter fallback claims them and
+# offers the reader a case that was never decided.  These markers appear in
+# journal abbreviations and in no case reporter:
+#
+#   "L. Rev."  Harv. L. Rev., Colum. L. Rev., N.Y.U. L. Rev.
+#   "L. J."    Yale L. J., Duke L.J., Hastings L.J.
+#   "L.Q."     Law Quarterly
+#   "Rev."     Sup. Ct. Rev., Ann. Rev. — any remaining review
+#   "J."       Am. J. Int'l L., J. Legal Stud. — a *standalone* J.
+#
+# The last one carries all the risk, because several real reporters end in a
+# "J." that must survive: N.J. (New Jersey), M.J. (Military Justice), N.J.L.
+# (New Jersey Law Reports), Wall. Jr.  What separates them from a journal is
+# the character before the J — a period or letter there means reporter, a space
+# or nothing means journal — so the standalone alternative is written with a
+# lookbehind, and the "L. J." family is matched explicitly since its own J does
+# follow a period.  Case-sensitive: journal abbreviations are capitalized, and
+# the broad regex only ever hands us a capitalized token.
+_JOURNAL_REPORTER_RE = re.compile(
+    r"L\.\s?J\.|L\.\s?Rev\.|L\.\s?Q\.|\bRev\.|(?<![A-Za-z.])J\."
+)
+
+# "10 Op. Atty Gen. 382" — an opinion of the Attorney General.  Cited in a
+# reporter's shape, but it is executive advice, not a decided case, and no
+# case-law source can open it.
+_AG_OPINION_RE = re.compile(r"Att(?:orne)?y?\.?\s*'?y?\.?\s*Gen", re.IGNORECASE)
 
 # Short-form citation: "Roe, 410 U.S., at 152" → volume, reporter, pin page.
 SHORT_CITE_RE = re.compile(
@@ -166,12 +202,345 @@ BROAD_SHORT_CITE_RE = re.compile(
 ID_CITE_RE = re.compile(r"\bid\.(?:\s*,?\s*at\s+\*?(\d{1,6}))?", re.IGNORECASE)
 
 # Record cites in briefs commonly use "Id." too.  If one appears between an
-# authority and a later "Id. at N", do not carry the authority forward.
+# authority and a later "Id. at N", do not carry the authority forward.  The
+# suffix guard matters for bare "ER"/"SER": without it ordinary prose such as
+# "error," "erred," and "errors" falsely breaks the chain.
 _RECORD_CITE_RE = re.compile(
     r"\b(?:App\.|J\.?A\.|A\.R\.|R\.|Tr\.|Dkt\.|Doc\.|ECF|Ex\.|ER|SER)"
-    r"\s*(?:No\.?\s*)?[\w*.-]+|\b(?:ECF|Dkt\.|Doc\.)\s+No\.?\s+\d+|¶\s*\d+",
+    r"(?![A-Za-z])\s*(?:No\.?\s*)?[\w*.-]+"
+    r"|\b(?:ECF|Dkt\.|Doc\.)\s+No\.?\s+\d+|¶\s*\d+",
     re.IGNORECASE,
 )
+
+# The Reporter of Decisions' running head, printed across the top of every
+# other page of a slip opinion or a bound-volume excerpt: "Cite as: 583 U. S.
+# 48 (2018)", or "Cite as: 609 U. S. ___ (2026)" before the volume is paged.
+# It cites the very opinion being read, so linking it only offers the reader a
+# trip back to where they already are — and, because the head sits between the
+# text of one page and the next, letting it register as a citation would also
+# hijack any "Id." that opens the following page.
+RUNNING_HEAD_CITE_RE = re.compile(
+    r"Cite\s+as\s*:\s*\d{1,4}\s+U\.\s?S\.\s+(?:\d{1,5}|_{2,})"
+    r"(?:\s*\(\s*\d{4}\s*\))?",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# How much text a case-citation link should cover
+# ---------------------------------------------------------------------------
+# The reporter cite ("534 U. S. 266") is what the regexes find, but a reader
+# sees one citation: "United States v. Arvizu, 534 U. S. 266, 277 (2002)".
+# The span is grown to that whole unit — name, reporter cite, pin cite, and the
+# court/year parenthetical — so the blue text matches the citation rather than
+# a fragment of it.  Explanatory parentheticals ("(plurality opinion)",
+# "(holding that …)") are left out: they are commentary, not the cite.
+
+# A parenthetical belongs to the citation when it *ends* in a year — "(2002)",
+# "(4th Cir. 2024)", "(D. Md. Apr. 30, 2015)".  Nothing else qualifies, which
+# is what keeps "(holding that the totality controls)" black.
+_COURT_YEAR_PAREN_RE = re.compile(r"\s*\((?:[^()]{0,60}?[\s.])?(?:1[6-9]|20)\d{2}\)")
+
+# A further pin page in the same citation ("216, 225, 228" — the ", 228").
+# Group 1 is the page it opens to; the range that may follow is highlighted but
+# not captured, since a range opens at its first page.
+_EXTRA_PIN_RE = re.compile(
+    r",\s*\*?(\d{1,6})(?:\s*[-–—]\s*\*?\d{1,6})?(?!\d|\s*[A-Z])")
+
+# The tail of a page range on a short cite.  SHORT_CITE_RE stops at the first
+# page ("542 U. S., at 254" out of "at 254–255"), so the rest of the range has
+# to be taken separately to finish the highlight.
+_RANGE_TAIL_RE = re.compile(r"\s*[-–—]\s*\*?\d{1,6}(?!\d)")
+
+# Lowercase words that sit *inside* a case name and must not end the backward
+# scan for one ("District of Columbia v. Wesby", "Rhode Island ex rel. …").
+_NAME_CONNECTORS = frozenset({
+    "of", "the", "and", "for", "et", "al", "al.", "ex", "rel.", "rel",
+    # "Goodell v. Jackson ex dem. Smith" — the old form for a suit brought on
+    # another's demise, and as much part of the name as "ex rel." is.
+    "dem.", "dem",
+    "de", "del", "des", "du", "da", "dos", "la", "le", "van", "von",
+    "den", "der", "&", "on", "to",
+})
+
+# Words that can never begin a case name, so the scan stops before them even
+# though many are capitalized at the start of a sentence or signal phrase.
+_NAME_STOPPERS = frozenset({
+    "see", "cf", "cf.", "accord", "compare", "contra", "citing", "quoting",
+    "quoted", "e.g", "e.g.", "eg", "but", "also", "id", "id.", "ibid",
+    "ibid.", "supra", "infra", "in", "at", "from", "under", "with", "than",
+    "that", "since", "because", "overruled", "overruling", "rev'd", "aff'd",
+    "cert", "cert.", "denied", "granted", "citation", "citations", "omitted",
+    "quotation", "internal", "marks", "per", "curiam", "slip", "op", "op.",
+    "no", "no.", "nos.", "v", "v.", "vs", "vs.",
+})
+
+# An abbreviation a name may legitimately contain ("Mgmt.", "Corp.", "U.S.",
+# "R.R.", "E.").  Any *other* period-terminated word — "Amendment.",
+# "reversed." — is the end of the previous sentence, and stops the scan.
+_NAME_ABBREV_RE = re.compile(r"^(?:[A-Z][A-Za-z'’]{0,6}\.|(?:[A-Z]\.){1,4})$")
+
+# Punctuation that can trail a word without being part of it.  Stripped before
+# the sentence-end test, so a quotation's closing mark cannot hide the period
+# that ends it — 'Amendment."' is still the end of a sentence.
+_NAME_TRAIL = ",;:”\"’')]}"
+
+# A token that can sit inside a party name: capitalized, quoted, or a company
+# designation like "3M".  A bare number is not — that is a page number from a
+# running head or the tail of an earlier citation.
+_NAME_TOKEN_RE = re.compile(r"^[\"“'(]?(?:[A-Z]|\d+[A-Za-z])")
+
+# How much text before a citation can hold its name.  Long enough for the
+# worst real caption ("Liverpool, New York & Philadelphia S. S. Co. v.
+# Commissioners of Emigration") with line breaks, short enough that the scan
+# never reaches the running head of the page above.
+_NAME_LOOKBEHIND = 200
+
+# "In re Winship", "Ex parte Young", "Matter of Doe" — a case name with no
+# "v." in it, anchored to the end of the window before the citation.
+_NAME_NO_V_RE = re.compile(
+    r"(?:In\s+re|In\s+the\s+Matter\s+of|Ex\s+parte|Matter\s+of)\s+"
+    r"[A-Z][\w.,'’&()-]*(?:\s+[\w.,'’&()-]+){0,6}$"
+)
+
+
+def _closes_parenthetical(tok: str) -> bool:
+    """True when *tok* shuts a parenthetical that opened in an earlier word.
+
+    A parenthetical between two citations belongs to the first one, not to the
+    second one's name.  Casey's syllabus reads "…462 U. S. 416 (Akron I), and
+    Thornburgh v. American College…"; without this the backward scan walks
+    through "and" and "I)," and starts the Thornburgh name at "(Akron", so the
+    two links run into each other on the page.
+
+    A parenthetical that opens and closes inside one word — a name's own
+    acronym, "…Gynecologists (ACOG), 476 U. S. 747" — is left alone.
+    """
+    core = tok.rstrip(",;:”\"’'")
+    return core.endswith(")") and "(" not in core
+
+
+def _mostly_italic(text: str, italic, lo: int, hi: int) -> bool:
+    """True when the letters in ``text[lo:hi]`` are set in an italic face.
+
+    A case name is italicised and the prose around a citation is not, which is
+    what tells "Illinois v. Wardlow, 528 U. S. 119" from "by appointment of the
+    Court, 551 U. S. 1186" — where "Court" is just the last word of a sentence
+    that happens to be capitalised.  Judged on letters only (digits, spaces and
+    punctuation carry no styling worth trusting) and by majority, so one roman
+    glyph does not disqualify a name.
+    """
+    letters = [i for i in range(lo, min(hi, len(italic))) if text[i].isalpha()]
+    if not letters:
+        return False
+    return sum(1 for i in letters if italic[i]) * 2 > len(letters)
+
+
+def _case_name_start(
+    text: str, cite_start: int, floor: int, italic=None) -> "int | None":
+    """Index where the case name introducing the citation at *cite_start*
+    begins, or ``None`` when no name reads as one.
+
+    The scan never crosses *floor* — the end of the last thing already linked,
+    or of a running head — so a name can never swallow a neighbouring citation
+    or the page furniture above it.
+
+    Both shapes of name count.  Most carry a "v." (or read "In re …"), but a
+    string cite shortens the name while keeping the full citation — "Abdul
+    Latif, 939 F. 3d 710", "National Broadcasting Co., 165 F. 3d 184" — so a
+    lone party is accepted too.  What keeps that from swallowing prose is the
+    same set of limits either way: the nearest comma bounds it, signal words
+    and sentence ends stop it, and it may not run past a few words.
+    """
+    # Only the text just before the citation can hold its name.  Bounding the
+    # window matters as much as the token rules: unbounded, the scan reaches
+    # into the page above and finds the "v." of the running head
+    # ("DISTRICT OF COLUMBIA v. WESBY"), which reads as a party name and
+    # swallows everything after it.
+    base = max(floor, cite_start - _NAME_LOOKBEHIND)
+    head = text[base:cite_start]
+    # Bluebook always separates the name from the volume with a comma.
+    tail = re.search(r",\s*$", head)
+    if not tail:
+        return None
+    head = head[:tail.start()]
+    if not head.strip():
+        return None
+
+    nov = _NAME_NO_V_RE.search(head)
+    if nov:
+        if italic is not None and not _mostly_italic(
+                text, italic, base + nov.start(), cite_start):
+            return None
+        return base + nov.start()
+
+    # The last "v." in the window opens the second party; everything after it
+    # (up to the comma) is that party, everything before it the first.
+    left_end = None
+    for split in reversed(list(re.finditer(r"(?<=[\w.'’)\]])\s+v[s]?\.\s+", head))):
+        right = head[split.end():]
+        if right and len(right) <= 70 and all(_name_token_ok(t) for t in right.split()):
+            left_end = split.start()
+        break
+    # No "v." immediately before the cite: read the shortened one-party form.
+    lone = left_end is None
+    if lone:
+        left_end = len(head)
+    toks = list(re.finditer(r"\S+", head[:left_end]))
+    i = len(toks)
+    while i > 0:
+        tok = toks[i - 1].group(0)
+        low = tok.lower().strip(",;:")
+        if low in _NAME_STOPPERS:
+            break
+        if lone and i < len(toks) and tok.endswith(","):
+            # With no "v." to anchor it, the party is whatever follows the
+            # nearest comma — "Later, Carpenter, 585 U. S., at 312" cites
+            # Carpenter, not "Later, Carpenter".
+            break
+        if _closes_parenthetical(tok):
+            break
+        if _NAME_TOKEN_RE.match(tok):
+            # A period ends the previous sentence unless it is an abbreviation
+            # a name could contain.
+            core = tok.rstrip(_NAME_TRAIL)
+            if core.endswith(".") and not _NAME_ABBREV_RE.match(core):
+                break
+            i -= 1
+            continue
+        if low in _NAME_CONNECTORS:
+            i -= 1
+            continue
+        break
+    # A name never *starts* with a connector ("of Columbia v. Wesby").
+    while i < len(toks) and toks[i].group(0).lower().strip(",;:") in _NAME_CONNECTORS:
+        i += 1
+    if i >= len(toks):
+        return None
+    if lone and len(toks) - i > 4:
+        return None  # a lone party is one or two words, not half a sentence
+    start = toks[i].start()
+    if left_end - start > 90:
+        return None  # implausibly long for a case name — leave it alone
+    if italic is not None and not _mostly_italic(
+            text, italic, base + start, cite_start):
+        return None  # roman type: prose running up to the cite, not a name
+    return base + start
+
+
+# ---------------------------------------------------------------------------
+# Statutes and regulations cited several sections at a time
+# ---------------------------------------------------------------------------
+# "18 U. S. C. §§ 1505, 1512, 1519" is three citations sharing one title, and
+# the section-symbol regexes stop at the first.  The rest are picked up here
+# and linked individually, each inheriting the title it was written under.
+# A *range* ("§§ 1505-1515") is deliberately not split: the whole range reads
+# as one citation and is highlighted as one, and the section group already
+# carries the dash, which load_section resolves to the opening provision.
+
+# ", 1512" / ", § 1512(b)" / ", 1614.106" — a bare section following the first,
+# optionally repeating the section symbol, with its own subsections.
+_MORE_SECTIONS_RE = re.compile(
+    r"(,\s*(?:and\s+)?|\s+and\s+)(?:§+\s*)?"
+    r"(\d+(?:\.\d+)?[a-zA-Z0-9]*(?:[-–—]\d+(?:\.\d+)?[a-zA-Z0-9]*)?)"
+    r"((?:\s?\((?:\d{1,3}|[ivxIVX]{2,4}|[a-zA-Z]{1,3})\))*)"
+)
+
+
+def _sibling_section_cites(
+    text: str, m: re.Match, dotted: bool,
+) -> list[tuple[int, int, str]]:
+    """Extra ``(start, end, spec)`` links for the sections listed after the
+    first in a multi-section citation.
+
+    *m* is a ``USC_CITE_RE``/``CFR_CITE_RE`` match and *dotted* says whether
+    that source numbers its sections with a dot (C.F.R. "1614.105") — the test
+    that keeps a plain pin cite or a date from being read as another section.
+    """
+    title = m.group(1)
+    plural = "§§" in m.group(0) or re.search(r"[Ss]ec(?:tions|s)\b", m.group(0))
+    out: list[tuple[int, int, str]] = []
+    pos = m.end()
+    while True:
+        nxt = _MORE_SECTIONS_RE.match(text, pos)
+        if not nxt:
+            break
+        section = nxt.group(2)
+        # C.F.R. sections always carry a part.section dot; a U.S.C. section
+        # never does.  Anything shaped the other way is a different animal —
+        # a pin cite, a year, a subsection — and ends the list.
+        if dotted != ("." in section):
+            break
+        # Without a plural section symbol ("§ 1505, 1512"), a following bare
+        # number is much more likely a pin cite or a date than a second
+        # section, so only an explicitly repeated "§" is trusted.
+        if not plural and "§" not in nxt.group(0):
+            break
+        subs = re.findall(r"\(([^)]+)\)", nxt.group(3) or "")
+        spec = (f"{title}:{section.replace('–', '-').replace('—', '-')}:"
+                f"{','.join(subs)}")
+        # The link covers the section itself, not the comma introducing it.
+        out.append((nxt.start() + len(nxt.group(1)), nxt.end(), spec))
+        pos = nxt.end()
+    return out
+
+
+def _name_token_ok(tok: str) -> bool:
+    low = tok.lower().strip(",;:")
+    if low in _NAME_STOPPERS:
+        return False
+    return bool(_NAME_TOKEN_RE.match(tok)) or low in _NAME_CONNECTORS
+
+
+def _case_cite_spans(
+    text: str, start: int, end: int, floor: int, *, short: bool = False,
+    italic=None, with_name: bool = True,
+) -> "list[tuple[int, int, str]]":
+    """The links the citation at ``(start, end)`` should produce, as
+    ``(span_start, span_end, pin)`` in document order.
+
+    A citation to one page is one link covering the whole thing a reader sees:
+    case name, reporter cite, pin cite, court/year parenthetical.  A citation to
+    *several* pages — "5 F. 4th 216, 225, 228 (2021)" — is that many links: the
+    name and first pin page open page 225, and each later page opens itself, so
+    following a pin cite lands where the opinion actually pointed.
+
+    ``pin`` is empty on the first segment, whose page the caller has already
+    worked into the citation it built (a short cite resolves its own pin through
+    the document index); later segments carry the page to open.
+
+    ``with_name=False`` skips the backward scan for a case name — an "Id." has
+    none, but its pages want splitting just the same ("id., at 675, 681–683,
+    693" is three).  ``short=True`` says the match already ends at its first
+    page, so only the tail of a range remains to be taken.
+    """
+    if with_name:
+        name_start = _case_name_start(text, start, floor, italic)
+        if name_start is not None:
+            start = name_start
+    if short:
+        # SHORT_CITE_RE ends at the first page of a range; take the rest so the
+        # whole range is highlighted.  It still opens at that first page.
+        tail = _RANGE_TAIL_RE.match(text, end)
+        if tail:
+            end = tail.end()
+    else:
+        pin = PINCITE_AFTER_RE.match(text, end)
+        if pin:
+            end = pin.end()
+    segments: list[list] = [[start, end, ""]]
+    while True:
+        extra = _EXTRA_PIN_RE.match(text, segments[-1][1])
+        if not extra:
+            break
+        # The comma joins the new segment so the blue runs unbroken.
+        segments.append([extra.start(), extra.end(), extra.group(1)])
+    # The court/year parenthetical closes the citation, so it belongs to
+    # whichever segment it follows.
+    paren = _COURT_YEAR_PAREN_RE.match(text, segments[-1][1])
+    if paren:
+        segments[-1][1] = paren.end()
+    return [(s, e, pin) for s, e, pin in segments]
 
 
 def norm_reporter(rep: str) -> str:
@@ -335,6 +704,10 @@ def _valid_case_reporter(rep: str) -> bool:
     key = _loose_reporter_key(rep)
     if not key or key in _NONCASE_REPORTERS:
         return False
+    if _JOURNAL_REPORTER_RE.search(rep or ""):
+        return False  # a law review, not a reporter — no case to open
+    if _AG_OPINION_RE.search(rep or ""):
+        return False  # an Attorney General opinion, not a decided case
     if key in _PLAIN_CASE_REPORTERS or key.endswith("lexis"):
         return True
     return "." in (rep or "")
@@ -433,12 +806,28 @@ def _iter_short_cites(text: str) -> list[re.Match]:
     return matches
 
 
+# Prose between an "Id." and the citation it would refer to.  Past ID_NEAR_GAP
+# the reference is only followed when the page number itself corroborates it —
+# a court discussing a case for a paragraph and then writing "Id., at 888" is
+# ordinary, and 888 falling inside that reporter's pages is better evidence
+# than proximity.  Past ID_FAR_GAP even that is not enough: the discussion has
+# moved on.
+ID_NEAR_GAP = 240
+ID_FAR_GAP = 900
+
+
+def _id_chain_hard_broken(gap: str) -> bool:
+    """Signals that end an "Id." chain however the page number reads: a record
+    citation in between — in a brief that "Id." means the record, not the
+    authority — or a blank line, which starts a new discussion."""
+    return bool("\n\n" in gap or _RECORD_CITE_RE.search(gap))
+
+
 def _id_chain_broken(gap: str) -> bool:
     stripped = (gap or "").strip()
     return bool(stripped and (
-        len(stripped) > 240
-        or "\n\n" in gap
-        or _RECORD_CITE_RE.search(gap)
+        len(stripped) > ID_NEAR_GAP
+        or _id_chain_hard_broken(gap)
     ))
 
 
@@ -701,6 +1090,15 @@ def _cite_first_page(base_cite: str) -> "int | None":
         return None
 
 
+def _page_in_window(first_page: int, pin: str) -> bool:
+    """True when *pin* is within :data:`ID_PIN_WINDOW` pages of *first_page*."""
+    try:
+        n = int(pin)
+    except (TypeError, ValueError):
+        return False
+    return first_page <= n <= first_page + ID_PIN_WINDOW
+
+
 def _id_pin_in_range(base_cite: str, pin: str) -> bool:
     """True when an "Id., at *pin*" page falls within :data:`ID_PIN_WINDOW` pages
     of *base_cite*'s start page — i.e. a page of that reporter, not a record page."""
@@ -712,7 +1110,64 @@ def _id_pin_in_range(base_cite: str, pin: str) -> bool:
     return start is not None and start <= n <= start + ID_PIN_WINDOW
 
 
-def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
+# How many citations back an "Id." will look when the nearest one cannot be
+# what it means.  Two or three intervening citations is already generous.
+ID_LOOKBACK = 4
+
+
+# The page a Statutes at Large link opens to, read back out of its GovInfo URL.
+_STAT_URL_PAGE_RE = re.compile(r"/statute/(\d+)/(\d+)")
+
+
+def _id_antecedent(
+    text: str, recent: list, pin: "str | None", start: int,
+    unlinkable: "list[tuple[int, int]] | None" = None,
+) -> "tuple[str, str] | None":
+    """The citation an "Id., at *pin*" refers to, or ``None``.
+
+    Usually that is simply the last citation, but two things send the search
+    further back.  A constitutional citation is never it — the Constitution has
+    no pages, so "Id., at 888" after a reference to the Fourth Amendment means
+    the case cited before that.  Neither is a case whose reporter cannot hold
+    the page: if *pin* falls outside :data:`ID_PIN_WINDOW` of that citation's
+    first page, the page belongs to some earlier authority, so the one before
+    is tried, and so on.
+
+    *recent* is the citations seen so far as ``(action, end)``, oldest first.
+    *unlinkable* holds the spans of authorities that were recognised but
+    deliberately not linked — a law review, an Attorney General opinion.  An
+    "Id." after one of those refers to *it*, so it must not reach past one to
+    an earlier authority and cite the wrong source.
+    """
+    if pin is None:
+        return None  # a bare "Id." names no page, and is never linked
+    for action, end in reversed(recent[-ID_LOOKBACK:]):
+        gap = len(text[end:start].strip())
+        if gap > ID_FAR_GAP:
+            break
+        if any(end <= u_start and u_end <= start
+               for u_start, u_end in unlinkable or ()):
+            break  # something we cannot open stands in between
+        if action[0] == "const":
+            continue  # unpaginated — "at N" cannot be pointing here
+        if action[0] == "cite":
+            if _id_pin_in_range(action[1], pin):
+                return ("cite", f"{action[1]}@{pin}")
+            continue  # that reporter has no such page — look further back
+        if action[0] == "statpdf":
+            # The Statutes at Large are paginated, so the same test applies.
+            m = _STAT_URL_PAGE_RE.search(action[1])
+            if m and not _page_in_window(int(m.group(2)), pin):
+                continue
+        if gap > ID_NEAR_GAP:
+            break  # a statute has no page to corroborate the reference with
+        return action  # a statute/rule/regulation simply reopens
+    return None
+
+
+def detect_links(
+    text: str, *, italic=None,
+) -> list[tuple[int, int, tuple[str, str]]]:
     """Scan `text` and return ``(start, end, action)`` for every citation that
     can be opened, in document order with overlaps resolved (first/longest
     wins).  ``action`` is the same ``(kind, value)`` pair the opinion reader
@@ -726,9 +1181,24 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     Unlike the opinion reader this works over the whole document at once, so a
     short form ("410 U.S. at 152") or an ``Id.`` resolves against citations that
     appear anywhere in the brief.
+
+    ``italic`` is an optional per-character sequence saying which glyphs are set
+    in an italic face.  Given it, a case name is only read where the type says
+    there is one — see :func:`_mostly_italic`.
     """
     if not text:
         return []
+    # Only usable when the document actually carries styling: a scan's OCR
+    # layer has none, and gating on it would then drop every case name.
+    if italic is not None and not any(italic):
+        italic = None
+    # Authorities recognised in a reporter's shape but deliberately not linked
+    # — a law review, an Attorney General opinion, the joint appendix.  They
+    # are still authorities, so an "Id." following one must stop there.
+    unlinkable = [
+        (m.start(), m.end()) for m in BROAD_CITE_CAPTURE_RE.finditer(text)
+        if not _valid_case_reporter(m.group(2))
+    ]
     index = build_short_cite_index(text)
     matches: list[tuple[int, int, str, object]] = []
     # English Reports citations first — both the reprint form ("156 Eng. Rep.
@@ -773,22 +1243,36 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     # Early lower-federal reporters ("1 Sumner, 73", "35 Fed. Rep. 665"),
     # pre-normalized to the abbreviations CourtListener indexes — claimed
     # ahead of the broad reporter fallback so the normalized form wins.
+    # The Statutes at Large ("14 Stat. 27") parse as a reporter cite as well,
+    # and a tie goes to whichever pass ran first — so this one runs before the
+    # case passes, and the volume GovInfo actually holds wins the span.
+    stat_spans: list[tuple[int, int]] = []
+    for m in statutes_at_large.STAT_CITE_RE.finditer(text):
+        if statutes_at_large.url_for(m):  # only link volumes GovInfo has
+            stat_spans.append((m.start(), m.end()))
+            matches.append((m.start(), m.end(), "stat", m))
     efed_spans: list[tuple[int, int]] = []
     for m in EARLY_FED_CITE_RE.finditer(text):
         if any(m.start() < e and s < m.end()
-               for s, e in engrep_spans + recap_spans + fedcas_spans):
+               for s, e in engrep_spans + recap_spans + fedcas_spans
+               + stat_spans):
             continue
         efed_spans.append((m.start(), m.end()))
         matches.append((m.start(), m.end(), "cite", early_fed_cite_text(m)))
-    claimed_spans = engrep_spans + recap_spans + fedcas_spans + efed_spans
+    claimed_spans = (engrep_spans + recap_spans + fedcas_spans + efed_spans
+                     + stat_spans)
     for m in _iter_case_cites(text):
         if any(m.start() < e and s < m.end() for s, e in claimed_spans):
             continue
         matches.append((m.start(), m.end(), "cite", m))
     for m in us_code.USC_CITE_RE.finditer(text):
         matches.append((m.start(), m.end(), "usc", m))
+        for s, e, spec in _sibling_section_cites(text, m, dotted=False):
+            matches.append((s, e, "usc-spec", spec))
     for m in ecfr.CFR_CITE_RE.finditer(text):
         matches.append((m.start(), m.end(), "cfr", m))
+        for s, e, spec in _sibling_section_cites(text, m, dotted=True):
+            matches.append((s, e, "cfr-spec", spec))
     for m in fed_rules.RULE_CITE_RE.finditer(text):
         matches.append((m.start(), m.end(), "rule", m))
     for m in constitution.CONST_CITE_RE.finditer(text):
@@ -818,19 +1302,24 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         if re.match(r"\s*id\.", c.text, re.IGNORECASE):
             continue
         matches.append((c.start, c.end, "statestat", c))
-    for m in statutes_at_large.STAT_CITE_RE.finditer(text):
-        if statutes_at_large.url_for(m):  # only link volumes GovInfo has
-            matches.append((m.start(), m.end(), "stat", m))
 
     matches.sort(key=lambda t: (t[0], -t[1]))
+    # The running head cites the opinion in hand; skip anything inside it, and
+    # keep a name grab from reaching back through one into the page above.
+    head_spans = [(hm.start(), hm.end())
+                  for hm in RUNNING_HEAD_CITE_RE.finditer(text)]
     out: list[tuple[int, int, tuple[str, str]]] = []
     pos = 0
-    last_cite_action: tuple[str, str] | None = None
+    # Every citation linked so far as (action, end), oldest first — an "Id."
+    # may have to look past the nearest one to find what it means.
+    recent: list[tuple[tuple[str, str], int]] = []
     last_cite_end: int | None = None
     const_linked: set[int] = set()  # amendments already linked (prose dedup)
     for start, end, kind, m in matches:
         if start < pos:
             continue  # overlapping match — first/longest wins
+        if any(start < he and hs < end for hs, he in head_spans):
+            continue  # the reporter's running head, not a citation to follow
         action: tuple[str, str] | None
         cite_base = ""
         if kind == "cite":
@@ -848,6 +1337,9 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
             action = ("usc", us_code.cite_spec(m))
         elif kind == "cfr":
             action = ("cfr", ecfr.cite_spec(m))
+        elif kind in ("usc-spec", "cfr-spec"):
+            # A later section of a multi-section cite; m is the built spec.
+            action = (kind.split("-")[0], m)
         elif kind == "rule":
             action = ("rule", fed_rules.cite_spec(m))
         elif kind == "const":
@@ -870,26 +1362,19 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
             action = ("cite", m)  # m is the pre-built "vol rep page@pin"
             cite_base = m.split("@")[0]
         elif kind == "idcite":
-            # "Id." → the last citation, but conservatively, because in a brief an
-            # "Id." often points at a record document rather than the cited
-            # authority.  A bare "Id." (no page) is never linked.  "Id. at N" links
-            # to the previous *case* only when N is plausibly a page of its reporter
-            # (within ID_PIN_WINDOW of its start); a far page is a record/appendix
-            # cite, left unlinked.  "Id. at N" after a statute/rule reopens that
-            # source.
-            la = last_cite_action
-            if la and last_cite_end is not None and _id_chain_broken(
+            # "Id." → the citation it refers back to, but conservatively:
+            # in a brief an "Id." often points at a record document rather than
+            # the cited authority.  A bare "Id." (no page) is never linked, and
+            # a run of intervening prose or record cites breaks the chain
+            # outright.  Which citation it means is _id_antecedent's job — not
+            # always the nearest one.
+            if last_cite_end is not None and _id_chain_hard_broken(
                 text[last_cite_end:start]
             ):
-                la = None
-            pin = m.group(1)
-            if not la or pin is None:
                 action = None
-            elif la[0] == "cite":
-                action = (("cite", f"{la[1]}@{pin}")
-                          if _id_pin_in_range(la[1], pin) else None)
             else:
-                action = la
+                action = _id_antecedent(
+                    text, recent, m.group(1), start, unlinkable)
         elif kind == "statestat":
             action = state_statutes.action_for(m)
         elif kind == "stat":
@@ -905,12 +1390,44 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
         else:  # pragma: no cover - defensive
             action = None
         if action is not None:
-            out.append((start, end, action))
-            if kind in ("cite", "shortcite"):
-                last_cite_action = ("cite", cite_base)
+            span_end = end
+            # An "Id." pointing at a case carries pages the same way a cite
+            # does — "id., at 675, 681-683, 693" is three of them — so it is
+            # split alongside them.  It has no name to find.
+            id_pages = kind == "idcite" and action[0] == "cite"
+            if kind in ("cite", "shortcite") or id_pages:
+                # Blue the citation the reader sees, not just the reporter
+                # fragment the regex matched.  The name may not reach back past
+                # anything already linked, or past a running head.
+                floor = pos
+                for hs, he in head_spans:
+                    if he <= start:
+                        floor = max(floor, he)
+                base = action[1].split("@")[0] if id_pages else cite_base
+                segments = _case_cite_spans(
+                    text, start, end, floor,
+                    short=(kind in ("shortcite", "idcite")),
+                    italic=italic, with_name=not id_pages,
+                )
+                for seg_start, seg_end, seg_pin in segments:
+                    # The first segment opens the page already folded into
+                    # *action*; each later pin cite opens its own page.
+                    out.append((seg_start, seg_end, (
+                        ("cite", f"{base}@{seg_pin}") if seg_pin else action
+                    )))
+                span_end = segments[-1][1]
+                # An Id. is itself the nearest antecedent for a following Id.,
+                # but retain the clean reporter cite rather than its @pin
+                # action so a chain never becomes "base@23@24".
+                recent.append((("cite", base), span_end))
             else:
-                last_cite_action = action
-            last_cite_end = end
+                out.append((start, end, action))
+                # Non-case Id. chains (to a statute, rule, or regulation) are
+                # safe too: their action has no pin suffix to accumulate.
+                recent.append((action, span_end))
+            last_cite_end = span_end
+            pos = span_end
+            continue
         pos = end
     return out
 
