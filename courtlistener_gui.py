@@ -12487,6 +12487,10 @@ class _TextFinder:
 # and crash the app when a case link was clicked from the PDF brief viewer.
 _PDFIUM_LOCK = pdfium_lock.PDFIUM_LOCK
 _PDF_HEADER_RE = re.compile(br"%PDF-\d")
+
+# Bit 7 of a PDF font descriptor's flags (PDF 1.7 §9.8.2, Table 123): the face
+# is italic.  Case names are set in italic and the prose around them is not.
+_FONT_FLAG_ITALIC = 1 << 6
 _PDF_LINK_ATTR_RE = re.compile(
     r"""(?is)\b(?:href|src|data|data-url)=["']([^"']+)["']"""
 )
@@ -12981,10 +12985,20 @@ def _union_line_runs(boxes: list) -> list:
 
 
 def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
-    """Extract a PDF's text layer as ``[[(char, box_or_None), …], …]`` — one
-    list per page, each a parallel run of characters and their glyph boxes
-    ``(left, bottom, right, top)`` in PDF points (``None`` for a char with no
-    usable box, e.g. a line break).
+    """The character/box data alone — see :func:`_extract_pdf_text_and_style`."""
+    return _extract_pdf_text_and_style(pdf_bytes)[0]
+
+
+def _extract_pdf_text_and_style(pdf_bytes: bytes) -> "tuple[list, list]":
+    """Extract a PDF's text layer, as ``(pages, italics)``.
+
+    ``pages`` is ``[[(char, box_or_None), …], …]`` — one list per page, each a
+    parallel run of characters and their glyph boxes ``(left, bottom, right,
+    top)`` in PDF points (``None`` for a char with no usable box, e.g. a line
+    break).  ``italics`` is the same shape with a bool per character, true where
+    the glyph is set in an italic face: case names are italicised and the prose
+    around them is not, which is what tells a citation from a sentence that
+    merely ends in a capitalised word.
 
     Runs on a background thread: it loads its *own* pdfium document (never the
     pane's), touches no tk objects, and returns plain data.  Every PDFium call is
@@ -12997,13 +13011,23 @@ def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
         doc = pdfium.PdfDocument(pdf_bytes)
     try:
         pages: list = []
+        italics: list = []
         try:
             with _PDFIUM_LOCK:
                 n_pages = len(doc)
         except Exception:
-            return []
+            return [], []
+        import ctypes
+
+        import pypdfium2.raw as C
+
+        # The font descriptor's italic bit.  Only the flags are wanted, so the
+        # name buffer is as small as the call will accept.
+        name_buf = ctypes.create_string_buffer(4)
+        font_flags = ctypes.c_int(0)
         for pi in range(n_pages):
             chars: list = []
+            slants: list = []
             with _PDFIUM_LOCK:
                 page = doc[pi]
                 try:
@@ -13023,20 +13047,32 @@ def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
                             except Exception:
                                 bx = None
                             chars.append((ch, bx))
+                            try:
+                                font_flags.value = 0
+                                C.FPDFText_GetFontInfo(
+                                    tp.raw, i, name_buf, 4,
+                                    ctypes.byref(font_flags),
+                                )
+                                slants.append(
+                                    bool(font_flags.value & _FONT_FLAG_ITALIC))
+                            except Exception:
+                                slants.append(False)
                     finally:
                         tp.close()
                 except Exception:
                     chars = []
+                    slants = []
                 finally:
                     page.close()
             pages.append(chars)
-        return pages
+            italics.append(slants)
+        return pages, italics
     finally:
         with _PDFIUM_LOCK:
             doc.close()
 
 
-def _citation_links_from_pages(pages: list) -> dict:
+def _citation_links_from_pages(pages: list, italics: "Optional[list]" = None) -> dict:
     """Build the per-page clickable-citation rectangles from extracted page char
     data (see :func:`_extract_pdf_text_pages`).  Pure — no PDFium, no tk — so it
     is cheap to run on the worker right after extraction:
@@ -13049,15 +13085,20 @@ def _citation_links_from_pages(pages: list) -> dict:
     lines (or pages) becomes one rectangle per line."""
     parts: list = []               # global text pieces
     gmap: list = []                # global index -> (page, local) or (None, None)
+    slants: list = []              # global index -> is the glyph italic
     for pi, chars in enumerate(pages):
+        page_italics = italics[pi] if italics and pi < len(italics) else ()
         for li, (ch, _bx) in enumerate(chars):
             parts.append(ch)
             gmap.append((pi, li))
+            slants.append(li < len(page_italics) and bool(page_italics[li]))
         parts.append("\n")          # page separator (keeps words from fusing)
         gmap.append((None, None))
+        slants.append(False)
     text = "".join(parts)
     try:
-        links = detect_brief_links(text)
+        links = detect_brief_links(
+            text, italic=slants if italics is not None else None)
     except Exception:
         return {}
 
@@ -13081,7 +13122,7 @@ def _citation_links_from_pages(pages: list) -> dict:
 def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
     """Convenience wrapper: extract a PDF's text and return its citation
     rectangles (see :func:`_citation_links_from_pages`)."""
-    return _citation_links_from_pages(_extract_pdf_text_pages(pdf_bytes))
+    return _citation_links_from_pages(*_extract_pdf_text_and_style(pdf_bytes))
 
 
 def _citation_links_from_visible_pdf_text(
@@ -20480,7 +20521,7 @@ class _ScholarTextWindow:
         # finder — so only the pane-local selection is enabled.
         def extract_text(d=data, p=pane) -> None:
             try:
-                pages = _extract_pdf_text_pages(d)
+                pages, italics = _extract_pdf_text_and_style(d)
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
                 return
@@ -20489,7 +20530,8 @@ class _ScholarTextWindow:
             if not any(pages or []):
                 return  # scan-only PDF: no text layer to select
             try:
-                links, quiet = _citation_links_from_visible_pdf_text(d, pages)
+                links, quiet = _citation_links_from_visible_pdf_text(
+                    d, pages, italics)
             except Exception as exc:
                 print(f"[pdf-links] citation scan failed: {exc}")
             # The separate opinions (Syllabus, Opinion of the Court, each
@@ -21279,7 +21321,7 @@ class _PdfWindow:
         # text selection (Ctrl-C copies) when the PDF carries text.
         def extract_text(d=data, p=pane) -> None:
             try:
-                pages = _extract_pdf_text_pages(d)
+                pages, italics = _extract_pdf_text_and_style(d)
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
                 return
@@ -21290,7 +21332,7 @@ class _PdfWindow:
             if self._is_case:
                 try:
                     links, quiet = _citation_links_from_visible_pdf_text(
-                        d, pages)
+                        d, pages, italics)
                 except Exception as exc:
                     print(f"[pdf-links] citation scan failed: {exc}")
 
@@ -22014,17 +22056,17 @@ class _SlipOpinionWindow:
         """Worker: extract the text layer once; build citation links and the
         section list from it."""
         try:
-            pages = _extract_pdf_text_pages(data)
+            pages, italics = _extract_pdf_text_and_style(data)
         except Exception as exc:
             print(f"[slip] text extraction failed: {exc}")
-            pages = []
+            pages, italics = [], []
         links: dict = {}
         quiet: set = set()
         sections: list = []
         if pages:
             try:
                 links, quiet = _citation_links_from_visible_pdf_text(
-                    data, pages)
+                    data, pages, italics)
             except Exception as exc:
                 print(f"[slip] citation scan failed: {exc}")
             try:
@@ -23210,9 +23252,10 @@ class _LinkedPdfWindow:
 
     def _scan(self) -> None:
         try:
-            pages = _extract_pdf_text_pages(self._bytes)   # one extraction pass
+            # one extraction pass, text and styling together
+            pages, italics = _extract_pdf_text_and_style(self._bytes)
             links, quiet = _citation_links_from_visible_pdf_text(
-                self._bytes, pages)
+                self._bytes, pages, italics)
         except Exception as exc:
             self._post(self._scan_failed, str(exc))
             return

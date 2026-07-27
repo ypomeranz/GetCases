@@ -360,6 +360,83 @@ class LawJournalTests(unittest.TestCase):
         self.assertEqual(_spans(text)[-1][1], ("cite", "410 U.S. 113@152"))
 
 
+class ItalicNameTests(unittest.TestCase):
+    """A case name is set in italic; the prose around a citation is not.
+
+    Without that signal "Green, by appointment of the Court, 551 U. S. 1186"
+    reads as a case called "Court" — the backward scan cannot tell the last
+    word of a sentence from a party.  PDFs carry the styling, so where it is
+    available the name is only taken where the type says there is one.
+    """
+
+    def _mask(self, text, *italic_phrases):
+        """A styling mask with every occurrence of *italic_phrases* italic —
+        a case name is set in italic wherever it appears."""
+        mask = [False] * len(text)
+        for phrase in italic_phrases:
+            for m in re.finditer(re.escape(phrase), text):
+                for i in range(m.start(), m.end()):
+                    mask[i] = True
+        return mask
+
+    DOC = ("See Illinois v. Wardlow, 528 U. S. 119, 124 (2000).\n"
+           "Green, by appointment of the Court, 551 U. S. 1186, argued the "
+           "cause for petitioner.")
+
+    def test_roman_prose_before_a_cite_is_not_a_case_name(self):
+        mask = self._mask(self.DOC, "Illinois v. Wardlow")
+        spans = [t for t, _a in
+                 [(self.DOC[s:e], a) for s, e, a in
+                  detect_links(self.DOC, italic=mask)]]
+        self.assertIn("551 U. S. 1186", spans)
+        self.assertNotIn("Court, 551 U. S. 1186", spans)
+
+    def test_an_italic_name_is_still_taken(self):
+        mask = self._mask(self.DOC, "Illinois v. Wardlow")
+        spans = [self.DOC[s:e] for s, e, _a in
+                 detect_links(self.DOC, italic=mask)]
+        self.assertIn("Illinois v. Wardlow, 528 U. S. 119, 124 (2000)", spans)
+
+    def test_a_shortened_italic_name_is_taken(self):
+        text = ("Illinois v. Wardlow, 528 U. S. 119 (2000). "
+                "Later, Wardlow, 528 U. S., at 124.")
+        mask = self._mask(text, "Illinois v. Wardlow", "Wardlow")
+        spans = [text[s:e] for s, e, _a in detect_links(text, italic=mask)]
+        self.assertIn("Wardlow, 528 U. S., at 124", spans)
+
+    def test_an_in_re_name_takes_the_same_test(self):
+        text = ("In re Winship, 397 U. S. 358 (1970). "
+                "Filed in re the estate, 400 U. S. 100.")
+        mask = self._mask(text, "In re Winship")
+        spans = [text[s:e] for s, e, _a in detect_links(text, italic=mask)]
+        self.assertIn("In re Winship, 397 U. S. 358 (1970)", spans)
+        self.assertNotIn("in re the estate, 400 U. S. 100", spans)
+
+    def test_without_styling_nothing_changes(self):
+        # A brief's plain text, or a scan's OCR layer, carries no styling.
+        self.assertEqual(detect_links(self.DOC),
+                         detect_links(self.DOC, italic=None))
+
+    def test_a_document_with_no_italics_at_all_is_not_gated(self):
+        # All-roman means the styling is unknown, not that no name exists —
+        # gating on it would drop every case name in the document.
+        flat = [False] * len(self.DOC)
+        self.assertEqual(detect_links(self.DOC, italic=flat),
+                         detect_links(self.DOC))
+
+    def test_a_stray_roman_glyph_does_not_disqualify_a_name(self):
+        text = "See Illinois v. Wardlow, 528 U. S. 119, 124 (2000)."
+        mask = self._mask(text, "Illinois v. Wardlow")
+        mask[text.index("Wardlow") + 3] = False  # an OCR slip mid-name
+        spans = [text[s:e] for s, e, _a in detect_links(text, italic=mask)]
+        self.assertIn("Illinois v. Wardlow, 528 U. S. 119, 124 (2000)", spans)
+
+    def test_the_cite_itself_is_still_linked_without_a_name(self):
+        mask = self._mask(self.DOC, "Illinois v. Wardlow")
+        actions = {a[1] for _s, _e, a in detect_links(self.DOC, italic=mask)}
+        self.assertIn("551 U.S. 1186", actions)
+
+
 class ReporterSweepTests(unittest.TestCase):
     """The journal filter must not cost a single real reporter.
 

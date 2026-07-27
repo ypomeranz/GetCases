@@ -293,8 +293,24 @@ _NAME_NO_V_RE = re.compile(
 )
 
 
+def _mostly_italic(text: str, italic, lo: int, hi: int) -> bool:
+    """True when the letters in ``text[lo:hi]`` are set in an italic face.
+
+    A case name is italicised and the prose around a citation is not, which is
+    what tells "Illinois v. Wardlow, 528 U. S. 119" from "by appointment of the
+    Court, 551 U. S. 1186" — where "Court" is just the last word of a sentence
+    that happens to be capitalised.  Judged on letters only (digits, spaces and
+    punctuation carry no styling worth trusting) and by majority, so one roman
+    glyph does not disqualify a name.
+    """
+    letters = [i for i in range(lo, min(hi, len(italic))) if text[i].isalpha()]
+    if not letters:
+        return False
+    return sum(1 for i in letters if italic[i]) * 2 > len(letters)
+
+
 def _case_name_start(
-    text: str, cite_start: int, floor: int) -> "int | None":
+    text: str, cite_start: int, floor: int, italic=None) -> "int | None":
     """Index where the case name introducing the citation at *cite_start*
     begins, or ``None`` when no name reads as one.
 
@@ -326,6 +342,9 @@ def _case_name_start(
 
     nov = _NAME_NO_V_RE.search(head)
     if nov:
+        if italic is not None and not _mostly_italic(
+                text, italic, base + nov.start(), cite_start):
+            return None
         return base + nov.start()
 
     # The last "v." in the window opens the second party; everything after it
@@ -374,6 +393,9 @@ def _case_name_start(
     start = toks[i].start()
     if left_end - start > 90:
         return None  # implausibly long for a case name — leave it alone
+    if italic is not None and not _mostly_italic(
+            text, italic, base + start, cite_start):
+        return None  # roman type: prose running up to the cite, not a name
     return base + start
 
 
@@ -443,6 +465,7 @@ def _name_token_ok(tok: str) -> bool:
 
 def _case_cite_spans(
     text: str, start: int, end: int, floor: int, *, short: bool = False,
+    italic=None,
 ) -> "list[tuple[int, int, str]]":
     """The links the citation at ``(start, end)`` should produce, as
     ``(span_start, span_end, pin)`` in document order.
@@ -457,7 +480,7 @@ def _case_cite_spans(
     worked into the citation it built (a short cite resolves its own pin through
     the document index); later segments carry the page to open.
     """
-    name_start = _case_name_start(text, start, floor)
+    name_start = _case_name_start(text, start, floor, italic)
     if name_start is not None:
         start = name_start
     if short:
@@ -1079,7 +1102,9 @@ def _id_antecedent(
     return None
 
 
-def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
+def detect_links(
+    text: str, *, italic=None,
+) -> list[tuple[int, int, tuple[str, str]]]:
     """Scan `text` and return ``(start, end, action)`` for every citation that
     can be opened, in document order with overlaps resolved (first/longest
     wins).  ``action`` is the same ``(kind, value)`` pair the opinion reader
@@ -1093,9 +1118,17 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
     Unlike the opinion reader this works over the whole document at once, so a
     short form ("410 U.S. at 152") or an ``Id.`` resolves against citations that
     appear anywhere in the brief.
+
+    ``italic`` is an optional per-character sequence saying which glyphs are set
+    in an italic face.  Given it, a case name is only read where the type says
+    there is one — see :func:`_mostly_italic`.
     """
     if not text:
         return []
+    # Only usable when the document actually carries styling: a scan's OCR
+    # layer has none, and gating on it would then drop every case name.
+    if italic is not None and not any(italic):
+        italic = None
     index = build_short_cite_index(text)
     matches: list[tuple[int, int, str, object]] = []
     # English Reports citations first — both the reprint form ("156 Eng. Rep.
@@ -1290,6 +1323,7 @@ def detect_links(text: str) -> list[tuple[int, int, tuple[str, str]]]:
                         floor = max(floor, he)
                 segments = _case_cite_spans(
                     text, start, end, floor, short=(kind == "shortcite"),
+                    italic=italic,
                 )
                 for seg_start, seg_end, seg_pin in segments:
                     # The first segment opens the page already folded into
