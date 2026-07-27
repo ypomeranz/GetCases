@@ -1412,6 +1412,7 @@ import us_reports_pdf
 import brief_reader
 import oyez
 import slip_opinion
+import opinion_location
 from citations import (
     PINCITE_AFTER_RE as _PINCITE_AFTER_RE,
     TEXT_CITE_RE as _TEXT_CITE_RE,
@@ -14008,6 +14009,44 @@ class _PdfPane(ttk.Frame):
             pass
         self._render_visible()
 
+    def viewport_anchor(self) -> "Optional[tuple[int, float]]":
+        """Return the PDF page and point-height nearest the reading position.
+
+        ``scroll_to_page`` deliberately leaves a small lead-in above a matched
+        line.  Add that lead-in back here so the two operations are inverses,
+        even when the PDF pane is zoomed or its pages have been cropped.
+        """
+        if not self._slots:
+            return None
+        try:
+            target_y = self._canvas.canvasy(0) + self._LINE_LEAD_IN
+        except tk.TclError:
+            return None
+        # Pick the slot containing the reading line. In a gap between pages,
+        # use the closest page edge instead of dropping the location.
+        page_i = min(
+            range(len(self._slots)),
+            key=lambda i: (
+                0.0
+                if self._slots[i][0]
+                <= target_y
+                <= self._slots[i][0] + self._slots[i][1]
+                else min(
+                    abs(target_y - self._slots[i][0]),
+                    abs(target_y - (self._slots[i][0] + self._slots[i][1])),
+                )
+            ),
+        )
+        y, _slot_h, frac, scale = self._slots[page_i]
+        _fl, ft, _fr, _fb = frac
+        _w_pt, h_pt, _ = self._meta[page_i]
+        if not scale:
+            return page_i, h_pt
+        y_pt = h_pt * (1.0 - ft) - (
+            target_y - y - self._margin
+        ) / scale
+        return page_i, max(0.0, min(float(h_pt), float(y_pt)))
+
     def _rect_to_canvas(self, i: int, rect: tuple) -> tuple:
         """Map a PDF-point box ``(l, b, r, t)`` on page *i* to canvas coordinates
         ``(x0, y0, x1, y1)`` using the same scale/crop the page image used."""
@@ -15026,6 +15065,8 @@ class _ScholarTextWindow:
     """
 
     _PAGENUM_COLOR = "#8e44ad"   # muted purple — visible but not loud
+    # Page boundaries inferred by aligning text to a U.S. Reports PDF.
+    _MAPPED_US_PAGE_COLOR = "#087f8c"
     _LINK_COLOR = "#1a56b0"
     _DISSENT_COLOR = "#a31515"   # dark red — top-of-window label & RTF headings
     _CONCUR_COLOR = "#1a7a3c"    # dark green
@@ -15050,7 +15091,7 @@ class _ScholarTextWindow:
         "dissent": _DISSENT_COLOR, "concurrence": _CONCUR_COLOR,
         "separate": _SEPARATE_COLOR, "majority": _MAJORITY_COLOR,
     }
-    _PAGECOL_W = 48     # left gutter: reporter page numbers (px)
+    _PAGECOL_W = 70     # left gutter: native and inferred reporter pages (px)
     _PARTMAP_W = 104    # right strip: map of the opinion's parts (px)
     # Approx. on-screen width of the right "Case details" panel (a 38-char Text
     # plus its scrollbar and padding).  Used to widen the window for SCOTUS
@@ -15167,6 +15208,29 @@ class _ScholarTextWindow:
             self._pdf_located = True
         self._prefetch_ok = prefetch_pdf
         self._pre_pdf_mode = "scholar"  # text view to return to from the PDF
+        # PDF text extraction and opinion-to-PDF alignment are shared.  A
+        # prefetched PDF is analysed once in the background, then the same
+        # result powers PDF selection/search, location-preserving switches, and
+        # (for S. Ct.-only text) inferred U.S. Reports page boundaries.
+        self._pdf_analysis_cache: dict[tuple, dict] = {}
+        self._pdf_analysis_running: set[tuple] = set()
+        self._pdf_analysis_waiters: dict[tuple, list] = {}
+        self._pdf_url_keys: dict[str, tuple] = {}
+        self._pdf_map_jobs: set[tuple[tuple, str]] = set()
+        self._active_pdf_analysis_key: Optional[tuple] = None
+        self._active_text_location_map = None
+        self._location_render_seq = 0
+        self._location_block_marks: dict[int, str] = {}
+        self._location_block_mark_names: list[str] = []
+        self._location_map_mark_names: list[str] = []
+        self._live_location_anchors: list[tuple[str, object]] = []
+        self._mapped_us_page_pos: dict[int, str] = {}
+        self._mapped_us_note_pages: dict[str, int] = {}
+        self._fn_num_to_id: dict[str, str] = {}
+        self._mapped_copy_cite = ""
+        self._pending_pdf_switch = False
+        self._pending_pdf_target: Optional[tuple[int, float]] = None
+        self._pending_text_target = None
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
         self._part_region_marks: list[str] = []
@@ -15259,6 +15323,10 @@ class _ScholarTextWindow:
                 # the PDF (Scholar rarely has the opinion text for them).
                 if self._fed_appx:
                     self._win.after(0, self._view_pdf)
+        if self._pdf_prefetch is not None:
+            self._active_pdf_analysis_key = self._request_pdf_analysis(
+                *self._pdf_prefetch
+            )
         # Fill in whatever the opinion text can't give us for a proper Bluebook
         # citation — chiefly the federal-district / lower-court parenthetical and
         # a missing year — from CourtListener in the background, then refresh the
@@ -16023,6 +16091,268 @@ class _ScholarTextWindow:
             self._fn_tip.destroy()
             self._fn_tip = None
 
+    # ------------------------------------------------------------------
+    # Text/PDF location-map marks
+    # ------------------------------------------------------------------
+
+    def _clear_location_map_marks(self) -> None:
+        txt = getattr(self, "_text", None)
+        for name in getattr(self, "_location_map_mark_names", []) or []:
+            try:
+                txt.mark_unset(name)
+            except (AttributeError, tk.TclError):
+                pass
+        self._location_map_mark_names = []
+        self._live_location_anchors = []
+        self._mapped_us_page_pos = {}
+        self._mapped_us_note_pages = {}
+        self._mapped_copy_cite = ""
+        self._active_text_location_map = None
+
+    def _reset_location_render_marks(self) -> None:
+        """Discard marks belonging to the old rendering before replacing it."""
+        self._clear_location_map_marks()
+        txt = getattr(self, "_text", None)
+        for name in getattr(self, "_location_block_mark_names", []) or []:
+            try:
+                txt.mark_unset(name)
+            except (AttributeError, tk.TclError):
+                pass
+        self._location_render_seq += 1
+        self._location_block_marks = {}
+        self._location_block_mark_names = []
+        self._fn_num_to_id = {}
+
+    def _new_location_mark(self, stem: str, index: str) -> Optional[str]:
+        name = (
+            f"__oploc_{self._location_render_seq}_{stem}_"
+            f"{len(self._location_map_mark_names)}"
+        )
+        try:
+            self._text.mark_set(name, index)
+            self._text.mark_gravity(name, "left")
+        except tk.TclError:
+            return None
+        self._location_map_mark_names.append(name)
+        return name
+
+    def _record_location_block_start(self, block) -> None:
+        """Remember a parsed block's exact start for alignment addresses."""
+        block_id = id(block)
+        if block_id in self._location_block_marks:
+            return
+        name = (
+            f"__oploc_{self._location_render_seq}_block_"
+            f"{len(self._location_block_mark_names)}"
+        )
+        try:
+            self._text.mark_set(name, "end-1c")
+            self._text.mark_gravity(name, "left")
+        except tk.TclError:
+            return
+        self._location_block_marks[block_id] = name
+        self._location_block_mark_names.append(name)
+
+    def _location_index_for_address(self, address) -> Optional[str]:
+        """Translate an alignment address into this rendering's Tk index."""
+        if address is None:
+            return None
+        block_id = getattr(address, "block_id", None)
+        if block_id is not None:
+            base = self._location_block_marks.get(block_id)
+            if base is None and block_id == 0 and not self._location_block_marks:
+                base = "1.0"
+            if base is None:
+                return None  # that block is outside the selected-part view
+            offset = max(0, int(getattr(address, "block_offset", 0) or 0))
+        else:
+            base = "1.0"
+            offset = max(0, int(getattr(address, "text_offset", 0) or 0))
+        try:
+            return self._text.index(f"{base}+{offset}c")
+        except tk.TclError:
+            return None
+
+    def _location_map_for(self, mode: Optional[str] = None, url: str = ""):
+        mode = mode or self._mode
+        key = None
+        if url:
+            key = self._pdf_url_keys.get(url)
+            if key is None:
+                wanted = self._comparable_pdf_url(url)
+                key = next(
+                    (
+                        known_key
+                        for known_url, known_key in self._pdf_url_keys.items()
+                        if self._comparable_pdf_url(known_url) == wanted
+                    ),
+                    None,
+                )
+            if key is None:
+                return None
+        else:
+            key = self._active_pdf_analysis_key
+        result = self._pdf_analysis_cache.get(key) if key is not None else None
+        return (result or {}).get("maps", {}).get(mode)
+
+    @staticmethod
+    def _location_address(value):
+        return getattr(value, "address", value)
+
+    def _mapped_copy_is_us(self, location_map) -> bool:
+        cite = str(getattr(location_map, "copy_cite", "") or "")
+        if not cite or not getattr(location_map, "copy_ready", False):
+            return False
+        if getattr(self, "_base_citation_override", ""):
+            return False
+        if not _US_CITE_RE.search(cite):
+            return False
+        native = opinion_location.parse_reporter_cite(
+            self._bb.get("cite", "")
+        )
+        if (native is not None and native.reporter_key == "us"
+                and bool(getattr(self, "_page_pos", None))):
+            return False  # the visible native U.S. stars already do this job
+        return True
+
+    def _install_current_location_map(self) -> None:
+        """Install movable anchors for the map matching the visible text."""
+        if self._mode not in ("scholar", "courtlistener"):
+            return
+        self._clear_location_map_marks()
+        location_map = self._location_map_for(self._mode)
+        if location_map is None:
+            self._schedule_gutter_redraw()
+            return
+        # Justification inserts display-only characters. Remove them while
+        # translating source offsets, then let the normal reflow put them back;
+        # the named marks installed below move with their text.
+        self._clear_justification()
+        for anchor in getattr(location_map, "anchors", ()) or ():
+            index = self._location_index_for_address(
+                self._location_address(anchor)
+            )
+            if index is None:
+                continue
+            mark = self._new_location_mark("anchor", index)
+            if mark is not None:
+                self._live_location_anchors.append((mark, anchor))
+
+        if self._mapped_copy_is_us(location_map):
+            self._mapped_copy_cite = str(location_map.copy_cite)
+            for boundary in getattr(location_map, "boundaries", ()) or ():
+                page = getattr(boundary, "reporter_page", None)
+                if page is None:
+                    page = getattr(boundary, "page", None)
+                try:
+                    page = int(page)
+                except (TypeError, ValueError):
+                    continue
+                index = self._location_index_for_address(
+                    self._location_address(boundary)
+                )
+                if index is None:
+                    continue
+                mark = self._new_location_mark(f"uspage_{page}", index)
+                if mark is not None:
+                    self._mapped_us_page_pos.setdefault(page, mark)
+
+            # A selected footnote is cited on the page where its in-text
+            # reference appears, not the page where the note is rendered.
+            for number, fid in self._fn_num_to_id.items():
+                pos = self._fn_marker_pos("fnref", fid)
+                page = self._mapped_page_at_index(pos) if pos else None
+                if page is not None:
+                    self._mapped_us_note_pages[number] = page
+
+        self._active_text_location_map = location_map
+        self._schedule_text_justify()
+        self._schedule_gutter_redraw()
+
+    def _mapped_page_at_index(self, index: str) -> Optional[int]:
+        txt = self._text
+        before: list[tuple[int, str]] = []
+        after: list[tuple[int, str]] = []
+        for page, mark in self._mapped_us_page_pos.items():
+            try:
+                bucket = before if txt.compare(mark, "<=", index) else after
+                bucket.append((page, mark))
+            except tk.TclError:
+                continue
+        if before:
+            # The last boundary preceding the text controls its page.
+            return max(before, key=lambda item: self._tk_index_key(
+                txt.index(item[1])
+            ))[0]
+        if after:
+            # Text before the first mapped boundary belongs to the first page.
+            return min(after, key=lambda item: self._tk_index_key(
+                txt.index(item[1])
+            ))[0]
+        return None
+
+    @staticmethod
+    def _short_page_range(first: int, last: int) -> str:
+        if last <= first:
+            return str(first)
+        sa, sb = str(first), str(last)
+        if len(sa) == len(sb) and len(sa) > 2 and sa[:-2] == sb[:-2]:
+            sb = sb[-2:]
+        return f"{sa}-{sb}"
+
+    def _mapped_pin_for_range(self, start: str, end: str) -> Optional[str]:
+        first = self._mapped_page_at_index(start)
+        if first is None:
+            m = _CITE_PARSE_RE.match(self._mapped_copy_cite)
+            first = int(m.group(3)) if m else None
+        if first is None:
+            return None
+        last = first
+        txt = self._text
+        ordered: list[tuple[str, int]] = []
+        for page, mark in self._mapped_us_page_pos.items():
+            try:
+                pos = txt.index(mark)
+                if txt.compare(pos, ">", start) and txt.compare(pos, "<", end):
+                    ordered.append((pos, page))
+            except tk.TclError:
+                continue
+        for _pos, page in sorted(ordered, key=lambda item: self._tk_index_key(
+                item[0])):
+            last = page
+        return self._short_page_range(first, last)
+
+    @staticmethod
+    def _tk_index_key(index: str) -> tuple[int, int]:
+        try:
+            line, char = str(index).split(".", 1)
+            return int(line), int(char)
+        except (TypeError, ValueError):
+            return (0, 0)
+
+    def _restore_pending_text_location(self) -> None:
+        address = self._pending_text_target
+        self._pending_text_target = None
+        if address is None:
+            return
+        index = self._location_index_for_address(address)
+        if index is None:
+            return
+        mark = self._new_location_mark("return", index)
+        if mark is None:
+            return
+
+        def restore(attempt: int = 0) -> None:
+            try:
+                self._text.see(mark)
+                self._text.yview(mark)
+                self._draw_page_column()
+            except tk.TclError:
+                if attempt < 1:
+                    self._win.after(100, lambda: restore(attempt + 1))
+
+        self._win.after_idle(restore)
+
     def _insert_span(self, span, block_tags: tuple, neutral: bool = False,
                      link_tag: Optional[str] = None,
                      detect_plain: bool = True) -> None:
@@ -16405,6 +16735,8 @@ class _ScholarTextWindow:
             if first is not None and first.fndef:
                 num = first.text.strip().strip("[]")
                 page = self._fnref_pages.get(first.fndef)
+                if num:
+                    self._fn_num_to_id.setdefault(num, first.fndef)
             else:
                 body_text = "".join(
                     s.text for s in block.spans if not s.pagenum
@@ -16430,6 +16762,7 @@ class _ScholarTextWindow:
         close_region()
 
     def _insert_block(self, block, part_tag: Optional[str]) -> None:
+        self._record_location_block_start(block)
         if block.kind == "center":
             block_tags: tuple = ("center",)
         elif block.kind == "blockquote":
@@ -16633,6 +16966,7 @@ class _ScholarTextWindow:
     def _render_scholar(self) -> None:
         txt = self._text
         txt.config(state="normal")
+        self._reset_location_render_marks()
         self._clear_part_region_marks()
         txt.delete("1.0", "end")
         self._hide_fn_tip()
@@ -16730,6 +17064,8 @@ class _ScholarTextWindow:
         self._refresh_outline_panel()
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
+        self._install_current_location_map()
+        self._restore_pending_text_location()
 
     def _on_part_selected(self, _event=None) -> None:
         idx = self._part_combo.current()
@@ -17134,7 +17470,8 @@ class _ScholarTextWindow:
         if canvas is None:
             return
         page_pos = getattr(self, "_page_pos", None) or {}
-        if self._mode == "pdf" or not page_pos:
+        us_page_pos = getattr(self, "_mapped_us_page_pos", None) or {}
+        if self._mode == "pdf" or not (page_pos or us_page_pos):
             canvas.delete("all")
             canvas.config(width=1)
             return
@@ -17142,20 +17479,28 @@ class _ScholarTextWindow:
         canvas.delete("all")
         txt = self._text
         w = self._PAGECOL_W
-        seen_y: set[int] = set()
-        for page, idx in page_pos.items():
-            try:
-                di = txt.dlineinfo(idx)
-            except tk.TclError:
-                di = None
-            if not di:  # page not on screen right now
-                continue
-            y = di[1] + di[3] // 2  # vertical centre of that display line
-            if y in seen_y:
-                continue
-            seen_y.add(y)
-            canvas.create_text(w - 5, y, anchor="e", text=str(page),
-                               fill="black", font=self._pagecol_font)
+        def draw(series: dict, x: int, anchor: str, color: str) -> None:
+            seen_y: set[int] = set()
+            for page, idx in series.items():
+                try:
+                    di = txt.dlineinfo(idx)
+                except tk.TclError:
+                    di = None
+                if not di:  # page not on screen right now
+                    continue
+                y = di[1] + di[3] // 2
+                if y in seen_y:
+                    continue
+                seen_y.add(y)
+                canvas.create_text(
+                    x, y, anchor=anchor, text=str(page),
+                    fill=color, font=self._pagecol_font,
+                )
+
+        # Keep simultaneous boundaries visible: inferred U.S. pages occupy the
+        # left half in teal; the source's own star pages stay black at right.
+        draw(us_page_pos, 4, "w", self._MAPPED_US_PAGE_COLOR)
+        draw(page_pos, w - 5, "e", "black")
 
     def _draw_part_map(self) -> None:
         """Draw a colour-coded strip on the right marking where each
@@ -17280,6 +17625,7 @@ class _ScholarTextWindow:
             self._part_combo.current(0)
         txt = self._text
         txt.config(state="normal")
+        self._reset_location_render_marks()
         self._clear_part_region_marks()
         txt.delete("1.0", "end")
         self._hide_fn_tip()
@@ -17371,6 +17717,8 @@ class _ScholarTextWindow:
         self._refresh_outline_panel()
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
+        self._install_current_location_map()
+        self._restore_pending_text_location()
 
     def _show_courtlistener(self) -> None:
         if self._cl_parts or self._cl_blocks:
@@ -17378,7 +17726,14 @@ class _ScholarTextWindow:
             return
         txt = self._text
         txt.config(state="normal")
+        self._reset_location_render_marks()
         txt.delete("1.0", "end")
+        self._page_pos = {}
+        self._cur_page = None
+        self._fnref_pages = {}
+        self._fn_ref_pos = {}
+        self._fn_def_pos = {}
+        self._reset_fn_regions()
         self._insert_text_with_document_links(
             self._cl_text or "(no text)", ()
         )
@@ -17413,6 +17768,8 @@ class _ScholarTextWindow:
         self._refresh_outline_panel()
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
+        self._install_current_location_map()
+        self._restore_pending_text_location()
 
     # ------------------------------------------------------------------
     # Bluebook citation
@@ -18092,6 +18449,7 @@ class _ScholarTextWindow:
         self, pin: Optional[str], writer: str = "",
         extra_parens: tuple[str, ...] = (),
         inline: bool = False,
+        cite_override: str = "",
     ) -> tuple[str, str]:
         """Return (plain, rtf-fragment) forms of the Bluebook citation.
         `extra_parens` follow the writer parenthetical — e.g. "footnote
@@ -18109,7 +18467,7 @@ class _ScholarTextWindow:
 
         bb = self._bb
         name = bb["name"]
-        cite = bb.get("display_cite") or bb["cite"]
+        cite = cite_override or bb.get("display_cite") or bb["cite"]
         court, year = bb["court"], bb["year"]
         rest = ""
         if cite:
@@ -18119,7 +18477,7 @@ class _ScholarTextWindow:
             else:
                 rest = f", {cite}"
                 if pin:
-                    m = _CITE_PARSE_RE.match(bb.get("cite", ""))
+                    m = _CITE_PARSE_RE.match(cite_override or bb.get("cite", ""))
                     if not (m and pin == m.group(3)):
                         rest += f", {pin}"
         paren_inner = "" if bb.get("omit_parenthetical") else " ".join(
@@ -18219,7 +18577,9 @@ class _ScholarTextWindow:
         prefix = "nn." if len(nums) > 1 else "n."
         return prefix + " & ".join(parts)
 
-    def _pin_with_footnotes(self, start: str, end: str) -> Optional[str]:
+    def _pin_with_footnotes(
+        self, start: str, end: str, mapped_us: bool = False,
+    ) -> Optional[str]:
         """
         Pinpoint for the selection, footnote-aware (Bluebook rule 3.2(b)):
         material in a footnote cites as "page n.N"; several notes as
@@ -18232,16 +18592,24 @@ class _ScholarTextWindow:
             if txt.compare(r[0], "<", end) and txt.compare(r[1], ">", start)
         ]
         if not regions:
-            return self._pin_for_range(start, end)
+            return (
+                self._mapped_pin_for_range(start, end)
+                if mapped_us else self._pin_for_range(start, end)
+            )
 
         fallback_page: Optional[int] = None
-        m = _CITE_PARSE_RE.match(self._bb["cite"])
+        fallback_cite = (
+            self._mapped_copy_cite if mapped_us else self._bb["cite"]
+        )
+        m = _CITE_PARSE_RE.match(fallback_cite)
         if m:
             fallback_page = int(m.group(3))
 
         # Group selected notes by the page they're cited on (document order)
         page_groups: dict[Optional[int], list[str]] = {}
         for _rs, _re, num, page in regions:
+            if mapped_us:
+                page = self._mapped_us_note_pages.get(num)
             page_groups.setdefault(page, []).append(num)
         note_strs = []
         for page, nums in page_groups.items():
@@ -18258,7 +18626,10 @@ class _ScholarTextWindow:
         )
         if not text_before:
             return notes
-        text_pin = self._pin_for_range(start, first_rs)
+        text_pin = (
+            self._mapped_pin_for_range(start, first_rs)
+            if mapped_us else self._pin_for_range(start, first_rs)
+        )
         if text_pin is None:
             return notes
         if len(page_groups) == 1:
@@ -18329,9 +18700,16 @@ class _ScholarTextWindow:
             scholar_like = (
                 self._mode == "scholar" or bool(self._text.tag_ranges("pagenum"))
             )
+            mapped_us = bool(
+                getattr(self, "_mapped_copy_cite", "")
+                and getattr(self, "_active_text_location_map", None) is not None
+                and self._mapped_copy_is_us(self._active_text_location_map)
+            )
             pin = (
-                self._pin_with_footnotes(start, end)
-                if (selected and scholar_like)
+                self._pin_with_footnotes(
+                    start, end, mapped_us=mapped_us
+                )
+                if (selected and (scholar_like or mapped_us))
                 else None
             )
             # The writer parenthetical ("Brandeis, J., dissenting") applies in
@@ -18353,7 +18731,9 @@ class _ScholarTextWindow:
                 extras = ("footnote omitted" if n_omitted == 1
                           else "footnotes omitted",)
             plain_cite, rtf_cite = self._bluebook_citation(
-                pin, writer, extras, inline=quote)
+                pin, writer, extras, inline=quote,
+                cite_override=self._mapped_copy_cite if mapped_us else "",
+            )
         body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map(),
                             omit_tags=omit_tags)
         plain = _plain_without_layout_chars(txt, start, end,
@@ -20178,8 +20558,10 @@ class _ScholarTextWindow:
         if parts:
             self._cl_parts = parts
             self._cl_blocks = blocks
+            self._ensure_cached_location_maps()
             self._render_cl_blocks()
         else:
+            self._ensure_cached_location_maps()
             self._show_courtlistener()
 
     def _on_cl_error(self, msg: str) -> None:
@@ -20257,6 +20639,7 @@ class _ScholarTextWindow:
         self._cl_primary = False
         if note:
             self._note = note
+        self._ensure_cached_location_maps()
         # Showing the CourtListener text: enable the switch-to-Scholar button.
         # (If the PDF is up, its button is left alone — the Scholar text is
         # picked up when the reader returns to the text view.)
@@ -20374,6 +20757,300 @@ class _ScholarTextWindow:
     # PDF view (official opinion PDF, shown in-app)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _pdf_analysis_key(data: bytes, url: str) -> tuple:
+        # URL alone is normally stable; the size/prefix distinguish a revised
+        # file served at the same endpoint without hashing a multi-megabyte PDF.
+        return (url or "", len(data), bytes(data[:32]))
+
+    @staticmethod
+    def _comparable_pdf_url(url: str) -> str:
+        try:
+            parsed = urllib.parse.urlsplit(url or "")
+            return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path}"
+        except Exception:
+            return url or ""
+
+    def _pdf_reporter_cite(self, url: str) -> str:
+        """Reporter whose physical pages the selected PDF represents."""
+        if _is_us_reports_pdf(url) and self._us_reports_cite:
+            return self._us_reports_cite
+        wanted = self._comparable_pdf_url(url)
+        choices = list(getattr(self, "_case_law_pdf_choices", []) or [])
+        for choice in choices:
+            if self._comparable_pdf_url(choice.url) == wanted:
+                return choice.cite
+        if len(choices) == 1 and "case.law" in (url or "").lower():
+            return choices[0].cite
+        return ""
+
+    def _location_sources(self) -> dict[str, object]:
+        """Immutable source snapshots safe to align on a worker thread."""
+        native_cite = self._bb.get("cite", "")
+        sources: dict[str, object] = {}
+        if not self._cl_primary:
+            if self._parts:
+                sources["scholar"] = opinion_location.build_text_source(
+                    self._parts, native_cite=native_cite
+                )
+            elif self._scholar_text:
+                sources["scholar"] = opinion_location.build_plain_text_source(
+                    self._scholar_text, native_cite=native_cite
+                )
+        if self._cl_parts:
+            sources["courtlistener"] = opinion_location.build_text_source(
+                self._cl_parts, native_cite=native_cite
+            )
+        elif self._cl_text:
+            sources["courtlistener"] = opinion_location.build_plain_text_source(
+                self._cl_text, native_cite=native_cite
+            )
+        return sources
+
+    def _align_location_sources(
+        self, sources: dict[str, object], pages: list, pdf_cite: str,
+    ) -> dict[str, object]:
+        maps: dict[str, object] = {}
+        parsed_pdf = opinion_location.parse_reporter_cite(pdf_cite)
+        us_cite = (
+            pdf_cite
+            if parsed_pdf is not None and parsed_pdf.reporter_key == "us"
+            else ""
+        )
+        for mode, source in sources.items():
+            try:
+                maps[mode] = opinion_location.align_opinion_locations(
+                    source,
+                    pages,
+                    pdf_cite=pdf_cite,
+                    native_cite=self._bb.get("cite", ""),
+                    us_cite=us_cite,
+                )
+            except Exception as exc:
+                print(f"[pdf-location] {mode} alignment failed: {exc}")
+        return maps
+
+    def _request_pdf_analysis(
+        self, data: bytes, url: str, callback=None,
+    ) -> tuple:
+        """Analyse *data* once, optionally notifying a live PDF pane."""
+        key = self._pdf_analysis_key(data, url)
+        self._pdf_url_keys[url] = key
+        if key in self._pdf_analysis_cache:
+            self._ensure_cached_location_maps(key)
+            if callback is not None:
+                cached = self._pdf_analysis_cache[key]
+                self._win.after_idle(lambda: callback(cached))
+            return key
+        if callback is not None:
+            self._pdf_analysis_waiters.setdefault(key, []).append(callback)
+        if key in self._pdf_analysis_running:
+            return key
+        self._pdf_analysis_running.add(key)
+        sources = self._location_sources()
+        pdf_cite = self._pdf_reporter_cite(url)
+
+        def run() -> None:
+            pages: list = []
+            italics: list = []
+            links: dict = {}
+            quiet: set = set()
+            sections: list = []
+            try:
+                pages, italics = _extract_pdf_text_and_style(data)
+            except Exception as exc:
+                print(f"[pdf-text] extraction failed: {exc}")
+            if any(pages or []):
+                try:
+                    links, quiet = _citation_links_from_visible_pdf_text(
+                        data, pages, italics
+                    )
+                except Exception as exc:
+                    print(f"[pdf-links] citation scan failed: {exc}")
+                try:
+                    sections = slip_opinion.detect_sections(pages)
+                except Exception as exc:
+                    print(f"[pdf-parts] section detection failed: {exc}")
+            maps = self._align_location_sources(sources, pages, pdf_cite)
+            result = {
+                "pages": pages,
+                "italics": italics,
+                "links": links,
+                "quiet": quiet,
+                "sections": sections,
+                "maps": maps,
+                "pdf_cite": pdf_cite,
+                "url": url,
+            }
+            self._post(self._finish_pdf_analysis, key, result)
+
+        threading.Thread(target=run, daemon=True).start()
+        return key
+
+    def _finish_pdf_analysis(self, key: tuple, result: dict) -> None:
+        self._pdf_analysis_running.discard(key)
+        self._pdf_analysis_cache[key] = result
+        url = result.get("url", "")
+        if url:
+            self._pdf_url_keys[url] = key
+        if (self._active_pdf_analysis_key == key
+                or self._comparable_pdf_url(self._pdf_url or "")
+                == self._comparable_pdf_url(url)):
+            self._active_pdf_analysis_key = key
+        callbacks = self._pdf_analysis_waiters.pop(key, [])
+        for callback in callbacks:
+            try:
+                callback(result)
+            except Exception as exc:
+                print(f"[pdf-analysis] apply failed: {exc}")
+        if self._mode in ("scholar", "courtlistener"):
+            self._install_current_location_map()
+
+    def _ensure_cached_location_maps(self, key: Optional[tuple] = None) -> None:
+        """Align a text source that arrived after the PDF analysis finished."""
+        keys = [key] if key is not None else list(self._pdf_analysis_cache)
+        sources = self._location_sources()
+        for cache_key in keys:
+            result = self._pdf_analysis_cache.get(cache_key)
+            if not result:
+                continue
+            for mode, source in sources.items():
+                if mode in result.get("maps", {}):
+                    continue
+                job = (cache_key, mode)
+                if job in self._pdf_map_jobs:
+                    continue
+                self._pdf_map_jobs.add(job)
+                pages = result.get("pages", [])
+                pdf_cite = result.get("pdf_cite", "")
+
+                def run(
+                    ck=cache_key, md=mode, src=source, pgs=pages, pc=pdf_cite,
+                    jb=job,
+                ) -> None:
+                    found = self._align_location_sources({md: src}, pgs, pc)
+                    self._post(self._finish_cached_location_map, ck, md,
+                               found.get(md), jb)
+
+                threading.Thread(target=run, daemon=True).start()
+
+    def _finish_cached_location_map(
+        self, key: tuple, mode: str, location_map, job: tuple,
+    ) -> None:
+        self._pdf_map_jobs.discard(job)
+        result = self._pdf_analysis_cache.get(key)
+        if result is None or location_map is None:
+            return
+        result.setdefault("maps", {})[mode] = location_map
+        if key == self._active_pdf_analysis_key and self._mode == mode:
+            self._install_current_location_map()
+
+    def _apply_pdf_analysis(self, pane: _PdfPane, result: dict) -> None:
+        """Attach cached text/search/link/parts data to the current pane."""
+        try:
+            if not pane.winfo_exists() or self._pdf_pane is not pane:
+                return
+        except tk.TclError:
+            return
+        pages = result.get("pages", [])
+        if not any(pages or []):
+            return  # scan-only PDF: switching remains the old top-to-top path
+        links = result.get("links", {})
+        quiet = result.get("quiet", set())
+        sections = result.get("sections", [])
+        if links:
+            pane.set_citation_links(
+                links,
+                self._open_pdf_cite,
+                self._open_pdf_cite_browser,
+                quiet_pages=quiet,
+            )
+        pane.enable_find(pages, bind_keys=False)
+        if len(sections) > 1 and self._pdf_holder is not None:
+            self._pdf_parts_nav = _build_pdf_parts_nav(
+                self._pdf_holder, sections, pane.scroll_to_page
+            )
+            self._apply_pdf_parts_visibility()
+        bits = []
+        n_links = sum(len(value) for value in links.values())
+        n_quiet = sum(
+            len(value) for page, value in links.items() if page in quiet
+        )
+        if n_links:
+            bits.append(
+                f"{n_links} citation link{'s' if n_links != 1 else ''} "
+                + (
+                    "clickable (not colored on scanned pages)"
+                    if n_quiet else "shown in blue"
+                )
+            )
+        if len(sections) > 1:
+            bits.append(
+                f"{len(sections)} opinion parts "
+                + (
+                    "listed on the right"
+                    if self._pdf_parts_on
+                    else "— tick Side panel to list them"
+                )
+            )
+        bits.append(
+            f"{_ACCEL}-F searches the page; drag to select text "
+            f"({_ACCEL}+C copies)"
+        )
+        self._status_var.set("; ".join(bits) + ".")
+
+    def _begin_pdf_switch(self, url: str = "") -> None:
+        """Freeze whether a ready map existed at the instant PDF was chosen."""
+        self._pending_pdf_switch = True
+        self._pending_pdf_target = None
+        if self._mode not in ("scholar", "courtlistener"):
+            return
+        location_map = self._location_map_for(self._mode, url)
+        if location_map is None or not self._live_location_anchors:
+            return
+        try:
+            top = self._text.index("@0,0")
+        except tk.TclError:
+            return
+        preceding = []
+        following = []
+        for mark, anchor in self._live_location_anchors:
+            try:
+                bucket = (
+                    preceding
+                    if self._text.compare(mark, "<=", top)
+                    else following
+                )
+                bucket.append((self._text.index(mark), anchor))
+            except tk.TclError:
+                continue
+        if preceding:
+            anchor = max(
+                preceding, key=lambda item: self._tk_index_key(item[0])
+            )[1]
+        elif following:
+            anchor = min(
+                following, key=lambda item: self._tk_index_key(item[0])
+            )[1]
+        else:
+            return
+        try:
+            page = int(anchor.pdf_page)
+            y_pt = anchor.y_pt
+            self._pending_pdf_target = (
+                page, float(y_pt) if y_pt is not None else None
+            )
+        except (AttributeError, TypeError, ValueError):
+            self._pending_pdf_target = None
+
+    def _consume_pdf_switch_target(self, url: str) -> Optional[tuple]:
+        if not self._pending_pdf_switch:
+            self._begin_pdf_switch(url)
+        target = self._pending_pdf_target
+        self._pending_pdf_switch = False
+        self._pending_pdf_target = None
+        return target
+
     def _pdf_item(self) -> dict:
         """The search-result-shaped dict used to resolve a PDF URL.  Falls back
         to the Bluebook citation when this window wasn't opened from a result."""
@@ -20485,6 +21162,7 @@ class _ScholarTextWindow:
             ):
                 webbrowser.open(choice.url)
             return
+        self._begin_pdf_switch(choice.url)
         if self._mode in ("scholar", "courtlistener"):
             self._pre_pdf_mode = self._mode
         if self._pdf_prefetch is not None and self._pdf_prefetch[1] == choice.url:
@@ -20652,6 +21330,10 @@ class _ScholarTextWindow:
 
     def _on_pdf_located(self, found: bool) -> None:
         self._pdf_located = found
+        if found and self._pdf_prefetch is not None:
+            data, url = self._pdf_prefetch
+            key = self._request_pdf_analysis(data, url)
+            self._active_pdf_analysis_key = key
         self._refresh_pdf_button()
 
     def _render_courtlistener_view(self) -> None:
@@ -20712,6 +21394,12 @@ class _ScholarTextWindow:
             ):
                 self._open_pdf_in_browser()
             return
+        switch_url = (
+            self._pdf_prefetch[1]
+            if self._pdf_prefetch is not None
+            else (self._pdf_url or "")
+        )
+        self._begin_pdf_switch(switch_url)
         # Remember which text view to return to when leaving the PDF.
         if self._mode in ("scholar", "courtlistener"):
             self._pre_pdf_mode = self._mode
@@ -20760,6 +21448,7 @@ class _ScholarTextWindow:
         threading.Thread(target=run, daemon=True).start()
 
     def _show_pdf(self, data: bytes, url: str) -> None:
+        switch_target = self._consume_pdf_switch_target(url)
         _clamp_toplevel_to_work_area(
             self._win, min_width=430, min_height=300, bottom_gap=72
         )
@@ -20797,78 +21486,20 @@ class _ScholarTextWindow:
         # The checkbox now speaks for the PDF view's own panel.
         self._sync_details_checkbox()
 
-        # Extract the text layer in the background so text on the page can be
-        # selected with the mouse and copied with Ctrl-C.  The find keys are
-        # NOT rebound — Ctrl-F in this window belongs to the text view's
-        # finder — so only the pane-local selection is enabled.
-        def extract_text(d=data, p=pane) -> None:
-            try:
-                pages, italics = _extract_pdf_text_and_style(d)
-            except Exception as exc:
-                print(f"[pdf-text] extraction failed: {exc}")
-                return
-            links: dict = {}
-            quiet: set = set()
-            if not any(pages or []):
-                return  # scan-only PDF: no text layer to select
-            try:
-                links, quiet = _citation_links_from_visible_pdf_text(
-                    d, pages, italics)
-            except Exception as exc:
-                print(f"[pdf-links] citation scan failed: {exc}")
-            # The separate opinions (Syllabus, Opinion of the Court, each
-            # concurrence/dissent), read from the running heads — slip
-            # opinions and US Reports pages share that layout.
-            sections: list = []
-            try:
-                sections = slip_opinion.detect_sections(pages)
-            except Exception as exc:
-                print(f"[pdf-parts] section detection failed: {exc}")
-
-            def apply() -> None:
-                try:
-                    if p.winfo_exists() and self._pdf_pane is p:
-                        if links:
-                            p.set_citation_links(
-                                links,
-                                self._open_pdf_cite,
-                                self._open_pdf_cite_browser,
-                                quiet_pages=quiet,
-                            )
-                        p.enable_find(pages, bind_keys=False)
-                        if len(sections) > 1:
-                            # Built now that the text layer has revealed the
-                            # separate opinions; shown only if the reader has
-                            # the side panel on for the PDF view.
-                            self._pdf_parts_nav = _build_pdf_parts_nav(
-                                self._pdf_holder, sections, p.scroll_to_page)
-                            self._apply_pdf_parts_visibility()
-                        bits = []
-                        n = sum(len(v) for v in links.values())
-                        nq = sum(len(v) for pg, v in links.items()
-                                 if pg in quiet)
-                        if n:
-                            bits.append(
-                                f"{n} citation link{'s' if n != 1 else ''} "
-                                + ("clickable (not colored on scanned pages)"
-                                   if nq else "shown in blue")
-                            )
-                        if len(sections) > 1:
-                            bits.append(
-                                f"{len(sections)} opinion parts "
-                                + ("listed on the right"
-                                   if self._pdf_parts_on else
-                                   "— tick Side panel to list them")
-                            )
-                        bits.append(f"{_ACCEL}-F searches the page; drag to "
-                                    f"select text ({_ACCEL}+C copies)")
-                        self._status_var.set("; ".join(bits) + ".")
-                except tk.TclError:
-                    pass
-
-            self._post(apply)
-
-        threading.Thread(target=extract_text, daemon=True).start()
+        # Search, citation linking, part detection, and location matching all
+        # consume the same cached extraction instead of opening the PDF again.
+        self._active_pdf_analysis_key = self._request_pdf_analysis(
+            data, url,
+            lambda result, p=pane: self._apply_pdf_analysis(p, result),
+        )
+        if switch_target is not None:
+            page, y_pt = switch_target
+            self._win.after_idle(
+                lambda p=pane, i=page, y=y_pt: (
+                    p.scroll_to_page(i, y)
+                    if self._pdf_pane is p else None
+                )
+            )
         self._hide_pdf_button()  # the toggle below is the way back from the PDF
         self._part_combo.config(state="disabled")
         self._view_label_var.set("PDF of opinion")
@@ -20972,6 +21603,29 @@ class _ScholarTextWindow:
     def _back_from_pdf(self) -> None:
         """Return from the PDF to the text view it was opened from — the Google
         Scholar text, or the CourtListener text for a CL-primary window."""
+        self._pending_text_target = None
+        pane = self._pdf_pane
+        location_map = self._location_map_for(self._pre_pdf_mode)
+        if pane is not None and location_map is not None:
+            viewport = pane.viewport_anchor()
+            if viewport is not None:
+                try:
+                    matched = location_map.text_location(*viewport)
+                except Exception:
+                    matched = None
+                address = self._location_address(matched) if matched else None
+                if address is not None:
+                    self._pending_text_target = address
+                    part_index = getattr(address, "part_index", None)
+                    if (self._current_part is not None
+                            and part_index != self._current_part):
+                        # The PDF can be scrolled into another writing. Show the
+                        # full opinion so that target exists in the rendering.
+                        self._current_part = None
+                        try:
+                            self._part_combo.current(0)
+                        except tk.TclError:
+                            pass
         holder = getattr(self, "_pdf_holder", None)
         if holder is not None:
             holder.destroy()  # takes the pane and its parts strip with it

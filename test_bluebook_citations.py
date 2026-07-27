@@ -2491,6 +2491,43 @@ class PublicDomainCitationTests(unittest.TestCase):
         )
 
 
+class MappedUsReportsCitationTests(unittest.TestCase):
+    @staticmethod
+    def _window():
+        win = object.__new__(_ScholarTextWindow)
+        win._base_citation_override = ""
+        win._bb = {
+            "name": "Ramos v. Louisiana",
+            "cite": "140 S. Ct. 1390",
+            "display_cite": "140 S. Ct. 1390",
+            "court": "",
+            "year": "2020",
+            "omit_parenthetical": "",
+            "pin_kind": "page",
+        }
+        return win
+
+    def test_copy_only_override_uses_us_reporter_and_pin(self):
+        plain, _rtf = self._window()._bluebook_citation(
+            "91", cite_override="590 U.S. 83",
+        )
+        self.assertEqual(
+            plain, "Ramos v. Louisiana, 590 U.S. 83, 91 (2020)."
+        )
+
+    def test_manual_citation_remains_authoritative(self):
+        win = self._window()
+        win._base_citation_override = (
+            "Ramos v. Louisiana, 140 S. Ct. 1390 (2020)"
+        )
+        plain, _rtf = win._bluebook_citation(
+            "1395", cite_override="590 U.S. 83",
+        )
+        self.assertEqual(
+            plain, "Ramos v. Louisiana, 140 S. Ct. 1390, 1395 (2020)."
+        )
+
+
 class WriterParentheticalTests(unittest.TestCase):
     @staticmethod
     def _win():
