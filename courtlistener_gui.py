@@ -16534,6 +16534,38 @@ class _ScholarTextWindow:
         self._location_map_mark_names.append(name)
         return name
 
+    def _reset_page_marks(self) -> None:
+        """Drop the star-page marks of the rendering being replaced."""
+        txt = getattr(self, "_text", None)
+        for name in getattr(self, "_page_mark_names", []) or []:
+            try:
+                txt.mark_unset(name)
+            except (AttributeError, tk.TclError):
+                pass
+        self._page_mark_names: list[str] = []
+        self._page_mark_seq = getattr(self, "_page_mark_seq", 0) + 1
+        self._page_pos: dict[int, str] = {}
+
+    def _new_page_mark(self, index: str) -> str:
+        """A mark on a star page's first character.
+
+        Justification threads padding spaces and hyphenation breaks through
+        the text, and every one of them shifts the "line.char" of everything
+        after it.  A star page recorded as a bare index was left pointing at
+        whatever had moved into its place, which is how the reporter page
+        numbers in the left margin came to sit beside the wrong lines.  Tk
+        carries a mark along with its text instead — the same thing the
+        inferred U.S. pages have always used.
+        """
+        name = f"__oppage_{self._page_mark_seq}_{len(self._page_mark_names)}"
+        try:
+            self._text.mark_set(name, index)
+            self._text.mark_gravity(name, "left")
+        except tk.TclError:
+            return index    # the recorded position, drift and all
+        self._page_mark_names.append(name)
+        return name
+
     def _record_location_block_start(self, block) -> None:
         """Remember a parsed block's exact start for alignment addresses."""
         block_id = id(block)
@@ -16821,8 +16853,10 @@ class _ScholarTextWindow:
             if m:
                 self._cur_page = int(m.group(0))
                 # where each star page begins, for pin-cited link arrivals
-                self._page_pos.setdefault(self._cur_page,
-                                          txt.index("end-1c"))
+                # and the reporter page numbers in the left margin
+                if self._cur_page not in self._page_pos:
+                    self._page_pos[self._cur_page] = self._new_page_mark(
+                        txt.index("end-1c"))
             tags.append("pagenum")
             txt.insert("end", span.text, tuple(tags))
             return
@@ -17442,7 +17476,7 @@ class _ScholarTextWindow:
         self._scroll_part: Optional[int] = None
         self._fn_ref_pos: dict[str, str] = {}  # footnote id → in-text marker index
         self._fn_def_pos: dict[str, str] = {}  # footnote id → body marker index
-        self._page_pos: dict[int, str] = {}    # star page → start index
+        self._reset_page_marks()   # star page → a mark on its marker
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(self._scholar_text)
         self._recap_spec_index = _recap_spec_index(self._scholar_text)
@@ -18145,7 +18179,7 @@ class _ScholarTextWindow:
         self._scroll_part: Optional[int] = None
         self._fn_ref_pos: dict[str, str] = {}
         self._fn_def_pos: dict[str, str] = {}
-        self._page_pos: dict[int, str] = {}
+        self._reset_page_marks()
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(
             self._scholar_text or self._cl_text or "")
@@ -18235,7 +18269,7 @@ class _ScholarTextWindow:
         txt.config(state="normal")
         self._reset_location_render_marks()
         txt.delete("1.0", "end")
-        self._page_pos = {}
+        self._reset_page_marks()
         self._cur_page = None
         self._fnref_pages = {}
         self._fn_ref_pos = {}
