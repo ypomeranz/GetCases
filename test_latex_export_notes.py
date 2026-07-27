@@ -9,7 +9,9 @@ parses "line.char" — so exporting any opinion that has a footnote crashed with
 ``_section_note_map`` and ``_section_body_ranges`` are lifted out of
 ``courtlistener_gui`` with ``ast`` (it imports tkinter, absent on a headless
 run) and driven against a fake Text whose ``index`` resolves marks the way Tk
-does.
+does.  The closing mark's gravity is tested too: later opinions are appended
+at the same ``end-1c`` boundary, and a right-gravity mark would absorb them
+into the preceding note.
 """
 
 import ast
@@ -52,6 +54,44 @@ class _FakeText:
         # A literal "line.char" (or "end-1c" in these tests) is returned as-is.
         int(spec.split(".")[0])  # raises for an unknown mark name, as Tk would
         return spec
+
+
+class _AppendAwareText:
+    """The subset of Tk mark behavior needed to model an append at end-1c."""
+
+    def __init__(self, initial):
+        self._length = len(initial)
+        self._marks = {}
+        self._gravities = {}
+
+    def _position(self, spec):
+        spec = str(spec)
+        if spec in ("end", "end-1c"):
+            return self._length
+        if spec in self._marks:
+            return self._marks[spec]
+        line, char = spec.split(".")
+        if int(line) != 1:
+            raise ValueError(spec)
+        return int(char)
+
+    def index(self, spec):
+        return f"1.{self._position(spec)}"
+
+    def mark_set(self, name, spec):
+        self._marks[name] = self._position(spec)
+
+    def mark_gravity(self, name, gravity):
+        self._gravities[name] = gravity
+
+    def insert(self, spec, value):
+        pos = self._position(spec)
+        for name, mark_pos in self._marks.items():
+            if mark_pos > pos or (
+                mark_pos == pos and self._gravities.get(name) == "right"
+            ):
+                self._marks[name] += len(value)
+        self._length += len(value)
 
 
 class SectionNoteMapTests(unittest.TestCase):
@@ -117,6 +157,32 @@ class SectionNoteMapTests(unittest.TestCase):
         r = self._reader({}, [])
         regions, parsed = r._section_note_map("1.0", "100.0", {})
         self.assertEqual((regions, parsed), ([], []))
+
+
+class FootnoteRegionMarkTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        ns = _load(
+            [],
+            methods_of=("_ScholarTextWindow", ["_fn_region_mark"]),
+        )
+        cls.fn_region_mark = staticmethod(ns["_fn_region_mark"])
+
+    def test_closed_note_does_not_absorb_appended_separate_opinion(self):
+        txt = _AppendAwareText("[10] Majority opinion's last footnote.\n\n")
+        reader = type("R", (), {})()
+        reader._text = txt
+        reader._fn_mark_seq = 0
+        mark = self.fn_region_mark(reader, "end", "end-1c")
+        note_end = txt.index(mark)
+
+        txt.insert(
+            "end",
+            "JUSTICE THOMAS, concurring.\n\nI join the Court's opinion.\n\n",
+        )
+
+        self.assertEqual(txt.index(mark), note_end)
+        self.assertEqual(txt._gravities[mark], "left")
 
 
 if __name__ == "__main__":

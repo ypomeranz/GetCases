@@ -18240,15 +18240,18 @@ class _ScholarTextWindow:
     def _fn_region_mark(self, side: str, index: str) -> str:
         """A uniquely named mark at *index* bracketing a footnote's text.
 
-        The gravities keep text inserted at either edge *inside* the note: a
-        start mark stays left of it, an end mark stays right of it.
+        Both marks use left gravity.  In particular, a finished note's end
+        sits at ``end-1c``, the same boundary where the full-opinion renderer
+        appends the next part.  Right gravity there would make the note grow
+        across the following concurrence or dissent.  Reflow edits within the
+        note still move the marks with their surrounding text.
         """
         name = f"__fnreg_{side}_{self._fn_mark_seq}"
         self._fn_mark_seq += 1
         txt = self._text
         try:
             txt.mark_set(name, index)
-            txt.mark_gravity(name, "left" if side == "start" else "right")
+            txt.mark_gravity(name, "left")
         except tk.TclError:
             return index  # marks unavailable — the raw index is still better
         return name
