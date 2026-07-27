@@ -10,6 +10,7 @@ from opinion_location import (
     align_opinion_locations,
     build_plain_text_source,
     build_text_source,
+    us_reports_cite_from_pdf,
 )
 
 
@@ -606,6 +607,35 @@ class AlignmentTests(unittest.TestCase):
         first = location_map.boundaries[0]
         self.assertTrue(first.exact)
         self.assertFalse(first.address.footnote)
+
+    def test_a_preliminary_print_supplies_its_own_citation(self):
+        # Clark v. Sweeney, 607 U. S. 7 (2025), published as a preliminary
+        # print months before the bound volume.  The Reporter revises the
+        # pagination precisely so it can be cited, and prints the citation in
+        # the running head of every interior recto.  Nothing else knows it.
+        pages = [
+            _page(["OCTOBER TERM, 2025 7", "Syllabus", "CLARK v. SWEENEY"]),
+            _page(["8 CLARK v. SWEENEY", "Per Curiam", "A Maryland jury"]),
+            _page(["Cite as: 607 U. S. 7 (2025) 9", "Per Curiam",
+                   "U. S. C. 2254 in Federal District Court."]),
+        ]
+        self.assertEqual(us_reports_cite_from_pdf(pages), "607 U.S. 7")
+
+    def test_a_preliminary_prints_cover_names_the_volume_too(self):
+        # Before the cover is stripped, it says the same thing — and it is
+        # all a two-page opinion has, since "Cite as:" first appears on the
+        # opinion's second recto.
+        pages = [
+            _page(["PRELIMINARY PRINT", "Volume 607 U. S. Part 1",
+                   "Pages 7-10", "OFFICIAL REPORTS"]),
+            _page(["OCTOBER TERM, 2025 7", "Syllabus"]),
+        ]
+        self.assertEqual(us_reports_cite_from_pdf(pages), "607 U.S. 7")
+
+    def test_a_pdf_that_prints_no_reporter_citation_yields_none(self):
+        pages = [_page(["CLARK v. SWEENEY (2025) - per curiam",
+                        "his right to trial by an impartial jury."])]
+        self.assertEqual(us_reports_cite_from_pdf(pages), "")
 
     def test_counsel_listing_at_a_page_foot_does_not_swallow_the_next_page(self):
         # Carpenter v. United States, 585 U. S. 296: the reporter prints the

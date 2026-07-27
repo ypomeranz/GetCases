@@ -13014,9 +13014,9 @@ def _fetch_pdf_bytes(
     file:// URLs (opinions extracted from local US Reports volumes) are read
     straight from disk.
 
-    A preliminary print's "Page Proof Pending Publication" stamp is taken out
-    here, so every path downstream — the viewer, the printer, Download PDF —
-    gets the clean document."""
+    A preliminary print's "Page Proof Pending Publication" stamp and its cover
+    page are taken out here, so every path downstream — the viewer, the
+    printer, Download PDF — gets the clean document."""
     queue = [url]
     seen: set[str] = set()
     while queue and len(seen) < max_hops:
@@ -13033,7 +13033,7 @@ def _fetch_pdf_bytes(
                 print(f"[pdf] local file read failed ({exc}): {cur}")
                 continue
             if data is not None:
-                return _strip_page_proof_watermark(data), cur
+                return _clean_reporter_pdf(data), cur
             continue
         resp = _pdf_get(cur, client=client, timeout=timeout)
         resp.raise_for_status()
@@ -13042,7 +13042,7 @@ def _fetch_pdf_bytes(
             resp.content, resp.headers.get("Content-Encoding", ""))
         data = _normalize_pdf_bytes(content)
         if data is not None:
-            return _strip_page_proof_watermark(data), final_url
+            return _clean_reporter_pdf(data), final_url
         for nxt in _pdf_link_candidates_from_html(content, final_url):
             if nxt not in seen and nxt not in queue:
                 queue.append(nxt)
@@ -13176,6 +13176,86 @@ def _strip_page_proof_watermark(data: bytes) -> bytes:
                 doc.close()
         except Exception:
             pass
+
+
+# The cover the Reporter of Decisions puts in front of a preliminary print:
+# "PRELIMINARY PRINT / Volume 607 U. S. Part 1 / Pages 7-10 / OFFICIAL
+# REPORTS OF THE SUPREME COURT".  It names the volume but carries no part of
+# the opinion, and it is the page the reader lands on.
+_PRELIM_COVER_RE = re.compile(
+    r"PRELIMINAR\s*Y\s+PRINT", re.IGNORECASE)
+_PRELIM_COVER_CONFIRM_RE = re.compile(
+    r"OFFICIAL\s+REPORTS|REPORTER\s+OF\s+DECISIONS", re.IGNORECASE)
+
+
+def _is_preliminary_print_cover(text: str) -> bool:
+    """True for a preliminary print's title page, and only for it: the banner
+    alone is not enough, since the same words can head a reporter's note."""
+    return bool(
+        _PRELIM_COVER_RE.search(text)
+        and _PRELIM_COVER_CONFIRM_RE.search(text)
+        # The cover has no opinion on it; the syllabus page that follows runs
+        # to thousands of characters.
+        and len(text.strip()) < 1200
+    )
+
+
+def _strip_preliminary_print_cover(data: bytes) -> bytes:
+    """Return *data* without the preliminary print's title page.
+
+    The Court publishes a revised per-opinion PDF once the preliminary print
+    is set, so the opinion can be cited to the United States Reports before
+    the bound volume exists — and puts a cover in front of it.  The opinion
+    proper starts on the next page, which is where the reader wants to be and
+    where every page-matching path expects page one to be.  Any failure
+    returns the original bytes: a spare page is a blemish, losing the opinion
+    is not.
+    """
+    import io
+
+    import pypdfium2 as pdfium
+
+    try:
+        with _PDFIUM_LOCK:
+            doc = pdfium.PdfDocument(data, autoclose=False)
+    except Exception:
+        return data
+    try:
+        with _PDFIUM_LOCK:
+            if len(doc) < 2:
+                return data      # never leave a document with no pages
+            page = doc[0]
+            try:
+                tp = page.get_textpage()
+                try:
+                    cover = _is_preliminary_print_cover(tp.get_text_range())
+                finally:
+                    tp.close()
+            finally:
+                page.close()
+            if not cover:
+                return data
+            doc.del_page(0)
+            buf = io.BytesIO()
+            doc.save(buf)
+            out = buf.getvalue()
+        print("[pdf] dropped the preliminary print's cover page")
+        return out if out.startswith(b"%PDF") else data
+    except Exception as exc:
+        print(f"[pdf] cover removal failed ({exc}); keeping the original")
+        return data
+    finally:
+        try:
+            with _PDFIUM_LOCK:
+                doc.close()
+        except Exception:
+            pass
+
+
+def _clean_reporter_pdf(data: bytes) -> bytes:
+    """Everything a reporter PDF carries that is not the opinion: the
+    preliminary print's watermark, and its cover page."""
+    return _strip_preliminary_print_cover(_strip_page_proof_watermark(data))
 
 
 def _page_has_scan_background(page) -> bool:
@@ -21346,6 +21426,7 @@ class _ScholarTextWindow:
                 pages, italics = _extract_pdf_text_and_style(data)
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
+            cite = pdf_cite
             if any(pages or []):
                 try:
                     links, quiet = _citation_links_from_visible_pdf_text(
@@ -21357,7 +21438,18 @@ class _ScholarTextWindow:
                     sections = slip_opinion.detect_sections(pages)
                 except Exception as exc:
                     print(f"[pdf-parts] section detection failed: {exc}")
-            maps = self._align_location_sources(sources, pages, pdf_cite)
+                if not cite:
+                    # Nothing the app already knew named a reporter for these
+                    # pages.  A preliminary print names one itself — that is
+                    # what it is for — and an opinion published only as one
+                    # has its U.S. Reports citation nowhere else yet.
+                    try:
+                        cite = opinion_location.us_reports_cite_from_pdf(pages)
+                    except Exception as exc:
+                        print(f"[pdf-location] printed cite scan failed: {exc}")
+                    if cite:
+                        print(f"[pdf-location] the PDF cites itself as {cite}")
+            maps = self._align_location_sources(sources, pages, cite)
             result = {
                 "pages": pages,
                 "italics": italics,
@@ -21365,7 +21457,7 @@ class _ScholarTextWindow:
                 "quiet": quiet,
                 "sections": sections,
                 "maps": maps,
-                "pdf_cite": pdf_cite,
+                "pdf_cite": cite,
                 "url": url,
             }
             self._post(self._finish_pdf_analysis, key, result)

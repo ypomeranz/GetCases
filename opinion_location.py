@@ -529,6 +529,51 @@ _LIGATURES = {
     "ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ſ": "s",
 }
 
+# What a United States Reports PDF prints about itself.  The running head of
+# every interior recto names the volume and the page the opinion *starts* on
+# ("Cite as: 607 U. S. 7 (2025)   9"), and a preliminary print's cover repeats
+# it ("Volume 607 U. S. Part 1 / Pages 7-10").  Both are read tolerantly: the
+# glyph grouping these arrive through can lose a period ("607 U S 7") or split
+# a word ("PRELIMINAR Y").
+_PDF_CITE_AS_RE = re.compile(
+    r"Cite\s+as:\s*(\d{1,4})\s*U\.?\s*S\.?\s*(\d{1,5})\b", re.IGNORECASE)
+_PDF_COVER_VOLUME_RE = re.compile(
+    r"Volume\s+(\d{1,4})\s*U\.?\s*S\.?\b", re.IGNORECASE)
+_PDF_COVER_PAGES_RE = re.compile(r"Pages?\s+(\d{1,5})\s*[-–—]\s*\d{1,5}")
+#: Pages of a reporter PDF to read before giving up on finding its citation.
+#: A "Cite as:" head appears on the first interior recto; a cover, on page one.
+_PDF_CITE_SCAN_PAGES = 12
+
+
+def us_reports_cite_from_pdf(pdf_pages: Iterable) -> str:
+    """The U.S. Reports citation a reporter PDF prints on itself, as
+    "607 U.S. 7" — or "" when it prints none.
+
+    An opinion published only as a preliminary print has no citation anywhere
+    else yet: the Reporter revises the pagination precisely so it can be cited
+    to the United States Reports before the bound volume exists, and prints
+    that citation in the running heads.  Reading it there is what lets the
+    page matching anchor such an opinion, and what supplies its pin cites.
+    """
+    for chars in list(pdf_pages or ())[:_PDF_CITE_SCAN_PAGES]:
+        try:
+            lines = group_lines(list(chars or ()))
+        except Exception:
+            continue
+        head = " ".join(line.text for line in lines[:3])
+        m = _PDF_CITE_AS_RE.search(head)
+        if m:
+            return f"{int(m.group(1))} U.S. {int(m.group(2))}"
+        # A cover page names the volume and the range it prints; the opinion
+        # starts on the first of those pages.
+        whole = " ".join(line.text for line in lines)
+        vol = _PDF_COVER_VOLUME_RE.search(whole)
+        pages = _PDF_COVER_PAGES_RE.search(whole)
+        if vol and pages:
+            return f"{int(vol.group(1))} U.S. {int(pages.group(1))}"
+    return ""
+
+
 #: Words a matched run needs before it may anchor a page.  A run of one or
 #: two ordinary words — "and", "of the" — matches all over an opinion and
 #: says nothing about where the page sits.  The reporter prints counsel and
