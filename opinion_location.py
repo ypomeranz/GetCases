@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 import citations
-from slip_opinion import group_lines, is_single_column
+from slip_opinion import group_lines
 
 
 @dataclass(frozen=True)
@@ -186,6 +186,13 @@ class OpinionLocationMap:
     us_cite: str
     copy_ready: bool
     copy_cite: str
+    navigation_ready: bool = False
+    pdf_page_count: int = 0
+    matched_pdf_pages: tuple[int, ...] = ()
+    source_edges_covered: bool = False
+    physical_edges_covered: bool = False
+    direct_page_coverage: float = 0.0
+    max_unmatched_pages: int = 0
 
     def _source_offset(self, value: "int | TextAddress") -> Optional[int]:
         if isinstance(value, TextAddress):
@@ -264,8 +271,15 @@ class OpinionLocationMap:
         if offset is None or not self.boundaries:
             return None
         before = [b for b in self.boundaries if b.source_offset <= offset]
-        boundary = max(before, key=lambda b: b.source_offset) if before else min(
-            self.boundaries, key=lambda b: abs(b.source_offset - offset)
+        boundary = max(
+            before,
+            key=lambda b: (b.source_offset, b.pdf_page),
+        ) if before else min(
+            self.boundaries,
+            key=lambda b: (
+                abs(b.source_offset - offset),
+                b.pdf_page,
+            ),
         )
         return boundary.reporter_page
 
@@ -395,7 +409,9 @@ def build_text_source(parts, native_cite: str = "") -> TextSource:
     text = "".join(pieces)
     real_runs = [run for run in runs if run.address is not None]
     if parsed_native and real_runs and not any(
-        anchor.page == parsed_native.page for anchor in pages
+        anchor.page == parsed_native.page
+        and not anchor.address.footnote
+        for anchor in pages
     ):
         pages.insert(
             0,
@@ -410,6 +426,19 @@ def build_text_source(parts, native_cite: str = "") -> TextSource:
 
 
 _PLAIN_PAGE_RE = re.compile(r"(?<!\*)\*(\d{1,5})\b")
+
+
+def _plain_page_markers(text: str):
+    """Yield star-page markers, excluding ordinary WL/LEXIS star pin cites."""
+    for match in _PLAIN_PAGE_RE.finditer(text or ""):
+        prefix = text[max(0, match.start() - 80):match.start()]
+        if re.search(r"\bat\s*$", prefix, re.IGNORECASE):
+            continue
+        if re.search(
+            r"\b(?:WL|LEXIS)\b[^\n]{0,50},\s*$", prefix, re.IGNORECASE
+        ):
+            continue
+        yield match
 
 
 def build_plain_text_source(text: str, native_cite: str = "") -> TextSource:
@@ -436,7 +465,7 @@ def build_plain_text_source(text: str, native_cite: str = "") -> TextSource:
             pieces, runs, current_page, source_length, value
         )
 
-    for match in _PLAIN_PAGE_RE.finditer(text):
+    for match in _plain_page_markers(text):
         if match.start() > pos:
             value = text[pos:match.start()]
             start = total()
@@ -585,7 +614,7 @@ def _page_variants(chars: list) -> tuple[tuple[_Word, ...], ...]:
         variants.append(_line_variant(lines))
 
     boxes = [box for _ch, box in (chars or ()) if box is not None]
-    if boxes and not is_single_column(chars or []):
+    if boxes:
         x0 = min(box[0] for box in boxes)
         x1 = max(box[2] for box in boxes)
         midpoint = (x0 + x1) / 2.0
@@ -651,8 +680,17 @@ def _alignment_candidates(
     for source_offset in hints:
         votes[_source_token_index(source_words, source_offset)] += 10
     if not votes:
-        step = max(1, len(page_values) // 2)
-        for start in range(0, len(source_values), step):
+        # With heavily damaged OCR there may be no exact word or n-gram vote.
+        # Probe the whole opinion evenly; insertion-ordered ``most_common(12)``
+        # otherwise examines only its beginning and can never reach late pages.
+        last = max(0, len(source_values) - min(
+            len(source_values), len(page_values)
+        ))
+        starts = {
+            int(round(last * slot / 11.0))
+            for slot in range(12)
+        } if last else {0}
+        for start in sorted(starts):
             votes[start] = 1
     return [delta for delta, _score in votes.most_common(12)]
 
@@ -693,25 +731,34 @@ def _align_variant(
     return best_score, best_blocks
 
 
-def _dominant_boundary_anchor(
+def _dominant_anchor_cluster(
     candidates: list[LocationAnchor],
-) -> Optional[LocationAnchor]:
-    """Choose the main-text cluster that begins a physical PDF page.
+    source_floor: Optional[int] = None,
+) -> list[LocationAnchor]:
+    """Return the main-text cluster on a physical PDF page.
 
     Reporter PDFs leave footnotes at the bottoms of their original pages,
     while text opinions commonly collect those notes after each writing.  A
-    raw minimum source offset can therefore jump the page boundary into a
-    detached footnote (or a repeated running head).  Prefer non-footnote
-    matches and the densest nearby source cluster, then take its earliest
-    source word.
+    raw match can therefore jump into a detached footnote or a repeated running
+    head.  Prefer non-footnote matches and the densest nearby source cluster.
+    The same filtering is applied to the dense y-level navigation anchors, so
+    clicking back from the top of a later PDF page cannot follow its running
+    head to the beginning of the opinion.
     """
     if not candidates:
-        return None
+        return []
     body = [
         anchor for anchor in candidates
         if anchor.address is None or not anchor.address.footnote
     ]
     pool = body or candidates
+    if source_floor is not None:
+        forward = [
+            anchor for anchor in pool
+            if anchor.source_offset > source_floor + 2
+        ]
+        if forward:
+            pool = forward
     ordered = sorted(pool, key=lambda anchor: anchor.source_offset)
     clusters: list[list[LocationAnchor]] = []
     for anchor in ordered:
@@ -722,7 +769,7 @@ def _dominant_boundary_anchor(
             clusters.append([anchor])
         else:
             clusters[-1].append(anchor)
-    cluster = max(
+    return max(
         clusters,
         key=lambda group: (
             len(group),
@@ -730,14 +777,27 @@ def _dominant_boundary_anchor(
             -group[0].source_offset,
         ),
     )
-    return min(cluster, key=lambda anchor: anchor.source_offset)
+
+
+def _dominant_boundary_anchor(
+    candidates: list[LocationAnchor],
+) -> Optional[LocationAnchor]:
+    # Collected notes occur out of physical-page order in the text source.
+    # Keep their dense anchors for precise navigation, but never let one claim
+    # to be the beginning of the reporter page on which it was printed.
+    body = [
+        anchor for anchor in candidates
+        if anchor.address is None or not anchor.address.footnote
+    ]
+    cluster = _dominant_anchor_cluster(body)
+    return min(cluster, key=lambda anchor: anchor.source_offset) if cluster else None
 
 
 def _monotonic_boundaries(
     rows: list[PageBoundary], source: TextSource,
 ) -> tuple[list[PageBoundary], set[int]]:
     """Repair fuzzy page-boundary outliers with a weighted monotonic chain."""
-    if len(rows) < 3 or any(row.exact for row in rows):
+    if len(rows) < 2:
         return rows, set()
     ordered = sorted(rows, key=lambda row: row.pdf_page)
     # Maximum-weight increasing subsequence.  A long run of mutually
@@ -746,7 +806,12 @@ def _monotonic_boundaries(
     scores: list[float] = []
     previous: list[int] = []
     for i, row in enumerate(ordered):
-        weight = max(0.1, float(row.confidence))
+        # Exact reporter stars are hard constraints.  When they are mutually
+        # monotonic, this weight makes every one part of the selected chain
+        # while still allowing fuzzy rows between them to be rejected.
+        weight = 1_000_000.0 if row.exact else max(
+            0.1, float(row.confidence)
+        )
         best_score = weight
         best_previous = -1
         for j in range(i):
@@ -775,30 +840,78 @@ def _monotonic_boundaries(
             continue
         before = [j for j in kept_order if j < i]
         after = [j for j in kept_order if j > i]
-        if not before or not after:
-            # Do not extrapolate beyond the reliable matched run.
-            repaired.append(row)
+        if before and after:
+            left, right = ordered[before[-1]], ordered[after[0]]
+            span = right.pdf_page - left.pdf_page
+            fraction = (
+                (row.pdf_page - left.pdf_page) / span if span > 0 else 0.0
+            )
+            source_offset = int(round(
+                left.source_offset
+                + fraction * (right.source_offset - left.source_offset)
+            ))
+            confidence = min(left.confidence, right.confidence) * 0.7
+        else:
+            # A rejected edge outlier cannot be interpolated.  Clamping it to
+            # the nearest kept row creates two reporter pages at one source
+            # offset and can shift even the trustworthy row's pin cite.
+            repaired_pages.add(row.pdf_page)
             continue
-        left, right = ordered[before[-1]], ordered[after[0]]
-        span = right.pdf_page - left.pdf_page
-        if span <= 0:
-            repaired.append(row)
-            continue
-        fraction = (row.pdf_page - left.pdf_page) / span
-        source_offset = int(round(
-            left.source_offset
-            + fraction * (right.source_offset - left.source_offset)
-        ))
         repaired.append(PageBoundary(
             pdf_page=row.pdf_page,
             reporter_page=row.reporter_page,
             source_offset=source_offset,
             address=source.address_at(source_offset),
-            confidence=min(left.confidence, right.confidence) * 0.7,
+            confidence=confidence,
             exact=False,
         ))
         repaired_pages.add(row.pdf_page)
     return repaired, repaired_pages
+
+
+def _complete_page_boundaries(
+    rows: list[PageBoundary],
+    source: TextSource,
+    page_count: int,
+    pdf: Optional[ReporterCitation],
+) -> tuple[list[PageBoundary], set[int]]:
+    """Interpolate pages whose OCR produced no trustworthy text match."""
+    if not rows or page_count <= 0:
+        return rows, set()
+    by_page = {row.pdf_page: row for row in rows}
+    known = sorted(by_page)
+    inserted: set[int] = set()
+    for page_index in range(page_count):
+        if page_index in by_page:
+            continue
+        before = [page for page in known if page < page_index]
+        after = [page for page in known if page > page_index]
+        # Only a bounded gap has enough information to interpolate.  Clamping
+        # unmatched leading/trailing pages to one known source offset creates
+        # duplicate boundaries and can assign the wrong reporter page even to
+        # the text that actually matched.
+        if not before or not after:
+            continue
+        left, right = by_page[before[-1]], by_page[after[0]]
+        span = right.pdf_page - left.pdf_page
+        fraction = (
+            (page_index - left.pdf_page) / span if span > 0 else 0.0
+        )
+        source_offset = int(round(
+            left.source_offset
+            + fraction * (right.source_offset - left.source_offset)
+        ))
+        confidence = min(left.confidence, right.confidence) * 0.55
+        by_page[page_index] = PageBoundary(
+            pdf_page=page_index,
+            reporter_page=(pdf.page + page_index) if pdf else None,
+            source_offset=source_offset,
+            address=source.address_at(source_offset),
+            confidence=confidence,
+            exact=False,
+        )
+        inserted.add(page_index)
+    return [by_page[page] for page in sorted(by_page)], inserted
 
 
 def align_opinion_locations(
@@ -823,13 +936,25 @@ def align_opinion_locations(
     exact_by_pdf: dict[int, NativePageAnchor] = {}
     if _same_reporter(native, pdf):
         for anchor in source.native_pages:
+            if anchor.address.footnote:
+                # Text renderers collect notes after a writing, whereas the
+                # reporter prints them on their original pages.  A star inside
+                # that collected note is not a main-text page boundary.
+                continue
             page_index = anchor.page - pdf.page
             if 0 <= page_index < len(pdf_pages):
-                exact_by_pdf.setdefault(page_index, anchor)
+                existing = exact_by_pdf.get(page_index)
+                if (
+                    existing is None
+                    or (not existing.explicit and anchor.explicit)
+                ):
+                    exact_by_pdf[page_index] = anchor
 
     dense: list[LocationAnchor] = []
     page_scores: dict[int, float] = {}
     matched_source_tokens: set[int] = set()
+    matched_tokens_by_page: dict[int, set[int]] = {}
+    source_frontier: Optional[int] = None
     for page_index, chars in enumerate(pdf_pages or ()):
         hints = []
         exact = exact_by_pdf.get(page_index)
@@ -846,10 +971,11 @@ def align_opinion_locations(
         minimum = 3 if len(best_words) < 20 else 5
         if matched < minimum or best_score < 0.16:
             continue
-        page_scores[page_index] = best_score
         reporter_page = pdf.page + page_index if pdf else None
+        page_dense: list[LocationAnchor] = []
+        page_source_tokens: set[int] = set()
         for pdf_start, source_start, size in best_blocks:
-            matched_source_tokens.update(range(source_start, source_start + size))
+            page_source_tokens.update(range(source_start, source_start + size))
             samples = {0, size - 1}
             samples.update(range(0, size, 10))
             for delta in sorted(samples):
@@ -857,7 +983,7 @@ def align_opinion_locations(
                     continue
                 sw = source_words[source_start + delta]
                 pw = best_words[pdf_start + delta]
-                dense.append(
+                page_dense.append(
                     LocationAnchor(
                         sw.start,
                         source.address_at(sw.start),
@@ -868,6 +994,39 @@ def align_opinion_locations(
                         best_score,
                     )
                 )
+        footnote_dense = [
+            anchor for anchor in page_dense
+            if anchor.address is not None and anchor.address.footnote
+        ]
+        main_dense = _dominant_anchor_cluster(
+            [
+                anchor for anchor in page_dense
+                if anchor.address is None or not anchor.address.footnote
+            ],
+            source_frontier,
+        )
+        if main_dense:
+            page_scores[page_index] = best_score
+            lo = min(anchor.source_offset for anchor in main_dense)
+            hi = max(anchor.source_offset for anchor in main_dense)
+            page_tokens = {
+                token for token in page_source_tokens
+                if lo <= source_words[token].start <= hi
+            }
+            matched_tokens_by_page[page_index] = page_tokens
+            matched_source_tokens.update(page_tokens)
+            dense.extend(main_dense)
+            source_frontier = max(
+                source_frontier if source_frontier is not None else -1,
+                max(anchor.source_offset for anchor in main_dense),
+            )
+        # A footnote is printed on its original page but commonly collected
+        # after the writing in text.  Retain those out-of-order y-level anchors
+        # so switching while reading a note still lands on that note.
+        dense.extend(
+            anchor for anchor in footnote_dense
+            if anchor not in main_dense
+        )
 
     # One hard boundary per exact marker; otherwise the first confidently
     # matched source word on the physical PDF page.
@@ -902,13 +1061,51 @@ def align_opinion_locations(
             )
 
     boundaries, repaired_pages = _monotonic_boundaries(boundaries, source)
+    boundaries, inserted_pages = _complete_page_boundaries(
+        boundaries, source, len(pdf_pages or ()), pdf
+    )
+    repaired_pages.update(inserted_pages)
     if repaired_pages:
         # The page's match was demonstrably out of document order.  Its dense
         # y-level anchors would send PDF→text back to that same false passage;
         # retain the interpolated coarse boundary instead.
         dense = [
             anchor for anchor in dense
-            if anchor.pdf_page not in repaired_pages
+            if (
+                anchor.pdf_page not in repaired_pages
+                or (
+                    anchor.address is not None
+                    and anchor.address.footnote
+                )
+            )
+        ]
+        for page_index in repaired_pages:
+            page_scores.pop(page_index, None)
+        matched_source_tokens = set().union(*(
+            tokens
+            for page_index, tokens in matched_tokens_by_page.items()
+            if page_index not in repaired_pages
+        )) if matched_tokens_by_page else set()
+
+    exact_boundaries = {
+        boundary.pdf_page: boundary
+        for boundary in boundaries
+        if boundary.exact
+    }
+    if exact_boundaries:
+        # An exact star marker is the source start of that physical page.
+        # Drop body matches before it (normally a repeated running head), but
+        # retain collected-footnote anchors because their source order is
+        # intentionally unrelated to their printed page.
+        dense = [
+            anchor for anchor in dense
+            if (
+                anchor.pdf_page not in exact_boundaries
+                or anchor.address is not None
+                and anchor.address.footnote
+                or anchor.source_offset
+                >= exact_boundaries[anchor.pdf_page].source_offset
+            )
         ]
 
     # Hard boundaries also act as coarse navigation anchors when exact text
@@ -943,13 +1140,106 @@ def align_opinion_locations(
         max(exact_ratio, 0.55 * mean_score + 0.45 * text_coverage),
     )
 
-    pdf_is_us = _same_reporter(pdf, us)
-    source_is_us = _same_reporter(native, us)
-    enough_inferred = bool(boundaries) and (
-        source_is_us
-        or (text_coverage >= 0.18 and mean_score >= 0.22)
+    page_count = len(pdf_pages or ())
+    matched_pdf_pages = tuple(sorted(page_scores))
+    physical_coverage = len(matched_pdf_pages) / max(1, page_count)
+    body_runs = [
+        run for run in source.runs
+        if (
+            run.address is not None
+            and not run.address.footnote
+            and run.end > run.start
+        )
+    ]
+    source_edges_covered = False
+    if matched_source_tokens and body_runs:
+        body_start = min(run.start for run in body_runs)
+        body_end = max(run.end for run in body_runs)
+        matched_start = min(
+            source_words[token].start for token in matched_source_tokens
+        )
+        matched_end = max(
+            source_words[token].end for token in matched_source_tokens
+        )
+        margin = max(20, int((body_end - body_start) * 0.20))
+        source_edges_covered = (
+            matched_start <= body_start + margin
+            and matched_end >= body_end - margin
+        )
+
+    exact_pages = sorted(exact_by_pdf)
+    if page_count <= 1:
+        exact_ready = bool(exact_pages)
+        fuzzy_ready = bool(
+            matched_pdf_pages
+            and text_coverage >= 0.18
+            and mean_score >= 0.22
+        )
+    else:
+        last_page = page_count - 1
+        exact_ready = bool(
+            len(exact_pages) >= 2
+            and exact_pages[0] == 0
+            and exact_pages[-1] == last_page
+        )
+        fuzzy_ready = bool(
+            len(matched_pdf_pages) >= 2
+            and matched_pdf_pages[0] == 0
+            and matched_pdf_pages[-1] == last_page
+            and physical_coverage >= 0.20
+            and source_edges_covered
+            and text_coverage >= 0.18
+            and mean_score >= 0.22
+        )
+    physical_edges_covered = bool(
+        page_count <= 1
+        or (
+            (0 in exact_pages or 0 in matched_pdf_pages)
+            and (
+                page_count - 1 in exact_pages
+                or page_count - 1 in matched_pdf_pages
+            )
+        )
     )
-    copy_ready = bool(us and pdf_is_us and enough_inferred)
+    navigation_ready = bool(boundaries) and (exact_ready or fuzzy_ready)
+
+    direct_pages = set(exact_pages) | set(matched_pdf_pages)
+    direct_page_coverage = len(direct_pages) / max(1, page_count)
+    max_unmatched_pages = 0
+    current_gap = 0
+    for page_index in range(page_count):
+        if page_index in direct_pages:
+            current_gap = 0
+        else:
+            current_gap += 1
+            max_unmatched_pages = max(max_unmatched_pages, current_gap)
+    # Approximate view switching can tolerate a broad interpolated interval.
+    # A legal pin cite cannot: page-density differences make long linear gaps
+    # capable of assigning the wrong reporter page.  Require most pages to
+    # have direct text/exact anchors, with only short bounded gaps, before
+    # enabling the inferred reporter for copy.  Very high overall coverage
+    # permits one additional missing page in a local OCR-damaged run.
+    copy_alignment_ready = bool(
+        navigation_ready
+        and (
+            page_count <= 1
+            or (
+                (
+                    direct_page_coverage >= 0.70
+                    and max_unmatched_pages <= 2
+                )
+                or (
+                    direct_page_coverage >= 0.80
+                    and max_unmatched_pages <= 3
+                )
+            )
+        )
+    )
+    pdf_is_us = _same_reporter(pdf, us)
+    enough_inferred = copy_alignment_ready
+    copy_ready = bool(
+        us and pdf_is_us and enough_inferred
+    )
     return OpinionLocationMap(
         source=source,
         anchors=tuple(dense),
@@ -960,6 +1250,13 @@ def align_opinion_locations(
         us_cite=us.cite if us else us_cite,
         copy_ready=copy_ready,
         copy_cite=us.cite if copy_ready and us else "",
+        navigation_ready=navigation_ready,
+        pdf_page_count=page_count,
+        matched_pdf_pages=matched_pdf_pages,
+        source_edges_covered=source_edges_covered,
+        physical_edges_covered=physical_edges_covered,
+        direct_page_coverage=direct_page_coverage,
+        max_unmatched_pages=max_unmatched_pages,
     )
 
 

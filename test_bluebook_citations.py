@@ -31,6 +31,8 @@ from court_catalog import bluebook_federal_trial_court
 from courtlistener_gui import (
     CourtListenerGUI,
     _CaseTabPage,
+    _CasePdfTextSource,
+    _PdfWindow,
     _ScholarTextWindow,
     _CaseLawPageOpinion,
     _CaseLawTextRecord,
@@ -64,6 +66,12 @@ from google_scholar import (
 )
 from opinion_db import OpinionDB, _gz_pack, _gz_unpack_prefix, _header_cites
 import us_code
+
+try:
+    import pypdfium2  # noqa: F401
+    HAVE_PDFIUM = True
+except ImportError:
+    HAVE_PDFIUM = False
 
 
 class SmartQuoteTests(unittest.TestCase):
@@ -2526,6 +2534,321 @@ class MappedUsReportsCitationTests(unittest.TestCase):
         self.assertEqual(
             plain, "Ramos v. Louisiana, 140 S. Ct. 1390, 1395 (2020)."
         )
+
+    def test_restarted_note_number_uses_its_own_writings_page(self):
+        class Text:
+            marks = {
+                "majority-note": "10.0", "majority-end": "11.0",
+                "dissent-note": "20.0", "dissent-end": "21.0",
+            }
+
+            def index(self, value):
+                return self.marks.get(value, value)
+
+            def compare(self, left, operator, right):
+                def key(value):
+                    line, char = self.index(value).split(".")
+                    return int(line), int(char)
+
+                lhs, rhs = key(left), key(right)
+                return {
+                    "<": lhs < rhs, ">": lhs > rhs,
+                    "<=": lhs <= rhs, ">=": lhs >= rhs,
+                }[operator]
+
+            @staticmethod
+            def get(_start, _end):
+                return ""
+
+        win = self._window()
+        win._text = Text()
+        win._fn_regions = [
+            ("majority-note", "majority-end", "1", None),
+            ("dissent-note", "dissent-end", "1", None),
+        ]
+        win._fn_region_fids = {
+            "majority-note": "majority-fn-1",
+            "dissent-note": "dissent-fn-1",
+        }
+        win._mapped_us_note_pages = {
+            "majority-fn-1": 90,
+            "dissent-fn-1": 121,
+        }
+        win._mapped_copy_cite = "590 U.S. 83"
+
+        self.assertEqual(
+            win._pin_with_footnotes(
+                "20.0", "21.0", mapped_us=True
+            ),
+            "121 n.1",
+        )
+
+
+class PdfReporterCitationInferenceTests(unittest.TestCase):
+    @staticmethod
+    def _window():
+        win = object.__new__(_ScholarTextWindow)
+        win._us_reports_cite = ""
+        win._item = {}
+        win._bb = {"cite": ""}
+        win._header_cites = []
+        win._case_law_pdf_choices = []
+        return win
+
+    def test_pdf_first_case_law_url_supplies_its_reporter(self):
+        win = self._window()
+        url = _static_case_law_url("754 F.2d 898")
+
+        self.assertEqual(win._pdf_reporter_cite(url), "754 F.2d 898")
+
+    def test_us_reports_url_can_use_item_parallel_citation(self):
+        win = self._window()
+        win._item = {"citation": ["140 S. Ct. 1390", "590 U.S. 83"]}
+
+        self.assertEqual(
+            win._pdf_reporter_cite(
+                "https://tile.loc.gov/storage-services/service/ll/usrep/"
+                "usrep590/usrep590083/usrep590083.pdf"
+            ),
+            "590 U.S. 83",
+        )
+
+
+class PdfFirstLocationPipelineTests(unittest.TestCase):
+    @staticmethod
+    def _glyphs(text, y):
+        return [
+            (
+                char,
+                (
+                    72.0 + index * 5.0,
+                    y,
+                    77.0 + index * 5.0,
+                    y + 10.0,
+                ),
+            )
+            for index, char in enumerate(text)
+        ]
+
+    def test_discovered_text_and_extracted_pages_build_switch_map(self):
+        first = (
+            "The first reporter page explains the distinctive federal "
+            "jurisdictional question."
+        )
+        second = (
+            "The next reporter page applies the governing rule and affirms "
+            "the judgment."
+        )
+        source = _CasePdfTextSource(
+            "case_law", "Text", "static.case.law", "case.json",
+            f"{first} *899 {second}", {}, [], [],
+        )
+        win = object.__new__(_PdfWindow)
+        win._url = _static_case_law_url("754 F.2d 898")
+        win._text_source = source
+        win._pdf_text_pages = [
+            self._glyphs(first, 700.0),
+            self._glyphs(second, 700.0),
+        ]
+        win._location_map = None
+        win._location_map_running = False
+        win._post = lambda fn, *args: fn(*args)
+
+        class ImmediateThread:
+            def __init__(self, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch("courtlistener_gui.threading.Thread", ImmediateThread):
+            win._maybe_start_location_map()
+
+        self.assertIsNotNone(win._location_map)
+        self.assertTrue(win._location_map.navigation_ready)
+        self.assertEqual(
+            [row.reporter_page for row in win._location_map.boundaries],
+            [898, 899],
+        )
+
+    def test_sct_stars_under_us_pdf_enable_us_mapping_without_false_exacts(self):
+        first = (
+            "The opening Supreme Court page explains the distinctive "
+            "constitutional question and relevant history."
+        )
+        second = (
+            "The following Supreme Court page applies that history and "
+            "announces the controlling judgment."
+        )
+        source = _CasePdfTextSource(
+            "courtlistener", "Text", "CourtListener", "opinion",
+            f"*1390 {first} *1391 {second}",
+            {"citation": ["140 S. Ct. 1390", "590 U.S. 83"]},
+            [], [],
+        )
+        win = object.__new__(_PdfWindow)
+        win._url = _static_case_law_url("590 U.S. 83")
+        win._text_source = source
+        win._pdf_text_pages = [
+            self._glyphs(first, 700.0),
+            self._glyphs(second, 700.0),
+        ]
+        win._location_map = None
+        win._location_map_running = False
+        win._post = lambda fn, *args: fn(*args)
+
+        class ImmediateThread:
+            def __init__(self, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch("courtlistener_gui.threading.Thread", ImmediateThread):
+            win._maybe_start_location_map()
+
+        self.assertEqual(
+            win._location_map.native_cite, "140 S. Ct. 1390"
+        )
+        self.assertTrue(win._location_map.navigation_ready)
+        self.assertTrue(win._location_map.copy_ready)
+        self.assertEqual(win._location_map.copy_cite, "590 U.S. 83")
+        self.assertTrue(all(
+            not row.exact for row in win._location_map.boundaries
+        ))
+
+
+@unittest.skipUnless(HAVE_PDFIUM, "pypdfium2 not installed")
+class PdfLocationAnalysisPipelineTests(unittest.TestCase):
+    @staticmethod
+    def _pdf(*page_lines):
+        """Small multi-page PDF used by the real pdfium extractor."""
+        objects = [
+            b"<</Type/Catalog/Pages 2 0 R>>",
+            (
+                b"<</Type/Pages/Kids[3 0 R 4 0 R]/Count 2>>"
+            ),
+            (
+                b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]"
+                b"/Resources<</Font<</F1 7 0 R>>>>/Contents 5 0 R>>"
+            ),
+            (
+                b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]"
+                b"/Resources<</Font<</F1 7 0 R>>>>/Contents 6 0 R>>"
+            ),
+        ]
+        for line in page_lines:
+            escaped = str(line).replace("\\", "\\\\").replace("(", "\\(") \
+                .replace(")", "\\)")
+            stream = (
+                f"BT /F1 12 Tf 72 700 Td ({escaped}) Tj ET"
+            ).encode("latin-1")
+            objects.append(
+                b"<</Length %d>>stream\n" % len(stream)
+                + stream + b"\nendstream"
+            )
+        objects.append(b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>")
+        out = bytearray(b"%PDF-1.4\n")
+        offsets = []
+        for number, body in enumerate(objects, start=1):
+            offsets.append(len(out))
+            out += b"%d 0 obj" % number + body + b"endobj\n"
+        xref = len(out)
+        out += b"xref\n0 %d\n" % (len(objects) + 1)
+        out += b"0000000000 65535 f \n"
+        for offset in offsets:
+            out += b"%010d 00000 n \n" % offset
+        out += (
+            b"trailer<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n"
+            % (len(objects) + 1, xref)
+        )
+        return bytes(out)
+
+    @staticmethod
+    def _window(text):
+        win = object.__new__(_ScholarTextWindow)
+        win._pdf_analysis_cache = {}
+        win._pdf_analysis_running = set()
+        win._pdf_analysis_waiters = {}
+        win._pdf_url_keys = {}
+        win._pdf_map_jobs = set()
+        win._active_pdf_analysis_key = None
+        win._active_text_location_map = None
+        win._pdf_url = ""
+        win._mode = "courtlistener"
+        win._bb = {"cite": "754 F.2d 898"}
+        win._base_citation_override = ""
+        win._us_reports_cite = ""
+        win._item = {}
+        win._header_cites = []
+        win._case_law_pdf_choices = []
+        win._cl_primary = True
+        win._parts = []
+        win._scholar_text = ""
+        win._cl_parts = []
+        win._cl_text = text
+        win._post = lambda fn, *args: fn(*args)
+        win._install_current_location_map = Mock()
+        win._ensure_cached_location_maps = (
+            _ScholarTextWindow._ensure_cached_location_maps.__get__(win)
+        )
+        return win
+
+    def test_real_extraction_reaches_cache_callback_and_location_map(self):
+        first = (
+            "The first reporter page explains the distinctive federal "
+            "jurisdictional question."
+        )
+        second = (
+            "The next reporter page applies the governing rule and affirms "
+            "the judgment."
+        )
+        win = self._window(f"{first} *899 {second}")
+        callback = Mock()
+
+        class ImmediateThread:
+            def __init__(self, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch("courtlistener_gui.threading.Thread", ImmediateThread):
+            key = win._request_pdf_analysis(
+                self._pdf(first, second),
+                _static_case_law_url("754 F.2d 898"),
+                callback,
+            )
+
+        result = win._pdf_analysis_cache[key]
+        self.assertEqual(len(result["pages"]), 2)
+        self.assertIn("courtlistener", result["maps"])
+        self.assertEqual(
+            [row.reporter_page
+             for row in result["maps"]["courtlistener"].boundaries],
+            [898, 899],
+        )
+        callback.assert_called_once_with(result)
+
+    def test_finished_analysis_rechecks_text_sources_that_arrived_late(self):
+        win = self._window("Text that was loaded while PDF extraction ran.")
+        key = ("pdf", 1, b"late-source")
+        win._pdf_analysis_running.add(key)
+        win._ensure_cached_location_maps = Mock()
+
+        win._finish_pdf_analysis(
+            key,
+            {
+                "url": _static_case_law_url("754 F.2d 898"),
+                "pages": [],
+                "links": {},
+                "page_info": [],
+                "part_starts": {},
+                "maps": {},
+            },
+        )
+
+        win._ensure_cached_location_maps.assert_called_once_with(key)
 
 
 class WriterParentheticalTests(unittest.TestCase):
