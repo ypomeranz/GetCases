@@ -2698,6 +2698,63 @@ def _us_reports_cite(cite: str) -> str:
     return f"{int(m.group(1)) + off} U.S. {m.group(3)}" if off is not None else ""
 
 
+# The docket line a report prints under the caption: "No. 25-52.",
+# "Nos. 24-1287, 25-250.", "No. 24A1007 24-1177."  Consolidated dockets keep
+# only the first — rule 10.8.1(b) cites one.
+_DOCKET_LINE_RE = re.compile(
+    r"^Nos?\.\s*(\d{1,3}[-‐‑–—]\d{1,5}|\d{2,3}A\d{1,5})", re.IGNORECASE)
+# "Decided November 24, 2025." on its own line under the docket.
+_DECIDED_LINE_RE = re.compile(
+    r"\b(?:Decided|Filed|Released|Entered)\b[^A-Za-z0-9]{0,4}"
+    r"(January|February|March|April|May|June|July|August|September|"
+    r"October|November|December)\s+(\d{1,2}),?\s+(1[6-9]\d{2}|20\d{2})",
+    re.IGNORECASE,
+)
+#: Bluebook table T12: the months, as a citation abbreviates them.
+_T12_MONTHS = {
+    "january": "Jan.", "february": "Feb.", "march": "Mar.", "april": "Apr.",
+    "may": "May", "june": "June", "july": "July", "august": "Aug.",
+    "september": "Sept.", "october": "Oct.", "november": "Nov.",
+    "december": "Dec.",
+}
+
+
+def _docket_cite(item: dict, blocks: list) -> str:
+    """The "No. 25-52" a not-yet-reported opinion is cited by (rule
+    10.8.1(b)), from the opinion's own docket line or the search result."""
+    for b in (blocks or [])[:16]:
+        if getattr(b, "kind", "") not in ("center", "heading"):
+            continue
+        m = _DOCKET_LINE_RE.match(re.sub(r"\s+", " ", b.text()).strip())
+        if m:
+            return f"No. {m.group(1).replace('‐', '-').replace('–', '-')}"
+    raw = re.sub(r"\s+", " ", str(item.get("docketNumber")
+                                  or item.get("docket_number") or "")).strip()
+    m = _DOCKET_LINE_RE.match(raw) or _DOCKET_LINE_RE.match(f"No. {raw}")
+    return f"No. {m.group(1)}" if m else ""
+
+
+def _decision_date_paren(item: dict, blocks: list) -> str:
+    """The decision date as a citation parenthetical prints it —
+    "Nov. 24, 2025" — from the opinion's "Decided …" line, else the
+    search result's filing date.  "" when only a year is known: a bare year
+    belongs to a reported citation, not a docket one."""
+    for b in (blocks or [])[:16]:
+        if getattr(b, "kind", "") not in ("center", "heading"):
+            continue
+        m = _DECIDED_LINE_RE.search(re.sub(r"\s+", " ", b.text()))
+        if m:
+            month = _T12_MONTHS.get(m.group(1).lower(), "")
+            if month:
+                return f"{month} {int(m.group(2))}, {m.group(3)}"
+    filed = str(item.get("dateFiled") or item.get("date_filed") or "")
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", filed)
+    if not m:
+        return ""
+    month = list(_T12_MONTHS.values())[int(m.group(2)) - 1]
+    return f"{month} {int(m.group(3))}, {m.group(1)}"
+
+
 def _citation_search_variants(query: str) -> tuple[str, ...]:
     """Equivalent citation spellings, with the query as entered first.
 
@@ -16002,9 +16059,13 @@ class _ScholarTextWindow:
         bb = self._bb
         name = bb.get("name", "")
         cite = bb.get("display_cite") or bb.get("cite", "")
+        court, year = bb.get("court", ""), bb.get("year", "")
+        if not cite and bb.get("docket_cite"):
+            # Not reported yet: docket number and exact date (rule 10.8.1(b)).
+            cite, court, year = bb["docket_cite"], bb["docket_paren"], ""
         value = f"{name}, {cite}" if name and cite else (name or cite)
         paren = "" if bb.get("omit_parenthetical") else " ".join(
-            p for p in (bb.get("court", ""), bb.get("year", "")) if p
+            p for p in (court, year) if p
         )
         return f"{value} ({paren})" if value and paren else value
 
@@ -18374,9 +18435,25 @@ class _ScholarTextWindow:
                 display_cite = wi_cite
                 omit_parenthetical = "1"
                 pin_kind = "paragraph"
+        # An opinion the reporters have not reached yet — anything decided in
+        # the last year or two — has no volume and page to be cited by, and
+        # the Court itself prints "606 U. S. ____".  Rule 10.8.1(b) cites it
+        # by docket number and exact date instead.  Kept apart from ``cite``,
+        # which every reporter-keyed path downstream (the official-PDF
+        # resolver, the pin cites, the star pagination) parses as a volume.
+        docket_cite = docket_paren = ""
+        if not cite:
+            docket_cite = _docket_cite(item, self._blocks)
+            decided = _decision_date_paren(item, self._blocks)
+            if docket_cite and decided:
+                court_name = "U.S." if is_scotus else court_abbr
+                docket_paren = " ".join(p for p in (court_name, decided) if p)
+            else:
+                docket_cite = ""
         return {
             "name": name, "cite": cite, "display_cite": display_cite,
             "court": court_abbr, "year": year,
+            "docket_cite": docket_cite, "docket_paren": docket_paren,
             "omit_parenthetical": omit_parenthetical, "pin_kind": pin_kind,
             "_caption_case_unresolved": unresolved_caption_case,
         }
@@ -18835,6 +18912,9 @@ class _ScholarTextWindow:
         name = bb["name"]
         cite = cite_override or bb.get("display_cite") or bb["cite"]
         court, year = bb["court"], bb["year"]
+        if not cite and bb.get("docket_cite"):
+            # Not reported yet: docket number and exact date (rule 10.8.1(b)).
+            cite, court, year = bb["docket_cite"], bb["docket_paren"], ""
         rest = ""
         if cite:
             if pin and bb.get("pin_kind") == "paragraph" and ", " in cite:
