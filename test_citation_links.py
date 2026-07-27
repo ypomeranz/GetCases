@@ -611,6 +611,30 @@ class ConstitutionCiteTests(unittest.TestCase):
                 self.assertEqual(len(found), 1, found)
                 self.assertEqual(found[0][1], ("const", spec))
 
+    def test_the_reporters_own_abbreviation_is_read(self):
+        # "U. S. Const., Amdt. 1" is how the Court's reporter writes it; the
+        # Bluebook's "amend." was all the pattern knew, so Trump v. Hawaii's
+        # Establishment Clause cite fell through to the whole document.
+        for text, spec in [("U. S. Const., Amdt. 1", "amend:1:"),
+                           ("U. S. Const., Amdt. 14, § 1", "amend:14:1"),
+                           ("U. S. Const., Amdts. 5, 14", "amend:5:"),
+                           ("U. S. Const., Art. III, § 2", "art:3:2")]:
+            with self.subTest(text=text):
+                found = [(text[s:e], a) for s, e, a in detect_links(text)
+                         if a[0] == "const"]
+                self.assertEqual([a for _t, a in found], [("const", spec)])
+
+    def test_the_document_with_no_part_named_is_not_a_cite(self):
+        # Prose about the Constitution, not a citation to any part of it —
+        # linking it sent the reader to the Preamble, which nobody cited.
+        for text in ("U.S. Constitution",
+                     "the U. S. Constitution guarantees",
+                     "authority under the Constitution to decide legal "
+                     "questions",
+                     "the oath to adhere to the Constitution is not confined"):
+            with self.subTest(text=text):
+                self.assertEqual(self._consts(text), [])
+
     def test_a_plural_amendment_still_links(self):
         # "the Fifth and Fourteenth Amendments" is ordinary prose; the closing
         # word boundary must not exclude the "s".
