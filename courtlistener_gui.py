@@ -1886,7 +1886,14 @@ _LOC_CUTOFF = 542
 # GPO's GovInfo edition; GovInfo is used only when LOC hasn't the volume/page.
 _LOC_PREFERRED_MAX = 501
 _GOVINFO_MAX = 583
-_US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
+# A U.S. Reports citation.  The space in "U. S." is not optional in practice —
+# it is how the Court itself sets the reporter, and how CourtListener and
+# Google Scholar hand it over — so it is tolerated here.  Without that,
+# "601 U. S. 124" fell through every path keyed on this pattern (the GovInfo
+# and LOC URLs, the "we already have a U.S. cite" test, the cite recorded for
+# the saved file name) while us_reports_pdf's own laxer pattern still found the
+# scan, which is how a U.S. Reports PDF came to be saved under its S. Ct. cite.
+_US_CITE_RE = re.compile(r"(\d+)\s+U\.\s?S\.\s+(\d+)")
 
 # The Supreme Court Reporter ("93 S. Ct. 705", or "S.Ct." closed up as Google
 # Scholar prints it).  Only SCOTUS opinions carry this reporter, so a match is a
@@ -12585,7 +12592,11 @@ def _fetch_pdf_bytes(
 ) -> "Optional[tuple[bytes, str]]":
     """Fetch *url* as a PDF, following a small HTML wrapper if necessary.
     file:// URLs (opinions extracted from local US Reports volumes) are read
-    straight from disk."""
+    straight from disk.
+
+    A preliminary print's "Page Proof Pending Publication" stamp is taken out
+    here, so every path downstream — the viewer, the printer, Download PDF —
+    gets the clean document."""
     queue = [url]
     seen: set[str] = set()
     while queue and len(seen) < max_hops:
@@ -12602,7 +12613,7 @@ def _fetch_pdf_bytes(
                 print(f"[pdf] local file read failed ({exc}): {cur}")
                 continue
             if data is not None:
-                return data, cur
+                return _strip_page_proof_watermark(data), cur
             continue
         resp = _pdf_get(cur, client=client, timeout=timeout)
         resp.raise_for_status()
@@ -12611,11 +12622,140 @@ def _fetch_pdf_bytes(
             resp.content, resp.headers.get("Content-Encoding", ""))
         data = _normalize_pdf_bytes(content)
         if data is not None:
-            return data, final_url
+            return _strip_page_proof_watermark(data), final_url
         for nxt in _pdf_link_candidates_from_html(content, final_url):
             if nxt not in seen and nxt not in queue:
                 queue.append(nxt)
     return None
+
+
+# The Reporter of Decisions stamps every page of a preliminary print with a
+# grey diagonal "Page Proof Pending Publication".  It is a real page object,
+# not part of the opinion, and it muddies the text on screen and drinks ink in
+# print — so it is taken out of the document as soon as it is fetched.
+_PAGE_PROOF_RE = re.compile(r"page\s*proof\s*pending\s*publication",
+                            re.IGNORECASE)
+
+
+def _text_obj_string(obj, textpage) -> str:
+    """The text a pdfium text object draws, or "" if it cannot be read."""
+    import ctypes
+
+    import pypdfium2.raw as C
+
+    try:
+        buf = ctypes.create_string_buffer(512)
+        n = C.FPDFTextObj_GetText(
+            obj, textpage, ctypes.cast(buf, ctypes.POINTER(ctypes.c_ushort)),
+            512,
+        )
+        if not n:
+            return ""
+        return bytes(buf[:n * 2]).decode("utf-16-le", "replace").rstrip("\x00")
+    except Exception:
+        return ""
+
+
+def _is_page_proof_object(obj, textpage, depth: int = 0) -> bool:
+    """True for the watermark: a text object drawing the phrase, or a form
+    whose contents are *entirely* such objects.  Requiring the whole form to
+    be watermark keeps a form that also carries opinion text from being
+    dropped along with it."""
+    import pypdfium2.raw as C
+
+    try:
+        kind = C.FPDFPageObj_GetType(obj)
+    except Exception:
+        return False
+    if kind == C.FPDF_PAGEOBJ_TEXT:
+        return bool(_PAGE_PROOF_RE.search(_text_obj_string(obj, textpage)))
+    if kind == C.FPDF_PAGEOBJ_FORM and depth < 3:
+        try:
+            n = C.FPDFFormObj_CountObjects(obj)
+        except Exception:
+            return False
+        return bool(n) and all(
+            _is_page_proof_object(C.FPDFFormObj_GetObject(obj, i),
+                                  textpage, depth + 1)
+            for i in range(n)
+        )
+    return False
+
+
+def _strip_page_proof_watermark(data: bytes) -> bytes:
+    """Return *data* with the "Page Proof Pending Publication" watermark
+    removed from every page, or *data* unchanged when there is none.
+
+    Cheap on the overwhelming majority of PDFs: a preliminary print carries the
+    stamp on every page, so the first page decides whether to look at the rest.
+    Any failure returns the original bytes — a watermark is a blemish, losing
+    the opinion is not.
+    """
+    import io
+
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as C
+
+    try:
+        with _PDFIUM_LOCK:
+            doc = pdfium.PdfDocument(data, autoclose=False)
+    except Exception:
+        return data
+    try:
+        with _PDFIUM_LOCK:
+            if not len(doc):
+                return data
+            first = doc[0]
+            try:
+                tp = first.get_textpage()
+                try:
+                    stamped = bool(_PAGE_PROOF_RE.search(tp.get_text_range()))
+                finally:
+                    tp.close()
+            finally:
+                first.close()
+            if not stamped:
+                return data
+
+            removed = 0
+            for i in range(len(doc)):
+                page = doc[i]
+                try:
+                    tp = page.get_textpage()
+                    try:
+                        victims = [
+                            obj for obj in (
+                                C.FPDFPage_GetObject(page, k)
+                                for k in range(C.FPDFPage_CountObjects(page))
+                            )
+                            if _is_page_proof_object(obj, tp)
+                        ]
+                    finally:
+                        tp.close()
+                    for obj in victims:
+                        if C.FPDFPage_RemoveObject(page, obj):
+                            C.FPDFPageObj_Destroy(obj)
+                            removed += 1
+                    if victims:
+                        C.FPDFPage_GenerateContent(page)
+                finally:
+                    page.close()
+            if not removed:
+                return data
+            buf = io.BytesIO()
+            doc.save(buf)
+            out = buf.getvalue()
+        print(f"[pdf] removed {removed} page-proof watermarks")
+        return out if out.startswith(b"%PDF") else data
+    except Exception as exc:
+        print(f"[pdf] watermark removal failed ({exc}); keeping the original")
+        return data
+    finally:
+        try:
+            with _PDFIUM_LOCK:
+                doc.close()
+        except Exception:
+            pass
 
 
 def _page_has_scan_background(page) -> bool:
