@@ -179,6 +179,11 @@ _JOURNAL_REPORTER_RE = re.compile(
     r"L\.\s?J\.|L\.\s?Rev\.|L\.\s?Q\.|\bRev\.|(?<![A-Za-z.])J\."
 )
 
+# "10 Op. Atty Gen. 382" — an opinion of the Attorney General.  Cited in a
+# reporter's shape, but it is executive advice, not a decided case, and no
+# case-law source can open it.
+_AG_OPINION_RE = re.compile(r"Att(?:orne)?y?\.?\s*'?y?\.?\s*Gen", re.IGNORECASE)
+
 # Short-form citation: "Roe, 410 U.S., at 152" → volume, reporter, pin page.
 SHORT_CITE_RE = re.compile(
     r"\b(\d{1,4})\s+(" + REPORTER_ALT + r")\s*,?\s+at\s+(\d{1,5})\b")
@@ -248,6 +253,9 @@ _RANGE_TAIL_RE = re.compile(r"\s*[-–—]\s*\*?\d{1,6}(?!\d)")
 # scan for one ("District of Columbia v. Wesby", "Rhode Island ex rel. …").
 _NAME_CONNECTORS = frozenset({
     "of", "the", "and", "for", "et", "al", "al.", "ex", "rel.", "rel",
+    # "Goodell v. Jackson ex dem. Smith" — the old form for a suit brought on
+    # another's demise, and as much part of the name as "ex rel." is.
+    "dem.", "dem",
     "de", "del", "des", "du", "da", "dos", "la", "le", "van", "von",
     "den", "der", "&", "on", "to",
 })
@@ -465,7 +473,7 @@ def _name_token_ok(tok: str) -> bool:
 
 def _case_cite_spans(
     text: str, start: int, end: int, floor: int, *, short: bool = False,
-    italic=None,
+    italic=None, with_name: bool = True,
 ) -> "list[tuple[int, int, str]]":
     """The links the citation at ``(start, end)`` should produce, as
     ``(span_start, span_end, pin)`` in document order.
@@ -479,10 +487,16 @@ def _case_cite_spans(
     ``pin`` is empty on the first segment, whose page the caller has already
     worked into the citation it built (a short cite resolves its own pin through
     the document index); later segments carry the page to open.
+
+    ``with_name=False`` skips the backward scan for a case name — an "Id." has
+    none, but its pages want splitting just the same ("id., at 675, 681–683,
+    693" is three).  ``short=True`` says the match already ends at its first
+    page, so only the tail of a range remains to be taken.
     """
-    name_start = _case_name_start(text, start, floor, italic)
-    if name_start is not None:
-        start = name_start
+    if with_name:
+        name_start = _case_name_start(text, start, floor, italic)
+        if name_start is not None:
+            start = name_start
     if short:
         # SHORT_CITE_RE ends at the first page of a range; take the rest so the
         # whole range is highlighted.  It still opens at that first page.
@@ -671,6 +685,8 @@ def _valid_case_reporter(rep: str) -> bool:
         return False
     if _JOURNAL_REPORTER_RE.search(rep or ""):
         return False  # a law review, not a reporter — no case to open
+    if _AG_OPINION_RE.search(rep or ""):
+        return False  # an Attorney General opinion, not a decided case
     if key in _PLAIN_CASE_REPORTERS or key.endswith("lexis"):
         return True
     return "." in (rep or "")
@@ -1053,6 +1069,15 @@ def _cite_first_page(base_cite: str) -> "int | None":
         return None
 
 
+def _page_in_window(first_page: int, pin: str) -> bool:
+    """True when *pin* is within :data:`ID_PIN_WINDOW` pages of *first_page*."""
+    try:
+        n = int(pin)
+    except (TypeError, ValueError):
+        return False
+    return first_page <= n <= first_page + ID_PIN_WINDOW
+
+
 def _id_pin_in_range(base_cite: str, pin: str) -> bool:
     """True when an "Id., at *pin*" page falls within :data:`ID_PIN_WINDOW` pages
     of *base_cite*'s start page — i.e. a page of that reporter, not a record page."""
@@ -1069,8 +1094,13 @@ def _id_pin_in_range(base_cite: str, pin: str) -> bool:
 ID_LOOKBACK = 4
 
 
+# The page a Statutes at Large link opens to, read back out of its GovInfo URL.
+_STAT_URL_PAGE_RE = re.compile(r"/statute/(\d+)/(\d+)")
+
+
 def _id_antecedent(
     text: str, recent: list, pin: "str | None", start: int,
+    unlinkable: "list[tuple[int, int]] | None" = None,
 ) -> "tuple[str, str] | None":
     """The citation an "Id., at *pin*" refers to, or ``None``.
 
@@ -1083,6 +1113,10 @@ def _id_antecedent(
     is tried, and so on.
 
     *recent* is the citations seen so far as ``(action, end)``, oldest first.
+    *unlinkable* holds the spans of authorities that were recognised but
+    deliberately not linked — a law review, an Attorney General opinion.  An
+    "Id." after one of those refers to *it*, so it must not reach past one to
+    an earlier authority and cite the wrong source.
     """
     if pin is None:
         return None  # a bare "Id." names no page, and is never linked
@@ -1090,12 +1124,20 @@ def _id_antecedent(
         gap = len(text[end:start].strip())
         if gap > ID_FAR_GAP:
             break
+        if any(end <= u_start and u_end <= start
+               for u_start, u_end in unlinkable or ()):
+            break  # something we cannot open stands in between
         if action[0] == "const":
             continue  # unpaginated — "at N" cannot be pointing here
         if action[0] == "cite":
             if _id_pin_in_range(action[1], pin):
                 return ("cite", f"{action[1]}@{pin}")
             continue  # that reporter has no such page — look further back
+        if action[0] == "statpdf":
+            # The Statutes at Large are paginated, so the same test applies.
+            m = _STAT_URL_PAGE_RE.search(action[1])
+            if m and not _page_in_window(int(m.group(2)), pin):
+                continue
         if gap > ID_NEAR_GAP:
             break  # a statute has no page to corroborate the reference with
         return action  # a statute/rule/regulation simply reopens
@@ -1129,6 +1171,13 @@ def detect_links(
     # layer has none, and gating on it would then drop every case name.
     if italic is not None and not any(italic):
         italic = None
+    # Authorities recognised in a reporter's shape but deliberately not linked
+    # — a law review, an Attorney General opinion, the joint appendix.  They
+    # are still authorities, so an "Id." following one must stop there.
+    unlinkable = [
+        (m.start(), m.end()) for m in BROAD_CITE_CAPTURE_RE.finditer(text)
+        if not _valid_case_reporter(m.group(2))
+    ]
     index = build_short_cite_index(text)
     matches: list[tuple[int, int, str, object]] = []
     # English Reports citations first — both the reprint form ("156 Eng. Rep.
@@ -1173,14 +1222,24 @@ def detect_links(
     # Early lower-federal reporters ("1 Sumner, 73", "35 Fed. Rep. 665"),
     # pre-normalized to the abbreviations CourtListener indexes — claimed
     # ahead of the broad reporter fallback so the normalized form wins.
+    # The Statutes at Large ("14 Stat. 27") parse as a reporter cite as well,
+    # and a tie goes to whichever pass ran first — so this one runs before the
+    # case passes, and the volume GovInfo actually holds wins the span.
+    stat_spans: list[tuple[int, int]] = []
+    for m in statutes_at_large.STAT_CITE_RE.finditer(text):
+        if statutes_at_large.url_for(m):  # only link volumes GovInfo has
+            stat_spans.append((m.start(), m.end()))
+            matches.append((m.start(), m.end(), "stat", m))
     efed_spans: list[tuple[int, int]] = []
     for m in EARLY_FED_CITE_RE.finditer(text):
         if any(m.start() < e and s < m.end()
-               for s, e in engrep_spans + recap_spans + fedcas_spans):
+               for s, e in engrep_spans + recap_spans + fedcas_spans
+               + stat_spans):
             continue
         efed_spans.append((m.start(), m.end()))
         matches.append((m.start(), m.end(), "cite", early_fed_cite_text(m)))
-    claimed_spans = engrep_spans + recap_spans + fedcas_spans + efed_spans
+    claimed_spans = (engrep_spans + recap_spans + fedcas_spans + efed_spans
+                     + stat_spans)
     for m in _iter_case_cites(text):
         if any(m.start() < e and s < m.end() for s, e in claimed_spans):
             continue
@@ -1222,9 +1281,6 @@ def detect_links(
         if re.match(r"\s*id\.", c.text, re.IGNORECASE):
             continue
         matches.append((c.start, c.end, "statestat", c))
-    for m in statutes_at_large.STAT_CITE_RE.finditer(text):
-        if statutes_at_large.url_for(m):  # only link volumes GovInfo has
-            matches.append((m.start(), m.end(), "stat", m))
 
     matches.sort(key=lambda t: (t[0], -t[1]))
     # The running head cites the opinion in hand; skip anything inside it, and
@@ -1296,7 +1352,8 @@ def detect_links(
             ):
                 action = None
             else:
-                action = _id_antecedent(text, recent, m.group(1), start)
+                action = _id_antecedent(
+                    text, recent, m.group(1), start, unlinkable)
         elif kind == "statestat":
             action = state_statutes.action_for(m)
         elif kind == "stat":
@@ -1313,7 +1370,11 @@ def detect_links(
             action = None
         if action is not None:
             span_end = end
-            if kind in ("cite", "shortcite"):
+            # An "Id." pointing at a case carries pages the same way a cite
+            # does — "id., at 675, 681-683, 693" is three of them — so it is
+            # split alongside them.  It has no name to find.
+            id_pages = kind == "idcite" and action[0] == "cite"
+            if kind in ("cite", "shortcite") or id_pages:
                 # Blue the citation the reader sees, not just the reporter
                 # fragment the regex matched.  The name may not reach back past
                 # anything already linked, or past a running head.
@@ -1321,19 +1382,21 @@ def detect_links(
                 for hs, he in head_spans:
                     if he <= start:
                         floor = max(floor, he)
+                base = action[1].split("@")[0] if id_pages else cite_base
                 segments = _case_cite_spans(
-                    text, start, end, floor, short=(kind == "shortcite"),
-                    italic=italic,
+                    text, start, end, floor,
+                    short=(kind in ("shortcite", "idcite")),
+                    italic=italic, with_name=not id_pages,
                 )
                 for seg_start, seg_end, seg_pin in segments:
                     # The first segment opens the page already folded into
                     # *action*; each later pin cite opens its own page.
                     out.append((seg_start, seg_end, (
-                        ("cite", f"{cite_base}@{seg_pin}") if seg_pin
-                        else action
+                        ("cite", f"{base}@{seg_pin}") if seg_pin else action
                     )))
                 span_end = segments[-1][1]
-                recent.append((("cite", cite_base), span_end))
+                if not id_pages:
+                    recent.append((("cite", cite_base), span_end))
             else:
                 out.append((start, end, action))
                 if kind != "idcite":

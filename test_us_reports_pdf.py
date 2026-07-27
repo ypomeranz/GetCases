@@ -187,5 +187,59 @@ class WatermarkRemovalTests(unittest.TestCase):
                 self.assertIs(NS["_strip_page_proof_watermark"](data), data)
 
 
+@unittest.skipUnless(HAVE_PDFIUM, "pypdfium2 not installed")
+class LinkPipelineTests(unittest.TestCase):
+    """The extraction-to-rectangles chain, called the way the viewer calls it.
+
+    Every link on a PDF goes through these three functions in order, and the
+    viewer swallows any exception from them into an empty result — a mismatch
+    anywhere along the chain shows up not as a crash but as a page with no blue
+    on it.  Running the real chain end to end is what catches that.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import citations
+        cls.ns = _load(
+            "_union_line_runs", "_extract_pdf_text_and_style",
+            "_extract_pdf_text_pages", "_citation_links_from_pages",
+            "_page_has_scan_background", "_pdf_ocr_scan_pages",
+            "_citation_links_from_visible_pdf_text",
+            "_detect_pdf_citation_links",
+            consts=("_FONT_FLAG_ITALIC",),
+        )
+        cls.ns["detect_brief_links"] = citations.detect_links
+        cls.pdf = _minimal_pdf("See Roe v. Wade, 410 U.S. 113, 152 (1973).")
+
+    def test_the_extractor_returns_text_and_styling_in_step(self):
+        pages, italics = self.ns["_extract_pdf_text_and_style"](self.pdf)
+        self.assertEqual(len(pages), len(italics))
+        for chars, slants in zip(pages, italics):
+            self.assertEqual(len(chars), len(slants))
+
+    def test_the_one_value_extractor_still_returns_just_pages(self):
+        pages = self.ns["_extract_pdf_text_pages"](self.pdf)
+        self.assertTrue(all(len(c) == 2 for c in pages[0]),
+                        "consumers unpack (char, box)")
+
+    def test_the_viewer_chain_produces_rectangles(self):
+        pages, italics = self.ns["_extract_pdf_text_and_style"](self.pdf)
+        links, quiet = self.ns["_citation_links_from_visible_pdf_text"](
+            self.pdf, pages, italics)
+        self.assertTrue(sum(len(v) for v in links.values()),
+                        "no citation rectangles — nothing would turn blue")
+        self.assertEqual(quiet, set())
+
+    def test_styling_is_optional_all_the_way_down(self):
+        pages = self.ns["_extract_pdf_text_pages"](self.pdf)
+        links, _quiet = self.ns["_citation_links_from_visible_pdf_text"](
+            self.pdf, pages)
+        self.assertTrue(sum(len(v) for v in links.values()))
+
+    def test_the_convenience_wrapper_agrees(self):
+        direct = self.ns["_detect_pdf_citation_links"](self.pdf)
+        self.assertTrue(sum(len(v) for v in direct.values()))
+
+
 if __name__ == "__main__":
     unittest.main()

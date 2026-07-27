@@ -354,10 +354,13 @@ class LawJournalTests(unittest.TestCase):
               ("cite", "410 U.S. 113@152"))],
         )
 
-    def test_a_journal_is_not_an_id_antecedent(self):
+    def test_an_id_after_a_journal_is_left_alone(self):
+        # The "Id." means the Note — the thing it follows — so it must not
+        # reach past it and cite Roe instead.  Nothing can open the Note, so
+        # nothing is linked.
         text = ("Roe v. Wade, 410 U.S. 113 (1973). "
                 "See also Note, 47 Harv. L. Rev. 527. Id., at 152.")
-        self.assertEqual(_spans(text)[-1][1], ("cite", "410 U.S. 113@152"))
+        self.assertNotIn("Id., at 152", [t for t, _a in _spans(text)])
 
 
 class ItalicNameTests(unittest.TestCase):

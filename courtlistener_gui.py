@@ -13126,7 +13126,7 @@ def _detect_pdf_citation_links(pdf_bytes: bytes) -> dict:
 
 
 def _citation_links_from_visible_pdf_text(
-    pdf_bytes: bytes, pages: list,
+    pdf_bytes: bytes, pages: list, italics: "Optional[list]" = None,
 ) -> "tuple[dict, set[int]]":
     """Citation rectangles for the whole document, plus the page indexes
     whose text layer is OCR over a scan.  OCR glyph boxes land imprecisely,
@@ -13138,7 +13138,7 @@ def _citation_links_from_visible_pdf_text(
     except Exception as exc:
         print(f"[pdf-links] OCR scan check failed: {exc}")
         ocr_pages = set()
-    return _citation_links_from_pages(pages), ocr_pages
+    return _citation_links_from_pages(pages, italics), ocr_pages
 
 
 # ---------------------------------------------------------------------------
