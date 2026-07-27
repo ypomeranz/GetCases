@@ -529,6 +529,15 @@ _LIGATURES = {
     "ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ſ": "s",
 }
 
+#: Words a matched run needs before it may anchor a page.  A run of one or
+#: two ordinary words — "and", "of the" — matches all over an opinion and
+#: says nothing about where the page sits.  The reporter prints counsel and
+#: amici listings at the foot of the page the opinion opens on, while the
+#: text version carries them in the header, so those listings match nothing
+#: nearby and scatter exactly such runs across the source; left in, they
+#: drag the frontier past the whole of the following page.
+_MIN_ANCHOR_BLOCK = 4
+
 
 def _words(
     text: str,
@@ -974,7 +983,8 @@ def align_opinion_locations(
         reporter_page = pdf.page + page_index if pdf else None
         page_dense: list[LocationAnchor] = []
         page_source_tokens: set[int] = set()
-        for pdf_start, source_start, size in best_blocks:
+        substantial = [b for b in best_blocks if b[2] >= _MIN_ANCHOR_BLOCK]
+        for pdf_start, source_start, size in (substantial or best_blocks):
             page_source_tokens.update(range(source_start, source_start + size))
             samples = {0, size - 1}
             samples.update(range(0, size, 10))

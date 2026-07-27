@@ -607,6 +607,61 @@ class AlignmentTests(unittest.TestCase):
         self.assertTrue(first.exact)
         self.assertFalse(first.address.footnote)
 
+    def test_counsel_listing_at_a_page_foot_does_not_swallow_the_next_page(self):
+        # Carpenter v. United States, 585 U. S. 296: the reporter prints the
+        # amici listings at the foot of page 300, where the opinion opens,
+        # while the text version carries them up in the header.  Those
+        # listings match nothing nearby, so they scatter one- and two-word
+        # runs ("and", "of the", "for the") across the source — and the
+        # furthest of them used to drag the frontier past almost the whole of
+        # page 301, whose boundary then landed twenty lines down the page.
+        header = (
+            "Briefs of amici curiae were filed for the State of Alabama and "
+            "for the National District Attorneys Association and for their "
+            "several jurisdictions as follows and for the respondents. "
+        )
+        first = (
+            "Chief Justice Roberts delivered the opinion of the Court. This "
+            "case presents the question whether the Government conducts a "
+            "search when it accesses historical cell phone records. "
+        )
+        second = (
+            "phone's features. Each time the phone connects to a cell site "
+            "it generates a time-stamped record known as cell-site location "
+            "information. The precision of that information depends on the "
+            "size of the area the cell site covers. "
+        )
+        third = (
+            "several other suspects. That statute permits the Government to "
+            "compel the disclosure of certain telecommunications records."
+        )
+        source = build_text_source(
+            [_part((_span(header),)),
+             _part((_span(first), _span(second), _span(third)))],
+            "585 U. S. 296",
+        )
+        location_map = align_opinion_locations(
+            source,
+            [
+                # Page 300 prints the opinion's opening above a foot of amici
+                # listings; only the stray function words of those listings
+                # find anything to match.
+                _page([first, "and Denise M. Harle and Jordan E. Pratt of",
+                       "Montana and for the several jurisdictions and"]),
+                _page([second]),
+                _page([third]),
+            ],
+            pdf_cite="585 U. S. 296",
+            us_cite="585 U. S. 296",
+        )
+
+        starts = {
+            b.reporter_page: source.text[b.source_offset:b.source_offset + 20]
+            for b in location_map.boundaries
+        }
+        self.assertEqual(starts.get(297), second[:20])
+        self.assertEqual(starts.get(298), third[:20])
+
 
 if __name__ == "__main__":
     unittest.main()
