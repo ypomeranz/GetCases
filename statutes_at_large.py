@@ -24,9 +24,14 @@ STAT_MAX_VOL = 137
 
 # "<volume> Stat. <page>" — a number immediately before "Stat." (so it can't be
 # a state code like "Minn. Stat.") and a bare page number after (so it can't be
-# "Stat. §" of a state code).  The period is required to avoid matching words
-# like "status".
-STAT_CITE_RE = re.compile(r"\b(\d{1,3})\s+Stat\.\s+(\d{1,5})\b")
+# "Stat. §" of a state code).  Scholar and OCR text sometimes close the space
+# after the abbreviation ("98 Stat.1981-82"), so that space is optional.  A
+# printed page range is part of the visible link, while group 2 remains the
+# first page GovInfo should open.
+STAT_CITE_RE = re.compile(
+    r"\b(\d{1,3})\s+Stat\.\s*(\d{1,5})"
+    r"(?:\s*[-–—]\s*\d{1,5})?\b"
+)
 
 
 def cite_label(m: re.Match) -> str:
@@ -62,6 +67,7 @@ if __name__ == "__main__":
         ("see 1 Stat. 112", "1", "112"),
         ("ch. 20, 60 Stat. 237", "60", "237"),
         ("act of June 25, 1948, 62 Stat. 869, 928", "62", "869"),  # page, not pincite
+        ("Pub. L. No. 98-473, 98 Stat.1981-82", "98", "1981"),
     ]:
         m = first(text)
         got = (m.group(1), m.group(2)) if m else None

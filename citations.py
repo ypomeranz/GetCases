@@ -202,10 +202,13 @@ BROAD_SHORT_CITE_RE = re.compile(
 ID_CITE_RE = re.compile(r"\bid\.(?:\s*,?\s*at\s+\*?(\d{1,6}))?", re.IGNORECASE)
 
 # Record cites in briefs commonly use "Id." too.  If one appears between an
-# authority and a later "Id. at N", do not carry the authority forward.
+# authority and a later "Id. at N", do not carry the authority forward.  The
+# suffix guard matters for bare "ER"/"SER": without it ordinary prose such as
+# "error," "erred," and "errors" falsely breaks the chain.
 _RECORD_CITE_RE = re.compile(
     r"\b(?:App\.|J\.?A\.|A\.R\.|R\.|Tr\.|Dkt\.|Doc\.|ECF|Ex\.|ER|SER)"
-    r"\s*(?:No\.?\s*)?[\w*.-]+|\b(?:ECF|Dkt\.|Doc\.)\s+No\.?\s+\d+|¶\s*\d+",
+    r"(?![A-Za-z])\s*(?:No\.?\s*)?[\w*.-]+"
+    r"|\b(?:ECF|Dkt\.|Doc\.)\s+No\.?\s+\d+|¶\s*\d+",
     re.IGNORECASE,
 )
 
@@ -1413,16 +1416,15 @@ def detect_links(
                         ("cite", f"{base}@{seg_pin}") if seg_pin else action
                     )))
                 span_end = segments[-1][1]
-                if not id_pages:
-                    recent.append((("cite", cite_base), span_end))
+                # An Id. is itself the nearest antecedent for a following Id.,
+                # but retain the clean reporter cite rather than its @pin
+                # action so a chain never becomes "base@23@24".
+                recent.append((("cite", base), span_end))
             else:
                 out.append((start, end, action))
-                if kind != "idcite":
-                    # An "Id." must not become the antecedent of the next
-                    # "Id." — chaining its already-pinned value builds a
-                    # malformed "410 U.S. 113@48@32".  Keep pointing at the
-                    # real citation, as the opinion reader's dispatch does.
-                    recent.append((action, span_end))
+                # Non-case Id. chains (to a statute, rule, or regulation) are
+                # safe too: their action has no pin suffix to accumulate.
+                recent.append((action, span_end))
             last_cite_end = span_end
             pos = span_end
             continue

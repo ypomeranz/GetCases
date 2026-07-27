@@ -3349,6 +3349,82 @@ def _special_citation_ranges(
     return merged
 
 
+def _text_opinion_link_ranges(parts) -> dict[int, list]:
+    """Whole-opinion citation links mapped back to each rendered block.
+
+    PDF opinions already run :func:`citations.detect_links` over the complete
+    text layer, which is what lets an ``Id.`` see an antecedent in an earlier
+    paragraph and lets a multi-pin cite produce one link per page.  Text
+    opinions used to scan each formatting span independently instead.  Build a
+    logical full-opinion stream here, retain a character map for every block,
+    and return block-relative ranges that the styled renderer can apply.
+
+    A single newline separates paragraphs so an ``Id.`` opening the next
+    paragraph can still refer back (as it does in Giancola).  Part and
+    body/footnote boundaries use a blank line to stop an antecedent from
+    leaking into a different writing or note apparatus.
+    """
+    chunks: list[str] = []
+    italic: list[bool] = []
+    block_offsets: list[tuple[int, int, int]] = []
+    cursor = 0
+
+    def add(text: str, slanted: bool = False) -> None:
+        nonlocal cursor
+        chunks.append(text)
+        italic.extend([slanted] * len(text))
+        cursor += len(text)
+
+    for pi, part in enumerate(parts or []):
+        if pi:
+            add("\n\n")
+        groups = (
+            list(getattr(part, "blocks", None) or []),
+            list(getattr(part, "footnotes", None) or []),
+        )
+        wrote_group = False
+        for group in groups:
+            if not group:
+                continue
+            if wrote_group:
+                add("\n\n")
+            for bi, block in enumerate(group):
+                if bi:
+                    add("\n")
+                start = cursor
+                for span in getattr(block, "spans", None) or []:
+                    text = str(getattr(span, "text", "") or "")
+                    add(text, bool(getattr(span, "italic", False)))
+                block_offsets.append((id(block), start, cursor))
+            wrote_group = True
+
+    if not block_offsets:
+        return {}
+    text = "".join(chunks)
+    try:
+        detected = detect_brief_links(text, italic=italic)
+    except Exception:
+        return {}  # retain the span-by-span legacy path on detector failure
+
+    out: dict[int, list] = {
+        block_id: [] for block_id, _start, _end in block_offsets
+    }
+    oi = 0
+    for start, end, action in detected:
+        while oi < len(block_offsets) and block_offsets[oi][2] <= start:
+            oi += 1
+        j = oi
+        while j < len(block_offsets) and block_offsets[j][1] < end:
+            block_id, block_start, block_end = block_offsets[j]
+            lo, hi = max(start, block_start), min(end, block_end)
+            if lo < hi:
+                out[block_id].append(
+                    (lo - block_start, hi - block_start, action)
+                )
+            j += 1
+    return out
+
+
 def _item_from_cluster(cluster: dict) -> dict:
     """A search-result-shaped item from a citation-lookup OpinionCluster,
     carrying just the fields the result rows and PDF resolver need."""
@@ -15100,6 +15176,10 @@ class _ScholarTextWindow:
         # WL/LEXIS cite → RECAP spec, built over the whole opinion so a docket
         # printed once also powers links on later short-form occurrences.
         self._recap_spec_index: dict[str, str] = {}
+        # Whole-opinion citation detections mapped back to styled source blocks.
+        # The key makes part-only re-renders reuse the same document scan.
+        self._text_link_cache_key: tuple[int, ...] = ()
+        self._text_block_links: dict[int, list] = {}
         # The most recently emitted citation's action — a case ("cite", base),
         # a statute ("usc"/"cfr"/"rule"/"const"/"statpdf"/…), etc. — so an "Id."
         # links back to whatever was last cited.  Reset per render.
@@ -15944,7 +16024,8 @@ class _ScholarTextWindow:
             self._fn_tip = None
 
     def _insert_span(self, span, block_tags: tuple, neutral: bool = False,
-                     link_tag: Optional[str] = None) -> None:
+                     link_tag: Optional[str] = None,
+                     detect_plain: bool = True) -> None:
         txt = self._text
         tags = list(block_tags)
         if span.pagenum:
@@ -15994,8 +16075,14 @@ class _ScholarTextWindow:
             tags += ["citelink", link_tag]
             txt.insert("end", span.text, tuple(tags))
             return
-        # Plain text: make recognizable citations clickable
-        self._insert_plain_with_links(span.text, tuple(tags))
+        # Plain text: make recognizable citations clickable.  A block covered
+        # by the whole-opinion scan has already reconciled every overlap and
+        # deliberately unlinked authority, so do not run the legacy per-span
+        # detector over its leftover pieces.
+        if detect_plain:
+            self._insert_plain_with_links(span.text, tuple(tags))
+        else:
+            txt.insert("end", span.text, tuple(tags))
 
     def _scholar_link_action(self, full_text: str, href: str) -> tuple[str, str]:
         """The click action for a Google Scholar case hyperlink whose text is
@@ -16268,6 +16355,34 @@ class _ScholarTextWindow:
             if re.search(r"[A-Za-z0-9]", tail):
                 self._pending_id = None
 
+    def _insert_text_with_document_links(self, text: str, tags: tuple) -> None:
+        """Insert an unstyled opinion through the whole-document detector.
+
+        Parsed text opinions use :func:`_text_opinion_link_ranges` so their
+        formatting survives.  CourtListener's rare plain-text fallback is
+        already one contiguous string, so apply those ranges directly.  If
+        the shared detector ever fails, retain the older local implementation
+        rather than preventing the opinion from rendering.
+        """
+        try:
+            ranges = detect_brief_links(text)
+        except Exception:
+            self._insert_plain_with_links(text, tags)
+            return
+        pos = 0
+        for start, end, action in ranges:
+            if start < pos:
+                continue
+            if start > pos:
+                self._text.insert("end", text[pos:start], tags)
+            link_tag = self._new_link(action)
+            self._text.insert(
+                "end", text[start:end], tags + ("citelink", link_tag)
+            )
+            pos = end
+        if pos < len(text):
+            self._text.insert("end", text[pos:], tags)
+
     def _render_footnotes(self, footnotes: list, part_tag: Optional[str]) -> None:
         """Insert a part's footnote blocks, recording each note's rendered
         region and number so copied selections can be pin-cited (page n.N)."""
@@ -16334,18 +16449,32 @@ class _ScholarTextWindow:
                        "".join(s.text for s in block.spans if not s.pagenum)).strip()
             )
         )
-        # English Reports, Federal Appendix, and unpublished federal opinions
-        # render as one of our links, replacing any Scholar link inside it.
-        link_ranges = _special_citation_ranges(
-            block.spans, self._recap_spec_index)
+        # Parts-aware text views use the same whole-document detector as PDFs,
+        # mapped back to this block.  Besides overriding Scholar links where
+        # our destination is better, this preserves cross-paragraph short/Id.
+        # context and gives every pin page its own link.
+        scanned = id(block) in self._text_block_links
+        link_ranges = self._text_block_links.get(id(block), [])
+        if not scanned:
+            # Legacy fallback for an ad-hoc block that was not part of the
+            # prepared document scan.
+            link_ranges = _special_citation_ranges(
+                block.spans, self._recap_spec_index)
         if link_ranges:
-            self._insert_spans_with_links(block, block_tags, neutral, link_ranges)
+            self._insert_spans_with_links(
+                block, block_tags, neutral, link_ranges,
+                detect_plain=not scanned,
+            )
         else:
-            self._insert_spans_grouped(block.spans, block_tags, neutral)
+            self._insert_spans_grouped(
+                block.spans, block_tags, neutral,
+                detect_plain=not scanned,
+            )
         self._text.insert("end", "\n\n", block_tags)
 
     def _insert_spans_grouped(self, spans, block_tags: tuple,
-                              neutral: bool) -> None:
+                              neutral: bool,
+                              detect_plain: bool = True) -> None:
         """Render a block's spans, giving every span of one Google Scholar case
         hyperlink — which Scholar often splits across italic/roman runs ("<i>
         Calder</i> v. <i>Bull,</i> 3 Dall. 386") — a single shared click action
@@ -16368,14 +16497,19 @@ class _ScholarTextWindow:
                 )
                 for s in spans[i:j]:
                     self._insert_span(s, block_tags, neutral=neutral,
-                                      link_tag=link_tag)
+                                      link_tag=link_tag,
+                                      detect_plain=detect_plain)
                 i = j
             else:
-                self._insert_span(spans[i], block_tags, neutral=neutral)
+                self._insert_span(
+                    spans[i], block_tags, neutral=neutral,
+                    detect_plain=detect_plain,
+                )
                 i += 1
 
     def _insert_spans_with_links(self, block, block_tags: tuple,
-                                 neutral: bool, ranges: list) -> None:
+                                 neutral: bool, ranges: list,
+                                 detect_plain: bool = True) -> None:
         """Render a block whose text contains citation runs we link ourselves
         (English Reports → CommonLII scan, Federal Appendix → case.law PDF): text
         inside a run gets one shared link (Scholar links dropped); everything
@@ -16388,7 +16522,10 @@ class _ScholarTextWindow:
             pos = s_end
             # Page/footnote markers never overlap a citation run — render whole.
             if span.pagenum or span.fnref or span.fndef or not span.text:
-                self._insert_span(span, block_tags, neutral=neutral)
+                self._insert_span(
+                    span, block_tags, neutral=neutral,
+                    detect_plain=detect_plain,
+                )
                 continue
             cur = s_start
             while cur < s_end:
@@ -16400,7 +16537,8 @@ class _ScholarTextWindow:
                     seg = span.text[cur - s_start: nxt - s_start]
                     if seg:
                         self._insert_span(_dc_replace(span, text=seg),
-                                          block_tags, neutral=neutral)
+                                          block_tags, neutral=neutral,
+                                          detect_plain=detect_plain)
                     cur = nxt
                 else:
                     rs, re_, action = ranges[ri]
@@ -16426,10 +16564,29 @@ class _ScholarTextWindow:
             tags.append("underline")
         tags += ["citelink", link_tag]
         self._text.insert("end", text, tuple(tags))
-        # A following "Id." should resolve to this E.R. case, not the last
-        # plain-text cite.
-        self._last_cite_action = self._link_actions.get(
-            link_tag, self._last_cite_action)
+        # Preserve a clean antecedent for the legacy fallback.  Pin-specific
+        # links must not produce a later "base@23@24" chain.
+        action = self._link_actions.get(link_tag)
+        if action and action[0] == "cite":
+            self._last_cite_action = ("cite", action[1].split("@", 1)[0])
+        elif action:
+            self._last_cite_action = action
+
+    def _prepare_text_link_ranges(self, parts) -> None:
+        """Cache one whole-document citation scan for repeated part renders."""
+        block_ids = tuple(
+            id(block)
+            for part in parts or []
+            for group in (
+                getattr(part, "blocks", None) or [],
+                getattr(part, "footnotes", None) or [],
+            )
+            for block in group
+        )
+        if block_ids == self._text_link_cache_key:
+            return
+        self._text_link_cache_key = block_ids
+        self._text_block_links = _text_opinion_link_ranges(parts)
 
     def _clear_part_region_marks(self) -> None:
         txt = getattr(self, "_text", None)
@@ -16492,6 +16649,7 @@ class _ScholarTextWindow:
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(self._scholar_text)
         self._recap_spec_index = _recap_spec_index(self._scholar_text)
+        self._prepare_text_link_ranges(self._parts)
         self._last_cite_action = None
         self._pending_id = None
         self._const_linked = set()
@@ -17140,11 +17298,14 @@ class _ScholarTextWindow:
             self._scholar_text or self._cl_text or "")
         self._recap_spec_index = _recap_spec_index(
             self._scholar_text or self._cl_text or "")
+        self._prepare_text_link_ranges(parts)
         self._last_cite_action = None
         self._pending_id = None
         self._const_linked = set()
         if not parts:
-            self._insert_plain_with_links(self._cl_text or "(no text)", ())
+            self._insert_text_with_document_links(
+                self._cl_text or "(no text)", ()
+            )
         else:
             if self._current_part is None:
                 shown = list(enumerate(parts))
@@ -17218,7 +17379,9 @@ class _ScholarTextWindow:
         txt = self._text
         txt.config(state="normal")
         txt.delete("1.0", "end")
-        self._insert_plain_with_links(self._cl_text or "(no text)", ())
+        self._insert_text_with_document_links(
+            self._cl_text or "(no text)", ()
+        )
         txt.config(state="disabled")
         self._mode = "courtlistener"
         self._sync_details_checkbox()  # back to the text view's own setting

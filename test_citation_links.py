@@ -14,6 +14,7 @@ import ast
 import pathlib
 import re
 import unittest
+from types import SimpleNamespace
 
 from citations import _valid_case_reporter, detect_links
 
@@ -168,6 +169,122 @@ class MultiplePinCiteTests(unittest.TestCase):
             _spans(text)[-2:],
             [("Intel, 542 U. S., at 254–255", ("cite", "542 U.S. 241@254")),
              (", 258", ("cite", "542 U.S. 241@258"))],
+        )
+
+    def test_id_with_a_second_pin_page(self):
+        text = ("United States v. Miller, 753 F.2d 19 (3d Cir. 1985). "
+                "Id. at 23, 24.")
+        self.assertEqual(
+            _spans(text)[-2:],
+            [("Id. at 23", ("cite", "753 F.2d 19@23")),
+             (", 24", ("cite", "753 F.2d 19@24"))],
+        )
+
+
+class StatutesAtLargeTests(unittest.TestCase):
+    def test_scholar_spacing_and_page_range(self):
+        text = "Pub. L. No. 98-473, § 203, 98 Stat.1981-82 (1984)."
+        self.assertEqual(
+            _spans(text),
+            [("98 Stat.1981-82",
+              ("statpdf",
+               "https://www.govinfo.gov/link/statute/98/1981"))],
+        )
+
+
+def _load_text_opinion_link_ranges():
+    src = pathlib.Path(__file__).with_name("courtlistener_gui.py").read_text()
+    tree = ast.parse(src)
+    node = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name == "_text_opinion_link_ranges"
+    )
+    ns = {"detect_brief_links": detect_links}
+    exec(ast.get_source_segment(src, node), ns)
+    return ns["_text_opinion_link_ranges"]
+
+
+class TextOpinionLinkRangeTests(unittest.TestCase):
+    """The PDF detector's document context survives styled text blocks."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.detect_blocks = staticmethod(_load_text_opinion_link_ranges())
+
+    @staticmethod
+    def _block(*spans):
+        return SimpleNamespace(spans=[
+            SimpleNamespace(text=text, italic=italic)
+            for text, italic in spans
+        ])
+
+    def _local_links(self, block, mapping):
+        text = "".join(span.text for span in block.spans)
+        return [(text[start:end], action)
+                for start, end, action in mapping[id(block)]]
+
+    def test_giancola_id_crosses_blocks_and_keeps_both_pins(self):
+        cite = self._block(
+            ("United States v. Miller, ", True),
+            ("753 F.2d 19 (3d Cir. 1985).", False),
+        )
+        discussion = self._block((
+            "The court explained at length why a trial judge need not "
+            "predict reversal before granting bail.",
+            False,
+        ))
+        first_ident = self._block(("Id.", True), (" at 23.", False))
+        application = self._block((
+            "We agree with that reasoning and apply the same construction "
+            "to the provision before us.",
+            False,
+        ))
+        ident = self._block(("Id.", True), (" at 23, 24.", False))
+        part = SimpleNamespace(
+            blocks=[cite, discussion, first_ident, application, ident],
+            footnotes=[],
+        )
+
+        links = self.detect_blocks([part])
+
+        self.assertEqual(
+            self._local_links(ident, links),
+            [("Id. at 23", ("cite", "753 F.2d 19@23")),
+             (", 24", ("cite", "753 F.2d 19@24"))],
+        )
+
+    def test_giancola_statute_range_maps_back_to_its_text_block(self):
+        block = self._block((
+            "Pub. L. No. 98-473, § 203, 98 Stat.1981-82 "
+            "(to be codified at 18 U.S.C. § 3143).",
+            False,
+        ))
+        part = SimpleNamespace(blocks=[block], footnotes=[])
+
+        links = self.detect_blocks([part])
+
+        self.assertIn(
+            ("98 Stat.1981-82",
+             ("statpdf",
+              "https://www.govinfo.gov/link/statute/98/1981")),
+            self._local_links(block, links),
+        )
+
+    def test_styled_full_cite_gets_pdf_style_pin_specific_ranges(self):
+        block = self._block(
+            ("Devenpeck v. Alford", True),
+            (", 543 U. S. 146, 149, 155–156 (2004).", False),
+        )
+        part = SimpleNamespace(blocks=[block], footnotes=[])
+
+        links = self.detect_blocks([part])
+
+        self.assertEqual(
+            self._local_links(block, links),
+            [("Devenpeck v. Alford, 543 U. S. 146, 149",
+              ("cite", "543 U.S. 146@149")),
+             (", 155–156 (2004)", ("cite", "543 U.S. 146@155"))],
         )
 
 
@@ -551,6 +668,15 @@ class RecordCiteTests(unittest.TestCase):
         # Linking it also handed the following "Id." the wrong case.
         self.assertEqual(_spans("See 2 App. 136. Id., at 137."), [])
 
+    def test_er_record_cite_still_breaks_an_id_chain(self):
+        text = ("Smith v. Jones, 500 U.S. 100 (2000). "
+                "The exhibit appears at ER 12. Id. at 105.")
+        self.assertEqual(
+            _spans(text),
+            [("Smith v. Jones, 500 U.S. 100 (2000)",
+              ("cite", "500 U.S. 100"))],
+        )
+
     def test_reporters_containing_app_still_link(self):
         for cite, want in [
             ("12 Cal. App. 4th 55", "12 Cal. App. 4th 55"),
@@ -650,6 +776,27 @@ class IdChainTests(unittest.TestCase):
         text = "See 841 F. Supp. 2d 20, 32 (DC 2012). Id., at 48. Id., at 32."
         for _t, (_kind, value) in _spans(text):
             self.assertLessEqual(value.count("@"), 1, value)
+
+    def test_chained_id_remains_the_nearest_clean_antecedent(self):
+        text = ("United States v. Miller, 753 F.2d 19 (3d Cir. 1985). "
+                "Id. at 23. The court then applied that construction. "
+                "Id. at 23, 24.")
+        self.assertEqual(
+            _spans(text)[-2:],
+            [("Id. at 23", ("cite", "753 F.2d 19@23")),
+             (", 24", ("cite", "753 F.2d 19@24"))],
+        )
+
+    def test_error_words_do_not_look_like_an_er_record_cite(self):
+        text = ("United States v. Miller, 753 F.2d 19 (3d Cir. 1985). "
+                "The court discussed the alleged error, why the judge had "
+                "not erred, and how those errors should be assessed. "
+                "Id. at 23, 24.")
+        self.assertEqual(
+            _spans(text)[-2:],
+            [("Id. at 23", ("cite", "753 F.2d 19@23")),
+             (", 24", ("cite", "753 F.2d 19@24"))],
+        )
 
     def test_id_looks_past_a_constitutional_citation(self):
         # The Constitution has no pages, so "at 888" means the case before it.
