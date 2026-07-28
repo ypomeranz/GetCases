@@ -1414,7 +1414,6 @@ import oyez
 import slip_opinion
 import opinion_location
 from citations import (
-    PINCITE_AFTER_RE as _PINCITE_AFTER_RE,
     TEXT_CITE_RE as _TEXT_CITE_RE,
     NOMINATIVE_PARALLEL_RE as _NOMINATIVE_PARALLEL_RE,
     US_NOMINATIVE_PARALLEL_RE as _US_NOMINATIVE_PARALLEL_RE,
@@ -1424,6 +1423,11 @@ from citations import (
     SHORT_CITE_RE as _SHORT_CITE_RE,
     ID_CITE_RE as _ID_CITE_RE,
     HAND_TYPED_CITE_RE as _LINE_CITE_RE,
+    join_note_pin as _join_note_pin,
+    note_pin_after_page as _note_pin_after_page,
+    pin_after as _pin_after,
+    pin_display as _pin_display,
+    split_note_pin as _split_note_pin,
     case_law_reporter_slug as _case_law_reporter_slug,
     reporter_citation_variants as _reporter_citation_variants,
     reporter_key as _canonical_reporter_key,
@@ -7626,7 +7630,7 @@ class CourtListenerGUI:
                            parent: "Optional[tk.Misc]" = None) -> None:
         title = f"{name} — {cite}" if name and cite else (cite or name)
         if pin:
-            title += f" at {pin}"
+            title += f" at {_pin_display(pin)}"
         view_parent = self.root if parent is None else parent
 
         def open_pdf() -> None:
@@ -7758,11 +7762,12 @@ class CourtListenerGUI:
         ttk.Label(
             frame,
             text="One citation per line — case name optional, pin cite "
-                 "after the page number:",
+                 "(page, or page and footnote) after the page number:",
         ).pack(anchor="w")
         ttk.Label(
             frame, foreground="gray",
-            text="e.g.  Monroe v. Pape, 365 U.S. 167, 171 (1961)",
+            text="e.g.  Monroe v. Pape, 365 U.S. 167, 171 (1961)"
+                 "   ·   Monroe v. Pape, 365 U.S. 167, 171 n.4 (1961)",
         ).pack(anchor="w", pady=(0, 4))
         box = tk.Text(frame, height=9, wrap="none", undo=True)
         box.pack(fill="both", expand=True)
@@ -15614,6 +15619,14 @@ class _ScholarTextWindow:
         self._mapped_us_note_pages: dict[str, int] = {}
         self._fn_region_fids: dict[str, str] = {}
         self._mapped_copy_cite = ""
+        # Reporter pagination recovered from an official scan in an earlier
+        # session and saved with the opinion: a stand-in location map that is
+        # ready before any PDF is fetched, so a pin cite lands at once.  The
+        # scan is still loaded in the background and replaces it (and the
+        # stored copy) if the alignment has changed.
+        self._stored_location_maps: dict[str, object] = {}
+        self._stored_pagination_started = False
+        self._saved_pagination_json: Optional[dict] = None
         self._pending_pdf_switch = False
         self._pending_pdf_target: Optional[tuple[int, float]] = None
         # A standalone PDF-first case view can hand us the address matching
@@ -15641,6 +15654,9 @@ class _ScholarTextWindow:
         # A bare "Id." whose pin ("at N") sits in a following span — (link tag,
         # base cite) — so the pin can be attached when that span arrives.
         self._pending_id: Optional[tuple[str, str]] = None
+        # A (cite, pin) this window was opened to jump to but could not reach
+        # yet — the inferred U.S. Reports pages arrive after the first render.
+        self._pending_pin_jump: Optional[tuple[str, str]] = None
         # Amendment numbers already linked in this render, so a repeated bare
         # prose mention ("the First Amendment guarantees …") isn't re-linked.
         self._const_linked: set[int] = set()
@@ -16623,7 +16639,12 @@ class _ScholarTextWindow:
         else:
             key = self._active_pdf_analysis_key
         result = self._pdf_analysis_cache.get(key) if key is not None else None
-        return (result or {}).get("maps", {}).get(mode)
+        found = (result or {}).get("maps", {}).get(mode)
+        if found is not None or url:
+            # A named PDF is being asked about specifically; the pagination
+            # saved with the opinion is not an answer about that file.
+            return found
+        return self._stored_location_maps.get(mode)
 
     @staticmethod
     def _location_address(value):
@@ -16673,6 +16694,7 @@ class _ScholarTextWindow:
         location_map = self._location_map_for(self._mode)
         if location_map is None:
             self._schedule_gutter_redraw()
+            self._retry_pending_pin_jump()
             return
         # Justification inserts display-only characters. Remove them while
         # translating source offsets, then let the normal reflow put them back;
@@ -16688,14 +16710,24 @@ class _ScholarTextWindow:
             if mark is not None:
                 self._live_location_anchors.append((mark, anchor))
 
-        if self._mapped_pages_are_us(location_map):
-            self._mapped_copy_cite = str(location_map.copy_cite)
+        # The inferred reporter pages need not come from the same map as the
+        # anchors above.  An alignment can be good enough to scroll between the
+        # text and the scan and still too coarse to pin-cite from, and when it
+        # is, pages already measured and saved with the opinion remain the
+        # better answer for the page track.
+        page_map = location_map
+        if not self._mapped_pages_are_us(page_map):
+            stored = self._stored_location_maps.get(self._mode)
+            page_map = stored if stored is not None else location_map
+
+        if self._mapped_pages_are_us(page_map):
+            self._mapped_copy_cite = str(page_map.copy_cite)
             # A selected writing can begin halfway through a reporter page whose
             # actual boundary lives in a hidden preceding part.  Seed the page
             # in effect at the selected part's first visible source address.
             current_part = getattr(self, "_current_part", None)
             if current_part is not None:
-                for run in getattr(location_map.source, "runs", ()) or ():
+                for run in getattr(page_map.source, "runs", ()) or ():
                     address = getattr(run, "address", None)
                     if (
                         address is None
@@ -16704,7 +16736,7 @@ class _ScholarTextWindow:
                         or address.block_id not in self._location_block_marks
                     ):
                         continue
-                    page = location_map.reporter_page(address)
+                    page = page_map.reporter_page(address)
                     index = self._location_index_for_address(address)
                     if page is not None and index is not None:
                         mark = self._new_location_mark(
@@ -16713,7 +16745,7 @@ class _ScholarTextWindow:
                         if mark is not None:
                             self._mapped_us_page_pos.setdefault(int(page), mark)
                     break
-            for boundary in getattr(location_map, "boundaries", ()) or ():
+            for boundary in getattr(page_map, "boundaries", ()) or ():
                 page = getattr(boundary, "reporter_page", None)
                 if page is None:
                     page = getattr(boundary, "page", None)
@@ -16738,9 +16770,15 @@ class _ScholarTextWindow:
                 if page is not None:
                     self._mapped_us_note_pages[fid] = page
 
-        self._active_text_location_map = location_map
+        # Copy reads its reporter and pin cites from the map that supplied the
+        # pages on screen, so a quotation is cited in the pagination the reader
+        # can see beside it.
+        self._active_text_location_map = page_map
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
+        # A pin cite followed into this window may have been waiting for these
+        # inferred reporter pages to exist.
+        self._retry_pending_pin_jump()
 
     def _mapped_page_at_index(self, index: str) -> Optional[int]:
         txt = self._text
@@ -16996,11 +17034,16 @@ class _ScholarTextWindow:
             id_start, id_end, ref = pend
             mp = re.match(r"\s*,?\s*at\s+(\d{1,5})\b", text)
             if mp and _id_pin_in_range(ref, mp.group(1)):
-                link_tag = self._new_link(("cite", f"{ref}@{mp.group(1)}"))
+                # A footnote pinpoint on that page ("at 160 n.4") belongs to
+                # the same link and decides where it lands.
+                notes, note_end = _note_pin_after_page(text, mp.end())
+                pin_end = note_end if notes else mp.end()
+                link_tag = self._new_link(
+                    ("cite", f"{ref}@{_join_note_pin(mp.group(1), notes)}"))
                 txt.tag_add("citelink", id_start, id_end)
                 txt.tag_add(link_tag, id_start, id_end)
-                txt.insert("end", text[:mp.end()], tags + ("citelink", link_tag))
-                text = text[mp.end():]
+                txt.insert("end", text[:pin_end], tags + ("citelink", link_tag))
+                text = text[pin_end:]
                 if not text:
                     return
         matches: list[tuple[int, int, str, re.Match]] = []
@@ -17052,8 +17095,9 @@ class _ScholarTextWindow:
             first = max(below) if below else pages[0]
             rep = re.sub(r"\s+", " ", m.group(2)).strip().replace("U. S.", "U.S.")
             cite = f"{m.group(1)} {rep} {first}"
-            if pin != first:
-                cite += f"@{pin}"
+            notes, _note_end = _note_pin_after_page(text, m.end())
+            if pin != first or notes:
+                cite += "@" + _join_note_pin(str(pin), notes)
             matches.append((m.start(), m.end(), "shortcite", cite))
         # "Id. at 152" — refers to the previous citation; resolved in document
         # order in the processing loop below.
@@ -17092,12 +17136,14 @@ class _ScholarTextWindow:
                     cite = cite.replace("’", "'")  # straight apostrophe for the search query
                 cite_base = cite  # base for a following "Id. at N"
                 # A pincite right after ("365 U.S. 167, 171") rides along
-                # so the opened case can jump to that page.  A number that
-                # opens a parallel cite ("556, 510 A.2d 562") is excluded
-                # by the capital letter that follows it.
-                pin_m = _PINCITE_AFTER_RE.match(text, end)
-                if pin_m:
-                    cite += "@" + pin_m.group(1)
+                # so the opened case can jump to that page — and a footnote
+                # pinpoint on it ("167, 171 n.4") rides along with it, so the
+                # link opens the note.  A number that opens a parallel cite
+                # ("556, 510 A.2d 562") is excluded by the capital letter that
+                # follows it.
+                pin, _pin_end = _pin_after(text, end)
+                if pin:
+                    cite += "@" + pin
                 action = ("cite", cite)
             elif kind == "recap":
                 action = ("recap", m)  # m is the pre-built JSON spec
@@ -17120,11 +17166,14 @@ class _ScholarTextWindow:
                 # splits them), it's resolved by the _pending_id path above.
                 la = self._last_cite_action
                 pin = m.group(1)
+                id_notes, _note_end = _note_pin_after_page(text, m.end())
                 if pin is None or not la:
                     action = None
                 elif la[0] == "cite":
-                    action = (("cite", f"{la[1]}@{pin}")
-                              if _id_pin_in_range(la[1], pin) else None)
+                    action = (
+                        ("cite", f"{la[1]}@{_join_note_pin(pin, id_notes)}")
+                        if _id_pin_in_range(la[1], pin) else None
+                    )
                 else:
                     action = la  # statute/regulation/rule → reopen (no pin page)
             elif kind == "statestat":
@@ -17561,6 +17610,7 @@ class _ScholarTextWindow:
         self._refresh_outline_panel()
         self._schedule_text_justify()
         self._schedule_gutter_redraw()
+        self._start_stored_pagination_load()
         self._install_current_location_map()
         self._restore_pending_text_location()
 
@@ -20846,7 +20896,7 @@ class _ScholarTextWindow:
                 self._status_var.set(f"Opening {cite} (case.law)…")
                 _open_case_law_pdf(
                     self._win, appx,
-                    cite + (f" at {pin}" if pin else ""),
+                    cite + (f" at {_pin_display(pin)}" if pin else ""),
                     self._status_var.set, app=self._app,
                 )
                 return
@@ -21014,7 +21064,7 @@ class _ScholarTextWindow:
         Google Scholar nor CourtListener has the opinion)."""
         self._status_var.set(f"Opening {cite} (case.law PDF)…")
         _open_case_law_pdf(
-            self._win, url, cite + (f" at {pin}" if pin else ""),
+            self._win, url, cite + (f" at {_pin_display(pin)}" if pin else ""),
             self._status_var.set, app=self._app,
             expected_name=expected_name,
         )
@@ -21069,28 +21119,130 @@ class _ScholarTextWindow:
                 "Google Scholar: cited case not found (or blocked)."
             )
 
+    def _pin_page_positions(self, cite: str) -> "dict[int, str]":
+        """The page → mark track a pin cite written in *cite*'s reporter should
+        be looked up in.
+
+        An opinion can carry two: the star pagination Google Scholar printed
+        (whatever reporter that is — for recent SCOTUS cases, usually S. Ct.)
+        and the U.S. Reports pages inferred from the official scan.  A pin cite
+        names a reporter, so use the track that reporter paginates."""
+        native = getattr(self, "_page_pos", None) or {}
+        mapped = getattr(self, "_mapped_us_page_pos", None) or {}
+        wanted = opinion_location.parse_reporter_cite(cite)
+        if wanted is not None:
+            native_cite = opinion_location.parse_reporter_cite(
+                self._bb.get("cite", "")
+            )
+            mapped_cite = opinion_location.parse_reporter_cite(
+                getattr(self, "_mapped_copy_cite", "")
+            )
+            if native_cite and native_cite.reporter_key == wanted.reporter_key \
+                    and native:
+                return native
+            if mapped_cite and mapped_cite.reporter_key == wanted.reporter_key \
+                    and mapped:
+                return mapped
+        return native or mapped
+
+    def _note_jump_range(
+        self, notes: "list[str]", page: "Optional[int]",
+        positions: "dict[int, str]",
+    ) -> "Optional[tuple[str, str]]":
+        """The rendered extent of the footnote a pin cite names, or ``None``.
+
+        Separate writings in one report each start their notes at 1, so the
+        note number alone can be ambiguous.  The page the note is *called on* —
+        which is what a Bluebook "13 n.4" pin gives — resolves it: prefer the
+        note recorded on that page, else the candidate whose in-text reference
+        sits nearest the page's position in the document.
+        """
+        txt = self._text
+        wanted = {str(n).strip().strip("[]().") for n in notes if str(n).strip()}
+        if not wanted:
+            return None
+        regions = getattr(self, "_fn_regions", None) or []
+        mapped = positions is getattr(self, "_mapped_us_page_pos", None)
+        candidates: list[tuple[tuple, Optional[int], Optional[str]]] = []
+        for region in regions:
+            start_mark, end_mark, number, native_page = region
+            if str(number).strip().strip("[]().") not in wanted:
+                continue
+            fid = getattr(self, "_fn_region_fids", {}).get(start_mark, "")
+            ref_pos = self._fn_marker_pos("fnref", fid) if fid else None
+            note_page = native_page
+            if mapped:
+                note_page = getattr(self, "_mapped_us_note_pages", {}).get(fid)
+                if note_page is None and ref_pos:
+                    note_page = self._mapped_page_at_index(ref_pos)
+            candidates.append((region, note_page, ref_pos))
+        if not candidates:
+            return None
+        if len(candidates) > 1 and page is not None:
+            exact = [c for c in candidates if c[1] == page]
+            if exact:
+                candidates = exact
+            else:
+                # No note recorded on that page: take the note referenced
+                # closest to where the page itself begins.
+                page_pos = positions.get(page)
+                if page_pos:
+                    with_ref = [c for c in candidates if c[2]]
+                    if with_ref:
+                        anchor = self._tk_index_key(txt.index(page_pos))
+                        candidates = [min(with_ref, key=lambda c: abs(
+                            self._tk_index_key(txt.index(c[2]))[0] - anchor[0]
+                        ))]
+        region = candidates[0][0]
+        try:
+            return txt.index(region[0]), txt.index(region[1])
+        except tk.TclError:
+            return None
+
     def jump_to_cite_page(self, cite: str, pin: str) -> None:
-        """Scroll to the pin page and briefly flash the *whole* page — from its
-        star-pagination marker to the next page's marker (or, on the last page,
-        to the footnotes / end of the opinion) — so the cited passage stands out
-        rather than just the marker's line.  Deferred until the window has laid
-        out (an immediate ``see`` on an unmapped widget does nothing), with one
-        retry while the text is still rendering."""
-        m_page = re.match(r"\d+", pin or "")
-        if not m_page:
+        """Scroll to what a pin cite names and briefly flash it.
+
+        A page pin flashes the *whole* page — from its star-pagination marker to
+        the next page's marker (or, on the last page, to the footnotes / end of
+        the opinion) — so the cited passage stands out rather than just the
+        marker's line.  A footnote pin ("200 U.S. 12, 13 n.4") flashes that
+        note instead, since the note, not the page carrying its reference, is
+        what the citation points at.
+
+        Deferred until the window has laid out (an immediate ``see`` on an
+        unmapped widget does nothing), with retries while the text is still
+        rendering.  The pin is also remembered: the U.S. Reports page track can
+        arrive later, from the stored pagination or from the official scan, and
+        :meth:`_retry_pending_pin_jump` replays the jump when it does.
+        """
+        page_text, notes = _split_note_pin(pin or "")
+        m_page = re.match(r"\d+", page_text)
+        if not (m_page or notes):
             return
-        page = int(m_page.group(0))
+        page = int(m_page.group(0)) if m_page else None
+        self._pending_pin_jump = (cite, pin)
 
         def do(attempt: int = 0) -> None:
             try:
-                pos = (self._page_pos or {}).get(page)
+                positions = self._pin_page_positions(cite)
             except tk.TclError:
                 return
+            if notes:
+                span = self._note_jump_range(notes, page, positions)
+                if span:
+                    self._pending_pin_jump = None
+                    self._flash_range(*span)
+                    self._status_var.set(
+                        f"Jumped to {_pin_display(pin)}."
+                    )
+                    return
+            pos = positions.get(page) if page is not None else None
             if pos:
+                self._pending_pin_jump = None
                 txt = self._text
-                # End of the flash: the nearest later star-page marker, else
+                # End of the flash: the nearest later page marker, else
                 # the start of the footnotes, else the end of the text.
-                later = [txt.index(p) for p in self._page_pos.values()
+                later = [txt.index(p) for p in positions.values()
                          if txt.compare(p, ">", pos)]
                 if later:
                     end = min(later,
@@ -21099,13 +21251,35 @@ class _ScholarTextWindow:
                     fn = txt.tag_nextrange("fnhead", pos)
                     end = fn[0] if fn else "end-1c"
                 self._flash_range(pos, end)
-                self._status_var.set(f"Jumped to page *{page}.")
+                self._status_var.set(
+                    # The note itself wasn't found; say where this actually
+                    # landed rather than claim the note was reached.
+                    f"Note {notes[0]} not found; jumped to page *{page}."
+                    if notes else f"Jumped to page *{page}."
+                )
             elif attempt < 2:
                 self._win.after(250, lambda: do(attempt + 1))
+            elif notes:
+                self._status_var.set(
+                    f"Note {notes[0]} not found in this text."
+                )
             else:
                 self._status_var.set(f"Page *{page} not marked in this text.")
 
         self._win.after(200, do)
+
+    def _retry_pending_pin_jump(self) -> None:
+        """Replay a pin jump that had nothing to land on when it was asked for.
+
+        The inferred U.S. Reports pages — and the footnote regions that go with
+        a re-render — appear after the window is already on screen, so a pin
+        cite followed into a fresh window would otherwise report the page
+        missing and stay put."""
+        pending = getattr(self, "_pending_pin_jump", None)
+        if not pending:
+            return
+        self._pending_pin_jump = None
+        self.jump_to_cite_page(*pending)
 
     def _open_statute(self, kind: str, spec: str) -> None:
         """Fetch a U.S. Code (OLRC) or C.F.R. (eCFR) section and show it."""
@@ -21245,6 +21419,11 @@ class _ScholarTextWindow:
         self._cl_primary = False
         if note:
             self._note = note
+        # These parts are new objects, so any pagination restored against the
+        # old ones addresses blocks that no longer exist; look it up again.
+        self._stored_location_maps.pop("scholar", None)
+        self._stored_pagination_started = False
+        self._saved_pagination_json = None
         self._ensure_cached_location_maps()
         # Showing the CourtListener text: enable the switch-to-Scholar button.
         # (If the PDF is up, its button is left alone — the Scholar text is
@@ -21539,6 +21718,7 @@ class _ScholarTextWindow:
                 callback(result)
             except Exception as exc:
                 print(f"[pdf-analysis] apply failed: {exc}")
+        self._store_scholar_pagination(result.get("maps", {}).get("scholar"))
         if self._mode in ("scholar", "courtlistener"):
             self._install_current_location_map()
 
@@ -21578,8 +21758,130 @@ class _ScholarTextWindow:
         if result is None or location_map is None:
             return
         result.setdefault("maps", {})[mode] = location_map
+        if mode == "scholar":
+            self._store_scholar_pagination(location_map)
         if key == self._active_pdf_analysis_key and self._mode == mode:
             self._install_current_location_map()
+
+    # ------------------------------------------------------------------
+    # Reporter pagination saved with the opinion
+    # ------------------------------------------------------------------
+    # Aligning the Court's own scan is how a recent SCOTUS opinion acquires
+    # U.S. Reports pages at all — Google Scholar carries it with the Supreme
+    # Court Reporter's star pagination, or with none.  That alignment needs the
+    # PDF downloaded and matched, which is far too slow to keep a reader
+    # waiting when they have just followed a pin cite into the case.  So the
+    # pages are kept in the opinion database and reloaded with the opinion;
+    # the scan still loads in the background and rewrites them if it disagrees.
+
+    def _opinion_scholar_id(self) -> str:
+        try:
+            import opinion_db
+        except Exception:
+            return ""
+        return opinion_db.scholar_id_from_url(self._scholar_url or "") or ""
+
+    def _start_stored_pagination_load(self) -> None:
+        """Fetch this opinion's saved reporter pagination and install it."""
+        if self._stored_pagination_started or self._cl_primary:
+            return
+        if self._app is None:
+            return
+        sid = self._opinion_scholar_id()
+        if not sid or not self._parts:
+            return
+        # The native star pagination already being U.S. Reports means the
+        # opinion carries the pages itself; nothing to restore.
+        native = opinion_location.parse_reporter_cite(self._bb.get("cite", ""))
+        if native is not None and native.reporter_key == "us":
+            return
+        self._stored_pagination_started = True
+        parts = self._parts
+        native_cite = self._bb.get("cite", "")
+        app = self._app
+
+        def run() -> None:
+            try:
+                db = app._get_opinion_db()
+                if db is None:
+                    return
+                stored = db.stored_pagination(sid)
+                if not stored:
+                    return
+                pagination = opinion_location.pagination_from_json(stored)
+                location_map = opinion_location.location_map_from_pagination(
+                    parts, pagination, native_cite=native_cite,
+                )
+            except Exception as exc:
+                print(f"[pagination] loading saved pages failed: {exc}")
+                return
+            if location_map is not None:
+                self._post(self._apply_stored_pagination, location_map, stored)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _apply_stored_pagination(self, location_map, stored: dict) -> None:
+        """Install saved pagination as the text view's reporter-page map."""
+        # An alignment measured in this session always wins: it has the scan
+        # in front of it, and may be why the stored copy is about to change.
+        if self._saved_pagination_json is not None:
+            return
+        key = self._active_pdf_analysis_key
+        cached = self._pdf_analysis_cache.get(key) if key is not None else None
+        if (cached or {}).get("maps", {}).get("scholar") is not None:
+            return
+        self._saved_pagination_json = stored
+        self._stored_location_maps["scholar"] = location_map
+        cite = str(getattr(location_map, "copy_cite", "") or "")
+        print(f"[pagination] restored saved {cite} pages for this opinion")
+        if self._mode == "scholar":
+            self._install_current_location_map()
+        else:
+            self._retry_pending_pin_jump()
+
+    def _store_scholar_pagination(self, location_map) -> None:
+        """Save a fresh alignment's reporter pages with the opinion.
+
+        Called whenever a scan finishes aligning against the Scholar text; only
+        a map good enough to pin-cite from is kept, and an unchanged pagination
+        is not rewritten (the JSONL store is Git-synced)."""
+        if location_map is None or self._cl_primary or not self._parts:
+            return
+        if self._app is None:
+            return
+        sid = self._opinion_scholar_id()
+        if not sid:
+            return
+        try:
+            pagination = opinion_location.pagination_from_map(
+                self._parts, location_map,
+            )
+            payload = opinion_location.pagination_to_json(pagination)
+        except Exception as exc:
+            print(f"[pagination] preparing pages to save failed: {exc}")
+            return
+        if payload is None or payload == self._saved_pagination_json:
+            return
+        self._saved_pagination_json = payload
+        # The freshly measured pages supersede whatever was restored.
+        self._stored_location_maps.pop("scholar", None)
+        app = self._app
+
+        def run() -> None:
+            try:
+                db = app._get_opinion_db()
+                if db is None:
+                    return
+                if db.save_pagination(sid, payload):
+                    print(
+                        f"[pagination] saved {payload.get('cite')} pages "
+                        f"({len(payload.get('pages') or ())} boundaries) "
+                        f"for Scholar opinion {sid}"
+                    )
+            except Exception as exc:
+                print(f"[pagination] saving pages failed: {exc}")
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _apply_pdf_analysis(self, pane: _PdfPane, result: dict) -> None:
         """Attach cached text/search/link/parts data to the current pane."""
@@ -22420,8 +22722,7 @@ def _parse_citation_line(line: str) -> Optional[tuple[str, str, str]]:
     cite = cite.replace("U. S.", "U.S.").replace("’", "'")
     cite = _respace_reporter_in_cite(cite)
     name = line[: m.start()].strip().rstrip(",;–—- ").strip()
-    pin_m = _PINCITE_AFTER_RE.match(line, m.end())
-    pin = pin_m.group(1) if pin_m else ""
+    pin, _pin_end = _pin_after(line, m.end())
     return name, cite, pin
 
 
