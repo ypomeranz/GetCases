@@ -13365,7 +13365,15 @@ def _page_has_scan_background(page) -> bool:
 
 
 def _pdf_ocr_scan_pages(pdf_bytes: bytes) -> set[int]:
-    """Page indexes whose text layer likely comes from OCR over a scan."""
+    """Page indexes whose OCR geometry is not safe to color.
+
+    Some GovInfo U.S. Reports PDFs (including volume 567) are full-page
+    images, but their hidden ABBYY-style text is accurately positioned. Its
+    oddity is that every glyph has an almost zero-height box and words arrive
+    letter-spaced (``"C i t e  a s: 5 6 7 U. S."``). The extractor repairs
+    that distinctive geometry; those pages can therefore use the ordinary
+    blue citation treatment. Other OCR-over-scan pages remain quiet.
+    """
     import pypdfium2 as pdfium
 
     pages: set[int] = set()
@@ -13375,7 +13383,10 @@ def _pdf_ocr_scan_pages(pdf_bytes: bytes) -> set[int]:
             for i in range(len(doc)):
                 page = doc[i]
                 try:
-                    if _page_has_scan_background(page):
+                    if (
+                        _page_has_scan_background(page)
+                        and not _page_has_repairable_ocr_text(page)
+                    ):
                         pages.add(i)
                 finally:
                     page.close()
@@ -13542,6 +13553,192 @@ def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
     return _extract_pdf_text_and_style(pdf_bytes)[0]
 
 
+def _degenerate_ocr_metrics(chars: list) -> "Optional[tuple[float, float]]":
+    """Return ``(median glyph width, inferred line gap)`` for the repairable
+    GovInfo/ABBYY hidden-text shape, or ``None`` for ordinary PDF text.
+
+    In the affected U.S. Reports files the OCR font is one point high but its
+    text matrix has effectively no vertical scale: glyph boxes are several PDF
+    points wide and only hundredths of a point tall. That ratio is far outside
+    real typesetting, and gives us a narrow signature that does not rewrite
+    conventional born-digital text or ordinary OCR layers.
+    """
+    import statistics
+
+    boxes = [
+        box
+        for ch, box in (chars or ())
+        if (
+            box is not None
+            and ch
+            and not ch.isspace()
+            and box[2] > box[0]
+            and box[3] > box[1]
+        )
+    ]
+    if len(boxes) < 40:
+        return None
+    widths = [box[2] - box[0] for box in boxes]
+    heights = [box[3] - box[1] for box in boxes]
+    median_width = statistics.median(widths)
+    median_height = statistics.median(heights)
+    if median_width <= 0 or median_height >= 0.08 * median_width:
+        return None
+
+    # Merge tiny baseline jitter before measuring the distance between lines.
+    levels: list[float] = []
+    for y in sorted((box[3] for box in boxes), reverse=True):
+        if not levels or levels[-1] - y > 1.0:
+            levels.append(y)
+    gaps = [
+        upper - lower
+        for upper, lower in zip(levels, levels[1:])
+        if 4.0 <= upper - lower <= 30.0
+    ]
+    line_gap = (
+        statistics.median(gaps)
+        if gaps
+        else max(8.0, median_width * 3.0)
+    )
+    return median_width, line_gap
+
+
+def _page_has_repairable_ocr_text(page) -> bool:
+    """Whether *page* carries the zero-height OCR geometry repaired below.
+
+    Only a prefix is needed to recognize the signature. Keeping this check
+    inside :func:`_pdf_ocr_scan_pages` lets that pass decide whether links may
+    be colored without changing the extraction function's long-standing
+    two-value return type.
+    """
+    tp = None
+    try:
+        tp = page.get_textpage()
+        count = min(tp.count_chars(), 768)
+        if count < 40:
+            return False
+        whole = tp.get_text_range(0, count)
+        aligned = len(whole) == count
+        chars = []
+        for i in range(count):
+            ch = whole[i] if aligned else tp.get_text_range(i, 1)
+            try:
+                box = tp.get_charbox(i)
+            except Exception:
+                box = None
+            chars.append((ch or " ", box))
+        return _degenerate_ocr_metrics(chars) is not None
+    except Exception:
+        return False
+    finally:
+        if tp is not None:
+            try:
+                tp.close()
+            except Exception:
+                pass
+
+
+def _repair_degenerate_ocr_page(
+    chars: list, slants: list,
+) -> "tuple[list, list]":
+    """Repair GovInfo's zero-height, letter-spaced hidden OCR text.
+
+    The returned character stream keeps a parallel italic flag for every
+    character. Artificial inter-letter spaces are removed using the glyph
+    positions, real word/line gaps are retained, and the baseline-only boxes
+    are expanded to the inferred printed line height. Citation detection,
+    text selection, section recognition, and reporter-page alignment can then
+    consume the page exactly like a normal text-bearing PDF.
+    """
+    import statistics
+
+    metrics = _degenerate_ocr_metrics(chars)
+    if metrics is None:
+        return chars, slants
+    _median_width, line_gap = metrics
+    glyph_height = min(14.0, max(6.0, line_gap * 0.72))
+
+    # Build nearest-visible-glyph indexes once. A typical opinion has hundreds
+    # of synthetic spaces per page; rescanning for each one would be quadratic.
+    count = len(chars)
+    previous: list["Optional[int]"] = [None] * count
+    following: list["Optional[int]"] = [None] * count
+    visible = None
+    for i, (ch, box) in enumerate(chars):
+        previous[i] = visible
+        if ch and not ch.isspace() and box is not None:
+            visible = i
+    visible = None
+    for i in range(count - 1, -1, -1):
+        following[i] = visible
+        ch, box = chars[i]
+        if ch and not ch.isspace() and box is not None:
+            visible = i
+
+    expanded: list = []
+    for ch, box in chars:
+        if box is not None and ch and not ch.isspace():
+            baseline = (box[1] + box[3]) / 2.0
+            box = (
+                box[0],
+                baseline - glyph_height * 0.20,
+                box[2],
+                baseline + glyph_height * 0.80,
+            )
+        expanded.append((ch, box))
+
+    out_chars: list = []
+    out_slants: list = []
+    i = 0
+    while i < count:
+        ch, _box = chars[i]
+        if not ch.isspace():
+            out_chars.append(expanded[i])
+            out_slants.append(bool(slants[i]) if i < len(slants) else False)
+            i += 1
+            continue
+
+        end = i + 1
+        while end < count and chars[end][0].isspace():
+            end += 1
+        whitespace = "".join(value for value, _box in chars[i:end])
+        left = previous[i]
+        right = following[end - 1]
+        keep = False
+        value = " "
+        if "\r" in whitespace or "\n" in whitespace:
+            keep, value = True, "\n"
+        elif left is None or right is None:
+            keep = True
+        else:
+            left_ch, left_box = chars[left]
+            right_ch, right_box = chars[right]
+            if abs(left_box[3] - right_box[3]) > max(1.0, line_gap * 0.20):
+                keep, value = True, "\n"
+            else:
+                gap = right_box[0] - left_box[2]
+                width = statistics.median((
+                    left_box[2] - left_box[0],
+                    right_box[2] - right_box[0],
+                ))
+                # Display-cap runs in the Reporter are deliberately tracked
+                # more widely than prose. Wide m/w glyphs also need a little
+                # extra room because this OCR font gives every box one width.
+                threshold = (
+                    1.85
+                    if left_ch.isupper() and right_ch.isupper()
+                    else 1.45
+                )
+                if left_ch in "mMwW" or right_ch in "mMwW":
+                    threshold += 0.20
+                keep = width > 0 and gap >= threshold * width
+        if keep:
+            out_chars.append((value, None))
+            out_slants.append(False)
+        i = end
+    return out_chars, out_slants
+
+
 def _extract_pdf_text_and_style(pdf_bytes: bytes) -> "tuple[list, list]":
     """Extract a PDF's text layer, as ``(pages, italics)``.
 
@@ -13617,6 +13814,7 @@ def _extract_pdf_text_and_style(pdf_bytes: bytes) -> "tuple[list, list]":
                     slants = []
                 finally:
                     page.close()
+            chars, slants = _repair_degenerate_ocr_page(chars, slants)
             pages.append(chars)
             italics.append(slants)
         return pages, italics
@@ -13682,9 +13880,10 @@ def _citation_links_from_visible_pdf_text(
     pdf_bytes: bytes, pages: list, italics: "Optional[list]" = None,
 ) -> "tuple[dict, set[int]]":
     """Citation rectangles for the whole document, plus the page indexes
-    whose text layer is OCR over a scan.  OCR glyph boxes land imprecisely,
-    so the pane renders those pages' links *quietly* — no tint, no
-    recoloring — while keeping them clickable (see
+    whose OCR glyph geometry remains unsuitable for coloring. The repairable
+    zero-height GovInfo layer has already been normalized by extraction; other
+    OCR boxes can land imprecisely, so the pane renders those pages' links
+    *quietly* — no tint, no recoloring — while keeping them clickable (see
     :meth:`_PdfPane.set_citation_links`)."""
     try:
         ocr_pages = _pdf_ocr_scan_pages(pdf_bytes)
