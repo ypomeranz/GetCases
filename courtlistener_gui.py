@@ -428,12 +428,15 @@ def _add_bookmarks_cascade(menubar: tk.Menu, app, win: tk.Misc) -> None:
 
 
 def _add_copy_cascade(menubar: tk.Menu, reader) -> None:
-    """Append the "Copy" cascade: the three styles Ctrl-C can copy in, as radio
-    items so the one in force is visible.  Choosing one remembers it for next
-    session and, with text selected, copies right away."""
+    """Append the citation-only command and selectable Ctrl-C styles."""
     if reader is None or not hasattr(reader, "on_copy_mode_chosen"):
         return
     copy_menu = tk.Menu(menubar, tearoff=0)
+    copy_menu.add_command(
+        label="Copy citation to clipboard",
+        command=reader._copy_citation_to_clipboard,
+    )
+    copy_menu.add_separator()
     for value, label in COPY_MODE_LABELS:
         copy_menu.add_radiobutton(
             label=label, value=value, variable=reader._copy_mode_var,
@@ -451,7 +454,6 @@ def _install_history_menubar(app, win: tk.Misc, reader=None):
     if app is None or not hasattr(app, "populate_history_menu"):
         return None
     menubar = tk.Menu(win)
-    _add_copy_cascade(menubar, reader)
     history_menu = tk.Menu(menubar, tearoff=0)
     try:
         history_menu.configure(
@@ -473,6 +475,8 @@ def _install_history_menubar(app, win: tk.Misc, reader=None):
         app.populate_window_menu(window_menu, win)
         menubar.add_cascade(label="Window", menu=window_menu)
     _add_bookmarks_cascade(menubar, app, win)
+    # Keep copy settings at the far right of the existing menu bar.
+    _add_copy_cascade(menubar, reader)
     try:
         win.config(menu=menubar)
     except tk.TclError:
@@ -1404,6 +1408,7 @@ import eng_rep
 import eng_rep_pdf
 import fed_cas
 import fed_rules
+import federal_register
 import state_statutes
 import statutes_at_large
 import us_code
@@ -1795,11 +1800,12 @@ def _save_token_prompt_suppressed(suppress: bool) -> None:
 #          default, and what the old "Copy with citation" checkbox did)
 #   quote  the selection wrapped in double quotes with the citation one space
 #          after the closing quote — a quotation ready to drop into a brief
-COPY_MODES = ("plain", "cite", "quote")
+COPY_MODES = ("plain", "cite", "quote", "parenthetical")
 COPY_MODE_LABELS = (
     ("plain", "Copy without citation"),
     ("cite", "Copy with citation"),
     ("quote", "Copy as quote"),
+    ("parenthetical", "Copy as parenthetical"),
 )
 _DEFAULT_COPY_MODE = "cite"
 
@@ -1816,6 +1822,15 @@ def _save_copy_mode(mode: str) -> None:
     data = _load_config()
     data["copy_mode"] = mode
     _save_config(data)
+
+
+def _next_copy_mode(mode: str) -> str:
+    """The mode reached by one press of the reader's ``x`` shortcut."""
+    try:
+        index = COPY_MODES.index(mode)
+    except ValueError:
+        index = COPY_MODES.index(_DEFAULT_COPY_MODE)
+    return COPY_MODES[(index + 1) % len(COPY_MODES)]
 
 
 
@@ -6480,7 +6495,16 @@ class CourtListenerGUI:
                 return
             self._spotlight_empty_returns = 0
 
-            # 1. Statute / regulation / federal rule: "42 USC 1983(b)",
+            # 1. Federal Register: "88 Fed. Reg. 382" or "88 FR 382".
+            fr_action = federal_register.parse_query(query)
+            if fr_action:
+                self._close_quick_popup()
+                _open_statute_action(
+                    self.root, fr_action, self._status_var.set, app=self
+                )
+                return
+
+            # 1a. Statute / regulation / federal rule: "42 USC 1983(b)",
             # "29 CFR 1614.105", "Fed. R. Civ. P. 56", "Cal. Penal Code 187".
             # The section sign is optional — it can't be typed on a keyboard.
             statute = _parse_statute_query(query)
@@ -11284,6 +11308,34 @@ def _flip_rtf_quotes(rtf: str) -> str:
     return _RTF_QUOTE_TOKEN_RE.sub(replace, rtf)
 
 
+def _parenthetical_plain(citation: str, passage: str) -> str:
+    """``Citation.`` + passage -> ``Citation (“passage”).``."""
+    citation = (citation or "").rstrip()
+    if citation.endswith("."):
+        citation = citation[:-1]
+    quoted = _QUOTE_OPEN + _flip_quotes(passage or "") + _QUOTE_CLOSE
+    return f"{citation} ({quoted})." if citation else quoted + "."
+
+
+def _parenthetical_rtf(citation: str, passage: str) -> str:
+    """RTF-body counterpart of :func:`_parenthetical_plain`.
+
+    ``citation`` is the inline fragment returned by ``_bluebook_citation`` and
+    ``passage`` is the paragraph fragment returned by ``_dump_to_rtf``.
+    """
+    cite = citation[1:] if citation.startswith(" ") else citation
+    if cite.endswith("."):
+        cite = cite[:-1]
+    body = _flip_rtf_quotes(passage or "")
+    tail = "\\par\n"
+    if body.endswith(tail):
+        body = body[:-len(tail)]
+    quoted = _rtf_escape(_QUOTE_OPEN) + body + _rtf_escape(_QUOTE_CLOSE)
+    if cite:
+        return cite + " (" + quoted + ")." + tail
+    return quoted + "." + tail
+
+
 def _rtf_escape(s: str) -> str:
     out: list[str] = []
     for ch in s:
@@ -15648,7 +15700,8 @@ class _ScholarTextWindow:
         self._text_link_cache_key: tuple[int, ...] = ()
         self._text_block_links: dict[int, list] = {}
         # The most recently emitted citation's action — a case ("cite", base),
-        # a statute ("usc"/"cfr"/"rule"/"const"/"statpdf"/…), etc. — so an "Id."
+        # a statute/publication ("usc"/"cfr"/"rule"/"const"/"statpdf"/
+        # "frpdf"/…), etc. — so an "Id."
         # links back to whatever was last cited.  Reset per render.
         self._last_cite_action: Optional[tuple[str, str]] = None
         # A bare "Id." whose pin ("at N") sits in a following span — (link tag,
@@ -16091,7 +16144,7 @@ class _ScholarTextWindow:
         )
         self._zoom_in_btn.pack(side="left", padx=(6, 10))
         # How Ctrl-C copies lives in the "Copy" menu at the top of the window
-        # rather than on this bar — three styles do not fit in a checkbox, and
+        # rather than on this bar — the styles do not fit in a checkbox, and
         # the bar has no room to spare.  Edit citation sits before the two
         # checkboxes so they read as a pair.
         self._edit_citation_btn = _ui_button(
@@ -16124,6 +16177,10 @@ class _ScholarTextWindow:
         # Bare "s" toggles whichever side panel the current view has, except
         # while a text field has focus.
         win.bind("<KeyPress-s>", self._toggle_details_shortcut)
+        # Bare "x" cycles the persistent Ctrl-C style. Like the side-panel
+        # shortcut, it stays out of fields where the user is typing.
+        win.bind("<KeyPress-x>", self._cycle_copy_mode)
+        win.bind("<KeyPress-X>", self._cycle_copy_mode)
         txt.bind(
             "<Control-MouseWheel>",
             lambda e: self._zoom(+1 if e.delta > 0 else -1) or "break",
@@ -17108,6 +17165,9 @@ class _ScholarTextWindow:
         for m in statutes_at_large.STAT_CITE_RE.finditer(text):
             if statutes_at_large.url_for(m):  # only link volumes GovInfo has
                 matches.append((m.start(), m.end(), "stat", m))
+        for m in federal_register.FR_CITE_RE.finditer(text):
+            if federal_register.url_for(m):
+                matches.append((m.start(), m.end(), "fr", m))
         for m in eng_rep.ER_CITE_RE.finditer(text):
             matches.append((m.start(), m.end(), "engrep", m))
         for s, e, spec, _cases in eng_rep.iter_nominate_cites(text):
@@ -17184,6 +17244,8 @@ class _ScholarTextWindow:
                 # Statutes at Large → free GovInfo scan, shown in the in-app
                 # PDF viewer (with a Download option).
                 action = ("statpdf", statutes_at_large.url_for(m))
+            elif kind == "fr":
+                action = ("frpdf", federal_register.url_for(m))
             elif kind == "engrep":
                 # English Reports cite ("156 Eng. Rep. 145") → CommonLII scan.
                 action = ("engrep", eng_rep.cite_spec(m))
@@ -19273,6 +19335,42 @@ class _ScholarTextWindow:
             return  # nothing selected; the choice was a preference only
         self._copy_formatted()
 
+    def _cycle_copy_mode(self, _event=None):
+        """Advance to the next Ctrl-C style and briefly identify it."""
+        if _widget_accepts_typing(self._focused_widget()):
+            return None
+        current = self.copy_mode()
+        mode = _next_copy_mode(current)
+        self._copy_mode_var.set(mode)
+        _save_copy_mode(mode)
+        label = dict(COPY_MODE_LABELS).get(mode, mode)
+        prior = self._status_var.get()
+        message = f"Copy mode: {label}"
+        self._status_var.set(message)
+
+        def restore() -> None:
+            try:
+                if self._status_var.get() == message:
+                    self._status_var.set(prior)
+            except tk.TclError:
+                pass
+
+        self._win.after(1800, restore)
+        return "break"
+
+    def _copy_citation_to_clipboard(self) -> None:
+        """Copy only this case's Bluebook citation, independent of selection."""
+        plain, fragment = self._bluebook_citation(None, inline=True)
+        if not plain:
+            self._status_var.set("No case citation is available to copy.")
+            return
+        fragment = fragment[1:] if fragment.startswith(" ") else fragment
+        rtf = _rtf_document("\\pard\\sa120 " + fragment + "\\par\n")
+        how = _copy_rich_clipboard(
+            self._win, rtf, plain
+        )
+        self._status_var.set(f"Copied the case citation as {how}.")
+
     def _copy_formatted(self) -> None:
         txt = self._text
         try:
@@ -19281,11 +19379,12 @@ class _ScholarTextWindow:
         except tk.TclError:
             start, end = "1.0", "end-1c"
             selected = False
-        # The Copy menu's three styles: the selection alone, the selection with
-        # the citation under it, or a brief-ready quotation.
+        # The Copy menu styles: the selection alone, the selection with the
+        # citation under it, a brief-ready quotation, or a parenthetical quote.
         mode = self.copy_mode()
         quote = mode == "quote"
-        with_cite = mode in ("cite", "quote")
+        parenthetical = mode == "parenthetical"
+        with_cite = mode in ("cite", "quote", "parenthetical")
         plain_cite, rtf_cite = "", ""
         omit_tags: set[str] = set()
         n_omitted = 0
@@ -19342,14 +19441,18 @@ class _ScholarTextWindow:
                 extras = ("footnote omitted" if n_omitted == 1
                           else "footnotes omitted",)
             plain_cite, rtf_cite = self._bluebook_citation(
-                pin, writer, extras, inline=quote,
+                pin, writer, extras, inline=(quote or parenthetical),
                 cite_override=self._mapped_copy_cite if mapped_us else "",
             )
         body = _dump_to_rtf(txt, start, end, fn_links=self._fn_link_map(),
                             omit_tags=omit_tags)
         plain = _plain_without_layout_chars(txt, start, end,
                                             omit_tags=omit_tags).strip()
-        if quote:
+        if parenthetical:
+            plain = _parenthetical_plain(plain_cite, plain)
+            body = _parenthetical_rtf(rtf_cite, body)
+            rtf = _rtf_document(body)
+        elif quote:
             # A quotation: the passage's own quotation marks drop a level, the
             # whole thing goes inside double quotes, and the citation follows
             # the closing quote after one space.  The flip runs first, so the
@@ -19375,7 +19478,8 @@ class _ScholarTextWindow:
         how = _copy_rich_clipboard(self._win, rtf, plain)
         what = "selection" if selected else "full text"
         styled = {"plain": ".", "cite": "; citation appended.",
-                  "quote": "; quoted with citation."}[mode]
+                  "quote": "; quoted with citation.",
+                  "parenthetical": "; copied as a parenthetical quote."}[mode]
         self._status_var.set(f"Copied {what} as {how}{styled}")
 
     def _fn_link_map(self) -> dict[str, tuple[str, str]]:
@@ -20844,7 +20948,7 @@ class _ScholarTextWindow:
             webbrowser.open(value)
             self._status_var.set("Opened in your browser.")
             return
-        if kind == "statpdf":
+        if kind in ("statpdf", "frpdf"):
             _open_statute_pdf(
                 self._win, value, self._status_var.set, app=self._app
             )
@@ -22837,17 +22941,21 @@ def _open_statute_action(parent: tk.Misc, action: tuple[str, str],
         webbrowser.open(value)
         status("Opened in your browser.")
         return
-    if kind == "statpdf":
+    if kind in ("statpdf", "frpdf"):
         _open_statute_pdf(parent, value, status, app=app)
         return
     _fetch_statute_window(parent, kind, value, status, app=app)
 
 
 def _stat_cite_from_url(url: str) -> str:
-    """'… /link/statute/88/1932' → '88 Stat. 1932' (the Statutes at Large
-    citation), falling back to a generic label."""
+    """Bluebook label for a GovInfo Statutes at Large/Federal Register URL."""
     m = re.search(r"/statute/(\d+)/(\d+)", url or "")
-    return f"{m.group(1)} Stat. {m.group(2)}" if m else "Statutes at Large"
+    if m:
+        return f"{m.group(1)} Stat. {m.group(2)}"
+    m = re.search(r"/fr/(\d+)/(\d+)", url or "")
+    if m:
+        return f"{m.group(1)} Fed. Reg. {int(m.group(2)):,}"
+    return "Official publication"
 
 
 def _choose_case_law_page_opinion(
@@ -23545,7 +23653,7 @@ def _print_pdf_file(parent: tk.Misc, path: str,
 
 def _open_statute_pdf(parent: tk.Misc, url: str,
                       status=lambda _s: None, *, app=None) -> None:
-    """Open a Statutes at Large GovInfo scan in the in-app PDF viewer."""
+    """Open a paginated GovInfo publication in the in-app PDF viewer."""
     cite = _stat_cite_from_url(url)
     status(f"Opening {cite}…")
     _PdfWindow(parent, url, cite, status, app=app)
@@ -24359,7 +24467,7 @@ def _open_citation_in_browser(action: tuple[str, str], text: str = "") -> None:
     cases go to Google Scholar, link-out actions to their URL, and anything
     else to a web search of the citation text."""
     kind, value = action
-    if kind in ("browse", "statpdf"):
+    if kind in ("browse", "statpdf", "frpdf"):
         url = value
     elif kind == "recap":
         # The RECAP search on CourtListener, pre-filtered to the docket (or,
@@ -24618,7 +24726,7 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
         Appendix scans, then the CourtListener text), with the pincite jump.
     """
     kind, value = action
-    if kind in _STATUTE_SOURCES or kind in ("browse", "statpdf"):
+    if kind in _STATUTE_SOURCES or kind in ("browse", "statpdf", "frpdf"):
         _open_statute_action(parent, action, status, app=app)
         return
     if kind == "engrep":
@@ -25049,7 +25157,7 @@ class _BriefCompileResolver:
         return self.pdf_bytes(url)
 
     def authority_label(self, kind: str, value: str) -> str:
-        if kind == "statpdf":
+        if kind in ("statpdf", "frpdf"):
             return _stat_cite_from_url(value)
         mod = _STATUTE_SOURCES.get(kind)
         if mod is not None:
@@ -25742,6 +25850,10 @@ class _StatuteWindow:
             url = statutes_at_large.url_for(m)
             if url:  # Statutes at Large → free GovInfo scan (in-app PDF viewer)
                 refs.append((m.start(), m.end(), "statpdf", url))
+        for m in federal_register.FR_CITE_RE.finditer(text):
+            url = federal_register.url_for(m)
+            if url:
+                refs.append((m.start(), m.end(), "frpdf", url))
         if self._doc.kind == "usc":
             for m in _USC_XREF_RE.finditer(text):
                 title = m.group(3) or self._doc.title
@@ -25796,7 +25908,7 @@ class _StatuteWindow:
             webbrowser.open(value)
             self._status_var.set("Opened in your browser.")
             return
-        if kind == "statpdf":
+        if kind in ("statpdf", "frpdf"):
             _open_statute_pdf(
                 self._win, value, self._status_var.set, app=self._app
             )

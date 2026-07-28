@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import citations
 from citations import _valid_case_reporter, detect_links
+import federal_register
 
 
 def _spans(text: str):
@@ -320,6 +321,66 @@ class StatutesAtLargeTests(unittest.TestCase):
             [("98 Stat.1981-82",
               ("statpdf",
                "https://www.govinfo.gov/link/statute/98/1981"))],
+        )
+
+
+class FederalRegisterTests(unittest.TestCase):
+    def test_compact_and_bluebook_forms_use_the_official_pdf_link(self):
+        for citation, page in (
+            ("57 FR 12146", "12146"),
+            ("88 Fed. Reg. 382", "382"),
+            ("77 Fed.Reg. 36,150–36,152", "36150"),
+        ):
+            with self.subTest(citation=citation):
+                self.assertEqual(
+                    _spans(citation),
+                    [(
+                        citation,
+                        (
+                            "frpdf",
+                            "https://www.govinfo.gov/link/fr/"
+                            f"{citation.split()[0]}/{page}?link-type=pdf",
+                        ),
+                    )],
+                )
+
+    def test_federal_rules_and_frd_cases_do_not_collide(self):
+        self.assertFalse(any(
+            action[0] == "frpdf"
+            for _start, _end, action in detect_links(
+                "See Fed. R. Civ. P. 56 and Smith, 123 F.R.D. 456."
+            )
+        ))
+
+    def test_spotlight_parser_accepts_the_existing_cfr_source_citation(self):
+        self.assertEqual(
+            federal_register.parse_query("57 FR 12146"),
+            (
+                "frpdf",
+                "https://www.govinfo.gov/link/fr/57/12146?link-type=pdf",
+            ),
+        )
+
+    def test_id_pin_can_reopen_the_federal_register_document(self):
+        text = "See 88 Fed. Reg. 382. Id. at 390."
+        self.assertEqual(
+            [item for item in _spans(text) if item[1][0] == "frpdf"],
+            [
+                (
+                    "88 Fed. Reg. 382",
+                    (
+                        "frpdf",
+                        "https://www.govinfo.gov/link/fr/88/382?link-type=pdf",
+                    ),
+                ),
+                (
+                    "Id. at 390",
+                    (
+                        "frpdf",
+                        "https://www.govinfo.gov/link/fr/88/382?link-type=pdf",
+                    ),
+                ),
+            ],
         )
 
 

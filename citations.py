@@ -11,9 +11,9 @@ a whole document and returns the clickable spans — case citations plus every
 statute/regulation/rule/constitution source the app already knows how to open.
 
 The per-source modules (``us_code``, ``ecfr``, ``fed_rules``, ``constitution``,
-``state_statutes``, ``statutes_at_large``) each expose their own ``*_CITE_RE``
-and a ``cite_spec``/``action`` helper; :func:`detect_links` simply runs them all
-over the text and reconciles overlaps the same way the opinion reader does.
+``state_statutes``, ``statutes_at_large``, ``federal_register``) each expose
+their own citation parser; :func:`detect_links` simply runs them all over the
+text and reconciles overlaps the same way the opinion reader does.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import ecfr
 import eng_rep
 import fed_cas
 import fed_rules
+import federal_register
 import state_statutes
 import statutes_at_large
 import us_code
@@ -1251,8 +1252,9 @@ def _id_pin_in_range(base_cite: str, pin: str) -> bool:
 ID_LOOKBACK = 4
 
 
-# The page a Statutes at Large link opens to, read back out of its GovInfo URL.
+# The page each paginated GovInfo link opens to, read back out of its URL.
 _STAT_URL_PAGE_RE = re.compile(r"/statute/(\d+)/(\d+)")
+_FR_URL_PAGE_RE = re.compile(r"/fr/(\d+)/(\d+)")
 
 
 def _id_antecedent(
@@ -1297,9 +1299,13 @@ def _id_antecedent(
                 return ("cite",
                         f"{action[1]}@{join_note_pin(pin, notes or [])}")
             continue  # that reporter has no such page — look further back
-        if action[0] == "statpdf":
-            # The Statutes at Large are paginated, so the same test applies.
-            m = _STAT_URL_PAGE_RE.search(action[1])
+        if action[0] in ("statpdf", "frpdf"):
+            # Both official serials are paginated, so the same test applies.
+            page_re = (
+                _STAT_URL_PAGE_RE if action[0] == "statpdf"
+                else _FR_URL_PAGE_RE
+            )
+            m = page_re.search(action[1])
             if m and not _page_in_window(int(m.group(2)), pin):
                 continue
         if gap > ID_NEAR_GAP:
@@ -1319,7 +1325,8 @@ def detect_links(
       * ``("cite", "410 U.S. 113@152")`` — a case (optionally pin-cited),
       * ``("usc"|"cfr"|"rule"|"const"|"statestat", spec)`` — an in-app source,
       * ``("browse", url)`` — a state statute we only link out to,
-      * ``("statpdf", url)`` — a Statutes at Large scan.
+      * ``("statpdf", url)`` — a Statutes at Large scan,
+      * ``("frpdf", url)`` — a Federal Register scan.
 
     Unlike the opinion reader this works over the whole document at once, so a
     short form ("410 U.S. at 152") or an ``Id.`` resolves against citations that
@@ -1394,16 +1401,23 @@ def detect_links(
         if statutes_at_large.url_for(m):  # only link volumes GovInfo has
             stat_spans.append((m.start(), m.end()))
             matches.append((m.start(), m.end(), "stat", m))
+    fr_spans: list[tuple[int, int]] = []
+    for m in federal_register.FR_CITE_RE.finditer(text):
+        if federal_register.url_for(m):
+            fr_spans.append((m.start(), m.end()))
+            matches.append((m.start(), m.end(), "fr", m))
     efed_spans: list[tuple[int, int]] = []
     for m in EARLY_FED_CITE_RE.finditer(text):
         if any(m.start() < e and s < m.end()
                for s, e in engrep_spans + recap_spans + fedcas_spans
-               + stat_spans):
+               + stat_spans + fr_spans):
             continue
         efed_spans.append((m.start(), m.end()))
         matches.append((m.start(), m.end(), "cite", early_fed_cite_text(m)))
-    claimed_spans = (engrep_spans + recap_spans + fedcas_spans + efed_spans
-                     + stat_spans)
+    claimed_spans = (
+        engrep_spans + recap_spans + fedcas_spans + efed_spans
+        + stat_spans + fr_spans
+    )
     for m in _iter_case_cites(text):
         if any(m.start() < e and s < m.end() for s, e in claimed_spans):
             continue
@@ -1525,6 +1539,8 @@ def detect_links(
             action = state_statutes.action_for(m)
         elif kind == "stat":
             action = ("statpdf", statutes_at_large.url_for(m))
+        elif kind == "fr":
+            action = ("frpdf", federal_register.url_for(m))
         elif kind == "engrep":
             # English Reports cite — reprint ("156 Eng. Rep. 145") or nominate
             # ("9 Exch. 341") — -> CommonLII scan; m is the pre-built spec.
