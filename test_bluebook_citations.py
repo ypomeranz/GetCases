@@ -1164,13 +1164,17 @@ class CopyWithCitationTests(unittest.TestCase):
             ]
 
     @staticmethod
-    def _window(with_cite: bool):
+    def _window(mode: str):
         win = object.__new__(_ScholarTextWindow)
         win._text = Mock()
         win._text.index.side_effect = ["2.0", "2.20"]
         win._text.tag_ranges.return_value = ()
-        win._copy_with_cite = Mock()
-        win._copy_with_cite.get.return_value = with_cite
+        # The Copy menu's style, read through copy_mode().  It swallows an
+        # AttributeError and falls back to the default, so a window that never
+        # sets this silently copies *with* a citation whichever style the test
+        # meant to exercise.
+        win._copy_mode_var = Mock()
+        win._copy_mode_var.get.return_value = mode
         win._omitted_footnote_tags = Mock(return_value=(set(), 0))
         win._bluebook_citation = Mock(return_value=("Case, 1 F.4th 2.", "rtf"))
         win._parts = []
@@ -1182,7 +1186,7 @@ class CopyWithCitationTests(unittest.TestCase):
         return win
 
     def test_copy_with_citation_omits_inline_star_pagination(self):
-        win = self._window(True)
+        win = self._window("cite")
         with (
             patch("courtlistener_gui._dump_to_rtf", return_value="body") as dump,
             patch("courtlistener_gui._plain_without_layout_chars",
@@ -1196,7 +1200,7 @@ class CopyWithCitationTests(unittest.TestCase):
         self.assertEqual(plain.call_args.kwargs["omit_tags"], {"pagenum"})
 
     def test_copy_without_citation_keeps_inline_star_pagination(self):
-        win = self._window(False)
+        win = self._window("plain")
         with (
             patch("courtlistener_gui._dump_to_rtf", return_value="body") as dump,
             patch("courtlistener_gui._plain_without_layout_chars",
