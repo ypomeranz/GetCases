@@ -444,7 +444,7 @@ def _add_copy_cascade(menubar: tk.Menu, reader) -> None:
         )
     copy_menu.add_separator()
     copy_menu.add_command(
-        label=f"Copy now\t{_ACCEL}+C", command=reader._copy_formatted)
+        label=f"Copy now \t{_ACCEL}+C", command=reader._copy_formatted)
     menubar.add_cascade(label="Copy", menu=copy_menu)
 
 
