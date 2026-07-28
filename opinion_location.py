@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import bisect
 import difflib
+import hashlib
 import re
 import unicodedata
 from collections import Counter, defaultdict
@@ -320,6 +321,264 @@ def parse_reporter_cite(value: str) -> Optional[ReporterCitation]:
     if not key:
         return None
     return ReporterCitation(volume, reporter, key, page)
+
+
+# ---------------------------------------------------------------------------
+# Pagination that outlives the scan it was measured from
+# ---------------------------------------------------------------------------
+# Aligning an opinion against the Court's own PDF is how a recent SCOTUS case
+# gets U.S. Reports pages at all: Google Scholar publishes it long before the
+# bound volume, so its star pagination is the Supreme Court Reporter's, or
+# missing outright.  That alignment costs a PDF download and a full text match,
+# which is far too slow to keep a reader waiting when they have just followed a
+# pin cite.  The result is therefore written back to the opinion database and
+# reloaded with the opinion, so the pages are there the instant it opens; the
+# scan is still fetched in the background and the stored pages replaced if the
+# alignment has moved on (a preliminary print superseded by the bound volume).
+#
+# Boundaries are stored by *position* in the structured opinion — which part,
+# body or footnotes, which block, and how far into it — because that survives a
+# restart, where the ``id()``-keyed live addresses do not.
+
+_PAGINATION_VERSION = 1
+_FINGERPRINT_WS_RE = re.compile(r"\s+")
+
+
+@dataclass(frozen=True)
+class StoredPageBoundary:
+    """Where a reporter page starts, addressed by position in the text."""
+
+    reporter_page: int
+    part_index: int
+    footnote: bool
+    block_index: int
+    block_offset: int
+
+
+@dataclass(frozen=True)
+class StoredPagination:
+    """A reporter's pagination of one opinion, ready to persist."""
+
+    cite: str
+    fingerprint: str
+    boundaries: tuple[StoredPageBoundary, ...]
+    pdf_page_count: int = 0
+    confidence: float = 0.0
+
+    def pages(self) -> tuple[int, ...]:
+        return tuple(row.reporter_page for row in self.boundaries)
+
+
+def source_fingerprint(parts) -> str:
+    """A digest of the structured opinion a pagination was measured against.
+
+    Stored boundaries address blocks by position, so they mean nothing against
+    a different text — and Google Scholar does re-issue opinions (a corrected
+    typo, newly added star pagination).  A stale map would not merely be
+    missing: it would put reporter pages at the wrong places and mis-cite the
+    passages a reader copies.  Comparing this digest keeps that from happening.
+    """
+    digest = hashlib.sha256()
+    for part_index, part in enumerate(parts or ()):
+        digest.update(f"P{part_index}\x1f{getattr(part, 'kind', '')}".encode())
+        for footnote, blocks in (
+            (False, getattr(part, "blocks", None) or ()),
+            (True, getattr(part, "footnotes", None) or ()),
+        ):
+            for block_index, block in enumerate(blocks):
+                text = "".join(
+                    str(getattr(span, "text", "") or "")
+                    for span in getattr(block, "spans", None) or ()
+                )
+                digest.update(f"\x1e{int(footnote)}:{block_index}\x1f".encode())
+                digest.update(
+                    _FINGERPRINT_WS_RE.sub(" ", text).strip()
+                    .encode("utf-8", "replace")
+                )
+    return digest.hexdigest()
+
+
+def block_positions(parts) -> dict[int, tuple[int, bool, int]]:
+    """``id(block)`` → (part index, is-footnote, block index) for *parts*."""
+    out: dict[int, tuple[int, bool, int]] = {}
+    for part_index, part in enumerate(parts or ()):
+        for footnote, blocks in (
+            (False, getattr(part, "blocks", None) or ()),
+            (True, getattr(part, "footnotes", None) or ()),
+        ):
+            for block_index, block in enumerate(blocks):
+                out[id(block)] = (part_index, footnote, block_index)
+    return out
+
+
+def blocks_by_position(parts) -> dict[tuple[int, bool, int], object]:
+    """The inverse of :func:`block_positions`."""
+    out: dict[tuple[int, bool, int], object] = {}
+    for part_index, part in enumerate(parts or ()):
+        for footnote, blocks in (
+            (False, getattr(part, "blocks", None) or ()),
+            (True, getattr(part, "footnotes", None) or ()),
+        ):
+            for block_index, block in enumerate(blocks):
+                out[(part_index, footnote, block_index)] = block
+    return out
+
+
+def pagination_from_map(parts, location_map) -> Optional[StoredPagination]:
+    """The storable pagination an alignment established, or ``None``.
+
+    Only a map good enough to pin-cite from is worth keeping: an approximate
+    one is fine for scrolling between views but would attach the wrong reporter
+    page to a quotation, so ``copy_ready`` is the bar here as it is for copy.
+    """
+    if location_map is None or not getattr(location_map, "copy_ready", False):
+        return None
+    parsed = parse_reporter_cite(str(getattr(location_map, "copy_cite", "")))
+    if parsed is None:
+        return None
+    positions = block_positions(parts)
+    rows: list[StoredPageBoundary] = []
+    seen: set[int] = set()
+    for boundary in getattr(location_map, "boundaries", ()) or ():
+        page = getattr(boundary, "reporter_page", None)
+        address = getattr(boundary, "address", None)
+        if page is None or address is None:
+            continue
+        found = positions.get(address.block_id)
+        if found is None:
+            continue
+        part_index, footnote, block_index = found
+        if part_index != address.part_index or footnote != address.footnote:
+            continue  # the map was built from a different parts list
+        if int(page) in seen:
+            continue
+        seen.add(int(page))
+        rows.append(
+            StoredPageBoundary(
+                int(page), part_index, footnote, block_index,
+                max(0, int(getattr(address, "block_offset", 0) or 0)),
+            )
+        )
+    if not rows:
+        return None
+    rows.sort(key=lambda row: (row.reporter_page,))
+    return StoredPagination(
+        cite=parsed.cite,
+        fingerprint=source_fingerprint(parts),
+        boundaries=tuple(rows),
+        pdf_page_count=int(getattr(location_map, "pdf_page_count", 0) or 0),
+        confidence=float(getattr(location_map, "confidence", 0.0) or 0.0),
+    )
+
+
+def pagination_to_json(pagination: Optional[StoredPagination]) -> Optional[dict]:
+    """A :class:`StoredPagination` as the plain dict the database stores."""
+    if pagination is None:
+        return None
+    return {
+        "v": _PAGINATION_VERSION,
+        "cite": pagination.cite,
+        "fingerprint": pagination.fingerprint,
+        "pdf_pages": pagination.pdf_page_count,
+        "confidence": round(float(pagination.confidence), 4),
+        # Compact rows keep the Git-synced JSONL readable and small:
+        # [reporter page, part, 0|1 footnote, block, offset].
+        "pages": [
+            [row.reporter_page, row.part_index, int(row.footnote),
+             row.block_index, row.block_offset]
+            for row in pagination.boundaries
+        ],
+    }
+
+
+def pagination_from_json(data) -> Optional[StoredPagination]:
+    """Read back :func:`pagination_to_json`; ``None`` if it is unusable."""
+    if not isinstance(data, dict):
+        return None
+    if int(data.get("v") or 0) != _PAGINATION_VERSION:
+        return None
+    rows: list[StoredPageBoundary] = []
+    for row in data.get("pages") or ():
+        try:
+            page, part_index, footnote, block_index, block_offset = row[:5]
+            rows.append(
+                StoredPageBoundary(
+                    int(page), int(part_index), bool(int(footnote)),
+                    int(block_index), int(block_offset),
+                )
+            )
+        except (TypeError, ValueError, IndexError):
+            return None
+    if not rows:
+        return None
+    return StoredPagination(
+        cite=str(data.get("cite") or ""),
+        fingerprint=str(data.get("fingerprint") or ""),
+        boundaries=tuple(rows),
+        pdf_page_count=int(data.get("pdf_pages") or 0),
+        confidence=float(data.get("confidence") or 0.0),
+    )
+
+
+def location_map_from_pagination(
+    parts, pagination: Optional[StoredPagination], native_cite: str = "",
+) -> Optional[OpinionLocationMap]:
+    """Rebuild a reporter-page map from stored pagination, or ``None``.
+
+    The result carries page boundaries and nothing else: it can say which
+    reporter page any passage is on — enough to jump to a pin cite, draw the
+    page numbers, and cite a copied quotation — but ``navigation_ready`` stays
+    false, because switching to the scan needs the scan.
+    """
+    if pagination is None or not pagination.boundaries:
+        return None
+    if not parts:
+        return None
+    if (pagination.fingerprint
+            and pagination.fingerprint != source_fingerprint(parts)):
+        return None  # the opinion's text has changed under the stored pages
+    parsed = parse_reporter_cite(pagination.cite)
+    if parsed is None:
+        return None
+    source = build_text_source(parts, native_cite=native_cite)
+    blocks = blocks_by_position(parts)
+    rows: list[PageBoundary] = []
+    for row in pagination.boundaries:
+        block = blocks.get((row.part_index, row.footnote, row.block_index))
+        if block is None:
+            continue
+        address = TextAddress(
+            row.part_index, row.footnote, id(block), row.block_offset
+        )
+        offset = source.offset_for(address)
+        if offset is None:
+            continue
+        rows.append(
+            PageBoundary(
+                max(0, row.reporter_page - parsed.page),
+                row.reporter_page,
+                offset,
+                address,
+                pagination.confidence or 1.0,
+                False,
+            )
+        )
+    if not rows:
+        return None
+    rows.sort(key=lambda boundary: (boundary.source_offset, boundary.pdf_page))
+    return OpinionLocationMap(
+        source=source,
+        anchors=(),
+        boundaries=tuple(rows),
+        confidence=pagination.confidence,
+        native_cite=native_cite,
+        pdf_cite=pagination.cite,
+        us_cite=pagination.cite,
+        copy_ready=True,
+        copy_cite=pagination.cite,
+        navigation_ready=False,
+        pdf_page_count=pagination.pdf_page_count,
+    )
 
 
 def _same_reporter(
@@ -1349,8 +1608,17 @@ __all__ = [
     "LocationAnchor",
     "PageBoundary",
     "OpinionLocationMap",
+    "StoredPageBoundary",
+    "StoredPagination",
     "parse_reporter_cite",
     "build_text_source",
     "build_plain_text_source",
     "align_opinion_locations",
+    "source_fingerprint",
+    "block_positions",
+    "blocks_by_position",
+    "pagination_from_map",
+    "pagination_to_json",
+    "pagination_from_json",
+    "location_map_from_pagination",
 ]

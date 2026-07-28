@@ -1,7 +1,9 @@
 """Pure location matching between text opinions and reporter PDFs."""
 
-from types import SimpleNamespace
+import json
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 
 from opinion_location import (
     OpinionLocationMap,
@@ -10,6 +12,10 @@ from opinion_location import (
     align_opinion_locations,
     build_plain_text_source,
     build_text_source,
+    location_map_from_pagination,
+    pagination_from_json,
+    pagination_from_map,
+    pagination_to_json,
     us_reports_cite_from_pdf,
 )
 
@@ -744,6 +750,129 @@ class AlignmentTests(unittest.TestCase):
         }
         self.assertEqual(starts.get(297), second[:20])
         self.assertEqual(starts.get(298), third[:20])
+
+
+class StoredPaginationTests(unittest.TestCase):
+    """Reporter pages recovered from a scan are saved with the opinion and
+    rebuilt from it, so a pin cite lands before any PDF is fetched."""
+
+    @staticmethod
+    def _parts():
+        return [
+            _part((_span("Opening passage of the majority. "),),
+                  (_span("Second page of the majority. "),)),
+            _part((_span("The dissent begins here. "),)),
+        ]
+
+    def _map(self, parts, cite="600 U. S. 100"):
+        source = build_text_source(parts, native_cite="143 S. Ct. 2200")
+        offsets = [
+            source.text.index("Second page"),
+            source.text.index("The dissent"),
+        ]
+        boundaries = [
+            PageBoundary(0, 100, 0, source.address_at(0), 1.0, False),
+            PageBoundary(
+                1, 101, offsets[0], source.address_at(offsets[0]), 1.0, False),
+            PageBoundary(
+                2, 102, offsets[1], source.address_at(offsets[1]), 1.0, False),
+        ]
+        return OpinionLocationMap(
+            source=source,
+            anchors=(),
+            boundaries=tuple(boundaries),
+            confidence=0.9,
+            native_cite="143 S. Ct. 2200",
+            pdf_cite=cite,
+            us_cite=cite,
+            copy_ready=True,
+            copy_cite=cite,
+            navigation_ready=True,
+            pdf_page_count=3,
+        )
+
+    def test_pages_survive_a_round_trip_through_the_database_record(self):
+        parts = self._parts()
+        stored = pagination_from_map(parts, self._map(parts))
+        payload = pagination_to_json(stored)
+
+        # Reparsed from JSON the way the store hands it back.
+        reloaded = pagination_from_json(json.loads(json.dumps(payload)))
+        rebuilt = location_map_from_pagination(
+            parts, reloaded, native_cite="143 S. Ct. 2200",
+        )
+
+        self.assertEqual(reloaded, stored)
+        self.assertEqual(rebuilt.copy_cite, "600 U. S. 100")
+        self.assertTrue(rebuilt.copy_ready)
+        text = rebuilt.source.text
+        self.assertEqual(rebuilt.reporter_page(text.index("Opening")), 100)
+        self.assertEqual(rebuilt.reporter_page(text.index("Second page")), 101)
+        self.assertEqual(rebuilt.reporter_page(text.index("The dissent")), 102)
+
+    def test_rebuilt_map_does_not_offer_itself_for_pdf_navigation(self):
+        # It has no scan behind it: there is nothing to switch to yet.
+        parts = self._parts()
+        rebuilt = location_map_from_pagination(
+            parts, pagination_from_map(parts, self._map(parts)),
+        )
+        self.assertFalse(rebuilt.navigation_ready)
+        self.assertEqual(rebuilt.anchors, ())
+
+    def test_pagination_is_refused_when_the_opinion_text_has_changed(self):
+        parts = self._parts()
+        stored = pagination_from_map(parts, self._map(parts))
+
+        edited = self._parts()
+        edited[0].blocks[0].spans[0].text = "A revised opening passage. "
+
+        self.assertIsNone(location_map_from_pagination(edited, stored))
+
+    def test_an_approximate_alignment_is_not_stored(self):
+        # Good enough to scroll between views, not good enough to pin-cite
+        # from — so not good enough to save and reuse as pin cites.
+        parts = self._parts()
+        location_map = self._map(parts)
+        approximate = replace(location_map, copy_ready=False, copy_cite="")
+
+        self.assertIsNone(pagination_from_map(parts, approximate))
+
+    def test_a_record_written_by_another_version_is_ignored(self):
+        parts = self._parts()
+        payload = pagination_to_json(
+            pagination_from_map(parts, self._map(parts))
+        )
+        payload["v"] = payload["v"] + 1
+
+        self.assertIsNone(pagination_from_json(payload))
+
+    def test_footnote_boundaries_keep_their_side_of_the_part(self):
+        parts = self._parts()
+        parts[0].footnotes = [
+            SimpleNamespace(spans=[_span("A note printed on page 101.")])
+        ]
+        source = build_text_source(parts, native_cite="143 S. Ct. 2200")
+        note_offset = source.text.index("A note printed")
+        location_map = replace(
+            self._map(parts),
+            source=source,
+            boundaries=(
+                PageBoundary(0, 100, 0, source.address_at(0), 1.0, False),
+                PageBoundary(
+                    1, 101, note_offset, source.address_at(note_offset),
+                    1.0, False),
+            ),
+        )
+
+        stored = pagination_from_map(parts, location_map)
+        rebuilt = location_map_from_pagination(parts, stored)
+
+        self.assertEqual([row.footnote for row in stored.boundaries],
+                         [False, True])
+        self.assertEqual(
+            rebuilt.reporter_page(rebuilt.source.text.index("A note printed")),
+            101,
+        )
 
 
 if __name__ == "__main__":

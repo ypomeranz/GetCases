@@ -11,9 +11,9 @@ a whole document and returns the clickable spans — case citations plus every
 statute/regulation/rule/constitution source the app already knows how to open.
 
 The per-source modules (``us_code``, ``ecfr``, ``fed_rules``, ``constitution``,
-``state_statutes``, ``statutes_at_large``) each expose their own ``*_CITE_RE``
-and a ``cite_spec``/``action`` helper; :func:`detect_links` simply runs them all
-over the text and reconciles overlaps the same way the opinion reader does.
+``state_statutes``, ``statutes_at_large``, ``federal_register``) each expose
+their own citation parser; :func:`detect_links` simply runs them all over the
+text and reconciles overlaps the same way the opinion reader does.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import ecfr
 import eng_rep
 import fed_cas
 import fed_rules
+import federal_register
 import state_statutes
 import statutes_at_large
 import us_code
@@ -40,6 +41,118 @@ PINCITE_AFTER_RE = re.compile(
     r",\s*(?:at\s+)?\*?(\d{1,6})(?:\s*[-–—]\s*\*?\d{1,6})?(?!\d|\s*[A-Z])",
     re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Footnote pin cites
+# ---------------------------------------------------------------------------
+# Bluebook rule 3.2(b) cites material in a note by the page the note is *called
+# on* plus the note's own number: "200 U.S. 12, 13 n.4", "13 n. 4", "13 nn.4-5",
+# "13 & n.4", "13 nn. 4 & 6".  Without this the pin cite read as a plain
+# reference to page 13 and the note number was left outside the link.
+#
+# Deliberately case-sensitive: an upper-case "N." next to digits is a reporter
+# ("529 N.W. 2d 155"), never a note.
+_NOTE_NUMBER = r"\d{1,4}[a-z]?|\*{1,3}|†{1,2}|‡{1,2}"
+# ``(?!\d)`` after each number stops the digit run being taken apart: without
+# it "…, 30 n.7" would fall back to reading a note "3" and leaving "0 n.7".
+_NOTE_HEAD_RE = re.compile(
+    r"\s*(?:,\s*)?(?:&\s*)?(nn\.|n\.|notes?\b\.?)\s*"
+    r"(" + _NOTE_NUMBER + r")(?!\d)"
+)
+# A further note in the same pinpoint.  A range or an "&" always continues the
+# list; a *comma* only does so after the plural marker, because "13 n.4, 25" is
+# a note and then a second pin page.  Even after "nn.", a comma yields to a
+# following note marker — "nn.4-5, 30 n.7" names page 30, not note 30.
+_NOTE_JOIN_RE = re.compile(
+    r"\s*(?:[-–—]|&)\s*(" + _NOTE_NUMBER + r")(?!\d)")
+_NOTE_LIST_JOIN_RE = re.compile(
+    r"\s*,\s*(" + _NOTE_NUMBER + r")(?!\d)"
+    r"(?!\s*(?:&\s*)?n(?:n?\.|otes?\b))"
+)
+# A pin already encoded for an action: "13n4", "13n4,5", or a bare "13".
+_ENCODED_NOTE_PIN_RE = re.compile(r"^(\d*)n(.+)$")
+
+# The pinpoint page, matched where a note marker follows it.
+# PINCITE_AFTER_RE ends in ``(?!\d|\s*[A-Z])`` — under its IGNORECASE flag that
+# refuses a page followed by *any* letter, which is what keeps a parallel
+# citation (", 510 A.2d 562") from reading as a pin page.  A note marker is a
+# letter too, so the same page needs matching without that guard; the guard's
+# job is then done by requiring an actual note to follow.
+_NOTE_PINCITE_AFTER_RE = re.compile(
+    r",\s*(?:at\s+)?\*?(\d{1,6})(?:\s*[-–—]\s*\*?\d{1,6})?(?!\d)",
+    re.IGNORECASE,
+)
+
+
+def join_note_pin(page: str, notes: "list[str]") -> str:
+    """Encode a footnote pin for a link action: page 13, note 4 → ``"13n4"``.
+
+    The page is retained even though the note is what the link opens: separate
+    writings in one report restart their notes at 1, so the page is what says
+    *whose* note 4 is meant.  A note with no page ("Id. n.4") encodes as
+    ``"n4"``."""
+    notes = [str(n).strip() for n in notes if str(n).strip()]
+    if not notes:
+        return str(page or "")
+    return f"{page or ''}n{','.join(notes)}"
+
+
+def split_note_pin(pin: str) -> "tuple[str, list[str]]":
+    """Decode :func:`join_note_pin` — ``"13n4"`` → ``("13", ["4"])``.  An
+    ordinary page pin yields no notes."""
+    pin = str(pin or "").strip()
+    m = _ENCODED_NOTE_PIN_RE.match(pin)
+    if not m:
+        return pin, []
+    return m.group(1), [n for n in m.group(2).split(",") if n]
+
+
+def pin_display(pin: str) -> str:
+    """A pin as a reader sees it: ``"13n4"`` → ``"13 n.4"``, ``"13n4,5"`` →
+    ``"13 nn.4, 5"``.  Used in window titles and status lines."""
+    page, notes = split_note_pin(pin)
+    if not notes:
+        return page
+    marker = ("n." if len(notes) == 1 else "nn.") + ", ".join(notes)
+    return f"{page} {marker}" if page else marker
+
+
+def note_pin_after(text: str, pos: int) -> "tuple[list[str], int]":
+    """The footnote pinpoint written at *pos*, as (note numbers, end)."""
+    text = text or ""
+    head = _NOTE_HEAD_RE.match(text, pos)
+    if head is None:
+        return [], pos
+    plural = head.group(1).lower().rstrip(".") in ("nn", "notes")
+    notes = [head.group(2)]
+    end = head.end()
+    while True:
+        more = _NOTE_JOIN_RE.match(text, end)
+        if more is None and plural:
+            more = _NOTE_LIST_JOIN_RE.match(text, end)
+        if more is None:
+            return notes, end
+        notes.append(more.group(1))
+        end = more.end()
+
+
+def pin_after(text: str, pos: int) -> "tuple[str, int]":
+    """The whole pin cite written at *pos*: (encoded pin, end offset).
+
+    Returns ``("", pos)`` when no pinpoint follows.  "…, 13 n.4" yields
+    ``("13n4", <end past the note>)`` so the link covers the note number the
+    reader sees and opens the note rather than the page carrying it."""
+    noted = _NOTE_PINCITE_AFTER_RE.match(text or "", pos)
+    if noted is not None:
+        notes, end = note_pin_after(text, noted.end())
+        if notes:
+            return join_note_pin(noted.group(1), notes), end
+    m = PINCITE_AFTER_RE.match(text or "", pos)
+    if not m:
+        return "", pos
+    notes, end = note_pin_after(text, m.end())
+    return join_note_pin(m.group(1), notes), end
+
 
 # Citations recognized inside running text (made clickable → Scholar lookup).
 # Pattern: volume, reporter abbreviation, page.
@@ -251,6 +364,22 @@ _EXTRA_PIN_RE = re.compile(
 # page ("542 U. S., at 254" out of "at 254–255"), so the rest of the range has
 # to be taken separately to finish the highlight.
 _RANGE_TAIL_RE = re.compile(r"\s*[-–—]\s*\*?\d{1,6}(?!\d)")
+
+
+def note_pin_after_page(text: str, pos: int) -> "tuple[list[str], int]":
+    """The footnote pinpoint following a pin page already matched up to *pos*,
+    as (note numbers, end offset).
+
+    Used where the page match stops at the first page of a range — a short cite
+    ("542 U. S., at 254–255 n.7") or an "Id., at 254–255 n.7" — so the range
+    tail is stepped over before the note is read.  The end is past the range
+    tail whether or not a note follows it, which is also what a short cite's
+    highlight wants."""
+    tail = _RANGE_TAIL_RE.match(text or "", pos)
+    if tail:
+        pos = tail.end()
+    return note_pin_after(text, pos)
+
 
 # Lowercase words that sit *inside* a case name and must not end the backward
 # scan for one ("District of Columbia v. Wesby", "Rhode Island ex rel. …").
@@ -513,6 +642,10 @@ def _case_cite_spans(
     none, but its pages want splitting just the same ("id., at 675, 681–683,
     693" is three).  ``short=True`` says the match already ends at its first
     page, so only the tail of a range remains to be taken.
+
+    A footnote pinpoint riding on any of those pages ("225 n.4") is taken into
+    that page's segment and encoded into its pin, so the whole citation stays
+    one blue run and following it opens the note.
     """
     if with_name:
         name_start = _case_name_start(text, start, floor, italic)
@@ -521,20 +654,21 @@ def _case_cite_spans(
     if short:
         # SHORT_CITE_RE ends at the first page of a range; take the rest so the
         # whole range is highlighted.  It still opens at that first page.
-        tail = _RANGE_TAIL_RE.match(text, end)
-        if tail:
-            end = tail.end()
+        _notes, end = note_pin_after_page(text, end)
     else:
-        pin = PINCITE_AFTER_RE.match(text, end)
+        pin, pin_end = pin_after(text, end)
         if pin:
-            end = pin.end()
+            end = pin_end
     segments: list[list] = [[start, end, ""]]
     while True:
         extra = _EXTRA_PIN_RE.match(text, segments[-1][1])
         if not extra:
             break
+        notes, extra_end = note_pin_after(text, extra.end())
         # The comma joins the new segment so the blue runs unbroken.
-        segments.append([extra.start(), extra.end(), extra.group(1)])
+        segments.append(
+            [extra.start(), extra_end, join_note_pin(extra.group(1), notes)]
+        )
     # The court/year parenthetical closes the citation, so it belongs to
     # whichever segment it follows.
     paren = _COURT_YEAR_PAREN_RE.match(text, segments[-1][1])
@@ -848,13 +982,15 @@ def cite_target_from_text(
     """(base cite, pin) named in `text`.  The base is "vol reporter firstpage"
     whether the cite is written in full ("8 F.4th 557, 565") or short
     ("8 F.4th at 565", resolved to its first page via `index`); the pin is the
-    pincite/short page, or "".  Empty base when no reporter cite is present."""
+    pincite/short page — encoded with its footnote when the cite pins one
+    ("8 F.4th 557, 565 n.4" → "565n4") — or "".  Empty base when no reporter
+    cite is present."""
     case_matches = _iter_case_cites(text)
     if case_matches:
         cm = case_matches[0]
         base = _case_match_text(cm)
-        pm = PINCITE_AFTER_RE.match(text, cm.end())
-        return base, (pm.group(1) if pm else "")
+        pin, _end = pin_after(text, cm.end())
+        return base, pin
     short_matches = _iter_short_cites(text)
     if short_matches:
         sm = short_matches[0]
@@ -868,7 +1004,8 @@ def cite_target_from_text(
             first = max(below) if below else pages[0]
         else:
             first = pin  # no full cite indexed — best effort
-        return f"{sm.group(1)} {rep} {first}", str(pin)
+        notes, _end = note_pin_after_page(text, sm.end())
+        return f"{sm.group(1)} {rep} {first}", join_note_pin(str(pin), notes)
     return "", ""
 
 
@@ -1115,13 +1252,15 @@ def _id_pin_in_range(base_cite: str, pin: str) -> bool:
 ID_LOOKBACK = 4
 
 
-# The page a Statutes at Large link opens to, read back out of its GovInfo URL.
+# The page each paginated GovInfo link opens to, read back out of its URL.
 _STAT_URL_PAGE_RE = re.compile(r"/statute/(\d+)/(\d+)")
+_FR_URL_PAGE_RE = re.compile(r"/fr/(\d+)/(\d+)")
 
 
 def _id_antecedent(
     text: str, recent: list, pin: "str | None", start: int,
     unlinkable: "list[tuple[int, int]] | None" = None,
+    notes: "list[str] | None" = None,
 ) -> "tuple[str, str] | None":
     """The citation an "Id., at *pin*" refers to, or ``None``.
 
@@ -1138,6 +1277,11 @@ def _id_antecedent(
     deliberately not linked — a law review, an Attorney General opinion.  An
     "Id." after one of those refers to *it*, so it must not reach past one to
     an earlier authority and cite the wrong source.
+
+    *notes* carries a footnote pinpoint written after the page ("Id., at 13
+    n.4"); it rides into the returned action's pin so the link opens the note.
+    The page still decides which authority is meant — a note number could
+    belong to any of them.
     """
     if pin is None:
         return None  # a bare "Id." names no page, and is never linked
@@ -1152,11 +1296,16 @@ def _id_antecedent(
             continue  # unpaginated — "at N" cannot be pointing here
         if action[0] == "cite":
             if _id_pin_in_range(action[1], pin):
-                return ("cite", f"{action[1]}@{pin}")
+                return ("cite",
+                        f"{action[1]}@{join_note_pin(pin, notes or [])}")
             continue  # that reporter has no such page — look further back
-        if action[0] == "statpdf":
-            # The Statutes at Large are paginated, so the same test applies.
-            m = _STAT_URL_PAGE_RE.search(action[1])
+        if action[0] in ("statpdf", "frpdf"):
+            # Both official serials are paginated, so the same test applies.
+            page_re = (
+                _STAT_URL_PAGE_RE if action[0] == "statpdf"
+                else _FR_URL_PAGE_RE
+            )
+            m = page_re.search(action[1])
             if m and not _page_in_window(int(m.group(2)), pin):
                 continue
         if gap > ID_NEAR_GAP:
@@ -1176,7 +1325,8 @@ def detect_links(
       * ``("cite", "410 U.S. 113@152")`` — a case (optionally pin-cited),
       * ``("usc"|"cfr"|"rule"|"const"|"statestat", spec)`` — an in-app source,
       * ``("browse", url)`` — a state statute we only link out to,
-      * ``("statpdf", url)`` — a Statutes at Large scan.
+      * ``("statpdf", url)`` — a Statutes at Large scan,
+      * ``("frpdf", url)`` — a Federal Register scan.
 
     Unlike the opinion reader this works over the whole document at once, so a
     short form ("410 U.S. at 152") or an ``Id.`` resolves against citations that
@@ -1251,16 +1401,23 @@ def detect_links(
         if statutes_at_large.url_for(m):  # only link volumes GovInfo has
             stat_spans.append((m.start(), m.end()))
             matches.append((m.start(), m.end(), "stat", m))
+    fr_spans: list[tuple[int, int]] = []
+    for m in federal_register.FR_CITE_RE.finditer(text):
+        if federal_register.url_for(m):
+            fr_spans.append((m.start(), m.end()))
+            matches.append((m.start(), m.end(), "fr", m))
     efed_spans: list[tuple[int, int]] = []
     for m in EARLY_FED_CITE_RE.finditer(text):
         if any(m.start() < e and s < m.end()
                for s, e in engrep_spans + recap_spans + fedcas_spans
-               + stat_spans):
+               + stat_spans + fr_spans):
             continue
         efed_spans.append((m.start(), m.end()))
         matches.append((m.start(), m.end(), "cite", early_fed_cite_text(m)))
-    claimed_spans = (engrep_spans + recap_spans + fedcas_spans + efed_spans
-                     + stat_spans)
+    claimed_spans = (
+        engrep_spans + recap_spans + fedcas_spans + efed_spans
+        + stat_spans + fr_spans
+    )
     for m in _iter_case_cites(text):
         if any(m.start() < e and s < m.end() for s, e in claimed_spans):
             continue
@@ -1293,8 +1450,9 @@ def detect_links(
         first = max(below) if below else pages[0]
         rep = re.sub(r"\s+", " ", m.group(2)).strip().replace("U. S.", "U.S.")
         cite = f"{m.group(1)} {rep} {first}"
-        if pin != first:
-            cite += f"@{pin}"
+        notes, _end = note_pin_after_page(text, m.end())
+        if pin != first or notes:
+            cite += "@" + join_note_pin(str(pin), notes)
         matches.append((m.start(), m.end(), "shortcite", cite))
     for m in ID_CITE_RE.finditer(text):
         matches.append((m.start(), m.end(), "idcite", m))
@@ -1327,9 +1485,9 @@ def detect_links(
             # for the WL/LEXIS cites added by the RECAP pass.
             cite = m if isinstance(m, str) else _case_match_text(m)
             cite_base = cite
-            pin_m = PINCITE_AFTER_RE.match(text, end)
-            if pin_m:
-                cite += "@" + pin_m.group(1)
+            pin, _pin_end = pin_after(text, end)
+            if pin:
+                cite += "@" + pin
             action = ("cite", cite)
         elif kind == "recap":
             action = ("recap", m)  # m is the pre-built JSON spec
@@ -1373,12 +1531,16 @@ def detect_links(
             ):
                 action = None
             else:
+                id_notes, _end = note_pin_after_page(text, end)
                 action = _id_antecedent(
-                    text, recent, m.group(1), start, unlinkable)
+                    text, recent, m.group(1), start, unlinkable,
+                    notes=id_notes)
         elif kind == "statestat":
             action = state_statutes.action_for(m)
         elif kind == "stat":
             action = ("statpdf", statutes_at_large.url_for(m))
+        elif kind == "fr":
+            action = ("frpdf", federal_register.url_for(m))
         elif kind == "engrep":
             # English Reports cite — reprint ("156 Eng. Rep. 145") or nominate
             # ("9 Exch. 341") — -> CommonLII scan; m is the pre-built spec.

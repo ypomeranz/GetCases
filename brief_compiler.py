@@ -58,9 +58,9 @@ class Authority:
     ``kind`` is the citation action kind from :func:`citations.detect_links`:
     "cite" for a reporter case, "recap" for an unpublished opinion cited by
     docket / WL number, "usc"/"cfr"/"rule"/"const"/"statestat" for a statute
-    source, "statpdf" for a Statutes at Large scan.  ``value`` is that action's
-    payload.  ``name``/``year`` are scraped from the brief only as a last-resort
-    fallback for the file name."""
+    source, "statpdf" for a Statutes at Large scan, and "frpdf" for a Federal
+    Register scan. ``value`` is that action's payload. ``name``/``year`` are
+    scraped from the brief only as a last-resort fallback for the file name."""
 
     kind: str
     value: str
@@ -349,12 +349,21 @@ def _resolve_statute(resolver, auth: Authority) -> _Resolved:
         label = resolver.authority_label(auth.kind, auth.value) or ""
     except Exception:
         label = ""
-    if auth.kind == "statpdf":
+    if auth.kind in ("statpdf", "frpdf"):
         data = resolver.statute_pdf_bytes(auth.value)
         if data:
-            return _Resolved(data, ".pdf", "Statutes at Large (GovInfo)",
+            source = (
+                "Federal Register (GovInfo)"
+                if auth.kind == "frpdf"
+                else "Statutes at Large (GovInfo)"
+            )
+            return _Resolved(data, ".pdf", source,
                              stem=label or auth.value)
-        return _Resolved(note="Statutes at Large PDF could not be downloaded")
+        label = (
+            "Federal Register" if auth.kind == "frpdf"
+            else "Statutes at Large"
+        )
+        return _Resolved(note=f"{label} PDF could not be downloaded")
     if auth.kind in _TEXT_STATUTE_KINDS:
         loaded = resolver.statute_text(auth.kind, auth.value)
         if loaded:

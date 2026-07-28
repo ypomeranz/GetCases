@@ -16,7 +16,9 @@ import re
 import unittest
 from types import SimpleNamespace
 
+import citations
 from citations import _valid_case_reporter, detect_links
+import federal_register
 
 
 def _spans(text: str):
@@ -181,6 +183,136 @@ class MultiplePinCiteTests(unittest.TestCase):
         )
 
 
+class FootnotePinCiteTests(unittest.TestCase):
+    """"200 U.S. 12, 13 n.4" cites note 4, not page 13.
+
+    Bluebook rule 3.2(b) names the page a note is *called* on and then the
+    note; the whole thing is one citation, so the note number belongs inside
+    the link and the link has to open the note."""
+
+    def test_note_rides_into_the_pin_and_the_link_covers_it(self):
+        text = "See Smith v. Jones, 200 U.S. 12, 13 n.4 (1906)."
+        self.assertEqual(
+            _spans(text),
+            [("Smith v. Jones, 200 U.S. 12, 13 n.4 (1906)",
+              ("cite", "200 U.S. 12@13n4"))],
+        )
+
+    def test_space_after_the_marker(self):
+        text = "See Smith v. Jones, 200 U.S. 12, 13 n. 4 (1906)."
+        self.assertEqual(
+            _spans(text),
+            [("Smith v. Jones, 200 U.S. 12, 13 n. 4 (1906)",
+              ("cite", "200 U.S. 12@13n4"))],
+        )
+
+    def test_several_notes(self):
+        text = "See Smith v. Jones, 200 U.S. 12, 13 nn.4-5 (1906)."
+        self.assertEqual(
+            _spans(text)[0], ("Smith v. Jones, 200 U.S. 12, 13 nn.4-5 (1906)",
+                              ("cite", "200 U.S. 12@13n4,5")),
+        )
+
+    def test_page_and_note_together(self):
+        text = "See Smith v. Jones, 200 U.S. 12, 13 & n.4 (1906)."
+        self.assertEqual(
+            _spans(text)[0][1], ("cite", "200 U.S. 12@13n4"))
+
+    def test_note_on_a_page_range(self):
+        text = "See Smith v. Jones, 200 U.S. 12, 13-14 n.4 (1906)."
+        self.assertEqual(
+            _spans(text),
+            [("Smith v. Jones, 200 U.S. 12, 13-14 n.4 (1906)",
+              ("cite", "200 U.S. 12@13n4"))],
+        )
+
+    def test_spelled_out_note(self):
+        text = "See Smith v. Jones, 200 U.S. 12, 13 note 4 (1906)."
+        self.assertEqual(_spans(text)[0][1], ("cite", "200 U.S. 12@13n4"))
+
+    def test_note_on_a_later_pin_page(self):
+        text = "See 5 F. 4th 216, 225, 228 n.7 (2021)."
+        self.assertEqual(
+            _spans(text),
+            [("5 F. 4th 216, 225", ("cite", "5 F. 4th 216@225")),
+             (", 228 n.7 (2021)", ("cite", "5 F. 4th 216@228n7"))],
+        )
+
+    def test_short_cite_note(self):
+        text = ("Intel Corp. v. Advanced Micro Devices, Inc., 542 U. S. 241, "
+                "258 (2004). Later, Intel, 542 U. S., at 254 n.9.")
+        self.assertEqual(
+            _spans(text)[-1],
+            ("Intel, 542 U. S., at 254 n.9", ("cite", "542 U.S. 241@254n9")),
+        )
+
+    def test_id_note(self):
+        text = ("United States v. Miller, 753 F.2d 19 (3d Cir. 1985). "
+                "Id. at 23 n.2.")
+        self.assertEqual(
+            _spans(text)[-1], ("Id. at 23 n.2", ("cite", "753 F.2d 19@23n2")))
+
+    def test_a_parallel_reporter_is_still_not_read_as_a_note(self):
+        # The upper-case "N." of a reporter must never look like a note
+        # marker: "529 N.W. 2d 155" is a citation, not note 2 of page 529.
+        text = "See Smith v. Jones, 123 Mich. 556, 529 N.W. 2d 155 (1986)."
+        self.assertEqual(
+            [a for _t, a in _spans(text)],
+            [("cite", "123 Mich. 556"), ("cite", "529 N.W. 2d 155")],
+        )
+
+    def test_an_ordinary_pin_page_is_unchanged(self):
+        text = "See Smith v. Jones, 200 U.S. 12, 13 (1906)."
+        self.assertEqual(_spans(text)[0][1], ("cite", "200 U.S. 12@13"))
+
+    def test_a_page_after_a_single_note_is_a_page(self):
+        # "n." is singular, so what follows the comma is a second pin page.
+        text = "See Smith v. Jones, 200 U.S. 12, 13 n.4, 25 (1906)."
+        self.assertEqual(
+            [a[1] for _t, a in _spans(text)],
+            ["200 U.S. 12@13n4", "200 U.S. 12@25"],
+        )
+
+    def test_a_note_list_yields_to_a_following_note_marker(self):
+        # "nn.4-5, 30 n.7" names a second page, not a note 30.
+        text = "See Smith v. Jones, 200 U.S. 12, 13 nn.4-5, 30 n.7 (1906)."
+        self.assertEqual(
+            [a[1] for _t, a in _spans(text)],
+            ["200 U.S. 12@13n4,5", "200 U.S. 12@30n7"],
+        )
+
+    def test_a_note_list_keeps_its_own_comma(self):
+        text = "See Smith v. Jones, 200 U.S. 12, 13 nn.4, 6 (1906)."
+        self.assertEqual(
+            _spans(text),
+            [("Smith v. Jones, 200 U.S. 12, 13 nn.4, 6 (1906)",
+              ("cite", "200 U.S. 12@13n4,6"))],
+        )
+
+
+class NotePinEncodingTests(unittest.TestCase):
+    """The "@pin" a link action carries round-trips, and reads back for
+    display as the citation was written."""
+
+    def test_round_trip(self):
+        for pin, expected in (
+            ("13", ("13", [])),
+            ("13n4", ("13", ["4"])),
+            ("13n4,5", ("13", ["4", "5"])),
+            ("n4", ("", ["4"])),
+            ("", ("", [])),
+        ):
+            with self.subTest(pin=pin):
+                self.assertEqual(citations.split_note_pin(pin), expected)
+                page, notes = expected
+                self.assertEqual(citations.join_note_pin(page, notes), pin)
+
+    def test_display(self):
+        self.assertEqual(citations.pin_display("13"), "13")
+        self.assertEqual(citations.pin_display("13n4"), "13 n.4")
+        self.assertEqual(citations.pin_display("13n4,5"), "13 nn.4, 5")
+
+
 class StatutesAtLargeTests(unittest.TestCase):
     def test_scholar_spacing_and_page_range(self):
         text = "Pub. L. No. 98-473, § 203, 98 Stat.1981-82 (1984)."
@@ -189,6 +321,66 @@ class StatutesAtLargeTests(unittest.TestCase):
             [("98 Stat.1981-82",
               ("statpdf",
                "https://www.govinfo.gov/link/statute/98/1981"))],
+        )
+
+
+class FederalRegisterTests(unittest.TestCase):
+    def test_compact_and_bluebook_forms_use_the_official_pdf_link(self):
+        for citation, page in (
+            ("57 FR 12146", "12146"),
+            ("88 Fed. Reg. 382", "382"),
+            ("77 Fed.Reg. 36,150–36,152", "36150"),
+        ):
+            with self.subTest(citation=citation):
+                self.assertEqual(
+                    _spans(citation),
+                    [(
+                        citation,
+                        (
+                            "frpdf",
+                            "https://www.govinfo.gov/link/fr/"
+                            f"{citation.split()[0]}/{page}?link-type=pdf",
+                        ),
+                    )],
+                )
+
+    def test_federal_rules_and_frd_cases_do_not_collide(self):
+        self.assertFalse(any(
+            action[0] == "frpdf"
+            for _start, _end, action in detect_links(
+                "See Fed. R. Civ. P. 56 and Smith, 123 F.R.D. 456."
+            )
+        ))
+
+    def test_spotlight_parser_accepts_the_existing_cfr_source_citation(self):
+        self.assertEqual(
+            federal_register.parse_query("57 FR 12146"),
+            (
+                "frpdf",
+                "https://www.govinfo.gov/link/fr/57/12146?link-type=pdf",
+            ),
+        )
+
+    def test_id_pin_can_reopen_the_federal_register_document(self):
+        text = "See 88 Fed. Reg. 382. Id. at 390."
+        self.assertEqual(
+            [item for item in _spans(text) if item[1][0] == "frpdf"],
+            [
+                (
+                    "88 Fed. Reg. 382",
+                    (
+                        "frpdf",
+                        "https://www.govinfo.gov/link/fr/88/382?link-type=pdf",
+                    ),
+                ),
+                (
+                    "Id. at 390",
+                    (
+                        "frpdf",
+                        "https://www.govinfo.gov/link/fr/88/382?link-type=pdf",
+                    ),
+                ),
+            ],
         )
 
 

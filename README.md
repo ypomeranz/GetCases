@@ -75,6 +75,9 @@ The app resolves each one via Google Scholar and then CourtListener.
 Browse Briefs (Ctrl+B)
 Open a PDF, Word, RTF, or text brief – all citations are highlighted and clickable, linking directly to the cited source.
 
+Following a pin cite
+A citation with a pinpoint page opens the cited case and jumps to that page. A citation to a footnote – “200 U.S. 12, 13 n.4”, “13 n. 4”, “13 nn.4–5”, “13 & n.4” – is read as a whole: the note number is part of the link, and following it lands on note 4 rather than on the page its reference sits on. Where a report carries several writings that each begin their notes at 1, the page in the pin cite is what says whose note 4 is meant. Short forms (“542 U. S., at 254 n.9”) and “Id., at 23 n.2” work the same way.
+
 What Sources Are Included
 Source	Description
 CourtListener	Full‑text search across U.S. federal and state court opinions. Provides PDFs and structured opinion text.
@@ -85,7 +88,7 @@ Federal Rules	Civil, Criminal, Evidence, Appellate, Bankruptcy – from Cornell 
 U.S. Constitution	Full text with article/amendment navigation; detects both formal citations and prose references.
 California & Florida Statutes	Official texts from the state legislatures (CA LegInfo, FL Senate). More states can be added.
 Statutes at Large	U.S. Statutes at Large (GovInfo PDFs) – cited as 88 Stat. 1932.
-US Reports PDFs	Official Supreme Court opinion scans: GPO’s GovInfo (vols 2–583) first, the Library of Congress CDN (vols 1–542) as fallback; for vols 584+ the app downloads the Court’s own bound‑volume / preliminary‑print PDF from supremecourt.gov into the “US Reports” folder (once per volume) and carves the cited opinion out of it. If those sources have no PDF for a post-2020 decision, the app matches its docket, citation, or caption and date against the Court’s slip-opinion archive, with CourtListener as the final fallback.
+US Reports PDFs	Official Supreme Court opinion scans: GPO’s GovInfo (vols 2–583) first, the Library of Congress CDN (vols 1–542) as fallback; for vols 584+ the app downloads the Court’s own bound‑volume / preliminary‑print PDF from supremecourt.gov into the “US Reports” folder (once per volume) and carves the cited opinion out of it. If those sources have no PDF for a post-2020 decision, the app matches its docket, citation, or caption and date against the Court’s slip-opinion archive, with CourtListener as the final fallback. A recent opinion reaches Google Scholar with the Supreme Court Reporter’s star pagination, or with none at all, so its U.S. Reports pages are worked out by matching the text against that scan – and the result is then **saved with the opinion in the local database**, so the next time it is opened the pages are there at once and a pin cite goes straight to its page. The scan is still fetched in the background and the saved pages replaced if the alignment has moved on (a preliminary print superseded by the bound volume).
 English Reports	Pre‑1865 English case law from CommonLII – offline index + CloudFlare‑aware PDF download (via Firefox cookies or Playwright).
 Federal Cases	Pre‑1880 lower federal opinions cited by case number ("Cole v. The Atlantic, Case No. 2,976", chained "Id. 2,717") – no digital number‑to‑reporter index exists, so the case is found live on CourtListener by the printed name (OCR‑forgiving), confirmed by the number at the head of its headnotes or by the F. Cas. volume the number's alphabetical position dictates.
 Oyez	Supreme Court case summaries, question presented, holdings, justice vote splits, and oral argument audio links.

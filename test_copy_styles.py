@@ -1,4 +1,4 @@
-"""The three copy styles an opinion reader offers.
+"""The copy styles an opinion reader offers.
 
 The quotation style is the one with real logic in it: a passage going inside
 fresh double quotes has to have its own quotes demoted a level, without touching
@@ -61,7 +61,9 @@ def _load(*names):
 
 NS = _load(
     "_QuoteFlipper", "_flip_quotes", "_rtf_escape", "_flip_rtf_quotes",
+    "_parenthetical_plain", "_parenthetical_rtf",
     "_load_config", "_save_config", "_load_copy_mode", "_save_copy_mode",
+    "_next_copy_mode",
 )
 flip = NS["_flip_quotes"]
 flip_rtf = NS["_flip_rtf_quotes"]
@@ -144,6 +146,33 @@ class RtfQuoteFlipTests(unittest.TestCase):
         self.assertEqual(rtf_flipped, esc(flip(text)))
 
 
+class ParentheticalCopyTests(unittest.TestCase):
+    def test_plain_citation_precedes_the_flipped_quotation(self):
+        citation = "Smith v. Jones, 1 F.4th 2, 3 (2d Cir. 2020)."
+        passage = f"The Court called it {LD}plain{RD} and O{RS}Connor agreed."
+        self.assertEqual(
+            NS["_parenthetical_plain"](citation, passage),
+            (
+                f"Smith v. Jones, 1 F.4th 2, 3 (2d Cir. 2020) "
+                f"({LD}The Court called it {LS}plain{RS} and "
+                f"O{RS}Connor agreed.{RD})."
+            ),
+        )
+
+    def test_rtf_keeps_citation_first_and_period_after_parenthesis(self):
+        citation = " {\\i Smith v. Jones}, 1 F.4th 2."
+        passage = "\\pard The " + esc(LD) + "plain" + esc(RD) + "\\par\n"
+        got = NS["_parenthetical_rtf"](citation, passage)
+        self.assertEqual(
+            got,
+            (
+                "{\\i Smith v. Jones}, 1 F.4th 2 ("
+                + esc(LD) + "\\pard The " + esc(LS) + "plain"
+                + esc(RS) + esc(RD) + ").\\par\n"
+            ),
+        )
+
+
 class CopyModePersistenceTests(unittest.TestCase):
     def setUp(self):
         NS["_CONFIG_PATH"] = pathlib.Path(tempfile.mkdtemp()) / "config.json"
@@ -172,9 +201,49 @@ class CopyModePersistenceTests(unittest.TestCase):
         NS["_save_copy_mode"]("quote")
         self.assertEqual(NS["_load_config"]()["api_token"], "abc123")
 
-    def test_the_three_labels_cover_the_three_modes(self):
+    def test_the_labels_cover_every_mode(self):
         self.assertEqual(tuple(v for v, _l in NS["COPY_MODE_LABELS"]),
                          NS["COPY_MODES"])
+        self.assertIn(
+            ("parenthetical", "Copy as parenthetical"),
+            NS["COPY_MODE_LABELS"],
+        )
+
+    def test_x_cycle_visits_every_mode_and_wraps(self):
+        mode = NS["COPY_MODES"][0]
+        visited = []
+        for _ in NS["COPY_MODES"]:
+            visited.append(mode)
+            mode = NS["_next_copy_mode"](mode)
+        self.assertEqual(tuple(visited), NS["COPY_MODES"])
+        self.assertEqual(mode, NS["COPY_MODES"][0])
+
+
+class CopyMenuLayoutTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = pathlib.Path(__file__).with_name(
+            "courtlistener_gui.py"
+        ).read_text(encoding="utf-8")
+
+    def test_copy_menu_is_appended_after_bookmarks(self):
+        tree = ast.parse(self.source)
+        node = next(
+            item for item in tree.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "_install_history_menubar"
+        )
+        body = ast.get_source_segment(self.source, node)
+        self.assertLess(
+            body.rfind("_add_bookmarks_cascade"),
+            body.rfind("_add_copy_cascade"),
+        )
+
+    def test_citation_only_command_is_first_and_x_is_bound(self):
+        menu = self.source.index('label="Copy citation to clipboard"')
+        radios = self.source.index("for value, label in COPY_MODE_LABELS")
+        self.assertLess(menu, radios)
+        self.assertIn('bind("<KeyPress-x>", self._cycle_copy_mode)', self.source)
 
 
 if __name__ == "__main__":

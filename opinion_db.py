@@ -62,6 +62,11 @@ from bluebook_names import (
 
 _SCHEMA_VERSION = 5
 
+# Record field holding the reporter pagination recovered from an official scan
+# (see :meth:`OpinionDB.save_pagination`).  Records written before this field
+# existed simply lack it, and gain it the next time the scan is aligned.
+_PAGINATION_FIELD = "us_pagination"
+
 # The ``opinions`` columns this release expects.  An index whose table differs
 # was written by another schema and is dropped and rebuilt (see
 # ``_drop_outdated_tables``); the JSONL is the source of truth, so nothing is
@@ -1144,6 +1149,44 @@ class OpinionDB:
             return False
         return self._rewrite_jsonl(str(sid).strip(), record)
 
+    # -- reporter pagination ------------------------------------------------
+    # A recent Supreme Court opinion reaches Google Scholar long before the
+    # bound volume does, so its star pagination is the Supreme Court Reporter's
+    # — or absent.  The app recovers the U.S. Reports pages by aligning the
+    # text against the Court's own PDF, which costs a download and a full text
+    # match.  Keeping the result here means the next reader who follows a pin
+    # cite into the opinion lands on the right page immediately, with the scan
+    # fetched in the background only to confirm or replace it.
+
+    def stored_pagination(self, sid: str) -> Optional[dict]:
+        """The saved reporter pagination for *sid*, or ``None``."""
+        record = self.stored_record(sid)
+        if not record:
+            return None
+        value = record.get(_PAGINATION_FIELD)
+        return value if isinstance(value, dict) else None
+
+    def save_pagination(self, sid: str, pagination: Optional[dict]) -> bool:
+        """Attach *pagination* to the stored opinion (``None`` clears it).
+
+        Returns whether the store changed — an unchanged pagination is not
+        rewritten, since the JSONL is the Git-synced source of truth and
+        rewriting it for an identical value would churn the history."""
+        if not sid:
+            return False
+        sid = str(sid).strip()
+        record = self.stored_record(sid)
+        if record is None:
+            return False  # the opinion isn't stored; nothing to attach it to
+        current = record.get(_PAGINATION_FIELD)
+        if current == pagination:
+            return False
+        if pagination is None:
+            record.pop(_PAGINATION_FIELD, None)
+        else:
+            record[_PAGINATION_FIELD] = pagination
+        return self._rewrite_jsonl(sid, record)
+
     def merge_from(self, other_jsonl: os.PathLike | str) -> dict:
         """Merge another ``opinions.jsonl`` into this store.  Opinions whose
         Scholar id is already present are skipped (existing copy kept).  Returns
@@ -1521,6 +1564,26 @@ if __name__ == "__main__":  # pragma: no cover - offline smoke test
               f"search_names ranks the fuller token match first: {names}")
         check(db2.search_names("xyzzy nonesuch") == [],
               "search_names with no shared token -> empty")
+
+        # Reporter pagination recovered from an official scan rides along with
+        # the opinion, and an unchanged value never rewrites the Git-synced
+        # JSONL (see save_pagination).
+        pages = {"v": 1, "cite": "608 U. S. 1", "fingerprint": "abc",
+                 "pdf_pages": 2, "confidence": 0.9,
+                 "pages": [[1, 0, 0, 0, 0], [2, 0, 0, 3, 0]]}
+        check(db2.save_pagination("12345678901234567890", pages) is True,
+              "save pagination -> True")
+        check(db2.stored_pagination("12345678901234567890") == pages,
+              "pagination reads back")
+        check(db2.save_pagination("12345678901234567890", dict(pages)) is False,
+              "unchanged pagination -> no rewrite")
+        check(db2.save_pagination("no-such-id", pages) is False,
+              "pagination needs a stored opinion")
+        roe = db2.get_by_scholar_id("12345678901234567890")
+        check(roe is not None and "delivered the opinion" in (roe["html"] or ""),
+              "the opinion survives a pagination write")
+        check(len(db2.find("410 U.S. 113")) == 2,
+              "the index survives a pagination write")
         db2.close()
 
     if failures:
