@@ -12784,6 +12784,83 @@ def _find_scholar_for_item(
     return None, cl_text, f"best candidate similarity {best_sim:.0%}"
 
 
+def _reader_scroll_key_owns(widget) -> bool:
+    """Whether a reader may consume Up/Down from the focused *widget*.
+
+    Arrow keys belong to text fields, selectors, lists, trees, scales, and
+    scrollbars when one of those has focus.  Buttons, labels, the document
+    surface, and the window itself have no useful vertical-arrow action, so the
+    visible reader may use them to scroll.
+    """
+    try:
+        cls = str(widget.winfo_class() or "").lower()
+    except Exception:
+        return True
+    return not any(name in cls for name in (
+        "entry", "spinbox", "combobox", "listbox", "treeview",
+        "scale", "scrollbar",
+    ))
+
+
+def _bind_reader_scroll_keys(win: tk.Misc, scroll_cb) -> None:
+    """Route Up/Down to a reader's visible text or PDF surface.
+
+    ``scroll_cb`` receives ``-1`` for Up and ``+1`` for Down.  Returning
+    ``False`` means there is not yet a surface to scroll (for example while a
+    PDF is loading), in which case the key is left alone.
+    """
+    def handler(event, direction: int):
+        if not _reader_scroll_key_owns(getattr(event, "widget", None)):
+            return None
+        # A secondary Text widget in the same reader (such as the case-details
+        # panel) should scroll itself rather than the main opinion behind it.
+        target = getattr(event, "widget", None)
+        try:
+            if str(target.winfo_class()).lower() == "text":
+                target.yview_scroll(direction, "units")
+                return "break"
+        except (AttributeError, tk.TclError):
+            pass
+        try:
+            handled = scroll_cb(direction)
+        except tk.TclError:
+            return None
+        return None if handled is False else "break"
+
+    win.bind(
+        "<KeyPress-Up>",
+        lambda event: handler(event, -1),
+        add="+",
+    )
+    win.bind(
+        "<KeyPress-Down>",
+        lambda event: handler(event, 1),
+        add="+",
+    )
+
+
+def _bind_text_scroll_keys(win: tk.Misc, txt: tk.Text, scroll_cb=None) -> None:
+    """Give a reader Text widget and its surrounding window Up/Down scrolling."""
+    def scroll_text(direction: int) -> bool:
+        txt.yview_scroll(direction, "units")
+        return True
+
+    # The widget-level binding runs before Tk's Text class binding, preventing
+    # an editable insertion cursor from moving as a side effect.  The window
+    # binding below covers clicks that left focus on a toolbar button.
+    txt.bind(
+        "<KeyPress-Up>",
+        lambda _event: scroll_text(-1) and "break",
+        add="+",
+    )
+    txt.bind(
+        "<KeyPress-Down>",
+        lambda _event: scroll_text(1) and "break",
+        add="+",
+    )
+    _bind_reader_scroll_keys(win, scroll_cb or scroll_text)
+
+
 def _bind_find_keys(win: tk.Misc, open_cb, next_cb, prev_cb) -> None:
     """Bind the find accelerators a reader would actually press.
 
@@ -14224,6 +14301,10 @@ class _PdfPane(ttk.Frame):
                     lambda e: self.zoom(1 if e.delta > 0 else -1) or "break")
         canvas.bind("<Control-Button-4>", lambda _e: self.zoom(1) or "break")
         canvas.bind("<Control-Button-5>", lambda _e: self.zoom(-1) or "break")
+        canvas.bind("<KeyPress-Up>",
+                    lambda _e: self.scroll_key(-1) and "break")
+        canvas.bind("<KeyPress-Down>",
+                    lambda _e: self.scroll_key(1) and "break")
         # Take keyboard focus only when the reader intentionally clicks in the
         # PDF.  Focusing on hover can make some platforms raise this window just
         # because the pointer crossed it.
@@ -14421,6 +14502,13 @@ class _PdfPane(ttk.Frame):
 
     def _wheel(self, direction: int) -> None:
         self._canvas.yview_scroll(direction * self._SCROLL_PX, "units")
+
+    def scroll_key(self, direction: int) -> bool:
+        """Scroll one keyboard step; shared by the canvas and its host window."""
+        if self._disposed:
+            return False
+        self._wheel(-1 if direction < 0 else 1)
+        return True
 
     def _render_visible(self) -> None:
         _flush_tk_image_graveyard()
@@ -16303,6 +16391,7 @@ class _ScholarTextWindow:
         _bind_find_keys(win, self._find_open,
                         lambda: self._find_step(+1),
                         lambda: self._find_step(-1))
+        _bind_text_scroll_keys(win, txt, self._scroll_reader)
 
         btn_frame = _ui_frame(win)
         btn_frame.pack(fill="x", padx=12, pady=(2, 10))
@@ -16618,6 +16707,13 @@ class _ScholarTextWindow:
             pane._find_step(delta)
         else:
             self._finder.step(delta)
+
+    def _scroll_reader(self, direction: int) -> bool:
+        """Arrow-key scroll whichever opinion surface is currently visible."""
+        if self._mode == "pdf" and self._pdf_pane is not None:
+            return self._pdf_pane.scroll_key(direction)
+        self._text.yview_scroll(direction, "units")
+        return True
 
     def _zoom(self, delta: int) -> None:
         """In the reader, grow/shrink every font (delta 0 resets to default);
@@ -23397,6 +23493,13 @@ class _PdfWindow:
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
             self._win.bind(seq, lambda _e: self._zoom(-1))
         self._win.bind("<Control-0>", lambda _e: self._zoom(0))
+        _bind_reader_scroll_keys(
+            self._win,
+            lambda direction: (
+                self._pane.scroll_key(direction)
+                if self._pane is not None else False
+            ),
+        )
 
         entry = self._history_entry()
         if entry is not None and self._app is not None and hasattr(
@@ -24177,6 +24280,7 @@ class _SlipTextWindow:
         body.insert("1.0", text)
         body.config(state="disabled")  # selectable & copyable, not editable
         self._text = body
+        _bind_text_scroll_keys(win, body)
 
         btns = _ui_frame(win)
         btns.pack(fill="x", padx=12, pady=(0, 10))
@@ -24318,6 +24422,13 @@ class _SlipOpinionWindow:
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
             win.bind(seq, lambda _e: self._zoom(-1))
         win.bind("<Control-0>", lambda _e: self._zoom(0))
+        _bind_reader_scroll_keys(
+            win,
+            lambda direction: (
+                self._pane.scroll_key(direction)
+                if self._pane is not None else False
+            ),
+        )
 
         if app is not None and hasattr(app, "record_case_view"):
             def reopen(
@@ -25074,6 +25185,7 @@ class _BriefTextWindow:
                      lambda _e: txt.config(cursor="hand2"))
         txt.tag_bind("brieflink", "<Leave>", lambda _e: txt.config(cursor=""))
         self._finder = _TextFinder(win, txt, text_frame)
+        _bind_text_scroll_keys(win, txt)
 
         bottom = _ui_frame(win)
         bottom.pack(fill="x", padx=12, pady=(0, 10))
@@ -25626,6 +25738,13 @@ class _LinkedPdfWindow:
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
             self._win.bind(seq, lambda _e: self._zoom(-1))
         self._win.bind("<Control-0>", lambda _e: self._zoom(0))
+        _bind_reader_scroll_keys(
+            self._win,
+            lambda direction: (
+                self._pane.scroll_key(direction)
+                if self._pane is not None else False
+            ),
+        )
 
         if hasattr(app, "register_secondary_window"):
             def reopen(parent=None, app=app, source=self) -> None:
@@ -25964,6 +26083,7 @@ class _StatuteWindow:
         txt.tag_bind("citelink", "<Leave>",
                      lambda _e: txt.config(cursor=""))
         self._finder = _TextFinder(win, txt, frame)
+        _bind_text_scroll_keys(win, txt)
 
         btns = _ui_frame(win)
         btns.pack(fill="x", padx=12, pady=(2, 10))

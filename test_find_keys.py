@@ -40,7 +40,9 @@ def _load(*names, cls=None):
     if missing:
         raise AssertionError(f"not found in {cls or 'module'}: {missing}")
     ns = {"sys": sys, "Optional": typing.Optional,
-          "tk": type("tk", (), {"TclError": Exception, "Misc": object})}
+          "tk": type("tk", (), {
+              "TclError": Exception, "Misc": object, "Text": object,
+          })}
     for name in names:
         exec(found[name], ns)
     return ns
@@ -116,6 +118,115 @@ class BindFindKeysTests(unittest.TestCase):
         for seq in win.bindings:
             with self.subTest(seq=seq):
                 self.assertEqual(win.press(seq), "break")
+
+
+class _ScrollWidget:
+    def __init__(self, cls="Button"):
+        self.cls = cls
+        self.bindings = {}
+        self.scrolls = []
+
+    def winfo_class(self):
+        return self.cls
+
+    def bind(self, sequence, callback, add=None):
+        self.bindings[sequence] = callback
+
+    def yview_scroll(self, direction, units):
+        self.scrolls.append((direction, units))
+
+
+class _ScrollWindow(_ScrollWidget):
+    pass
+
+
+class ReaderScrollKeyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        ns = _load(
+            "_reader_scroll_key_owns",
+            "_bind_reader_scroll_keys",
+            "_bind_text_scroll_keys",
+        )
+        cls.owns = staticmethod(ns["_reader_scroll_key_owns"])
+        cls.bind_reader = staticmethod(ns["_bind_reader_scroll_keys"])
+        cls.bind_text = staticmethod(ns["_bind_text_scroll_keys"])
+
+    @staticmethod
+    def _event(widget):
+        return type("Event", (), {"widget": widget})()
+
+    def test_up_and_down_scroll_the_reader_and_are_consumed(self):
+        win = _ScrollWindow()
+        calls = []
+        self.bind_reader(win, lambda direction: calls.append(direction))
+
+        self.assertEqual(
+            win.bindings["<KeyPress-Up>"](self._event(_ScrollWidget())),
+            "break",
+        )
+        self.assertEqual(
+            win.bindings["<KeyPress-Down>"](self._event(_ScrollWidget())),
+            "break",
+        )
+        self.assertEqual(calls, [-1, 1])
+
+    def test_arrow_keys_remain_native_in_inputs_and_selectors(self):
+        for cls_name in (
+            "Entry", "TEntry", "Spinbox", "TCombobox", "Listbox",
+            "Treeview", "TScale", "TScrollbar",
+        ):
+            with self.subTest(widget_class=cls_name):
+                self.assertFalse(self.owns(_ScrollWidget(cls_name)))
+
+        win = _ScrollWindow()
+        calls = []
+        self.bind_reader(win, lambda direction: calls.append(direction))
+        result = win.bindings["<KeyPress-Down>"](
+            self._event(_ScrollWidget("TEntry")),
+        )
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
+
+    def test_a_secondary_text_panel_scrolls_itself(self):
+        win = _ScrollWindow()
+        calls = []
+        panel = _ScrollWidget("Text")
+        self.bind_reader(win, lambda direction: calls.append(direction))
+
+        result = win.bindings["<KeyPress-Down>"](self._event(panel))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(panel.scrolls, [(1, "units")])
+        self.assertEqual(calls, [])
+
+    def test_text_widget_and_toolbar_focus_both_scroll_the_document(self):
+        win = _ScrollWindow()
+        text = _ScrollWidget("Text")
+        self.bind_text(win, text)
+
+        direct = text.bindings["<KeyPress-Up>"](self._event(text))
+        routed = win.bindings["<KeyPress-Down>"](
+            self._event(_ScrollWidget("TButton")),
+        )
+
+        self.assertEqual((direct, routed), ("break", "break"))
+        self.assertEqual(text.scrolls, [(-1, "units"), (1, "units")])
+
+    def test_pdf_keyboard_step_uses_the_existing_wheel_distance(self):
+        ns = _load("scroll_key", cls="_PdfPane")
+        Pane = type("Pane", (), {"scroll_key": ns["scroll_key"]})
+        pane = Pane()
+        pane._disposed = False
+        pane.steps = []
+        pane._wheel = pane.steps.append
+
+        self.assertTrue(pane.scroll_key(-20))
+        self.assertTrue(pane.scroll_key(4))
+        self.assertEqual(pane.steps, [-1, 1])
+        pane._disposed = True
+        self.assertFalse(pane.scroll_key(1))
+        self.assertEqual(pane.steps, [-1, 1])
 
 
 class _FakePane:
