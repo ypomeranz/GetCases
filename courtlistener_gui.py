@@ -3572,15 +3572,25 @@ def _cl_item_for_citation(client, cite: str, name: str = "") -> Optional[dict]:
                 out.add(re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", str(c))).lower())
         return out
 
-    def score(case_name: str, cites: set[str], court: str) -> int:
-        s = 0
-        if altkey and altkey in cites:
-            s += 4
-        if name and _name_match_score(name, case_name or "") >= _NAME_MATCH_MIN:
-            s += 2
-        if altkey and (court or "").lower() == _SCOTUS_COURT_ID:
-            s += 1
-        return s
+    def score(case_name: str, cites: set[str], court: str) -> tuple:
+        # Keep the original priority order, but retain the full name score
+        # instead of reducing every acceptable match to the same +2 tie.  Two
+        # short opinions can legitimately begin on the same reporter page
+        # (The Buena Ventura and In re Cooper both bear 243 F. 797); the printed
+        # caption is then the signal that identifies the intended cluster.
+        clean_name = re.sub(r"<[^>]+>", "", case_name or "")
+        name_tier = _match_tier(name, clean_name) if name else -1
+        name_score = _name_match_score(name, clean_name) if name else 0.0
+        query_tokens = _name_tokens(name) if name else []
+        candidate_tokens = _name_tokens(clean_name) if name else []
+        return (
+            bool(altkey and altkey in cites),
+            name_tier,
+            bool(query_tokens and query_tokens == candidate_tokens),
+            name_score,
+            -abs(len(query_tokens) - len(candidate_tokens)),
+            bool(altkey and (court or "").lower() == _SCOTUS_COURT_ID),
+        )
 
     # 1) Resolution via the citation-lookup endpoint (exact; 300 = ambiguous).
     # Try the form the user entered first.  A Cranch citation can also denote a
@@ -21183,6 +21193,15 @@ class _ScholarTextWindow:
         elif kind == "cite":
             cite, _, pin = value.partition("@")
             url_val = ""
+            # The citation detector deliberately highlights the caption along
+            # with the reporter cite.  Preserve that text as a disambiguator:
+            # CourtListener can have two short opinions at the same first page.
+            try:
+                ranges = self._text.tag_ranges(tag)
+                snippet = self._text.get(ranges[0], ranges[-1]) if ranges else ""
+            except tk.TclError:
+                snippet = ""
+            name = _citation_link_name(snippet, cite)
         else:
             cite, pin, url_val = value, "", ""
         # CourtListener opinion URL: fetch structured text from CL directly
@@ -22871,7 +22890,7 @@ class _ScholarTextWindow:
     def _open_pdf_cite(self, action: tuple, snippet: str) -> None:
         if self._app is not None:
             _follow_brief_action(self._app, self._win, action,
-                                 self._status_var.set)
+                                 self._status_var.set, snippet=snippet)
         else:
             _open_citation_in_browser(action, snippet)
 
@@ -23027,6 +23046,26 @@ def _parse_citation_line(line: str) -> Optional[tuple[str, str, str]]:
     name = line[: m.start()].strip().rstrip(",;–—- ").strip()
     pin, _pin_end = _pin_after(line, m.end())
     return name, cite, pin
+
+
+def _citation_link_name(snippet: str, cite: str = "") -> str:
+    """Case caption carried by a highlighted citation span.
+
+    Link actions intentionally remain the stable ``("cite", "vol rep page")``
+    shape used throughout the app.  The visible span already includes the name,
+    so click dispatch can recover it here and pass it to CourtListener when an
+    exact reporter page resolves to more than one short opinion.
+    """
+    parsed = _parse_citation_line(re.sub(r"\s+", " ", snippet or "").strip())
+    if not parsed:
+        return ""
+    name, parsed_cite, _pin = parsed
+    if cite:
+        parsed_keys = set(citation_identity_keys({}, parsed_cite))
+        wanted_keys = set(citation_identity_keys({}, cite.split("@", 1)[0]))
+        if parsed_keys and wanted_keys and not (parsed_keys & wanted_keys):
+            return ""
+    return name
 
 
 # A hand-typed statute/regulation lookup: "42 USC 1983(b)", "29 cfr
@@ -23821,7 +23860,7 @@ class _PdfWindow:
     def _open_cite(self, action: tuple, snippet: str) -> None:
         if self._app is not None:
             _follow_brief_action(self._app, self._win, action,
-                                 self._status_var.set)
+                                 self._status_var.set, snippet=snippet)
         else:
             _open_citation_in_browser(action, snippet)
 
@@ -24505,7 +24544,7 @@ class _SlipOpinionWindow:
     def _open_cite(self, action: tuple, snippet: str) -> None:
         if self._app is not None:
             _follow_brief_action(self._app, self._win, action,
-                                 self._status_var.set)
+                                 self._status_var.set, snippet=snippet)
         else:
             _open_citation_in_browser(action, snippet)
 
@@ -24913,7 +24952,8 @@ def _open_fedcas_citation(app: "CourtListenerGUI", parent: tk.Misc,
 def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
                          action: tuple[str, str],
                          status=lambda _s: None,
-                         prefetch_pdf: bool = True) -> None:
+                         prefetch_pdf: bool = True,
+                         snippet: str = "") -> None:
     """Open whatever a highlighted brief citation points at, reusing the exact
     paths the rest of the app uses — so briefs behave like the opinion reader
     and the Quick Look Up dialog rather than a parallel implementation:
@@ -24942,6 +24982,7 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
         return
 
     cite, _, pin = value.partition("@")
+    name = _citation_link_name(snippet, cite)
     fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
     client = app._get_client() if app._token_var.get().strip() else None
     if fetcher is None and client is None:
@@ -24957,7 +24998,7 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
     safe_status(f"Opening {cite}…")
 
     def run() -> None:
-        ok = app._try_open_citation("", cite, pin, fetcher, client,
+        ok = app._try_open_citation(name, cite, pin, fetcher, client,
                                     prefetch_pdf=prefetch_pdf,
                                     view_parent=parent)
         try:
@@ -25081,7 +25122,7 @@ class _BriefTextWindow:
         entry = self._link_actions.get(tag)
         if entry:
             _follow_brief_action(self._app, self._win, entry[0],
-                                 self._status_var.set)
+                                 self._status_var.set, snippet=entry[1])
         return "break"
 
     def _follow_browser(self, tag: str):
@@ -25683,7 +25724,7 @@ class _LinkedPdfWindow:
         # prefetch_pdf=False: warming a second big PDF while this viewer's
         # pane is live renders/extracts in parallel and can hang the app.
         _follow_brief_action(self._app, self._win, action, self._safe_status,
-                             prefetch_pdf=False)
+                             prefetch_pdf=False, snippet=snippet)
 
     def _open_cite_browser(self, action: tuple, snippet: str) -> None:
         _open_citation_in_browser(action, snippet)
@@ -25909,9 +25950,13 @@ class _StatuteWindow:
         txt.tag_configure("notebody", font=self._fonts["small"],
                           foreground="#444444")
         for i in range(7):
-            margin = 10 + 26 * i
+            # A slightly wider step keeps deep CFR paragraphs—whose hierarchy
+            # can reach (a)(1)(i)(A)(1)(i)—visibly distinct at a glance.
+            is_cfr = self._doc.kind == "cfr"
+            margin = (8 + 32 * i) if is_cfr else (10 + 26 * i)
             txt.tag_configure(f"ind{i}", lmargin1=margin,
-                              lmargin2=margin + 22, spacing3=6)
+                              lmargin2=margin + (24 if is_cfr else 22),
+                              spacing3=6)
         txt.tag_configure("jumpflash", background="#fff2a8")
         txt.tag_configure("citelink", foreground="#1a56b0")
         txt.tag_bind("citelink", "<Enter>",
@@ -25984,7 +26029,16 @@ class _StatuteWindow:
                 else None
             lead = m.group(1) if m else ""
             if lead:
-                enums = re.findall(r"\(([^)]+)\)", lead)
+                # One eCFR <P> can open several nested levels separated by
+                # heading dashes, e.g. "(b) ...—(1) ..." or
+                # "(v) ...—(A) ...—(1) ...".  Use the same structural reading
+                # as the parser so pin-cite jumps and Copy + Cite retain the
+                # complete subdivision path, not just the first marker.
+                enums = (
+                    ecfr._structural_enums(text)
+                    if self._doc.kind == "cfr"
+                    else re.findall(r"\(([^)]+)\)", lead)
+                )
                 path[ind:] = enums
                 self._anchors.append((txt.index("end-1c"), tuple(path)))
                 if (target and target_pos is None

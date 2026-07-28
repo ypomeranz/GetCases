@@ -46,6 +46,7 @@ from courtlistener_gui import (
     _match_case_law_page_opinion,
     _opinion_db_spotlight_results,
     _citation_search_variants,
+    _citation_link_name,
     _cl_item_for_citation,
     _combined_parts_cover_typed,
     _cut_companion_cases,
@@ -61,6 +62,7 @@ from courtlistener_gui import (
     _spotlight_case_action,
     _static_case_law_url,
     _special_citation_ranges,
+    _follow_brief_action,
     _wisconsin_display_cite,
 )
 from google_scholar import (
@@ -1112,6 +1114,120 @@ class NominativeCitationSearchTests(unittest.TestCase):
 
         self.assertEqual(item["cluster_id"], 8)
         client.lookup_citation.assert_called_once_with("1 Cranch 299")
+
+    def test_same_reporter_page_is_disambiguated_by_case_name(self):
+        client = Mock()
+        client.lookup_citation.return_value = [{
+            "status": 300,
+            "clusters": [
+                {
+                    "id": 1917,
+                    "case_name": "In re Cooper",
+                    "citations": ["243 F. 797"],
+                    "court_id": "mad",
+                },
+                {
+                    "id": 1916,
+                    "case_name": "The Buena Ventura",
+                    "citations": ["243 F. 797"],
+                    "court_id": "nysd",
+                },
+            ],
+        }]
+
+        item = _cl_item_for_citation(
+            client, "243 F. 797", name="The Buena Ventura",
+        )
+
+        self.assertEqual(item["cluster_id"], 1916)
+        self.assertEqual(item["caseName"], "The Buena Ventura")
+
+    def test_exact_name_breaks_tie_between_two_acceptable_name_matches(self):
+        client = Mock()
+        client.lookup_citation.return_value = [{
+            "status": 300,
+            "clusters": [
+                {
+                    "id": 2,
+                    "case_name": "The Buena Ventura Shipping Co.",
+                    "citations": ["243 F. 797"],
+                },
+                {
+                    "id": 1,
+                    "case_name": "The Buena Ventura",
+                    "citations": ["243 F. 797"],
+                },
+            ],
+        }]
+
+        item = _cl_item_for_citation(
+            client, "243 F. 797", name="The Buena Ventura",
+        )
+
+        self.assertEqual(item["cluster_id"], 1)
+
+    def test_highlighted_text_supplies_name_to_ambiguous_cite_dispatch(self):
+        self.assertEqual(
+            _citation_link_name(
+                "The Buena Ventura, 243 F. 797, 799 (S.D.N.Y. 1916)",
+                "243 F. 797",
+            ),
+            "The Buena Ventura",
+        )
+        app = Mock()
+        parent = Mock()
+        client = object()
+        app._get_scholar.return_value = None
+        app._get_client.return_value = client
+        app._token_var.get.return_value = "token"
+        app._try_open_citation.return_value = True
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch("courtlistener_gui.threading.Thread", ImmediateThread):
+            _follow_brief_action(
+                app,
+                parent,
+                ("cite", "243 F. 797@799"),
+                snippet=(
+                    "The Buena Ventura, 243 F. 797, 799 "
+                    "(S.D.N.Y. 1916)"
+                ),
+            )
+
+        app._try_open_citation.assert_called_once_with(
+            "The Buena Ventura",
+            "243 F. 797",
+            "799",
+            None,
+            client,
+            prefetch_pdf=True,
+            view_parent=parent,
+        )
+
+    def test_opinion_text_click_preserves_highlighted_case_name(self):
+        win = object.__new__(_ScholarTextWindow)
+        win._link_actions = {"lnk1": ("cite", "243 F. 797@799")}
+        win._text = Mock()
+        win._text.tag_ranges.return_value = ("1.0", "1.52")
+        win._text.get.return_value = (
+            "The Buena Ventura, 243 F. 797, 799 (S.D.N.Y. 1916)"
+        )
+        win._app = Mock()
+        win._app._get_scholar.return_value = None
+        win._follow_cite_via_cl = Mock()
+        win._status_var = Mock()
+
+        win._follow_link("lnk1")
+
+        win._follow_cite_via_cl.assert_called_once_with(
+            "243 F. 797", "799", name="The Buena Ventura",
+        )
 
     def test_direct_lookup_retries_us_reports_alias_after_scholar_miss(self):
         win = object.__new__(CourtListenerGUI)

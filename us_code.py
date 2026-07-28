@@ -66,7 +66,10 @@ def spec_label(spec: str) -> str:
 # ---------------------------------------------------------------------------
 
 USC_HIERARCHY = ("a", "1", "A", "i", "I")
-CFR_HIERARCHY = ("a", "1", "i", "A")
+# CFR subdivisions repeat the Arabic/lower-roman pair after the capital-letter
+# level: (a) -> (1) -> (i) -> (A) -> (1) -> (i).  Deep Treasury regulations
+# use the whole sequence (for example 26 C.F.R. § 1.36B-2(c)(3)(v)(A)(1)).
+CFR_HIERARCHY = ("a", "1", "i", "A", "1", "i")
 
 ENUM_LEAD_RE = re.compile(r"^((?:\((?:\d{1,3}|[a-zA-Z]{1,5})\)\s*)+)")
 
