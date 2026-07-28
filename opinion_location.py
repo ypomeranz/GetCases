@@ -529,6 +529,65 @@ _LIGATURES = {
     "ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ſ": "s",
 }
 
+# What a United States Reports PDF prints about itself.  The running head of
+# every interior recto names the volume and the page the opinion *starts* on
+# ("Cite as: 607 U. S. 7 (2025)   9"), and a preliminary print's cover repeats
+# it ("Volume 607 U. S. Part 1 / Pages 7-10").  Both are read tolerantly: the
+# glyph grouping these arrive through can lose a period ("607 U S 7") or split
+# a word ("PRELIMINAR Y").
+_PDF_CITE_AS_RE = re.compile(
+    r"Cite\s+as:\s*(\d{1,4})\s*U\.?\s*S\.?\s*(\d{1,5})\b", re.IGNORECASE)
+_PDF_COVER_VOLUME_RE = re.compile(
+    r"Volume\s+(\d{1,4})\s*U\.?\s*S\.?\b", re.IGNORECASE)
+_PDF_COVER_PAGES_RE = re.compile(r"Pages?\s+(\d{1,5})\s*[-–—]\s*\d{1,5}")
+#: Pages of a reporter PDF to read before giving up on finding its citation.
+#: A "Cite as:" head appears on the first interior recto; a cover, on page one.
+_PDF_CITE_SCAN_PAGES = 12
+
+
+def us_reports_cite_from_pdf(pdf_pages: Iterable) -> str:
+    """The U.S. Reports citation a reporter PDF prints on itself, as
+    "607 U.S. 7" — or "" when it prints none.
+
+    An opinion published only as a preliminary print has no citation anywhere
+    else yet: the Reporter revises the pagination precisely so it can be cited
+    to the United States Reports before the bound volume exists, and prints
+    that citation in the running heads.  Reading it there is what lets the
+    page matching anchor such an opinion, and what supplies its pin cites.
+    """
+    for chars in list(pdf_pages or ())[:_PDF_CITE_SCAN_PAGES]:
+        try:
+            lines = group_lines(list(chars or ()))
+        except Exception:
+            continue
+        head = " ".join(line.text for line in lines[:3])
+        m = _PDF_CITE_AS_RE.search(head)
+        if m:
+            return f"{int(m.group(1))} U.S. {int(m.group(2))}"
+        # A cover page names the volume and the range it prints; the opinion
+        # starts on the first of those pages.
+        whole = " ".join(line.text for line in lines)
+        vol = _PDF_COVER_VOLUME_RE.search(whole)
+        pages = _PDF_COVER_PAGES_RE.search(whole)
+        if vol and pages:
+            return f"{int(vol.group(1))} U.S. {int(pages.group(1))}"
+    return ""
+
+
+#: Pages of the Reporter's own apparatus that may trail an opinion without
+#: matching any of it: the "Reporter's Note" a draft reporter appends, and
+#: the blank leaf that can follow it.
+_TRAILING_APPARATUS_PAGES = 2
+
+#: Words a matched run needs before it may anchor a page.  A run of one or
+#: two ordinary words — "and", "of the" — matches all over an opinion and
+#: says nothing about where the page sits.  The reporter prints counsel and
+#: amici listings at the foot of the page the opinion opens on, while the
+#: text version carries them in the header, so those listings match nothing
+#: nearby and scatter exactly such runs across the source; left in, they
+#: drag the frontier past the whole of the following page.
+_MIN_ANCHOR_BLOCK = 4
+
 
 def _words(
     text: str,
@@ -974,7 +1033,8 @@ def align_opinion_locations(
         reporter_page = pdf.page + page_index if pdf else None
         page_dense: list[LocationAnchor] = []
         page_source_tokens: set[int] = set()
-        for pdf_start, source_start, size in best_blocks:
+        substantial = [b for b in best_blocks if b[2] >= _MIN_ANCHOR_BLOCK]
+        for pdf_start, source_start, size in (substantial or best_blocks):
             page_source_tokens.update(range(source_start, source_start + size))
             samples = {0, size - 1}
             samples.update(range(0, size, 10))
@@ -1177,15 +1237,35 @@ def align_opinion_locations(
         )
     else:
         last_page = page_count - 1
+
+        def reaches_last_page(seen) -> bool:
+            """Whether *seen* carries the alignment to the end of the opinion.
+
+            A draft reporter appends a "Reporter's Note" — it constitutes no
+            part of the opinion, as it says itself, and so matches nothing in
+            the text.  Insisting the last physical sheet match would veto the
+            alignment of every opinion published that way, taking the page
+            switching and the pin cites with it.  A short unmatched tail is
+            allowed instead, but only when the source's own end was covered:
+            an alignment that really did lose the last pages of the opinion
+            fails that test.
+            """
+            if not seen:
+                return False
+            if seen[-1] == last_page:
+                return True
+            return (last_page - seen[-1] <= _TRAILING_APPARATUS_PAGES
+                    and source_edges_covered)
+
         exact_ready = bool(
             len(exact_pages) >= 2
             and exact_pages[0] == 0
-            and exact_pages[-1] == last_page
+            and reaches_last_page(exact_pages)
         )
         fuzzy_ready = bool(
             len(matched_pdf_pages) >= 2
             and matched_pdf_pages[0] == 0
-            and matched_pdf_pages[-1] == last_page
+            and reaches_last_page(matched_pdf_pages)
             and physical_coverage >= 0.20
             and source_edges_covered
             and text_coverage >= 0.18

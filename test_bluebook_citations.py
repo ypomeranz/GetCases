@@ -49,6 +49,8 @@ from courtlistener_gui import (
     _cl_item_for_citation,
     _combined_parts_cover_typed,
     _cut_companion_cases,
+    _decision_date_paren,
+    _docket_cite,
     _dump_to_rtf,
     _nominative_display_cite,
     _pick_combined_opinion,
@@ -441,6 +443,49 @@ class ConsolidatedAndSinglePartyCaptionTests(unittest.TestCase):
 
         self.assertEqual(name, "The “Scotland.”")
         self.assertEqual(abbreviate_case_name(name), "The Scotland")
+
+    def test_a_doubled_initial_survives_the_repeated_abbreviation_collapse(self):
+        # A.A.R.P. v. Trump, 605 U.S. 246 (2025): the applicants are
+        # anonymized to initials, and the reporter spaces them out.  The
+        # collapse that folds a consolidated caption's repeated abbreviation
+        # ("United States U.S. U.S.") used to read "A. A." as one of those
+        # and hand back "A.R.P." — the wrong party, and a Bluebook cite to a
+        # case that does not exist.
+        blocks = [
+            Block("center", [Span("145 S.Ct. 1364 (2025)")]),
+            Block("center", [Span(
+                "A. A. R. P., et al. v. Donald J. TRUMP, President of the "
+                "United States, et al."
+            )]),
+            Block("center", [Span("Supreme Court of United States.")]),
+        ]
+
+        name = _scholar_caption_name(blocks)
+
+        self.assertEqual(name, "A. A. R. P. v. Trump")
+        self.assertEqual(abbreviate_case_name(name), "A.A.R.P. v. Trump")
+
+    def test_a_doubled_initial_survives_for_the_companion_case(self):
+        # W.M.M. v. Trump, 606 U.S. ___ (2025), argued the same term.
+        blocks = [Block("center", [Span(
+            "W. M. M., et al. v. Donald J. TRUMP, President of the United "
+            "States, et al."
+        )])]
+
+        self.assertEqual(
+            abbreviate_case_name(_scholar_caption_name(blocks)),
+            "W.M.M. v. Trump",
+        )
+
+    def test_a_consolidated_captions_repeated_abbreviation_still_collapses(self):
+        blocks = [Block("center", [Span(
+            "ACME OIL CO. v. UNITED STATES of America U.S. U.S."
+        )])]
+
+        self.assertEqual(
+            _scholar_caption_name(blocks),
+            "Acme Oil Co. v. United States of America U.S.",
+        )
 
     def test_lowercase_words_do_not_end_a_procedural_case_name(self):
         blocks = [Block("center", [Span(
@@ -2496,6 +2541,88 @@ class PublicDomainCitationTests(unittest.TestCase):
             plain,
             "State v. Prado, 2021 WI 64, ¶ 12, 397 Wis. 2d 719, "
             "960 N.W.2d 869.",
+        )
+
+
+class NotYetReportedCitationTests(unittest.TestCase):
+    """Bluebook 10.8.1(b): an opinion the reporters have not reached is cited
+    by docket number and exact date.  Clark v. Sweeney was decided in
+    November 2025 and has no U.S. Reports page — the Court prints
+    "606 U. S. ____" — so the app used to print no citation at all."""
+
+    @staticmethod
+    def _blocks():
+        return [
+            Block("center", [Span(
+                "TERENCE CLARK, DIRECTOR, PRINCE GEORGE'S COUNTY DEPARTMENT "
+                "OF CORRECTIONS, ET AL., v. JEREMIAH ANTOINE SWEENEY."
+            )]),
+            Block("center", [Span("No. 25-52.")]),
+            Block("center", [Span("Supreme Court of the United States.")]),
+            Block("center", [Span("Decided November 24, 2025.")]),
+        ]
+
+    def test_docket_and_decision_date_are_read_from_the_opinion(self):
+        blocks = self._blocks()
+        self.assertEqual(_docket_cite({}, blocks), "No. 25-52")
+        self.assertEqual(_decision_date_paren({}, blocks), "Nov. 24, 2025")
+
+    def test_the_search_result_supplies_them_when_the_header_does_not(self):
+        self.assertEqual(_docket_cite({"docketNumber": "25-52"}, []),
+                         "No. 25-52")
+        self.assertEqual(_decision_date_paren({"dateFiled": "2025-11-24"}, []),
+                         "Nov. 24, 2025")
+
+    def test_a_consolidated_docket_line_cites_only_the_first(self):
+        blocks = [Block("center", [Span("Nos. 24-1287, 25-250.")])]
+        self.assertEqual(_docket_cite({}, blocks), "No. 24-1287")
+
+    def test_an_application_docket_is_recognized(self):
+        blocks = [Block("center", [Span("No. 24A1007 24-1177.")])]
+        self.assertEqual(_docket_cite({}, blocks), "No. 24A1007")
+
+    def test_a_bare_year_is_not_enough_for_a_docket_citation(self):
+        # Without the day there is no rule-10.8.1(b) parenthetical to print,
+        # and a bare year belongs to a reported cite.
+        self.assertEqual(_decision_date_paren({"dateFiled": "2025"}, []), "")
+
+    def test_the_citation_reads_as_the_rule_prints_it(self):
+        win = object.__new__(_ScholarTextWindow)
+        win._base_citation_override = ""
+        win._bb = {
+            "name": "Clark v. Sweeney", "cite": "", "display_cite": "",
+            "court": "", "year": "2025",
+            "docket_cite": "No. 25-52",
+            "docket_paren": "U.S. Nov. 24, 2025",
+            "omit_parenthetical": "", "pin_kind": "page",
+        }
+
+        self.assertEqual(
+            win._bluebook_citation(None)[0],
+            "Clark v. Sweeney, No. 25-52 (U.S. Nov. 24, 2025).",
+        )
+        self.assertEqual(
+            win._bluebook_citation(None, writer="per curiam")[0],
+            "Clark v. Sweeney, No. 25-52 (U.S. Nov. 24, 2025) (per curiam).",
+        )
+        self.assertEqual(
+            win._automatic_base_citation(),
+            "Clark v. Sweeney, No. 25-52 (U.S. Nov. 24, 2025)",
+        )
+
+    def test_a_reported_opinion_is_untouched(self):
+        win = object.__new__(_ScholarTextWindow)
+        win._base_citation_override = ""
+        win._bb = {
+            "name": "Carpenter v. United States", "cite": "585 U.S. 296",
+            "display_cite": "585 U.S. 296", "court": "", "year": "2018",
+            "docket_cite": "", "docket_paren": "",
+            "omit_parenthetical": "", "pin_kind": "page",
+        }
+
+        self.assertEqual(
+            win._bluebook_citation(None)[0],
+            "Carpenter v. United States, 585 U.S. 296 (2018).",
         )
 
 

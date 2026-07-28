@@ -2698,6 +2698,63 @@ def _us_reports_cite(cite: str) -> str:
     return f"{int(m.group(1)) + off} U.S. {m.group(3)}" if off is not None else ""
 
 
+# The docket line a report prints under the caption: "No. 25-52.",
+# "Nos. 24-1287, 25-250.", "No. 24A1007 24-1177."  Consolidated dockets keep
+# only the first — rule 10.8.1(b) cites one.
+_DOCKET_LINE_RE = re.compile(
+    r"^Nos?\.\s*(\d{1,3}[-‐‑–—]\d{1,5}|\d{2,3}A\d{1,5})", re.IGNORECASE)
+# "Decided November 24, 2025." on its own line under the docket.
+_DECIDED_LINE_RE = re.compile(
+    r"\b(?:Decided|Filed|Released|Entered)\b[^A-Za-z0-9]{0,4}"
+    r"(January|February|March|April|May|June|July|August|September|"
+    r"October|November|December)\s+(\d{1,2}),?\s+(1[6-9]\d{2}|20\d{2})",
+    re.IGNORECASE,
+)
+#: Bluebook table T12: the months, as a citation abbreviates them.
+_T12_MONTHS = {
+    "january": "Jan.", "february": "Feb.", "march": "Mar.", "april": "Apr.",
+    "may": "May", "june": "June", "july": "July", "august": "Aug.",
+    "september": "Sept.", "october": "Oct.", "november": "Nov.",
+    "december": "Dec.",
+}
+
+
+def _docket_cite(item: dict, blocks: list) -> str:
+    """The "No. 25-52" a not-yet-reported opinion is cited by (rule
+    10.8.1(b)), from the opinion's own docket line or the search result."""
+    for b in (blocks or [])[:16]:
+        if getattr(b, "kind", "") not in ("center", "heading"):
+            continue
+        m = _DOCKET_LINE_RE.match(re.sub(r"\s+", " ", b.text()).strip())
+        if m:
+            return f"No. {m.group(1).replace('‐', '-').replace('–', '-')}"
+    raw = re.sub(r"\s+", " ", str(item.get("docketNumber")
+                                  or item.get("docket_number") or "")).strip()
+    m = _DOCKET_LINE_RE.match(raw) or _DOCKET_LINE_RE.match(f"No. {raw}")
+    return f"No. {m.group(1)}" if m else ""
+
+
+def _decision_date_paren(item: dict, blocks: list) -> str:
+    """The decision date as a citation parenthetical prints it —
+    "Nov. 24, 2025" — from the opinion's "Decided …" line, else the
+    search result's filing date.  "" when only a year is known: a bare year
+    belongs to a reported citation, not a docket one."""
+    for b in (blocks or [])[:16]:
+        if getattr(b, "kind", "") not in ("center", "heading"):
+            continue
+        m = _DECIDED_LINE_RE.search(re.sub(r"\s+", " ", b.text()))
+        if m:
+            month = _T12_MONTHS.get(m.group(1).lower(), "")
+            if month:
+                return f"{month} {int(m.group(2))}, {m.group(3)}"
+    filed = str(item.get("dateFiled") or item.get("date_filed") or "")
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", filed)
+    if not m:
+        return ""
+    month = list(_T12_MONTHS.values())[int(m.group(2)) - 1]
+    return f"{month} {int(m.group(3))}, {m.group(1)}"
+
+
 def _citation_search_variants(query: str) -> tuple[str, ...]:
     """Equivalent citation spellings, with the query as entered first.
 
@@ -10596,6 +10653,12 @@ _PARTY_ABBR_SUFFIXES = {
     "co", "cos", "corp", "corps", "inc", "ltd", "llc", "llp", "lp", "lllp",
     "plc", "pc", "pa", "pllc", "na", "sa", "ag", "nv", "bros",
 }
+# One letter and a period: an initial, whether it stands in a person's name
+# or is a letter of a spaced initialism ("A. A. R. P.").
+_SINGLE_INITIAL_RE = re.compile(r"[A-Za-z]\.")
+# The same dotted abbreviation repeated back to back, as consolidated
+# captions leave it ("United States U.S. U.S.").
+_REPEATED_ABBREV_RE = re.compile(r"\b((?:[A-Za-z]+\.)+)(\s+\1)+")
 
 
 def _party_ends_in_abbrev(s: str) -> bool:
@@ -10607,6 +10670,11 @@ def _party_ends_in_abbrev(s: str) -> bool:
         return False
     last = parts[-1]
     if "." in last[:-1]:  # an internal period → initialism (L.L.C., N.A.)
+        return True
+    # A lone initial closing the name — the last letter of a spaced
+    # initialism ("A. A. R. P."), or a person's middle initial ("John Q.").
+    # A single letter is never a word a sentence ended on.
+    if _SINGLE_INITIAL_RE.fullmatch(last):
         return True
     return last.rstrip(".").replace("’", "'").lower() in _PARTY_ABBR_SUFFIXES
 
@@ -10782,8 +10850,15 @@ def _caption_party(s: str) -> str:
     s = s.strip().lstrip(".;").rstrip(";").strip()
     s = re.sub(r"\s+et\s+als?\.?$", "", s, flags=re.IGNORECASE).strip()
     # Repeated dotted abbreviations from consolidated captions ("United
-    # States U.S. U.S.") collapse to the first occurrence.
-    s = re.sub(r"\b((?:[A-Za-z]+\.)+)(\s+\1)+", r"\1", s)
+    # States U.S. U.S.") collapse to the first occurrence.  A doubled *single*
+    # initial is not one of those — it is the name: the anonymized applicants
+    # in "A. A. R. P. v. Trump" and "W. M. M. v. Trump" lose their case if
+    # the second letter goes, and so does "J. J. Smith".
+    s = _REPEATED_ABBREV_RE.sub(
+        lambda m: (m.group(0) if _SINGLE_INITIAL_RE.fullmatch(m.group(1))
+                   else m.group(1)),
+        s,
+    )
     s = re.sub(r"\b([Uu]nited\s+[Ss]tates)(?:\s+U\.?S\.?A?\.?)+", r"\1", s)
     # Drop a stray trailing period, but keep an entity abbreviation's period
     # ("Acme Co.", "Foo Corp.", "Bar Inc.").
@@ -11567,6 +11642,206 @@ def _dump_statute_rtf(txt: tk.Text, start: str, end: str) -> str:
     if par_open:
         out.append("\\par\n")
     return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Front matter: what a report prints ahead of the opinion of the Court — the
+# syllabus and headnotes, and in the early volumes the reporter's statement of
+# the case and the arguments of counsel.  A full-document export gives it a
+# section, and a running head, of its own when the text says what it is.
+#
+# The parts' own labels can't decide this.  Google Scholar's header part is
+# called "Header & Syllabus" whenever the opinion carries an attribution line
+# — including for the many older U.S. Reports pages that print no syllabus at
+# all, only the counsel listings — and when an early opinion opens "The
+# opinion of the court was delivered by MARSHALL, Ch. J." the segmenter can
+# sweep the whole opinion into the header instead.  So the text itself is read.
+# ---------------------------------------------------------------------------
+
+
+# Front-matter section headings, as the reports and CAP's headmatter write
+# them.  Only these name a section: a "Counsel" or "History" heading marks
+# matter that rides along with the rest, never a reason to break the page.
+_FRONT_MATTER_HEADINGS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"^syllabus\b", re.IGNORECASE), "Syllabus"),
+    (re.compile(r"^head\s?notes?\b", re.IGNORECASE), "Headnotes"),
+    (re.compile(r"^statement\s+of\s+the\s+case\b", re.IGNORECASE),
+     "Statement of the Case"),
+    (re.compile(r"^arguments?\b", re.IGNORECASE), "Argument of Counsel"),
+    (re.compile(r"^summary\b", re.IGNORECASE), "Summary"),
+)
+# One-line front matter every report prints above an opinion: the docket
+# number, the argument and decision dates, how the case arrived, the panel,
+# and the fields CourtListener supplies as metadata.  A caption made of these
+# belongs on the opinion's own first page, not on a page of its own.
+_FM_ROUTINE_RE = re.compile(
+    r"^(?:Nos?\.\s|Docket\b|Argued\b|Reargued\b|Submitted\b|Decided\b|Filed\b"
+    r"|Released\b|Signed\b|Before\b|Judges:|Attorneys:|Syllabus\b|Headnotes\b"
+    r"|(?:ON\s+)?(?:WRITS?\s+OF\s+)?CERTIORARI\b|ON\s+WRITS?\b|ON\s+PETITION\b"
+    r"|ON\s+APPLICATION\b|APPEALS?\s+FROM\b|ON\s+APPEAL\b|APPEAL\s+FROM\b"
+    r"|ERROR\s+TO\b|CERTIFICATE\b|CERTIFIED\b|MOTION\b)",
+    re.IGNORECASE,
+)
+# Counsel listings, in the house styles the reports use for them.
+_FM_COUNSEL_RE = re.compile(
+    r"\bamic(?:us|i)\s+curiae\b|\bre?argued\s+the\s+cause\b"
+    r"|\bon\s+(?:the\s+)?briefs?\b|\bfiled\s+a\s+brief\b"
+    r"|\bbriefs?\s+(?:of|for|was|were)\b|\bcounsel\s+(?:of\s+record|for)\b"
+    r"|\bof\s+counsel\b|\bpro\s+se\b|\bpro\s+hac\s+vice\b"
+    r"|\battorneys?\s+(?:at\s+law|for)\b|\bwith\s+whom\s+.{0,90}\bwere?\s+on\b"
+    r"|\bsubmitted\s+(?:on\s+)?(?:the\s+)?brief",
+    re.IGNORECASE,
+)
+# …and their shape when the phrasing gives nothing away: a name, a firm and a
+# city, closing with the party appeared for ("Robert L. Byer, Duane Morris,
+# L.L.P., Pittsburgh, for Ford Motor Company.").
+_FM_COUNSEL_LINE_RE = re.compile(
+    r",\s*(?:Counsel\s+)?for\s+[^.]{0,120}\.?\s*$", re.IGNORECASE,
+)
+_FM_FOR_PARTY_RE = re.compile(
+    r"\bfor\s+(?:the\s+)?(?:plaintiffs?|defendants?|appellants?|appellees?"
+    r"|petitioners?|respondents?|movants?|intervenors?|applicants?"
+    r"|the\s+United\s+States)\b",
+    re.IGNORECASE,
+)
+# The syllabus' closing line-up ("ROBERTS, C. J., delivered the opinion of the
+# Court, in which THOMAS … joined.  KAVANAUGH, J., filed a concurring
+# opinion.") — the reporter's, not the opinion's own byline.
+_FM_LINEUP_RE = re.compile(
+    r"\bin\s+which\s+.{0,240}?\bjoin(?:ed|s)?\b"
+    r"|\bfiled\s+(?:a|an)\s+(?:concurring|dissenting|separate|opinion)"
+    r"|\btook\s+no\s+part\s+in\s+the\s+(?:consideration|decision)\b"
+    r"|\bfor\s+a\s+unanimous\s+Court\b",
+    re.IGNORECASE,
+)
+# The line that opens an opinion of the court, in its several house styles.
+_FM_ATTRIB_RE = re.compile(
+    r"\bdeliver(?:ed|s)\s+the\s+(?:\w+\s+){0,3}opinion\b"
+    r"|\b(?:opinion|judgment)\s+of\s+the\s+court\s+(?:was|were|is)\s+delivered\b"
+    r"|\bannounced\s+the\s+judgment\b",
+    re.IGNORECASE,
+)
+# A byline or opinion heading standing alone as a whole line — nothing after
+# the name.  The oral arguments the early reports print are full of "MR.
+# JUSTICE HARLAN.  Does that apply to revenue cases?", which is a question
+# from the bench, not the opening of an opinion.
+_FM_BYLINE_RE = re.compile(
+    r"(?:OPINION(?:\s+OF\s+THE\s+COURT)?"
+    r"|PER\s+CURIAM"
+    r"|(?:MR\.|MRS\.|MS\.)?\s*(?:CHIEF\s+)?JUSTICE\s+[A-Z][\w.'’-]+"
+    r"|[A-Z][\w.'’-]+,\s*(?:C\.\s*)?J"
+    r"|[A-Z][\w.'’ -]{0,40},\s*(?:Chief\s+|Senior\s+|Circuit\s+|District\s+)*Judge)"
+    r"\s*[.:]?\s*$",
+    re.IGNORECASE,
+)
+# A syllabus in prose, for the pages that print no heading over it: the held
+# paragraph, and the pin cites to the opinion the syllabus summarizes.
+_FM_SYLLABUS_PROSE_RE = re.compile(
+    r"^Held\b[:.,]|^Held\s+that\b|\bPp?\.\s*\d+[-–—]\d+", re.IGNORECASE,
+)
+# Counsel arguing, as the early reports report it.
+_FM_ARGUMENT_PROSE_RE = re.compile(
+    r"\bfor\s+the\s+(?:plaintiffs?|defendants?)\s+in\s+error\b"
+    r"|\bin\s+support\s+of\s+the\s+(?:motion|rule|petition)\b"
+    r"|\bon\s+the\s+part\s+of\s+the\s+(?:plaintiff|defendant|appellant|appellee)\b"
+    r"|\b(?:contended|insisted|argued|urged)\s+(?:that|for)\b",
+    re.IGNORECASE,
+)
+_FM_STAR_PREFIX_RE = re.compile(r"^(?:\*\d+\s*)+")
+
+#: How long a line naming the party it appeared for can be and still read as
+#: a counsel listing rather than prose that happens to mention a party.
+_FM_COUNSEL_MAX_CHARS = 400
+#: Front matter under a heading of its own still needs some text under it…
+_FM_MIN_NAMED_CHARS = 400
+#: …and front matter recognized only from its prose needs rather more.
+_FM_MIN_CHARS = 900
+#: Text past an opinion's opening line that means the opinion is in here.
+_FM_OPINION_TAIL = 600
+
+
+def _front_matter_section_label(parts: list) -> str:
+    """The running-head label for the front matter in *parts* — "Syllabus",
+    "Headnotes", "Statement of the Case", "Argument of Counsel" — or "" when
+    it is only a caption, or when the opinion itself was segmented into it.
+
+    Prose the report prints as a matter of course — the docket line, the
+    dates, how the case arrived, the counsel and amici listings, the
+    syllabus' closing line-up — doesn't count toward the bulk that earns a
+    page: a Supreme Court header of nothing but counsel listings can run
+    several thousand characters (Copperweld's is 4,000) without a word of
+    syllabus in it.
+    """
+    rows: list[tuple[str, str]] = []
+    for part in parts:
+        for block in part.blocks:
+            text = _FM_STAR_PREFIX_RE.sub(
+                "", " ".join(block.text().split())
+            ).strip()
+            if text:
+                rows.append((block.kind, text))
+
+    names: list[str] = []
+    named_at: Optional[int] = None      # where the front matter names itself
+    opinion_at: Optional[int] = None    # where an opinion appears to open
+    syllabus_prose = argument_prose = False
+    weights: list[int] = []             # per row, 0 for the routine ones
+    for i, (kind, text) in enumerate(rows):
+        short = len(text) <= 60
+        if short:
+            for pattern, name in _FRONT_MATTER_HEADINGS:
+                if pattern.match(text):
+                    if name not in names:
+                        names.append(name)
+                    if named_at is None:
+                        named_at = i
+                    break
+        # A line the report prints as a matter of course is never an opinion
+        # opening, whatever it looks like: the panel line "Before SYKES,
+        # Chief Judge." has a byline's shape and none of its meaning.
+        if opinion_at is None and not _FM_ROUTINE_RE.match(text) and (
+            _FM_ATTRIB_RE.search(text)
+            or (short and _FM_BYLINE_RE.fullmatch(text))
+        ):
+            opinion_at = i
+        if _FM_SYLLABUS_PROSE_RE.search(text):
+            syllabus_prose = True
+            if named_at is None:
+                named_at = i
+        if _FM_ARGUMENT_PROSE_RE.search(text):
+            argument_prose = True
+        routine = (
+            kind in ("center", "heading")
+            or _FM_ROUTINE_RE.match(text)
+            or _FM_COUNSEL_RE.search(text)
+            or _FM_COUNSEL_LINE_RE.search(text)
+            or (len(text) <= _FM_COUNSEL_MAX_CHARS
+                and _FM_FOR_PARTY_RE.search(text))
+            or _FM_LINEUP_RE.search(text)
+        )
+        weights.append(0 if routine else len(text))
+
+    # An opinion never opens before the front matter has named itself: a
+    # byline out in front of any syllabus heading, with the bulk of the
+    # section behind it, means segmentation swept the opinion in here (as it
+    # does for Dartmouth College, whose "The opinion of the court was
+    # delivered by MARSHALL, Ch. J." reads nothing like a modern byline), and
+    # there is no front matter to lift out.  Once a syllabus has begun, the
+    # attributions inside it are the reporter's own ("Justice GORSUCH
+    # delivered the opinion of the Court with respect to Parts I, II-A …,
+    # concluding that …" — Ramos), and prove nothing.
+    if (opinion_at is not None and (named_at is None or opinion_at < named_at)
+            and sum(weights[opinion_at + 1:]) > _FM_OPINION_TAIL):
+        return ""
+    substantive = sum(weights)
+    if names and substantive >= _FM_MIN_NAMED_CHARS:
+        return " & ".join(names[:2])
+    if substantive >= _FM_MIN_CHARS:
+        if syllabus_prose:
+            return "Syllabus"
+        if argument_prose:
+            return "Argument of Counsel"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -12739,9 +13014,9 @@ def _fetch_pdf_bytes(
     file:// URLs (opinions extracted from local US Reports volumes) are read
     straight from disk.
 
-    A preliminary print's "Page Proof Pending Publication" stamp is taken out
-    here, so every path downstream — the viewer, the printer, Download PDF —
-    gets the clean document."""
+    A preliminary print's "Page Proof Pending Publication" stamp and its cover
+    page are taken out here, so every path downstream — the viewer, the
+    printer, Download PDF — gets the clean document."""
     queue = [url]
     seen: set[str] = set()
     while queue and len(seen) < max_hops:
@@ -12758,7 +13033,7 @@ def _fetch_pdf_bytes(
                 print(f"[pdf] local file read failed ({exc}): {cur}")
                 continue
             if data is not None:
-                return _strip_page_proof_watermark(data), cur
+                return _clean_reporter_pdf(data), cur
             continue
         resp = _pdf_get(cur, client=client, timeout=timeout)
         resp.raise_for_status()
@@ -12767,7 +13042,7 @@ def _fetch_pdf_bytes(
             resp.content, resp.headers.get("Content-Encoding", ""))
         data = _normalize_pdf_bytes(content)
         if data is not None:
-            return _strip_page_proof_watermark(data), final_url
+            return _clean_reporter_pdf(data), final_url
         for nxt in _pdf_link_candidates_from_html(content, final_url):
             if nxt not in seen and nxt not in queue:
                 queue.append(nxt)
@@ -12901,6 +13176,86 @@ def _strip_page_proof_watermark(data: bytes) -> bytes:
                 doc.close()
         except Exception:
             pass
+
+
+# The cover the Reporter of Decisions puts in front of a preliminary print:
+# "PRELIMINARY PRINT / Volume 607 U. S. Part 1 / Pages 7-10 / OFFICIAL
+# REPORTS OF THE SUPREME COURT".  It names the volume but carries no part of
+# the opinion, and it is the page the reader lands on.
+_PRELIM_COVER_RE = re.compile(
+    r"PRELIMINAR\s*Y\s+PRINT", re.IGNORECASE)
+_PRELIM_COVER_CONFIRM_RE = re.compile(
+    r"OFFICIAL\s+REPORTS|REPORTER\s+OF\s+DECISIONS", re.IGNORECASE)
+
+
+def _is_preliminary_print_cover(text: str) -> bool:
+    """True for a preliminary print's title page, and only for it: the banner
+    alone is not enough, since the same words can head a reporter's note."""
+    return bool(
+        _PRELIM_COVER_RE.search(text)
+        and _PRELIM_COVER_CONFIRM_RE.search(text)
+        # The cover has no opinion on it; the syllabus page that follows runs
+        # to thousands of characters.
+        and len(text.strip()) < 1200
+    )
+
+
+def _strip_preliminary_print_cover(data: bytes) -> bytes:
+    """Return *data* without the preliminary print's title page.
+
+    The Court publishes a revised per-opinion PDF once the preliminary print
+    is set, so the opinion can be cited to the United States Reports before
+    the bound volume exists — and puts a cover in front of it.  The opinion
+    proper starts on the next page, which is where the reader wants to be and
+    where every page-matching path expects page one to be.  Any failure
+    returns the original bytes: a spare page is a blemish, losing the opinion
+    is not.
+    """
+    import io
+
+    import pypdfium2 as pdfium
+
+    try:
+        with _PDFIUM_LOCK:
+            doc = pdfium.PdfDocument(data, autoclose=False)
+    except Exception:
+        return data
+    try:
+        with _PDFIUM_LOCK:
+            if len(doc) < 2:
+                return data      # never leave a document with no pages
+            page = doc[0]
+            try:
+                tp = page.get_textpage()
+                try:
+                    cover = _is_preliminary_print_cover(tp.get_text_range())
+                finally:
+                    tp.close()
+            finally:
+                page.close()
+            if not cover:
+                return data
+            doc.del_page(0)
+            buf = io.BytesIO()
+            doc.save(buf)
+            out = buf.getvalue()
+        print("[pdf] dropped the preliminary print's cover page")
+        return out if out.startswith(b"%PDF") else data
+    except Exception as exc:
+        print(f"[pdf] cover removal failed ({exc}); keeping the original")
+        return data
+    finally:
+        try:
+            with _PDFIUM_LOCK:
+                doc.close()
+        except Exception:
+            pass
+
+
+def _clean_reporter_pdf(data: bytes) -> bytes:
+    """Everything a reporter PDF carries that is not the opinion: the
+    preliminary print's watermark, and its cover page."""
+    return _strip_preliminary_print_cover(_strip_page_proof_watermark(data))
 
 
 def _page_has_scan_background(page) -> bool:
@@ -15116,6 +15471,9 @@ class _ScholarTextWindow:
     _JUSTIFY_HARD_BREAK_EXTRA_SPACES = 4
     _JUSTIFY_PAD_TAG = "justify-pad"
     _JUSTIFY_HIDE_TAG = "justify-hide"
+    # Characters to read past a display line when the next word is all that
+    # is wanted.  The longest word in the U.S. Reports is well under this.
+    _JUSTIFY_LOOKAHEAD = 80
     _HYPHEN_MIN_WORD = 7
     _HYPHEN_MIN_PREFIX = 2
     _HYPHEN_MIN_SUFFIX = 3
@@ -15781,9 +16139,13 @@ class _ScholarTextWindow:
         bb = self._bb
         name = bb.get("name", "")
         cite = bb.get("display_cite") or bb.get("cite", "")
+        court, year = bb.get("court", ""), bb.get("year", "")
+        if not cite and bb.get("docket_cite"):
+            # Not reported yet: docket number and exact date (rule 10.8.1(b)).
+            cite, court, year = bb["docket_cite"], bb["docket_paren"], ""
         value = f"{name}, {cite}" if name and cite else (name or cite)
         paren = "" if bb.get("omit_parenthetical") else " ".join(
-            p for p in (bb.get("court", ""), bb.get("year", "")) if p
+            p for p in (court, year) if p
         )
         return f"{value} ({paren})" if value and paren else value
 
@@ -16143,6 +16505,10 @@ class _ScholarTextWindow:
 
     def _reset_location_render_marks(self) -> None:
         """Discard marks belonging to the old rendering before replacing it."""
+        # The old rendering's justification goes with it: the text about to be
+        # deleted takes the padding along, so the next pass must not decide
+        # the wrap is unchanged and skip its work.
+        self._justified_key = None
         self._clear_location_map_marks()
         txt = getattr(self, "_text", None)
         for name in getattr(self, "_location_block_mark_names", []) or []:
@@ -16166,6 +16532,38 @@ class _ScholarTextWindow:
         except tk.TclError:
             return None
         self._location_map_mark_names.append(name)
+        return name
+
+    def _reset_page_marks(self) -> None:
+        """Drop the star-page marks of the rendering being replaced."""
+        txt = getattr(self, "_text", None)
+        for name in getattr(self, "_page_mark_names", []) or []:
+            try:
+                txt.mark_unset(name)
+            except (AttributeError, tk.TclError):
+                pass
+        self._page_mark_names: list[str] = []
+        self._page_mark_seq = getattr(self, "_page_mark_seq", 0) + 1
+        self._page_pos: dict[int, str] = {}
+
+    def _new_page_mark(self, index: str) -> str:
+        """A mark on a star page's first character.
+
+        Justification threads padding spaces and hyphenation breaks through
+        the text, and every one of them shifts the "line.char" of everything
+        after it.  A star page recorded as a bare index was left pointing at
+        whatever had moved into its place, which is how the reporter page
+        numbers in the left margin came to sit beside the wrong lines.  Tk
+        carries a mark along with its text instead — the same thing the
+        inferred U.S. pages have always used.
+        """
+        name = f"__oppage_{self._page_mark_seq}_{len(self._page_mark_names)}"
+        try:
+            self._text.mark_set(name, index)
+            self._text.mark_gravity(name, "left")
+        except tk.TclError:
+            return index    # the recorded position, drift and all
+        self._page_mark_names.append(name)
         return name
 
     def _record_location_block_start(self, block) -> None:
@@ -16455,8 +16853,10 @@ class _ScholarTextWindow:
             if m:
                 self._cur_page = int(m.group(0))
                 # where each star page begins, for pin-cited link arrivals
-                self._page_pos.setdefault(self._cur_page,
-                                          txt.index("end-1c"))
+                # and the reporter page numbers in the left margin
+                if self._cur_page not in self._page_pos:
+                    self._page_pos[self._cur_page] = self._new_page_mark(
+                        txt.index("end-1c"))
             tags.append("pagenum")
             txt.insert("end", span.text, tuple(tags))
             return
@@ -17076,7 +17476,7 @@ class _ScholarTextWindow:
         self._scroll_part: Optional[int] = None
         self._fn_ref_pos: dict[str, str] = {}  # footnote id → in-text marker index
         self._fn_def_pos: dict[str, str] = {}  # footnote id → body marker index
-        self._page_pos: dict[int, str] = {}    # star page → start index
+        self._reset_page_marks()   # star page → a mark on its marker
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(self._scholar_text)
         self._recap_spec_index = _recap_spec_index(self._scholar_text)
@@ -17266,6 +17666,7 @@ class _ScholarTextWindow:
 
     def _clear_justification(self) -> None:
         txt = self._text
+        self._justified_key = None   # the padding is going: it must be redone
         try:
             old_state = str(txt.cget("state"))
         except tk.TclError:
@@ -17286,20 +17687,19 @@ class _ScholarTextWindow:
 
     def _line_has_any_tag(self, start: str, end: str, names: tuple[str, ...]) -> bool:
         txt = self._text
-        for name in names:
-            if name in txt.tag_names(start):
+        wanted = set(names)
+        # One tag_names call per index, not one per name: this runs for every
+        # display line of the opinion (twice, counting the hyphenation check).
+        if wanted.intersection(txt.tag_names(start)):
+            return True
+        try:
+            before_end = txt.index(f"{end} -1c")
+            if (txt.compare(before_end, ">=", start)
+                    and wanted.intersection(txt.tag_names(before_end))):
                 return True
-            try:
-                before_end = txt.index(f"{end} -1c")
-                if (txt.compare(before_end, ">=", start)
-                        and name in txt.tag_names(before_end)):
-                    return True
-            except tk.TclError:
-                pass
-            ranges = txt.tag_nextrange(name, start, end)
-            if ranges:
-                return True
-        return False
+        except tk.TclError:
+            pass
+        return any(txt.tag_nextrange(name, start, end) for name in names)
 
     def _hyphen_points(self, word: str) -> list[int]:
         """Conservative English-ish syllable break candidates for layout only."""
@@ -17354,6 +17754,19 @@ class _ScholarTextWindow:
                     points.append(point)
         return sorted(set(points))
 
+    def _short_lookahead(self, index: str) -> str:
+        """The end of a window just wide enough to hold the next word.
+
+        The two places that read forward from a display line want one word,
+        but "lineend" is the end of the whole *logical* line — a reporter
+        paragraph, thousands of characters — and both run once per display
+        line, so asking for the paragraph each time pulls it out of Tk over
+        and over."""
+        txt = self._text
+        line_end = txt.index(f"{index} lineend")
+        window = txt.index(f"{index}+{self._JUSTIFY_LOOKAHEAD}c")
+        return line_end if txt.compare(window, ">", line_end) else window
+
     def _hyphenate_next_word(self, line_end: str, used: float, width: int,
                              space_px: int) -> bool:
         """Borrow a syllable-like prefix from the next wrapped word.
@@ -17365,7 +17778,7 @@ class _ScholarTextWindow:
         txt = self._text
         try:
             scan = txt.index("__justify_next")
-            line_limit = txt.index(f"{scan} lineend")
+            line_limit = self._short_lookahead(scan)
         except tk.TclError:
             return False
         following = txt.get(scan, line_limit)
@@ -17410,11 +17823,11 @@ class _ScholarTextWindow:
         txt.mark_gravity("__justify_next", "right")
         return True
 
-    def _pad_display_line_to_margin(self, start: str, end: str, used: float,
-                                    width: int, space_px: int) -> None:
+    def _pad_display_line_to_margin(self, start: str, line_text: str,
+                                    used: float, width: int,
+                                    space_px: int) -> None:
         """Apply the original extra-space justification to one display line."""
         txt = self._text
-        line_text = txt.get(start, end)
         space_offsets = [
             m.start() for m in re.finditer(r"(?<=\S) (?=\S)", line_text)
         ]
@@ -17449,7 +17862,7 @@ class _ScholarTextWindow:
         next_start = txt.index(f"{line_end} +1c")
         if txt.compare(next_start, ">=", "end-1c"):
             return False  # nothing follows: last line of the document
-        next_text = txt.get(next_start, f"{next_start} lineend")
+        next_text = txt.get(next_start, self._short_lookahead(next_start))
         if not next_text.strip():
             return False  # a blank line ends the paragraph: this is its last line
         first_word = next_text.split(None, 1)[0]
@@ -17471,12 +17884,26 @@ class _ScholarTextWindow:
             return
         try:
             txt.config(state="normal")
-            self._clear_justification()
             txt.update_idletasks()
             width = txt.winfo_width() - int(txt.cget("padx")) * 2 - 4
             if width <= 100:
                 return
+            # Nothing that leaves the wrap width and the body font alone can
+            # move a line break, so a taller window, the page-number gutter
+            # appearing beside the text, or the side panel opening does not
+            # need the opinion justified again.
+            key = (width, getattr(self, "_base_size", None))
+            if key == getattr(self, "_justified_key", None):
+                return
+            self._clear_justification()
             space_px = max(self._fonts["base"].measure(" "), 1)
+            # Pass 1 records what each line needs rather than padding it on
+            # the spot.  Every insert invalidates the display metrics of the
+            # whole logical line it lands in, and a reporter paragraph runs
+            # to dozens of display lines, so padding as we go has Tk re-wrap
+            # the paragraph from its start once per line of it — quadratic,
+            # and seconds of it on a long opinion.
+            pending: list[tuple[str, str, float]] = []
             idx = "1.0"
             while txt.compare(idx, "<", "end-1c"):
                 try:
@@ -17514,13 +17941,19 @@ class _ScholarTextWindow:
                             line_end, used, width, space_px):
                         try:
                             line_end = txt.index(f"{idx} display lineend")
-                            used = self._fonts["base"].measure(
-                                txt.get(idx, line_end))
+                            line_text = txt.get(idx, line_end)
+                            used = self._fonts["base"].measure(line_text)
                         except tk.TclError:
                             pass
-                    self._pad_display_line_to_margin(
-                        idx, line_end, used, width, space_px)
+                    pending.append((idx, line_text, used))
                 idx = txt.index("__justify_next")
+            # Pass 2, from the bottom up: an insert only ever moves text after
+            # it, so working backwards leaves every index recorded above it
+            # still pointing where it did.
+            for start, line_text, used in reversed(pending):
+                self._pad_display_line_to_margin(
+                    start, line_text, used, width, space_px)
+            self._justified_key = key
         finally:
             try:
                 txt.config(state=old_state)
@@ -17746,7 +18179,7 @@ class _ScholarTextWindow:
         self._scroll_part: Optional[int] = None
         self._fn_ref_pos: dict[str, str] = {}
         self._fn_def_pos: dict[str, str] = {}
-        self._page_pos: dict[int, str] = {}
+        self._reset_page_marks()
         self._cur_page: Optional[int] = None
         self._short_cite_index = _build_short_cite_index(
             self._scholar_text or self._cl_text or "")
@@ -17836,7 +18269,7 @@ class _ScholarTextWindow:
         txt.config(state="normal")
         self._reset_location_render_marks()
         txt.delete("1.0", "end")
-        self._page_pos = {}
+        self._reset_page_marks()
         self._cur_page = None
         self._fnref_pages = {}
         self._fn_ref_pos = {}
@@ -18116,9 +18549,25 @@ class _ScholarTextWindow:
                 display_cite = wi_cite
                 omit_parenthetical = "1"
                 pin_kind = "paragraph"
+        # An opinion the reporters have not reached yet — anything decided in
+        # the last year or two — has no volume and page to be cited by, and
+        # the Court itself prints "606 U. S. ____".  Rule 10.8.1(b) cites it
+        # by docket number and exact date instead.  Kept apart from ``cite``,
+        # which every reporter-keyed path downstream (the official-PDF
+        # resolver, the pin cites, the star pagination) parses as a volume.
+        docket_cite = docket_paren = ""
+        if not cite:
+            docket_cite = _docket_cite(item, self._blocks)
+            decided = _decision_date_paren(item, self._blocks)
+            if docket_cite and decided:
+                court_name = "U.S." if is_scotus else court_abbr
+                docket_paren = " ".join(p for p in (court_name, decided) if p)
+            else:
+                docket_cite = ""
         return {
             "name": name, "cite": cite, "display_cite": display_cite,
             "court": court_abbr, "year": year,
+            "docket_cite": docket_cite, "docket_paren": docket_paren,
             "omit_parenthetical": omit_parenthetical, "pin_kind": pin_kind,
             "_caption_case_unresolved": unresolved_caption_case,
         }
@@ -18577,6 +19026,9 @@ class _ScholarTextWindow:
         name = bb["name"]
         cite = cite_override or bb.get("display_cite") or bb["cite"]
         court, year = bb["court"], bb["year"]
+        if not cite and bb.get("docket_cite"):
+            # Not reported yet: docket number and exact date (rule 10.8.1(b)).
+            cite, court, year = bb["docket_cite"], bb["docket_paren"], ""
         rest = ""
         if cite:
             if pin and bb.get("pin_kind") == "paragraph" and ", " in cite:
@@ -18993,18 +19445,41 @@ class _ScholarTextWindow:
         exports keep :meth:`_filename_item` — they carry the Scholar text, and
         its star pagination, not these pages."""
         item = self._filename_item()
-        us_cite = getattr(self, "_us_reports_cite", "")
-        if us_cite and _is_us_reports_pdf(getattr(self, "_pdf_url", "") or ""):
+        us_cite = self._shown_us_reports_cite()
+        if us_cite:
             item = dict(item)
             item["_us_reports_cite"] = us_cite
         return item
 
+    def _shown_us_reports_cite(self) -> str:
+        """The U.S. Reports citation the PDF on screen actually prints.
+
+        A draft reporter reaches us from the Court's opinions page like any
+        slip, so its URL says nothing about the reporter — what makes it a
+        U.S. Reports scan is the pagination the Reporter of Decisions put in
+        it, which the analysis reads off its running heads.  For everything
+        else the URL still decides.
+        """
+        key = getattr(self, "_active_pdf_analysis_key", None)
+        cache = getattr(self, "_pdf_analysis_cache", None) or {}
+        printed = _normalized_us_cite(
+            str((cache.get(key) or {}).get("pdf_cite") or "") if key else ""
+        )
+        if printed:
+            return printed
+        us_cite = getattr(self, "_us_reports_cite", "")
+        if us_cite and _is_us_reports_pdf(getattr(self, "_pdf_url", "") or ""):
+            return us_cite
+        return ""
+
     def _export_section_list(self) -> list[tuple[str, str, str, str]]:
         """
         Sections for a full-document export, as (running-head label, start,
-        end, kind): the header and majority share the first section, then
-        each concurrence/dissent follows as its own.  Without parts (a plain
-        text view) the whole widget is one section.
+        end, kind): front matter the report names — a syllabus, headnotes,
+        the arguments of counsel — leads as a section of its own, the header
+        and majority share the next one, and each concurrence/dissent follows
+        as its own.  Without parts (a plain text view) the whole widget is
+        one section.
         """
         txt = self._text
         parts = getattr(self, "_rendered_parts", None) or self._parts
@@ -19022,6 +19497,25 @@ class _ScholarTextWindow:
 
         # (author label, start, end, kind)
         sections: list[tuple[str, str, str, str]] = []
+        # A syllabus (or, in the early reports, the statement of the case and
+        # the arguments of counsel) leads on a page of its own, under its own
+        # running head, the way the reports print it.  An opinion has to
+        # follow it here: a run of header parts with nothing after it is the
+        # whole document, and then there is no front for it to be in front of.
+        head_run = 0
+        while (head_run < len(main_regions)
+               and parts[main_regions[head_run][2]].kind == "header"):
+            head_run += 1
+        front_label = ""
+        if 0 < head_run < len(main_regions):
+            front_label = _front_matter_section_label(
+                [parts[pi] for _rs, _rend, pi in main_regions[:head_run]]
+            )
+        if front_label:
+            front_regions = main_regions[:head_run]
+            main_regions = main_regions[head_run:]
+            sections.append((front_label, front_regions[0][0],
+                             front_regions[-1][1], "frontmatter"))
         if main_regions:
             maj = next(
                 (parts[pi] for _rs, _re, pi in main_regions
@@ -19039,12 +19533,13 @@ class _ScholarTextWindow:
     def _build_export_rtf(self) -> str:
         """
         Two-column RTF of the full opinion, one section per separate
-        opinion: the header and majority share the first section, and each
-        concurrence/dissent starts a new page (numbering continues).  Every
-        section carries a running head with the Bluebook citation and the
-        opinion's author, and a page-number footer.  The running head is
-        coloured by opinion kind (dissent red, concurrence green); the body
-        text is black.
+        opinion: front matter the report names (a syllabus, the arguments of
+        counsel) leads, the header and majority share the next section, and
+        each concurrence/dissent starts a new page (numbering continues).
+        Every section carries a page-number footer and a running head with
+        the Bluebook citation and the opinion's author — or the front
+        matter's name.  The running head is coloured by opinion kind
+        (dissent red, concurrence green); the body text is black.
         """
         txt = self._text
         case_line = self._bluebook_citation(None)[0].rstrip(".")
@@ -19198,7 +19693,8 @@ class _ScholarTextWindow:
         Century Schoolbook (or the closest installed face), footnotes at
         the bottom of the page that cites them, star pagination kept inline
         and echoed as a reporter page range in the running head, a page
-        number in the footer, and each separate opinion starting on a fresh
+        number in the footer, and each separate opinion — and any front
+        matter the report names, such as the syllabus — starting on a fresh
         page under its own running head.
         """
         txt = self._text
@@ -20985,6 +21481,7 @@ class _ScholarTextWindow:
                 pages, italics = _extract_pdf_text_and_style(data)
             except Exception as exc:
                 print(f"[pdf-text] extraction failed: {exc}")
+            cite = pdf_cite
             if any(pages or []):
                 try:
                     links, quiet = _citation_links_from_visible_pdf_text(
@@ -20996,7 +21493,18 @@ class _ScholarTextWindow:
                     sections = slip_opinion.detect_sections(pages)
                 except Exception as exc:
                     print(f"[pdf-parts] section detection failed: {exc}")
-            maps = self._align_location_sources(sources, pages, pdf_cite)
+                if not cite:
+                    # Nothing the app already knew named a reporter for these
+                    # pages.  A preliminary print names one itself — that is
+                    # what it is for — and an opinion published only as one
+                    # has its U.S. Reports citation nowhere else yet.
+                    try:
+                        cite = opinion_location.us_reports_cite_from_pdf(pages)
+                    except Exception as exc:
+                        print(f"[pdf-location] printed cite scan failed: {exc}")
+                    if cite:
+                        print(f"[pdf-location] the PDF cites itself as {cite}")
+            maps = self._align_location_sources(sources, pages, cite)
             result = {
                 "pages": pages,
                 "italics": italics,
@@ -21004,7 +21512,7 @@ class _ScholarTextWindow:
                 "quiet": quiet,
                 "sections": sections,
                 "maps": maps,
-                "pdf_cite": pdf_cite,
+                "pdf_cite": cite,
                 "url": url,
             }
             self._post(self._finish_pdf_analysis, key, result)

@@ -10,6 +10,7 @@ from opinion_location import (
     align_opinion_locations,
     build_plain_text_source,
     build_text_source,
+    us_reports_cite_from_pdf,
 )
 
 
@@ -606,6 +607,143 @@ class AlignmentTests(unittest.TestCase):
         first = location_map.boundaries[0]
         self.assertTrue(first.exact)
         self.assertFalse(first.address.footnote)
+
+    def test_a_preliminary_print_supplies_its_own_citation(self):
+        # Clark v. Sweeney, 607 U. S. 7 (2025), published as a preliminary
+        # print months before the bound volume.  The Reporter revises the
+        # pagination precisely so it can be cited, and prints the citation in
+        # the running head of every interior recto.  Nothing else knows it.
+        pages = [
+            _page(["OCTOBER TERM, 2025 7", "Syllabus", "CLARK v. SWEENEY"]),
+            _page(["8 CLARK v. SWEENEY", "Per Curiam", "A Maryland jury"]),
+            _page(["Cite as: 607 U. S. 7 (2025) 9", "Per Curiam",
+                   "U. S. C. 2254 in Federal District Court."]),
+        ]
+        self.assertEqual(us_reports_cite_from_pdf(pages), "607 U.S. 7")
+
+    def test_a_preliminary_prints_cover_names_the_volume_too(self):
+        # Before the cover is stripped, it says the same thing — and it is
+        # all a two-page opinion has, since "Cite as:" first appears on the
+        # opinion's second recto.
+        pages = [
+            _page(["PRELIMINARY PRINT", "Volume 607 U. S. Part 1",
+                   "Pages 7-10", "OFFICIAL REPORTS"]),
+            _page(["OCTOBER TERM, 2025 7", "Syllabus"]),
+        ]
+        self.assertEqual(us_reports_cite_from_pdf(pages), "607 U.S. 7")
+
+    def test_a_reporters_note_trailing_the_opinion_is_not_a_failed_page(self):
+        # A draft reporter appends a "Reporter's Note" that constitutes no
+        # part of the opinion and matches nothing in it.  Requiring the last
+        # physical sheet to match took the page switching and the pin cites
+        # down with it — Bost v. Illinois State Bd. of Elections, 607 U. S.
+        # 71, is 36 pages of opinion and one of that note.
+        body = [
+            "The candidates challenged the procedure for counting mail-in "
+            "ballots received after election day in this matter.",
+            "We consider whether those candidates have standing to maintain "
+            "their suit against the board of elections here.",
+            "Reputational harms are classic Article III injuries and are "
+            "concrete for those whose jobs depend on public support.",
+        ]
+        source = build_plain_text_source(" ".join(body), "607 U. S. 71")
+        pages = [_page([line]) for line in body]
+        pages.append(_page([
+            "Reporter's Note",
+            "The attached opinion has been revised to reflect the usual "
+            "publication and citation style of the United States Reports.",
+            "The syllabus has been prepared by the Reporter of Decisions and "
+            "constitutes no part of the opinion of the Court.",
+        ]))
+        location_map = align_opinion_locations(
+            source, pages, pdf_cite="607 U. S. 71", us_cite="607 U. S. 71")
+
+        self.assertTrue(location_map.navigation_ready)
+        self.assertEqual(location_map.copy_cite, "607 U. S. 71")
+        self.assertEqual(
+            [b.reporter_page for b in location_map.boundaries], [71, 72, 73])
+
+    def test_losing_the_opinions_own_last_pages_is_still_a_failure(self):
+        # The tail allowance must not paper over an alignment that really did
+        # lose the end of the opinion: there, the source's own end is
+        # uncovered, and that is what the allowance turns on.
+        body = [
+            "The candidates challenged the procedure for counting mail-in "
+            "ballots received after election day in this matter.",
+            "We consider whether those candidates have standing to maintain "
+            "their suit against the board of elections here.",
+        ]
+        tail = (" The remainder of this opinion runs on at considerable "
+                "length about entirely unrelated statutory questions, none "
+                "of which appears anywhere among the pages supplied, and it "
+                "continues in that vein for a good while yet.") * 3
+        source = build_plain_text_source(" ".join(body) + tail, "607 U. S. 71")
+        pages = [_page([line]) for line in body]
+        pages.append(_page(["Reporter's Note", "no part of the opinion"]))
+        location_map = align_opinion_locations(
+            source, pages, pdf_cite="607 U. S. 71", us_cite="607 U. S. 71")
+
+        self.assertFalse(location_map.copy_ready)
+
+    def test_a_pdf_that_prints_no_reporter_citation_yields_none(self):
+        pages = [_page(["CLARK v. SWEENEY (2025) - per curiam",
+                        "his right to trial by an impartial jury."])]
+        self.assertEqual(us_reports_cite_from_pdf(pages), "")
+
+    def test_counsel_listing_at_a_page_foot_does_not_swallow_the_next_page(self):
+        # Carpenter v. United States, 585 U. S. 296: the reporter prints the
+        # amici listings at the foot of page 300, where the opinion opens,
+        # while the text version carries them up in the header.  Those
+        # listings match nothing nearby, so they scatter one- and two-word
+        # runs ("and", "of the", "for the") across the source — and the
+        # furthest of them used to drag the frontier past almost the whole of
+        # page 301, whose boundary then landed twenty lines down the page.
+        header = (
+            "Briefs of amici curiae were filed for the State of Alabama and "
+            "for the National District Attorneys Association and for their "
+            "several jurisdictions as follows and for the respondents. "
+        )
+        first = (
+            "Chief Justice Roberts delivered the opinion of the Court. This "
+            "case presents the question whether the Government conducts a "
+            "search when it accesses historical cell phone records. "
+        )
+        second = (
+            "phone's features. Each time the phone connects to a cell site "
+            "it generates a time-stamped record known as cell-site location "
+            "information. The precision of that information depends on the "
+            "size of the area the cell site covers. "
+        )
+        third = (
+            "several other suspects. That statute permits the Government to "
+            "compel the disclosure of certain telecommunications records."
+        )
+        source = build_text_source(
+            [_part((_span(header),)),
+             _part((_span(first), _span(second), _span(third)))],
+            "585 U. S. 296",
+        )
+        location_map = align_opinion_locations(
+            source,
+            [
+                # Page 300 prints the opinion's opening above a foot of amici
+                # listings; only the stray function words of those listings
+                # find anything to match.
+                _page([first, "and Denise M. Harle and Jordan E. Pratt of",
+                       "Montana and for the several jurisdictions and"]),
+                _page([second]),
+                _page([third]),
+            ],
+            pdf_cite="585 U. S. 296",
+            us_cite="585 U. S. 296",
+        )
+
+        starts = {
+            b.reporter_page: source.text[b.source_offset:b.source_offset + 20]
+            for b in location_map.boundaries
+        }
+        self.assertEqual(starts.get(297), second[:20])
+        self.assertEqual(starts.get(298), third[:20])
 
 
 if __name__ == "__main__":
