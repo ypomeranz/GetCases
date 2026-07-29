@@ -4171,16 +4171,20 @@ def _is_scotus_order_item(item: dict) -> bool:
     return cites_count <= 2
 
 
+def _courtlistener_main_opinion(item: dict) -> dict:
+    """The opinion represented most strongly by a CourtListener search hit."""
+    return max(
+        item.get("opinions") or [],
+        key=lambda opinion: len(opinion.get("cites") or []),
+        default={},
+    )
+
+
 def _courtlistener_result_snippet(item: dict, limit: int = 300) -> str:
     """Plain-text search snippet carried by a CourtListener result."""
-    opinions = item.get("opinions") or []
-    main_op = max(
-        opinions,
-        key=lambda opinion: len(opinion.get("cites") or []),
-        default=None,
-    )
+    main_op = _courtlistener_main_opinion(item)
     raw = (
-        (main_op or {}).get("snippet")
+        main_op.get("snippet")
         or item.get("snippet")
         or item.get("text")
         or ""
@@ -4190,6 +4194,196 @@ def _courtlistener_result_snippet(item: dict, limit: int = 300) -> str:
     if len(text) > limit:
         return text[:limit].rstrip() + "…"
     return text
+
+
+_CL_OPINION_ID_RE = re.compile(r"/opinions?/(\d+)(?:/|$)")
+_CL_FRONT_MATTER_RE = re.compile(
+    r"^(?:"
+    r"(?:chief\s+)?justice\s+\S+.*(?:delivered|announced|filed|concurring|"
+    r"dissenting)|"
+    r"per\s+curiam\.?|"
+    r"(?:argued|submitted|decided|filed)\b|"
+    r"(?:no\.?|nos\.?|docket\s+no\.?)\s+\S+|"
+    r"(?:appeal|certiorari)\s+from\b|"
+    r"(?:before|present):\s|"
+    r"(?:counsel|attorneys?)\s+for\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _courtlistener_opinion_id(item: dict) -> Optional[int]:
+    """Return the main nested opinion ID from a search-shaped result."""
+    opinion = _courtlistener_main_opinion(item)
+    for value in (
+        opinion.get("id"),
+        opinion.get("resource_uri"),
+        opinion.get("absolute_url"),
+        opinion.get("download_url"),
+    ):
+        if isinstance(value, int):
+            return value
+        value = str(value or "").strip()
+        if value.isdigit():
+            return int(value)
+        match = _CL_OPINION_ID_RE.search(value)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _courtlistener_opinion_preview(raw: str, limit: int = 300) -> str:
+    """Extract the first real prose paragraph from a full CL opinion.
+
+    Search snippets highlight the matching text.  For a case-name search that
+    is usually the caption, so Spotlight instead fetches the opinion itself
+    and skips captions, court/date headings, and opinion-author bylines.
+    """
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+
+    paragraphs: list[tuple[str, str]] = []
+    if re.search(r"<[A-Za-z][^>]*>", raw):
+        blocks, _footnotes = _parse_cl_html(raw)
+        paragraphs = [
+            (str(getattr(block, "kind", "para")), block.text())
+            for block in blocks
+        ]
+    else:
+        # CourtListener's plain_text field uses blank lines for paragraph
+        # breaks and single newlines for hard wrapping within a paragraph.
+        for chunk in re.split(r"(?:\r?\n\s*){2,}", raw):
+            paragraphs.append(("para", re.sub(r"\s*\r?\n\s*", " ", chunk)))
+
+    fallback = ""
+    for kind, paragraph in paragraphs:
+        text = _html.unescape(re.sub(r"<[^>]+>", " ", str(paragraph)))
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or kind in {"center", "heading"}:
+            continue
+        if not fallback and len(text) >= 30:
+            fallback = text
+        # Skip the common front matter that is not opinion prose.
+        if _CL_FRONT_MATTER_RE.search(text):
+            continue
+        if re.search(r"\b(?:v\.?|versus)\s+", text, re.IGNORECASE):
+            caption_probe = re.sub(
+                r"\b(?:v\.?|versus)\s+", " versus ", text,
+                flags=re.IGNORECASE,
+            )
+            if not re.search(r"[.!?]", caption_probe):
+                continue
+        letters = [char for char in text if char.isalpha()]
+        if letters and len(text.split()) < 20:
+            upper_ratio = sum(char.isupper() for char in letters) / len(letters)
+            if upper_ratio > 0.78:
+                continue
+        # A substantive paragraph normally has at least a short sentence.  We
+        # still retain the first longer candidate as a fallback for unusually
+        # terse or poorly segmented source material.
+        if len(text) < 40 or len(text.split()) < 7:
+            continue
+        return text[:limit].rstrip() + ("…" if len(text) > limit else "")
+
+    if fallback:
+        return fallback[:limit].rstrip() + ("…" if len(fallback) > limit else "")
+    return ""
+
+
+def _courtlistener_full_opinion_preview(
+    client: CourtListenerClient, item: dict, limit: int = 300,
+) -> str:
+    """Fetch and summarize the main opinion for one Spotlight result."""
+    opinion_ids: list[int] = []
+    direct_id = _courtlistener_opinion_id(item)
+    if direct_id is not None:
+        opinion_ids.append(direct_id)
+
+    if not opinion_ids:
+        cluster_id = item.get("cluster_id") or item.get("id")
+        if cluster_id:
+            cluster = client.get_cluster(int(cluster_id), fields="sub_opinions")
+            for ref in cluster.get("sub_opinions") or []:
+                if isinstance(ref, int):
+                    opinion_ids.append(ref)
+                    continue
+                match = _CL_OPINION_ID_RE.search(str(ref or ""))
+                if match:
+                    opinion_ids.append(int(match.group(1)))
+
+    for opinion_id in opinion_ids:
+        preview = _courtlistener_opinion_preview(
+            client.get_opinion_text(opinion_id), limit=limit,
+        )
+        if preview:
+            return preview
+    return ""
+
+
+def _courtlistener_search_pages(
+    client: CourtListenerClient,
+    query: str,
+    *,
+    max_results: Optional[int],
+    **search_kwargs,
+):
+    """Yield cursor-paginated search pages capped at an exact result total.
+
+    CourtListener's search endpoint pages at no more than 20 results and may
+    return 20 even when a smaller ``page_size`` is requested.  The main-window
+    selector therefore controls the total locally: pages are followed until
+    the requested count is reached, and the last page is sliced as needed.
+
+    Each yielded tuple is ``(page, done, exhausted)``.  ``done`` means the UI
+    should stop loading; ``exhausted`` distinguishes reaching the end of the
+    API result set from intentionally stopping at the user's limit.
+    """
+    if max_results is not None and max_results <= 0:
+        return
+
+    loaded = 0
+    cursor = None
+    seen_cursors: set[str] = set()
+    while True:
+        data = client.search(
+            query,
+            cursor=cursor,
+            page_size=20,
+            **search_kwargs,
+        )
+        api_results = list(data.get("results") or [])
+        results = api_results
+        if max_results is not None:
+            remaining = max_results - loaded
+            results = api_results[:remaining]
+        loaded += len(results)
+
+        next_url = data.get("next") or ""
+        next_cursor = None
+        if next_url:
+            parsed = urllib.parse.urlparse(next_url)
+            next_cursor = urllib.parse.parse_qs(
+                parsed.query
+            ).get("cursor", [None])[0]
+
+        exhausted = (
+            not next_cursor
+            or next_cursor in seen_cursors
+            or not api_results
+        )
+        limit_reached = (
+            max_results is not None and loaded >= max_results
+        )
+        done = exhausted or limit_reached
+        page = dict(data)
+        page["results"] = results
+        yield page, done, exhausted
+        if done:
+            break
+
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
 
 
 def _main_view_scotus_order(
@@ -5337,6 +5531,8 @@ class CourtListenerGUI:
         self._opinion_db_loading = False
         self._opinion_db_thread: Optional[threading.Thread] = None
         self._opinion_db_lock = threading.RLock()
+        self._spotlight_snippet_cache: dict[str, str] = {}
+        self._spotlight_snippet_lock = threading.Lock()
 
         self._preview_cache: dict[int, str] = {}  # result index → snippet text
         self._sort_state: dict[int, tuple[str, bool]] = {}  # tree id → (col, reverse)
@@ -6125,6 +6321,17 @@ class CourtListenerGUI:
             side="left", padx=4
         )
 
+        ttk.Label(row2, text="  CourtListener results:").pack(side="left")
+        self._result_limit_var = tk.StringVar(value="20")
+        self._result_limit_combo = ttk.Combobox(
+            row2,
+            textvariable=self._result_limit_var,
+            values=("5", "10", "20", "50", "100", "200", "All"),
+            state="normal",
+            width=5,
+        )
+        self._result_limit_combo.pack(side="left", padx=4)
+
         # --- Results area: left trees + right preview ---
         results_frame = ttk.LabelFrame(self.root, text="Results", padding=6)
         results_frame.pack(fill="both", expand=True, padx=10, pady=4)
@@ -6785,7 +6992,7 @@ class CourtListenerGUI:
 
     def _spot_build_row(self, parent, court_abbr: str, tier_color: str,
                         display_name: str, detail_text: str,
-                        snippet: str = "") -> dict:
+                        snippet: str = "", year: str = "") -> dict:
         """Create one spotlight result row and return the widgets the caller
         needs to bind clicks and re-colour on highlight.  Builds a rounded,
         themed card when CustomTkinter is present, or the plain-Tk row otherwise.
@@ -6797,12 +7004,22 @@ class CourtListenerGUI:
             )
             row.pack(side="top", fill="x", padx=10, pady=(4, 0))
             row.pack_propagate(False)
-            badge = ctk.CTkLabel(
-                row, text=court_abbr, fg_color=tier_color, corner_radius=6,
-                text_color="#ffffff", font=_ui_font(11, "bold"),
-                width=78, height=36,
+            badge = ctk.CTkFrame(
+                row, fg_color=tier_color, corner_radius=6,
+                width=78, height=44,
             )
             badge.pack(side="left", padx=(10, 12), pady=9)
+            badge.pack_propagate(False)
+            badge_court = ctk.CTkLabel(
+                badge, text=court_abbr, fg_color="transparent",
+                text_color="#ffffff", font=_ui_font(11, "bold"), height=19,
+            )
+            badge_court.pack(fill="x", pady=(3, 0))
+            badge_year = ctk.CTkLabel(
+                badge, text=year, fg_color="transparent",
+                text_color="#ffffff", font=_ui_font(10), height=15,
+            )
+            badge_year.pack(fill="x", pady=(0, 3))
             text_frame = ctk.CTkFrame(row, fg_color="transparent")
             text_frame.pack(side="left", fill="both", expand=True, padx=(0, 12))
             header_frame = ctk.CTkFrame(
@@ -6825,7 +7042,9 @@ class CourtListenerGUI:
             )
             snippet_lbl.pack(fill="x", pady=(2, 6))
             return {
-                "row": row, "badge": badge, "text_frame": text_frame,
+                "row": row, "badge": badge, "badge_court": badge_court,
+                "badge_year": badge_year, "year": year,
+                "text_frame": text_frame,
                 "header_frame": header_frame,
                 "name": name_lbl, "detail": detail_lbl,
                 "snippet": snippet_lbl, "modern": True,
@@ -6836,12 +7055,21 @@ class CourtListenerGUI:
         )
         row.pack(side="top", fill="x", padx=4, pady=(2, 0))
         row.pack_propagate(False)
-        badge = tk.Label(
-            row, text=court_abbr, bg=tier_color, fg="#ffffff",
-            font=("TkDefaultFont", 10, "bold"), padx=6, pady=2,
-            anchor="center", width=8,
+        badge = tk.Frame(
+            row, bg=tier_color, width=76, height=46,
         )
         badge.pack(side="left", padx=(6, 8))
+        badge.pack_propagate(False)
+        badge_court = tk.Label(
+            badge, text=court_abbr, bg=tier_color, fg="#ffffff",
+            font=("TkDefaultFont", 10, "bold"), anchor="center",
+        )
+        badge_court.pack(fill="x", pady=(3, 0))
+        badge_year = tk.Label(
+            badge, text=year, bg=tier_color, fg="#ffffff",
+            font=("TkDefaultFont", 9), anchor="center",
+        )
+        badge_year.pack(fill="x", pady=(0, 3))
         text_frame = tk.Frame(row, bg="#ffffff")
         text_frame.pack(side="left", fill="x", expand=True, padx=(0, 6))
         header_frame = tk.Frame(text_frame, bg="#ffffff")
@@ -6862,7 +7090,9 @@ class CourtListenerGUI:
         )
         snippet_lbl.pack(fill="x")
         return {
-            "row": row, "badge": badge, "text_frame": text_frame,
+            "row": row, "badge": badge, "badge_court": badge_court,
+            "badge_year": badge_year, "year": year,
+            "text_frame": text_frame,
             "header_frame": header_frame,
             "name": name_lbl, "detail": detail_lbl,
             "snippet": snippet_lbl, "modern": False,
@@ -6885,9 +7115,24 @@ class CourtListenerGUI:
         color = self._spot_tier_color(court_id)
         try:
             if r["modern"]:
-                r["badge"].configure(text=text, fg_color=color)
+                r["badge"].configure(fg_color=color)
+                r["badge_court"].configure(text=text)
             else:
-                r["badge"].config(text=text, bg=color)
+                r["badge"].config(bg=color)
+                r["badge_court"].config(text=text, bg=color)
+                r["badge_year"].config(bg=color)
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _spot_set_badge_year(r: dict, year: str) -> None:
+        """Update the smaller year line without disturbing the court label."""
+        r["year"] = year
+        try:
+            if r["modern"]:
+                r["badge_year"].configure(text=year)
+            else:
+                r["badge_year"].config(text=year)
         except tk.TclError:
             pass
 
@@ -7055,10 +7300,8 @@ class CourtListenerGUI:
         shown: list[dict] = []
         bucket_counts: dict[str, int] = {}
 
-        def _detail_text(cite: str, year: str, source_label: str) -> str:
+        def _detail_text(cite: str, source_label: str) -> str:
             detail = f"{cite}" if cite else ""
-            if year:
-                detail = f"{detail} ({year})" if detail else f"({year})"
             if source_label:
                 sep = "  ·  " if _CTK_AVAILABLE else "  — "
                 detail = (f"{detail}{sep}{source_label}"
@@ -7075,7 +7318,8 @@ class CourtListenerGUI:
             r["open_fn"] = open_fn
             try:
                 r["detail"].configure(
-                    text=_detail_text(cite, year, source_label))
+                    text=_detail_text(cite, source_label))
+                self._spot_set_badge_year(r, year)
                 if snippet and r.get("snippet") is not None:
                     r["snippet"].configure(text=snippet)
             except tk.TclError:
@@ -7116,7 +7360,8 @@ class CourtListenerGUI:
 
         def _add_result(bucket: str, court_id: str, name: str, cite: str,
                         year: str, source_label: str, open_fn,
-                        opinion_id: str = "", snippet: str = "") -> None:
+                        opinion_id: str = "", snippet: str = "",
+                        snippet_loader=None) -> None:
             # Ignore results streaming in from a superseded search.
             if my_gen != self._spotlight_generation:
                 return
@@ -7180,14 +7425,15 @@ class CourtListenerGUI:
             court_abbr = "…" if resolving else self._spot_court_label(court_id)
 
             display_name = name[:80] + ("…" if len(name) > 80 else "")
-            detail = _detail_text(cite, year, source_label)
+            detail = _detail_text(cite, source_label)
             snippet = re.sub(r"\s+", " ", snippet or "").strip()
             if len(snippet) > 150:
                 snippet = snippet[:150].rstrip() + "…"
 
             r = self._spot_build_row(
                 rows_frame, court_abbr,
-                self._spot_tier_color(court_id), display_name, detail, snippet,
+                self._spot_tier_color(court_id), display_name, detail,
+                snippet=snippet, year=year,
             )
             _bind_wheel(r["row"])
             r["open_fn"] = open_fn
@@ -7200,6 +7446,48 @@ class CourtListenerGUI:
             # find one for the badge without holding anything back.
             if resolving:
                 _resolve_court(r, cite, name)
+
+            # A CourtListener search hit's snippet is commonly just the party
+            # names because those are the matched terms.  Once the row is on
+            # screen, fetch its full opinion on a worker and replace that
+            # placeholder with the first actual prose paragraph.
+            if snippet_loader is not None:
+                original_bucket = bucket
+
+                def load_better_snippet() -> None:
+                    try:
+                        better = snippet_loader()
+                    except Exception as exc:
+                        print(f"[spot-snippet] opinion preview failed: {exc}")
+                        return
+                    better = re.sub(r"\s+", " ", better or "").strip()
+                    if not better:
+                        return
+                    if len(better) > 150:
+                        better = better[:150].rstrip() + "…"
+
+                    def apply() -> None:
+                        if my_gen != self._spotlight_generation:
+                            return
+                        if not any(candidate is r for candidate in result_rows):
+                            return
+                        # Scholar may have taken this duplicate row over while
+                        # the CL opinion was loading; preserve Scholar's text.
+                        if r.get("bucket") != original_bucket:
+                            return
+                        try:
+                            r["snippet"].configure(text=better)
+                        except tk.TclError:
+                            pass
+
+                    try:
+                        self.root.after(0, apply)
+                    except (tk.TclError, RuntimeError):
+                        pass
+
+                threading.Thread(
+                    target=load_better_snippet, daemon=True,
+                ).start()
 
             def on_click(_e=None, _r=r) -> None:
                 self._close_quick_popup()
@@ -7514,6 +7802,11 @@ class CourtListenerGUI:
                 cite_str = _pick_citation(item.get("citation", []))
                 date = item.get("dateFiled") or item.get("date_filed") or ""
                 year = date[:4] if len(date) >= 4 else ""
+                preview_key = (
+                    f"opinion:{_courtlistener_opinion_id(item)}"
+                    if _courtlistener_opinion_id(item) is not None
+                    else f"cluster:{item.get('cluster_id') or item.get('id')}"
+                )
 
                 def make_opener(it=item, nm=case_name):
                     def open_it():
@@ -7538,10 +7831,33 @@ class CourtListenerGUI:
                         threading.Thread(target=run, daemon=True).start()
                     return open_it
 
+                def make_snippet_loader(it=item, key=preview_key):
+                    def load() -> str:
+                        with self._spotlight_snippet_lock:
+                            cached = self._spotlight_snippet_cache.get(key)
+                        if cached is not None:
+                            return cached
+                        preview = _courtlistener_full_opinion_preview(
+                            client, it,
+                        )
+                        if preview:
+                            with self._spotlight_snippet_lock:
+                                self._spotlight_snippet_cache[key] = preview
+                        return preview
+                    return load
+
+                nested_opinion_id = _courtlistener_opinion_id(item)
+                identity = (
+                    f"courtlistener:{nested_opinion_id}"
+                    if nested_opinion_id is not None
+                    else ""
+                )
+
                 self.root.after(
                     0, _add_result, bucket, court_id, case_name, cite_str,
-                    year, "CourtListener", make_opener(), "",
+                    year, "CourtListener", make_opener(), identity,
                     _courtlistener_result_snippet(item),
+                    make_snippet_loader(),
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
@@ -9097,6 +9413,21 @@ class CourtListenerGUI:
         court = " ".join(sorted(selected_courts)) or None
         date_from = self._date_from_var.get().strip() or None
         date_to = self._date_to_var.get().strip() or None
+        limit_text = self._result_limit_var.get().strip()
+        if limit_text.lower() == "all":
+            max_results = None
+        else:
+            try:
+                max_results = int(limit_text)
+                if max_results <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning(
+                    "Invalid Result Count",
+                    "CourtListener results must be a positive whole number "
+                    'or "All".',
+                )
+                return
         self._search_generation += 1
         search_generation = self._search_generation
 
@@ -9153,35 +9484,20 @@ class CourtListenerGUI:
 
         def run() -> None:
             try:
-                cursor = None
-                seen_cursors: set[str] = set()
-                while True:
-                    data = client.search(
-                        query,
-                        type="o",
-                        court=court,
-                        date_filed_min=date_from,
-                        date_filed_max=date_to,
-                        highlight=True,
-                        cursor=cursor,
-                        page_size=20,
-                    )
-                    next_url = data.get("next") or ""
-                    next_cursor = None
-                    if next_url:
-                        parsed = urllib.parse.urlparse(next_url)
-                        next_cursor = urllib.parse.parse_qs(
-                            parsed.query
-                        ).get("cursor", [None])[0]
-                    done = not next_cursor or next_cursor in seen_cursors
+                for data, done, exhausted in _courtlistener_search_pages(
+                    client,
+                    query,
+                    max_results=max_results,
+                    type="o",
+                    court=court,
+                    date_filed_min=date_from,
+                    date_filed_max=date_to,
+                    highlight=True,
+                ):
                     self.root.after(
                         0, self._on_results_page, data, done,
-                        search_generation,
+                        search_generation, max_results, exhausted,
                     )
-                    if done:
-                        break
-                    seen_cursors.add(next_cursor)
-                    cursor = next_cursor
             except CourtListenerError as exc:
                 self.root.after(
                     0, self._on_error, str(exc), search_generation,
@@ -9198,6 +9514,8 @@ class CourtListenerGUI:
     def _on_results_page(
         self, data: dict, done: bool = True,
         generation: Optional[int] = None,
+        requested_limit: Optional[int] = None,
+        exhausted: Optional[bool] = None,
     ) -> None:
         if generation is not None and generation != self._search_generation:
             return
@@ -9231,11 +9549,28 @@ class CourtListenerGUI:
 
         loaded = len(self._results)
         if loaded:
-            self._status_var.set(
-                (
-                    f"Loaded all {loaded:,} results. "
-                    if done else f"Loaded {loaded:,} of {count:,} results… "
+            if done:
+                stopped_at_limit = (
+                    requested_limit is not None
+                    and loaded >= requested_limit
+                    and count > loaded
+                    and exhausted is False
                 )
+                if stopped_at_limit:
+                    progress = (
+                        f"Loaded requested {loaded:,} of {count:,} "
+                        "matching results. "
+                    )
+                else:
+                    progress = f"Loaded all {loaded:,} results. "
+            else:
+                target = (
+                    min(count, requested_limit)
+                    if requested_limit is not None else count
+                )
+                progress = f"Loaded {loaded:,} of {target:,} results… "
+            self._status_var.set(
+                progress
                 + "Select a row and click Download PDF (or double-click)."
             )
         elif done:

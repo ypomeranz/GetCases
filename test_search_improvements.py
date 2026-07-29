@@ -8,7 +8,11 @@ from urllib.parse import parse_qs, urlparse
 from citations import detect_links
 from courtlistener import CourtListenerClient
 from courtlistener_gui import (
+    _courtlistener_full_opinion_preview,
+    _courtlistener_opinion_id,
+    _courtlistener_opinion_preview,
     _courtlistener_result_snippet,
+    _courtlistener_search_pages,
     _main_view_scotus_order,
     _parse_statute_query,
 )
@@ -56,6 +60,159 @@ class CourtListenerSearchTests(unittest.TestCase):
             _courtlistener_result_snippet(item),
             "The main opinion text",
         )
+
+    def test_selected_result_total_slices_api_twenty_item_page(self):
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def search(self, query, **kwargs):
+                self.calls.append((query, kwargs))
+                return {
+                    "count": 100,
+                    "results": [{"id": value} for value in range(20)],
+                    "next": "https://example.test/search/?cursor=second",
+                }
+
+        client = Client()
+        pages = list(_courtlistener_search_pages(
+            client, "example", max_results=7, type="o",
+        ))
+
+        self.assertEqual(len(pages), 1)
+        page, done, exhausted = pages[0]
+        self.assertEqual(len(page["results"]), 7)
+        self.assertTrue(done)
+        self.assertFalse(exhausted)
+        self.assertEqual(client.calls[0][1]["page_size"], 20)
+
+    def test_selected_result_total_follows_pages_and_stops_exactly(self):
+        class Client:
+            def __init__(self):
+                self.cursors = []
+
+            def search(self, query, **kwargs):
+                cursor = kwargs.get("cursor")
+                self.cursors.append(cursor)
+                start = 0 if cursor is None else 20
+                return {
+                    "count": 100,
+                    "results": [
+                        {"id": value} for value in range(start, start + 20)
+                    ],
+                    "next": (
+                        "https://example.test/search/?cursor=second"
+                        if cursor is None else
+                        "https://example.test/search/?cursor=third"
+                    ),
+                }
+
+        client = Client()
+        pages = list(_courtlistener_search_pages(
+            client, "example", max_results=35, type="o",
+        ))
+
+        self.assertEqual([len(page[0]["results"]) for page in pages], [20, 15])
+        self.assertEqual(client.cursors, [None, "second"])
+        self.assertTrue(pages[-1][1])
+        self.assertFalse(pages[-1][2])
+
+    def test_all_results_follows_cursor_until_api_is_exhausted(self):
+        class Client:
+            def __init__(self):
+                self.cursors = []
+
+            def search(self, query, **kwargs):
+                cursor = kwargs.get("cursor")
+                self.cursors.append(cursor)
+                if cursor is None:
+                    start, size, next_cursor = 0, 20, "second"
+                elif cursor == "second":
+                    start, size, next_cursor = 20, 20, "third"
+                else:
+                    start, size, next_cursor = 40, 5, None
+                return {
+                    "count": 45,
+                    "results": [
+                        {"id": value} for value in range(start, start + size)
+                    ],
+                    "next": (
+                        f"https://example.test/search/?cursor={next_cursor}"
+                        if next_cursor else None
+                    ),
+                }
+
+        client = Client()
+        pages = list(_courtlistener_search_pages(
+            client, "example", max_results=None, type="o",
+        ))
+
+        self.assertEqual(
+            [len(page[0]["results"]) for page in pages], [20, 20, 5],
+        )
+        self.assertEqual(client.cursors, [None, "second", "third"])
+        self.assertTrue(pages[-1][1])
+        self.assertTrue(pages[-1][2])
+
+    def test_nested_main_opinion_id_is_extracted(self):
+        item = {
+            "opinions": [
+                {"id": 11, "cites": []},
+                {
+                    "resource_uri": "/api/rest/v4/opinions/22/",
+                    "cites": ["a", "b"],
+                },
+            ],
+        }
+
+        self.assertEqual(_courtlistener_opinion_id(item), 22)
+
+    def test_full_opinion_preview_skips_caption_and_author_byline(self):
+        opinion = """
+        <opinion>
+          <center>EXAMPLE v. RESPONDENT</center>
+          <author>Justice Example delivered the opinion of the Court.</author>
+          <p>The first real paragraph explains the dispute and the governing
+          legal question presented to the Court in this appeal.</p>
+          <p>The second paragraph should not be needed.</p>
+        </opinion>
+        """
+
+        self.assertEqual(
+            _courtlistener_opinion_preview(opinion),
+            (
+                "The first real paragraph explains the dispute and the "
+                "governing legal question presented to the Court in this "
+                "appeal."
+            ),
+        )
+
+    def test_full_opinion_preview_uses_cluster_sub_opinion_fallback(self):
+        class Client:
+            def get_cluster(self, cluster_id, fields=None):
+                self.cluster_request = (cluster_id, fields)
+                return {
+                    "sub_opinions": [
+                        "https://www.courtlistener.com/api/rest/v4/opinions/44/"
+                    ],
+                }
+
+            def get_opinion_text(self, opinion_id):
+                self.opinion_id = opinion_id
+                return (
+                    "EXAMPLE v. RESPONDENT\n\n"
+                    "The actual opinion begins with a meaningful explanation "
+                    "of the facts and procedural history."
+                )
+
+        client = Client()
+        preview = _courtlistener_full_opinion_preview(
+            client, {"cluster_id": 33},
+        )
+
+        self.assertEqual(client.cluster_request, (33, "sub_opinions"))
+        self.assertEqual(client.opinion_id, 44)
+        self.assertTrue(preview.startswith("The actual opinion begins"))
 
     def test_main_scotus_order_uses_age_appropriate_signal(self):
         today = dt.date(2026, 7, 29)
