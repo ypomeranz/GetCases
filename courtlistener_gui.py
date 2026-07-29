@@ -2185,6 +2185,47 @@ _REPORTER_SERIES_RE = re.compile(r"\b\d*(?:2d|3d|4th|5th|6th)\b\.?|\b\d+\b")
 _SCOTUS_REPORTERS = {"U.S.", "S. Ct.", "S.Ct.", "L. Ed.", "L. Ed. 2d", "L.Ed.", "L.Ed.2d"}
 
 
+def _court_result_label(item: dict) -> str:
+    """Short court label for a CourtListener result-table row.
+
+    Search results carry both a formal court name (often much too long for the
+    main table) and a stable CourtListener court ID.  Prefer the repository's
+    Bluebook map for that ID, then CourtListener's own citation string, then
+    derive a Bluebook abbreviation from the formal name.
+    """
+    raw_id = str(item.get("court_id") or "").strip().lower()
+    raw_name = str(item.get("court") or "").strip()
+    if not raw_id and raw_name.lower() in _COURT_BLUEBOOK:
+        raw_id = raw_name.lower()
+
+    if raw_id == "scotus" or _CAP_SCOTUS_RE.match(raw_name):
+        return "SCOTUS"
+
+    mapped = _COURT_BLUEBOOK.get(raw_id, "")
+    if mapped:
+        return mapped
+
+    supplied = str(
+        item.get("court_citation_string")
+        or item.get("court_abbreviation")
+        or ""
+    ).strip()
+    if supplied:
+        return supplied
+
+    derived = (
+        _bluebook_court_from_name(raw_name)
+        or _bluebook_federal_trial_court(raw_name)
+    )
+    if derived:
+        return derived
+
+    # A short value is likely already an abbreviation.  Retain a formal name
+    # only as the last resort; it is more intelligible than an unknown opaque
+    # court ID.
+    return raw_name or raw_id.upper()
+
+
 def _court_for_paren(citation: str, court_id: str, fallback: str = "") -> str:
     """
     Court abbreviation for a Bluebook date parenthetical, omitting or
@@ -9281,7 +9322,7 @@ class CourtListenerGUI:
         """Return the tuple of column values for inserting a row into the tree."""
         case_name = item.get("caseName") or item.get("case_name") or "(unknown)"
         case_name = re.sub(r"<[^>]+>", "", case_name).strip()
-        court = item.get("court") or item.get("court_id") or ""
+        court = _court_result_label(item)
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
         citation_str = _pick_citation(item.get("citation", []))
         status = item.get("status") or item.get("precedentialStatus") or ""

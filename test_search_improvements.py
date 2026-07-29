@@ -13,6 +13,7 @@ from courtlistener_gui import (
     _courtlistener_opinion_preview,
     _courtlistener_result_snippet,
     _courtlistener_search_pages,
+    _court_result_label,
     _main_view_scotus_order,
     _parse_statute_query,
 )
@@ -43,6 +44,40 @@ class CourtListenerSearchTests(unittest.TestCase):
 
         self.assertEqual(endpoint, "search/")
         self.assertEqual(params["page_size"], 17)
+
+    def test_main_result_uses_bluebook_court_id_abbreviation(self):
+        self.assertEqual(
+            _court_result_label({
+                "court_id": "ca9",
+                "court": "United States Court of Appeals for the Ninth Circuit",
+            }),
+            "9th Cir.",
+        )
+        self.assertEqual(
+            _court_result_label({
+                "court_id": "nysd",
+                "court": "United States District Court, S.D. New York",
+            }),
+            "S.D.N.Y.",
+        )
+
+    def test_main_result_shortens_scotus_and_unmapped_state_court(self):
+        self.assertEqual(
+            _court_result_label({
+                "court_id": "scotus",
+                "court": "Supreme Court of the United States",
+            }),
+            "SCOTUS",
+        )
+        self.assertEqual(
+            _court_result_label({
+                "court": (
+                    "Court of Appeals of Ohio, "
+                    "Twelfth Appellate District"
+                ),
+            }),
+            "Ohio Ct. App.",
+        )
 
     def test_result_snippet_prefers_main_opinion_and_removes_html(self):
         item = {
