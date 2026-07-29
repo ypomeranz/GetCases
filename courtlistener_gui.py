@@ -1730,6 +1730,11 @@ class _SavedStatuteDoc:
 
     def __init__(self, data: dict) -> None:
         self.paras = [tuple(p) for p in (data.get("paras") or []) if len(p) == 3]
+        self.para_styles = [
+            [tuple(style) for style in styles if len(style) == 3]
+            for styles in (data.get("para_styles") or [])
+        ]
+        self.site_formatting = bool(data.get("site_formatting", False))
         self.url = str(data.get("url", ""))
         self.title = str(data.get("title", ""))
         self.set_key = data.get("set_key")
@@ -6800,23 +6805,28 @@ class CourtListenerGUI:
             badge.pack(side="left", padx=(10, 12), pady=9)
             text_frame = ctk.CTkFrame(row, fg_color="transparent")
             text_frame.pack(side="left", fill="both", expand=True, padx=(0, 12))
+            header_frame = ctk.CTkFrame(
+                text_frame, fg_color="transparent",
+            )
+            header_frame.pack(fill="x", pady=(7, 0))
+            detail_lbl = ctk.CTkLabel(
+                header_frame, text=detail_text, fg_color="transparent",
+                text_color=_UI["muted"], font=_ui_font(11), anchor="e",
+            )
+            detail_lbl.pack(side="right", padx=(12, 0))
             name_lbl = ctk.CTkLabel(
-                text_frame, text=display_name, fg_color="transparent",
+                header_frame, text=display_name, fg_color="transparent",
                 text_color=_UI["text"], font=_ui_font(14), anchor="w",
             )
-            name_lbl.pack(fill="x", pady=(7, 0))
-            detail_lbl = ctk.CTkLabel(
-                text_frame, text=detail_text, fg_color="transparent",
-                text_color=_UI["muted"], font=_ui_font(11), anchor="w",
-            )
-            detail_lbl.pack(fill="x")
+            name_lbl.pack(side="left", fill="x", expand=True)
             snippet_lbl = ctk.CTkLabel(
                 text_frame, text=snippet, fg_color="transparent",
                 text_color=_UI["muted"], font=_ui_font(10), anchor="w",
             )
-            snippet_lbl.pack(fill="x", pady=(0, 4))
+            snippet_lbl.pack(fill="x", pady=(2, 6))
             return {
                 "row": row, "badge": badge, "text_frame": text_frame,
+                "header_frame": header_frame,
                 "name": name_lbl, "detail": detail_lbl,
                 "snippet": snippet_lbl, "modern": True,
             }
@@ -6834,16 +6844,18 @@ class CourtListenerGUI:
         badge.pack(side="left", padx=(6, 8))
         text_frame = tk.Frame(row, bg="#ffffff")
         text_frame.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        header_frame = tk.Frame(text_frame, bg="#ffffff")
+        header_frame.pack(fill="x")
+        detail_lbl = tk.Label(
+            header_frame, text=detail_text, bg="#ffffff", fg="#888888",
+            font=("TkDefaultFont", 8), anchor="e",
+        )
+        detail_lbl.pack(side="right", padx=(10, 0))
         name_lbl = tk.Label(
-            text_frame, text=display_name, bg="#ffffff", fg="#222222",
+            header_frame, text=display_name, bg="#ffffff", fg="#222222",
             font=("TkDefaultFont", 10), anchor="w",
         )
-        name_lbl.pack(fill="x")
-        detail_lbl = tk.Label(
-            text_frame, text=detail_text, bg="#ffffff", fg="#888888",
-            font=("TkDefaultFont", 8), anchor="w",
-        )
-        detail_lbl.pack(fill="x")
+        name_lbl.pack(side="left", fill="x", expand=True)
         snippet_lbl = tk.Label(
             text_frame, text=snippet, bg="#ffffff", fg="#888888",
             font=("TkDefaultFont", 8), anchor="w",
@@ -6851,6 +6863,7 @@ class CourtListenerGUI:
         snippet_lbl.pack(fill="x")
         return {
             "row": row, "badge": badge, "text_frame": text_frame,
+            "header_frame": header_frame,
             "name": name_lbl, "detail": detail_lbl,
             "snippet": snippet_lbl, "modern": False,
         }
@@ -6887,7 +6900,8 @@ class CourtListenerGUI:
             return
         bg = "#d0e0f0" if selected else "#ffffff"
         for w in (
-            r["row"], r["text_frame"], r["name"], r["detail"],
+            r["row"], r["text_frame"], r.get("header_frame"),
+            r["name"], r["detail"],
             r.get("snippet"),
         ):
             if w is None:
@@ -26019,13 +26033,13 @@ class _StatuteWindow:
     the eCFR (www.ecfr.gov).  Both sources are parsed into the same
     (kind, indent, text) stream, so one window serves both.
 
-    Formatting follows the statutory hierarchy: the section heading and
-    subdivision headings are bold, inline enumerators ("(a)", "(1)(A)")
-    are bold, and each nesting level is indented with a hanging indent so
-    wrapped lines stay aligned under their text.  When the citation that
-    opened the window pin-cites a subdivision ("§ 922(g)(1)"), the view
-    scrolls there and flashes it.  Source credit is shown small below the
-    text; long editorial/statutory notes sit behind a toggle.
+    C.F.R. formatting follows eCFR's own ``indent-N`` and inline emphasis
+    markup.  Other sources use the shared statutory hierarchy: subdivision
+    headings and inline enumerators are bold, and every nesting level has a
+    hanging indent so wrapped lines align under their text.  When the citation
+    that opened the window pin-cites a subdivision ("§ 922(g)(1)"), the view
+    scrolls there and flashes it.  Source credit is shown small below the text;
+    long editorial/statutory notes sit behind a toggle.
     """
 
     def __init__(
@@ -26034,7 +26048,10 @@ class _StatuteWindow:
         self._app = app
         self._doc = doc
         self._highlight = tuple(highlight)
-        self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
+        self._has_notes = any(
+            entry and str(entry[0]).startswith("note")
+            for entry in doc.paras
+        )
         self._neighbors: tuple = (None, None)
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
@@ -26081,6 +26098,12 @@ class _StatuteWindow:
         try:
             local = {
                 "paras": _json_ready([list(p) for p in doc.paras]),
+                "para_styles": _json_ready(
+                    getattr(doc, "para_styles", []),
+                ),
+                "site_formatting": bool(
+                    getattr(doc, "site_formatting", False),
+                ),
                 "url": doc.url,
                 "kind": doc.kind,
                 "title": getattr(doc, "title", ""),
@@ -26182,6 +26205,10 @@ class _StatuteWindow:
         self._fonts = {
             "base": tkfont.Font(family=fam, size=s),
             "bold": tkfont.Font(family=fam, size=s, weight="bold"),
+            "italic": tkfont.Font(family=fam, size=s, slant="italic"),
+            "bolditalic": tkfont.Font(
+                family=fam, size=s, weight="bold", slant="italic",
+            ),
             "sechead": tkfont.Font(family=fam, size=s + 2, weight="bold"),
             "small": tkfont.Font(family=fam, size=max(s - 2, 8)),
         }
@@ -26197,6 +26224,11 @@ class _StatuteWindow:
                           spacing1=4, spacing3=12)
         txt.tag_configure("headline", font=self._fonts["bold"], spacing1=8)
         txt.tag_configure("enum", font=self._fonts["bold"])
+        txt.tag_configure("inline-bold", font=self._fonts["bold"])
+        txt.tag_configure("inline-italic", font=self._fonts["italic"])
+        txt.tag_configure(
+            "inline-bolditalic", font=self._fonts["bolditalic"],
+        )
         txt.tag_configure("credit", font=self._fonts["small"],
                           foreground="#555555", spacing1=14)
         txt.tag_configure("notehead", font=self._fonts["bold"],
@@ -26204,13 +26236,20 @@ class _StatuteWindow:
         txt.tag_configure("notebody", font=self._fonts["small"],
                           foreground="#444444")
         for i in range(7):
-            # A slightly wider step keeps deep CFR paragraphs—whose hierarchy
-            # can reach (a)(1)(i)(A)(1)(i)—visibly distinct at a glance.
             is_cfr = self._doc.kind == "cfr"
-            margin = (8 + 32 * i) if is_cfr else (10 + 26 * i)
-            txt.tag_configure(f"ind{i}", lmargin1=margin,
-                              lmargin2=margin + (24 if is_cfr else 22),
-                              spacing3=6)
+            if is_cfr:
+                # Match eCFR's .indent-N rule: each level adds 32 px, with
+                # the marker hanging 40 px left of wrapped paragraph text.
+                txt.tag_configure(
+                    f"ind{i}", lmargin1=22 + 32 * i,
+                    lmargin2=62 + 32 * i, spacing3=6,
+                )
+            else:
+                margin = 10 + 26 * i
+                txt.tag_configure(
+                    f"ind{i}", lmargin1=margin,
+                    lmargin2=margin + 22, spacing3=6,
+                )
         txt.tag_configure("jumpflash", background="#fff2a8")
         txt.tag_configure("citelink", foreground="#1a56b0")
         txt.tag_bind("citelink", "<Enter>",
@@ -26273,10 +26312,20 @@ class _StatuteWindow:
         # (position, enumerator path) per enumerated paragraph, for the
         # pin-cite jump and for citing a selection in _copy_cite
         self._anchors: list[tuple[str, tuple]] = []
-        for kind, ind, text in self._doc.paras:
+        para_styles = getattr(self._doc, "para_styles", [])
+        site_formatting = bool(
+            self._doc.kind == "cfr"
+            and getattr(self._doc, "site_formatting", False)
+        )
+        for para_index, (kind, ind, text) in enumerate(self._doc.paras):
             if kind.startswith("note") and not show_notes:
                 continue
-            text = educate_quotes(text)
+            styles = (
+                para_styles[para_index]
+                if para_index < len(para_styles) else []
+            )
+            if not site_formatting:
+                text = educate_quotes(text)
             indtag = f"ind{min(ind, 6)}"
             # Track the enumerator path: a paragraph at indent level N
             # replaces the path from depth N down.
@@ -26310,7 +26359,23 @@ class _StatuteWindow:
                         target_pos = txt.index("end-1c")
                 txt.insert("end", text + "\n", ("headline", indtag))
             elif kind == "body":
-                if lead:
+                if site_formatting:
+                    para_start = txt.index("end-1c")
+                    self._insert_refs(text, (indtag,))
+                    for start, end, style in styles:
+                        if style not in ("bold", "italic", "bolditalic"):
+                            continue
+                        try:
+                            start_i, end_i = int(start), int(end)
+                        except (TypeError, ValueError):
+                            continue
+                        if 0 <= start_i < end_i <= len(text):
+                            txt.tag_add(
+                                f"inline-{style}",
+                                f"{para_start}+{start_i}c",
+                                f"{para_start}+{end_i}c",
+                            )
+                elif lead:
                     txt.insert("end", lead.rstrip() + " ",
                                ("enum", indtag))
                     self._insert_refs(text[len(lead):].lstrip(), (indtag,))
@@ -26496,7 +26561,10 @@ class _StatuteWindow:
         """Show another section in this same window (prev/next nav)."""
         self._doc = doc
         self._highlight = tuple(highlight)
-        self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
+        self._has_notes = any(
+            entry and str(entry[0]).startswith("note")
+            for entry in doc.paras
+        )
         self._notes_btn.configure(
             state="normal" if self._has_notes else "disabled")
         self._win.title(f"{doc.label} — {doc.source_name}")

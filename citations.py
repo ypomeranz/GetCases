@@ -758,6 +758,15 @@ _REPORTER_FAMILIES = (
         ("Wn. App.", "Wash App", "Wn App", "Wash.App.", "Wn.App."),
         ("Wash. App.", "Wn. App."), "wash-app",
     ),
+    _ReporterFamily(
+        "Johns. Ch.",
+        (
+            "John. Ch.", "John. Chan.", "Johns. Chan.",
+            "John Ch", "John Chan", "Johns Ch", "Johns Chan",
+        ),
+        ("Johns. Ch.", "John. Chan.", "Johns. Chan."),
+        "johns-ch",
+    ),
     # Spelled-out nineteenth-century lower-federal reporters are normalized
     # by the link detector, but declaring them here also makes database,
     # override, and direct-search identity bidirectional.
@@ -842,6 +851,9 @@ def _valid_case_reporter(rep: str) -> bool:
         return False  # a law review, not a reporter — no case to open
     if _AG_OPINION_RE.search(rep or ""):
         return False  # an Attorney General opinion, not a decided case
+    family = reporter_family(rep)
+    if family is not None and family.canonical == "Johns. Ch.":
+        return True
     if key in _PLAIN_CASE_REPORTERS or key.endswith("lexis"):
         return True
     return "." in (rep or "")
@@ -855,6 +867,8 @@ def case_match_text(m: re.Match) -> str:
     dual cite ("4 Wheat. [17 U. S.] 438" -> "4 Wheat. 438", "5 U.S. (1
     Cranch) 137" -> "5 U.S. 137"), plus the OCR hyphen sometimes glued to
     the page ("21 Wall. (88 U. S.)-597" -> "21 Wall. 597")."""
+    if canonical_reporter(m.group(2)) == "Johns. Ch.":
+        return f"{m.group(1)} Johns. Ch. {m.group(3)}"
     s = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.").replace("’", "'")
     s = re.sub(r"\s*[\[(][^\])]*[\])]\s*", " ", s)
     s = re.sub(r"\s[-–—]\s*(?=\d)", " ", s)

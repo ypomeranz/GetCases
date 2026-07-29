@@ -849,6 +849,29 @@ class ReporterSweepTests(unittest.TestCase):
         kept = [j for j in self.JOURNALS if _valid_case_reporter(j)]
         self.assertEqual(kept, [], f"journals still accepted: {kept}")
 
+    def test_johns_chancery_variants_normalize_to_canonical_reporter(self):
+        for printed in (
+            "3 John. Chan. 45",
+            "3 Johns. Chan. 45",
+            "3 John. Ch. 45",
+            "3 John Chan 45",
+            "3 Johns Ch 45",
+        ):
+            with self.subTest(printed=printed):
+                links = [
+                    action for _start, _end, action in detect_links(printed)
+                    if action[0] == "cite"
+                ]
+                self.assertEqual(links, [("cite", "3 Johns. Ch. 45")])
+        self.assertEqual(
+            citations.reporter_citation_variants("3 John. Chan. 45"),
+            (
+                "3 John. Chan. 45",
+                "3 Johns. Ch. 45",
+                "3 Johns. Chan. 45",
+            ),
+        )
+
 
 class RecordCiteTests(unittest.TestCase):
     """A bare "App." is the joint appendix, not a reporter."""
