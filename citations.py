@@ -1042,8 +1042,9 @@ _RECAP_AFTER_RE = re.compile(
 # The case name before the citation — for the viewer's window title, and,
 # when the citation prints no docket number, as the RECAP search key itself.
 _RECAP_NAME_BODY = (
-    r"([A-Z][\w.,'’&() -]{1,80}?\sv\.\s[\w.,'’&() -]{1,60}?|"
-    r"In\s+re\s+[\w.,'’&() -]{2,60}?)"
+    r"([A-Z][\w.,'’&()/ -]{1,180}?\sv\.?\s"
+    r"[\w.,'’&()/ -]{1,140}?|"
+    r"In\s+re\s+[\w.,'’&()/ -]{2,140}?)"
 )
 # … followed by the docket number ("Care One …, No. 12-6371, 2024 WL …"):
 _RECAP_NAME_RE = re.compile(
@@ -1125,7 +1126,7 @@ def iter_recap_cites(text: str) -> list[tuple[int, int, "str | None"]]:
         key = (m.group(1), norm_reporter(m.group(2)), m.group(3))
         info = index.setdefault(
             key, {"cite": re.sub(r"\s+", " ", m.group(0))})
-        before = re.sub(r"\s+", " ", text[max(0, m.start() - 90):m.start()])
+        before = re.sub(r"\s+", " ", text[max(0, m.start() - 260):m.start()])
         dm = _RECAP_DOCKET_RE.search(before)
         if dm:
             info.setdefault("docket", dm.group(1).strip())
@@ -1139,7 +1140,7 @@ def iter_recap_cites(text: str) -> list[tuple[int, int, "str | None"]]:
             if name:
                 info.setdefault("name", name)
         am = _RECAP_AFTER_RE.match(
-            re.sub(r"\s+", " ", text[m.end():m.end() + 110]))
+            re.sub(r"\s+", " ", text[m.end():m.end() + 180]))
         if am:
             info.setdefault(
                 "court_raw", re.sub(r"\s+", " ", am.group(1)).strip())
@@ -1195,7 +1196,7 @@ def iter_docket_cites(text: str) -> list[tuple[int, int, str]]:
         fields = {"docket": m.group(1).strip(),
                   "date": f"{m.group(6)}-{mon:02d}-{int(m.group(5)):02d}",
                   "court": court_id}
-        before = re.sub(r"\s+", " ", text[max(0, m.start() - 90):m.start()])
+        before = re.sub(r"\s+", " ", text[max(0, m.start() - 260):m.start()])
         nm = _RECAP_NAME_END_RE.search(before)
         if nm:
             name = _clean_case_name(nm.group(1))

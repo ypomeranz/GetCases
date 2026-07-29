@@ -17,6 +17,7 @@ Token lookup order:
 
 from __future__ import annotations
 
+import datetime as _dt
 import difflib
 import gc
 import html as _html
@@ -4165,6 +4166,66 @@ def _is_scotus_order_item(item: dict) -> bool:
     return cites_count <= 2
 
 
+def _courtlistener_result_snippet(item: dict, limit: int = 300) -> str:
+    """Plain-text search snippet carried by a CourtListener result."""
+    opinions = item.get("opinions") or []
+    main_op = max(
+        opinions,
+        key=lambda opinion: len(opinion.get("cites") or []),
+        default=None,
+    )
+    raw = (
+        (main_op or {}).get("snippet")
+        or item.get("snippet")
+        or item.get("text")
+        or ""
+    )
+    text = _html.unescape(re.sub(r"<[^>]+>", " ", str(raw)))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[:limit].rstrip() + "…"
+    return text
+
+
+def _main_view_scotus_order(
+    item: dict, today: Optional[_dt.date] = None,
+) -> bool:
+    """Whether the main search should put a SCOTUS row in its orders pane.
+
+    CourtListener's inbound ``citeCount`` is the stronger minor-order signal
+    once an opinion has had time to be cited. Decisions from the trailing
+    twelve months retain the former outbound-citation heuristic because even a
+    merits opinion can legitimately have no inbound citations yet.
+    """
+    court_val = str(item.get("court_id") or item.get("court") or "").lower()
+    if "scotus" not in court_val:
+        return False
+
+    current = today or _dt.date.today()
+    try:
+        cutoff = current.replace(year=current.year - 1)
+    except ValueError:  # February 29
+        cutoff = current.replace(year=current.year - 1, day=28)
+    filed_raw = str(item.get("dateFiled") or item.get("date_filed") or "")[:10]
+    try:
+        filed = _dt.date.fromisoformat(filed_raw)
+    except ValueError:
+        filed = None
+
+    if filed is not None and filed >= cutoff:
+        opinions = item.get("opinions") or []
+        main_op = max(
+            opinions,
+            key=lambda opinion: len(opinion.get("cites") or []),
+            default=None,
+        )
+        return (
+            main_op is not None
+            and len(main_op.get("cites") or []) <= 2
+        )
+    return _is_scotus_order_item(item)
+
+
 # --- Jurisdiction hint parsing ----------------------------------------------
 # A query may pin the court itself — "Doe v. Roe (7th Cir. 2009)" — in which
 # case the search is aimed straight at that jurisdiction.  Only a court hint
@@ -5264,6 +5325,7 @@ class CourtListenerGUI:
         self._scholar_results: list = []  # ScholarResult objects
         self._selected_courts: set[str] = set()  # empty = all courts
         self._search_thread: Optional[threading.Thread] = None
+        self._search_generation = 0
         self._scholar: Optional["GoogleScholarFetcher"] = None
         self._opinion_db = None          # opinion_db.OpinionDB (lazy)
         self._opinion_db_failed = False  # don't retry a broken DB every call
@@ -6058,12 +6120,6 @@ class CourtListenerGUI:
             side="left", padx=4
         )
 
-        ttk.Label(row2, text="  Max results:").pack(side="left")
-        self._page_size_var = tk.IntVar(value=20)
-        ttk.Spinbox(
-            row2, from_=5, to=20, textvariable=self._page_size_var, width=5
-        ).pack(side="left", padx=4)
-
         # --- Results area: left trees + right preview ---
         results_frame = ttk.LabelFrame(self.root, text="Results", padding=6)
         results_frame.pack(fill="both", expand=True, padx=10, pady=4)
@@ -6147,7 +6203,7 @@ class CourtListenerGUI:
         ttk.Separator(orders_sep, orient="horizontal").pack(fill="x")
         ttk.Label(
             orders_sep,
-            text="Orders  (≤ 2 citations)",
+            text="Likely minor orders",
             foreground="gray",
             font=("TkDefaultFont", 9, "italic"),
         ).pack(anchor="w", pady=(2, 0))
@@ -6520,7 +6576,9 @@ class CourtListenerGUI:
             statute = _parse_statute_query(query)
             if statute:
                 self._close_quick_popup()
-                _open_statute_action(self.root, statute, app=self)
+                _open_statute_action(
+                    self.root, statute, self._status_var.set, app=self,
+                )
                 return
 
             # 1b. English Reports citation ("156 Eng. Rep. 145", "95 E.R. 807"):
@@ -6721,14 +6779,17 @@ class CourtListenerGUI:
         return _UI["badge"] if court_id == "scotus" else _UI["badge_alt"]
 
     def _spot_build_row(self, parent, court_abbr: str, tier_color: str,
-                        display_name: str, detail_text: str) -> dict:
+                        display_name: str, detail_text: str,
+                        snippet: str = "") -> dict:
         """Create one spotlight result row and return the widgets the caller
         needs to bind clicks and re-colour on highlight.  Builds a rounded,
         themed card when CustomTkinter is present, or the plain-Tk row otherwise.
         """
         if _CTK_AVAILABLE:
-            row = ctk.CTkFrame(parent, corner_radius=10,
-                               fg_color=_UI["window"], height=54)
+            row = ctk.CTkFrame(
+                parent, corner_radius=10, fg_color=_UI["window"],
+                height=72,
+            )
             row.pack(side="top", fill="x", padx=10, pady=(4, 0))
             row.pack_propagate(False)
             badge = ctk.CTkLabel(
@@ -6749,11 +6810,20 @@ class CourtListenerGUI:
                 text_color=_UI["muted"], font=_ui_font(11), anchor="w",
             )
             detail_lbl.pack(fill="x")
+            snippet_lbl = ctk.CTkLabel(
+                text_frame, text=snippet, fg_color="transparent",
+                text_color=_UI["muted"], font=_ui_font(10), anchor="w",
+            )
+            snippet_lbl.pack(fill="x", pady=(0, 4))
             return {
                 "row": row, "badge": badge, "text_frame": text_frame,
-                "name": name_lbl, "detail": detail_lbl, "modern": True,
+                "name": name_lbl, "detail": detail_lbl,
+                "snippet": snippet_lbl, "modern": True,
             }
-        row = tk.Frame(parent, bg="#ffffff", height=52, cursor="hand2")
+        row = tk.Frame(
+            parent, bg="#ffffff", height=68,
+            cursor="hand2",
+        )
         row.pack(side="top", fill="x", padx=4, pady=(2, 0))
         row.pack_propagate(False)
         badge = tk.Label(
@@ -6774,9 +6844,15 @@ class CourtListenerGUI:
             font=("TkDefaultFont", 8), anchor="w",
         )
         detail_lbl.pack(fill="x")
+        snippet_lbl = tk.Label(
+            text_frame, text=snippet, bg="#ffffff", fg="#888888",
+            font=("TkDefaultFont", 8), anchor="w",
+        )
+        snippet_lbl.pack(fill="x")
         return {
             "row": row, "badge": badge, "text_frame": text_frame,
-            "name": name_lbl, "detail": detail_lbl, "modern": False,
+            "name": name_lbl, "detail": detail_lbl,
+            "snippet": snippet_lbl, "modern": False,
         }
 
     @staticmethod
@@ -6810,7 +6886,12 @@ class CourtListenerGUI:
             )
             return
         bg = "#d0e0f0" if selected else "#ffffff"
-        for w in (r["row"], r["text_frame"], r["name"], r["detail"]):
+        for w in (
+            r["row"], r["text_frame"], r["name"], r["detail"],
+            r.get("snippet"),
+        ):
+            if w is None:
+                continue
             try:
                 w.config(bg=bg)
             except tk.TclError:
@@ -6841,7 +6922,7 @@ class CourtListenerGUI:
         # reachable by wheel or arrow keys instead of spilling off-screen.
         max_rows = 10
         pw = 600 if _CTK_AVAILABLE else 580
-        row_unit = 58 if _CTK_AVAILABLE else 54  # one row including its top gap
+        row_unit = 76 if _CTK_AVAILABLE else 70  # snippet-bearing row + gap
         sx = popup.winfo_screenwidth()
         sy = popup.winfo_screenheight()
         pos_x = (sx - pw) // 2
@@ -6971,7 +7052,7 @@ class CourtListenerGUI:
             return detail
 
         def _replace_row(r: dict, cite: str, year: str, source_label: str,
-                         open_fn) -> None:
+                         open_fn, snippet: str = "") -> None:
             # A preferred source (Google Scholar) took over an already-shown
             # row: swap its opener and re-label the detail line.  Badge and name
             # stay — it is the same case, so they already match.  The row does
@@ -6981,6 +7062,8 @@ class CourtListenerGUI:
             try:
                 r["detail"].configure(
                     text=_detail_text(cite, year, source_label))
+                if snippet and r.get("snippet") is not None:
+                    r["snippet"].configure(text=snippet)
             except tk.TclError:
                 pass
 
@@ -7019,7 +7102,7 @@ class CourtListenerGUI:
 
         def _add_result(bucket: str, court_id: str, name: str, cite: str,
                         year: str, source_label: str, open_fn,
-                        opinion_id: str = "") -> None:
+                        opinion_id: str = "", snippet: str = "") -> None:
             # Ignore results streaming in from a superseded search.
             if my_gen != self._spotlight_generation:
                 return
@@ -7045,7 +7128,7 @@ class CourtListenerGUI:
                     if _prefer_source(bucket, entry["bucket"]):
                         old_bucket = entry["bucket"]
                         _replace_row(entry["row"], cite, year, source_label,
-                                     open_fn)
+                                     open_fn, snippet)
                         entry["bucket"] = bucket
                         entry["row"]["bucket"] = bucket
                         if old_bucket != bucket:
@@ -7084,10 +7167,13 @@ class CourtListenerGUI:
 
             display_name = name[:80] + ("…" if len(name) > 80 else "")
             detail = _detail_text(cite, year, source_label)
+            snippet = re.sub(r"\s+", " ", snippet or "").strip()
+            if len(snippet) > 150:
+                snippet = snippet[:150].rstrip() + "…"
 
             r = self._spot_build_row(
                 rows_frame, court_abbr,
-                self._spot_tier_color(court_id), display_name, detail,
+                self._spot_tier_color(court_id), display_name, detail, snippet,
             )
             _bind_wheel(r["row"])
             r["open_fn"] = open_fn
@@ -7341,6 +7427,7 @@ class CourtListenerGUI:
                     0, _add_result, "scholar", court_id, r.title, cite, year,
                     "Scholar", make_opener(),
                     _scholar_result_identity(r.url),
+                    r.snippet,
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
@@ -7439,7 +7526,8 @@ class CourtListenerGUI:
 
                 self.root.after(
                     0, _add_result, bucket, court_id, case_name, cite_str,
-                    year, "CourtListener", make_opener(),
+                    year, "CourtListener", make_opener(), "",
+                    _courtlistener_result_snippet(item),
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
@@ -7508,6 +7596,7 @@ class CourtListenerGUI:
                         0, _add_result, "opiniondb", court_id, name, cite,
                         year, "Opinion database", make_opener(),
                         f"scholar:{sid}" if sid else "",
+                        str(hit.get("snippet") or ""),
                     )
             finally:
                 search_done[0] += 1
@@ -8986,11 +9075,16 @@ class CourtListenerGUI:
                 if token:
                     client = self._get_client()
 
-        # CourtListener accepts space-separated court IDs; empty set = all
-        court = " ".join(sorted(self._selected_courts)) or None
+        # Snapshot the jurisdiction selection for both providers.  The Scholar
+        # request runs on its own thread, so it should not observe a later
+        # picker change midway through this search.
+        selected_courts = frozenset(self._selected_courts)
+        # CourtListener accepts space-separated court IDs; empty set = all.
+        court = " ".join(sorted(selected_courts)) or None
         date_from = self._date_from_var.get().strip() or None
         date_to = self._date_to_var.get().strip() or None
-        page_size = self._page_size_var.get()
+        self._search_generation += 1
+        search_generation = self._search_generation
 
         # Clear previous results
         self._search_btn.config(state="disabled")
@@ -9017,11 +9111,16 @@ class CourtListenerGUI:
 
             def scholar_run() -> None:
                 try:
-                    res = fetcher.search_cases(query, limit=15)
+                    res = fetcher.search_cases(
+                        query, limit=15, courts=selected_courts,
+                    )
                 except Exception as exc:
                     print(f"[scholar] search failed: {exc}")
                     res = []
-                self.root.after(0, self._on_scholar_search_results, res)
+                self.root.after(
+                    0, self._on_scholar_search_results, res,
+                    search_generation,
+                )
 
             threading.Thread(target=scholar_run, daemon=True).start()
         else:
@@ -9040,29 +9139,60 @@ class CourtListenerGUI:
 
         def run() -> None:
             try:
-                data = client.search(
-                    query,
-                    type="o",
-                    court=court,
-                    date_filed_min=date_from,
-                    date_filed_max=date_to,
-                    highlight=True,
-                    page_size=page_size,
-                )
-                self.root.after(0, self._on_results, data)
+                cursor = None
+                seen_cursors: set[str] = set()
+                while True:
+                    data = client.search(
+                        query,
+                        type="o",
+                        court=court,
+                        date_filed_min=date_from,
+                        date_filed_max=date_to,
+                        highlight=True,
+                        cursor=cursor,
+                        page_size=20,
+                    )
+                    next_url = data.get("next") or ""
+                    next_cursor = None
+                    if next_url:
+                        parsed = urllib.parse.urlparse(next_url)
+                        next_cursor = urllib.parse.parse_qs(
+                            parsed.query
+                        ).get("cursor", [None])[0]
+                    done = not next_cursor or next_cursor in seen_cursors
+                    self.root.after(
+                        0, self._on_results_page, data, done,
+                        search_generation,
+                    )
+                    if done:
+                        break
+                    seen_cursors.add(next_cursor)
+                    cursor = next_cursor
             except CourtListenerError as exc:
-                self.root.after(0, self._on_error, str(exc))
+                self.root.after(
+                    0, self._on_error, str(exc), search_generation,
+                )
             except Exception as exc:
-                self.root.after(0, self._on_error, f"Unexpected error: {exc}")
+                self.root.after(
+                    0, self._on_error, f"Unexpected error: {exc}",
+                    search_generation,
+                )
 
         self._search_thread = threading.Thread(target=run, daemon=True)
         self._search_thread.start()
 
-    def _on_results(self, data: dict) -> None:
-        self._search_btn.config(state="normal")
+    def _on_results_page(
+        self, data: dict, done: bool = True,
+        generation: Optional[int] = None,
+    ) -> None:
+        if generation is not None and generation != self._search_generation:
+            return
+        if done:
+            self._search_btn.config(state="normal")
         results = data.get("results", [])
         count = data.get("count", len(results))
-        self._results = results
+        first_index = len(self._results)
+        self._results.extend(results)
         # Normalize citations from the API: strip any HTML tags (<mark>, etc.)
         # immediately so every downstream consumer gets clean plain-text strings.
         for item in results:
@@ -9072,37 +9202,34 @@ class CourtListenerGUI:
             elif raw:
                 item["citation"] = re.sub(r"<[^>]+>", "", str(raw)).strip()
 
-        for i, item in enumerate(results):
-            # Each search result has an 'opinions' list.  The opinion with the
-            # most outbound citations is the main opinion for this cluster.
-            opinions = item.get("opinions") or []
-            main_op = max(opinions, key=lambda o: len(o.get("cites") or []), default=None)
+        for page_index, item in enumerate(results):
+            i = first_index + page_index
+            text = _courtlistener_result_snippet(item)
+            if text:
+                self._preview_cache[i] = text
 
-            # Preview text comes from the main opinion's snippet field.
-            if main_op:
-                raw = main_op.get("snippet") or ""
-                text = re.sub(r"<[^>]+>", "", raw).strip()
-                if text:
-                    self._preview_cache[i] = text
-
-            # Route to orders tree only for SCOTUS cases with ≤ 2 outbound
-            # citations.  Published orders don't exist for lower courts, so
-            # we leave everything else in the main tree.
-            court_val = str(item.get("court_id") or "")
-            cites_count = len(main_op.get("cites") or []) if main_op else None
+            # Published minor orders are a SCOTUS-only distinction.
             row = self._format_row(item)
-            if "scotus" in court_val and cites_count is not None and cites_count <= 2:
+            if _main_view_scotus_order(item):
                 self._orders_tree.insert("", "end", iid=str(i), values=row)
             else:
                 self._tree.insert("", "end", iid=str(i), values=row)
 
-        if results:
+        loaded = len(self._results)
+        if loaded:
             self._status_var.set(
-                f"Showing {len(results)} of {count:,} results. "
-                "Select a row and click Download PDF (or double-click)."
+                (
+                    f"Loaded all {loaded:,} results. "
+                    if done else f"Loaded {loaded:,} of {count:,} results… "
+                )
+                + "Select a row and click Download PDF (or double-click)."
             )
-        else:
+        elif done:
             self._status_var.set("No results found.")
+
+    def _on_results(self, data: dict) -> None:
+        """Compatibility wrapper for a complete, single search response."""
+        self._on_results_page(data, True)
 
     def _set_preview(self, text: str) -> None:
         self._preview_text.config(state="normal")
@@ -9117,7 +9244,11 @@ class CourtListenerGUI:
             text if text else "(No preview available — download PDF for full opinion)"
         )
 
-    def _on_error(self, message: str) -> None:
+    def _on_error(
+        self, message: str, generation: Optional[int] = None,
+    ) -> None:
+        if generation is not None and generation != self._search_generation:
+            return
         self._search_btn.config(state="normal")
         self._status_var.set(f"Error: {message}")
         messagebox.showerror("API Error", message)
@@ -9709,7 +9840,11 @@ class CourtListenerGUI:
             print(f"[update] post-update merge failed "
                   f"(will retry next launch): {exc}")
 
-    def _on_scholar_search_results(self, results: list) -> None:
+    def _on_scholar_search_results(
+        self, results: list, generation: Optional[int] = None,
+    ) -> None:
+        if generation is not None and generation != self._search_generation:
+            return
         self._scholar_results = results
         for row in self._scholar_tree.get_children():
             self._scholar_tree.delete(row)

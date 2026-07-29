@@ -60,7 +60,7 @@ from bluebook_names import (
     strip_related_case_note,
 )
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 # Record field holding the reporter pagination recovered from an official scan
 # (see :meth:`OpinionDB.save_pagination`).  Records written before this field
@@ -74,7 +74,7 @@ _PAGINATION_FIELD = "us_pagination"
 _OPINION_COLUMNS = (
     "scholar_id", "url", "name", "court", "year", "date_filed",
     "line_offset", "line_length", "cites_json", "parties_json",
-    "added_at", "source",
+    "snippet", "added_at", "source",
 )
 
 # How much of an opinion's HTML the indexer expands.  It reads only the
@@ -146,6 +146,12 @@ def _prose_text(blocks: list, cap: int = 40000) -> str:
         if total > cap:
             break
     return "\n".join(out)
+
+
+def _opinion_snippet(blocks: list, limit: int = 300) -> str:
+    """Normalized beginning of the opinion prose for search-result previews."""
+    text = re.sub(r"\s+", " ", _prose_text(blocks, cap=limit * 3)).strip()
+    return text[:limit].rstrip()
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +541,7 @@ def extract_record(
         "dockets": _header_dockets(blocks),
         "added_at": time.time(),
         "source": item.get("source") or "scholar",
+        "snippet": _opinion_snippet(blocks),
         "html_gz": _gz_pack(html),
     }
 
@@ -684,6 +691,7 @@ class OpinionDB:
                     line_length  INTEGER,
                     cites_json   TEXT,
                     parties_json TEXT,
+                    snippet      TEXT,
                     added_at     REAL,
                     source       TEXT
                 );
@@ -870,18 +878,22 @@ class OpinionDB:
         court = str(rec.get("court") or "").strip().lower()
         if not court:
             court = _court_from_cites(cites) or _court_from_header(blocks)
+        snippet = str(rec.get("snippet") or "").strip()
+        if not snippet and blocks:
+            snippet = _opinion_snippet(blocks)
 
         self._db.execute(
             "INSERT OR REPLACE INTO opinions (scholar_id, url, name, court, year, "
             "date_filed, line_offset, line_length, cites_json, "
-            "parties_json, added_at, source) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "parties_json, snippet, added_at, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 sid, rec.get("url", ""), rec.get("name", ""), court,
                 year, date_filed,
                 int(offset), int(length),
                 json.dumps(cites, ensure_ascii=False),
                 json.dumps(parties, ensure_ascii=False),
+                snippet,
                 rec.get("added_at") or time.time(), rec.get("source", "scholar"),
             ),
         )
@@ -1321,6 +1333,7 @@ class OpinionDB:
             "court": row["court"],
             "year": row["year"],
             "date_filed": row["date_filed"],
+            "snippet": row["snippet"] or str(stored.get("snippet") or ""),
             "html": html,
             "text": _blocks_text(blocks) if blocks else "",
             "cites": json.loads(row["cites_json"] or "[]"),
@@ -1345,7 +1358,8 @@ class OpinionDB:
         placeholders = ",".join("?" * len(reporters))
         with self._lock:
             rows = self._db.execute(
-                "SELECT o.scholar_id, o.name, o.court, o.year, o.url, o.cites_json FROM citations c JOIN opinions o "
+                "SELECT o.scholar_id, o.name, o.court, o.year, o.url, "
+                "o.cites_json, o.snippet FROM citations c JOIN opinions o "
                 "ON o.scholar_id=c.scholar_id "
                 f"WHERE c.reporter IN ({placeholders}) "
                 "AND c.vol=? AND c.page=? "
@@ -1364,7 +1378,8 @@ class OpinionDB:
         placeholders = ",".join("?" * len(toks))
         with self._lock:
             rows = self._db.execute(
-                f"SELECT o.scholar_id, o.name, o.court, o.year, o.url, o.cites_json FROM parties p JOIN opinions o "
+                f"SELECT o.scholar_id, o.name, o.court, o.year, o.url, "
+                f"o.cites_json, o.snippet FROM parties p JOIN opinions o "
                 f"ON o.scholar_id=p.scholar_id "
                 f"WHERE p.token IN ({placeholders}) "
                 f"GROUP BY o.scholar_id "
@@ -1389,7 +1404,9 @@ class OpinionDB:
         placeholders = ",".join("?" * len(toks))
         with self._lock:
             rows = self._db.execute(
-                f"SELECT o.scholar_id, o.name, o.court, o.year, o.url, o.cites_json, COUNT(DISTINCT p.token) AS _n "
+                f"SELECT o.scholar_id, o.name, o.court, o.year, o.url, "
+                f"o.cites_json, o.snippet, "
+                f"COUNT(DISTINCT p.token) AS _n "
                 f"FROM parties p JOIN opinions o ON o.scholar_id=p.scholar_id "
                 f"WHERE p.token IN ({placeholders}) "
                 f"GROUP BY o.scholar_id "
@@ -1428,6 +1445,7 @@ class OpinionDB:
             "court": row["court"],
             "year": row["year"],
             "url": row["url"],
+            "snippet": row["snippet"] or "",
         }
 
     @staticmethod
@@ -1441,6 +1459,7 @@ class OpinionDB:
             "court": rec.get("court", ""),
             "year": rec.get("year", ""),
             "url": rec.get("url", ""),
+            "snippet": rec.get("snippet", ""),
         }
 
     def close(self) -> None:

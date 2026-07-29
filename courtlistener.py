@@ -197,6 +197,7 @@ class CourtListenerClient:
             "type": resolved_type,
             "highlight": "on" if highlight else None,
             "cursor": cursor,
+            "page_size": page_size,
             "court": court,
             "filed_after": date_filed_min,
             "filed_before": date_filed_max,
