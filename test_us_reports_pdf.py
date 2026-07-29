@@ -131,6 +131,66 @@ def _minimal_pdf(*content_lines: str) -> bytes:
     return bytes(out)
 
 
+def _govinfo_ocr_pdf() -> bytes:
+    """Small image-plus-hidden-text PDF with GovInfo's letter-spaced shape."""
+    def spaced(line: str) -> str:
+        # One PDF space is the artificial inter-letter gap; a real word gap is
+        # wide enough for the geometry repair to retain it.
+        return " ".join(line.replace(" ", "                    "))
+
+    lines = (
+        "Cite as: 567 U. S. 519 (2012) 521",
+        "See Roe v. Wade, 410 U. S. 113, 152 (1973).",
+        "The judgment of the Court is affirmed.",
+    )
+    text = []
+    for i, line in enumerate(lines):
+        escaped = (
+            spaced(line)
+            .replace("\\", "\\\\")
+            .replace("(", "\\(")
+            .replace(")", "\\)")
+        )
+        # Near-zero vertical text scale reproduces the baseline-only glyph
+        # boxes in the GovInfo volume; render mode 3 makes the layer invisible.
+        # Negative word spacing makes each artificial single space narrow;
+        # the enlarged run at a genuine word boundary remains visibly wider.
+        text.append(
+            f"BT /F1 1 Tf -0.55 Tw 3 Tr 3 0 0 .01 72 {700 - 18 * i} Tm "
+            f"({escaped}) Tj ET"
+        )
+    stream = (
+        "q 612 0 0 792 0 0 cm /Im1 Do Q\n" + "\n".join(text)
+    ).encode("latin-1")
+    objects = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]"
+        b"/Resources<</Font<</F1 5 0 R>>/XObject<</Im1 6 0 R>>>>"
+        b"/Contents 4 0 R>>",
+        b"<</Length %d>>stream\n" % len(stream) + stream + b"\nendstream",
+        b"<</Type/Font/Subtype/Type1/BaseFont/Courier>>",
+        b"<</Type/XObject/Subtype/Image/Width 1/Height 1"
+        b"/ColorSpace/DeviceGray/BitsPerComponent 8/Length 1>>stream\n"
+        b"\xff\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj" % i + body + b"endobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n" % (len(objects) + 1)
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += b"%010d 00000 n \n" % off
+    out += (
+        b"trailer<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n"
+        % (len(objects) + 1, xref)
+    )
+    return bytes(out)
+
+
 @unittest.skipUnless(HAVE_PDFIUM, "pypdfium2 not installed")
 class WatermarkRemovalTests(unittest.TestCase):
     """The stamp comes off; everything else is left exactly as it was."""
@@ -201,6 +261,8 @@ class LinkPipelineTests(unittest.TestCase):
     def setUpClass(cls):
         import citations
         cls.ns = _load(
+            "_degenerate_ocr_metrics", "_page_has_repairable_ocr_text",
+            "_repair_degenerate_ocr_page",
             "_union_line_runs", "_extract_pdf_text_and_style",
             "_extract_pdf_text_pages", "_citation_links_from_pages",
             "_page_has_scan_background", "_pdf_ocr_scan_pages",
@@ -239,6 +301,58 @@ class LinkPipelineTests(unittest.TestCase):
     def test_the_convenience_wrapper_agrees(self):
         direct = self.ns["_detect_pdf_citation_links"](self.pdf)
         self.assertTrue(sum(len(v) for v in direct.values()))
+
+
+@unittest.skipUnless(HAVE_PDFIUM, "pypdfium2 not installed")
+class GovInfoHiddenTextTests(unittest.TestCase):
+    """The image-backed 2012 GovInfo format remains searchable and colored."""
+
+    @classmethod
+    def setUpClass(cls):
+        import citations
+        cls.ns = _load(
+            "_degenerate_ocr_metrics", "_page_has_repairable_ocr_text",
+            "_repair_degenerate_ocr_page",
+            "_union_line_runs", "_extract_pdf_text_and_style",
+            "_citation_links_from_pages", "_page_has_scan_background",
+            "_pdf_ocr_scan_pages", "_citation_links_from_visible_pdf_text",
+            consts=("_FONT_FLAG_ITALIC",),
+        )
+        cls.ns["detect_brief_links"] = citations.detect_links
+        cls.pdf = _govinfo_ocr_pdf()
+        cls.pages, cls.italics = cls.ns["_extract_pdf_text_and_style"](cls.pdf)
+
+    def test_letter_spacing_is_repaired(self):
+        text = "".join(ch for ch, _box in self.pages[0])
+        self.assertIn("Cite as: 567 U. S. 519", text)
+        self.assertIn("Roe v. Wade, 410 U. S. 113", text)
+        self.assertNotIn("C i t e", text)
+
+    def test_baseline_boxes_are_expanded_to_the_printed_line(self):
+        heights = [
+            box[3] - box[1]
+            for ch, box in self.pages[0]
+            if box is not None and ch.strip()
+        ]
+        self.assertTrue(heights)
+        self.assertGreater(min(heights), 5.0)
+
+    def test_repair_keeps_text_and_style_parallel(self):
+        self.assertEqual(len(self.pages[0]), len(self.italics[0]))
+
+    def test_links_are_found_and_colored_not_quiet(self):
+        links, quiet = self.ns["_citation_links_from_visible_pdf_text"](
+            self.pdf, self.pages, self.italics
+        )
+        self.assertTrue(sum(len(value) for value in links.values()))
+        self.assertEqual(quiet, set())
+
+    def test_us_reports_citation_is_recovered_for_pagination(self):
+        import opinion_location
+        self.assertEqual(
+            opinion_location.us_reports_cite_from_pdf(self.pages),
+            "567 U.S. 519",
+        )
 
 
 if __name__ == "__main__":

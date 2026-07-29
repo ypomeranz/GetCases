@@ -444,7 +444,7 @@ def _add_copy_cascade(menubar: tk.Menu, reader) -> None:
         )
     copy_menu.add_separator()
     copy_menu.add_command(
-        label=f"Copy now\t{_ACCEL}+C", command=reader._copy_formatted)
+        label=f"Copy now \t{_ACCEL}+C", command=reader._copy_formatted)
     menubar.add_cascade(label="Copy", menu=copy_menu)
 
 
@@ -3572,15 +3572,25 @@ def _cl_item_for_citation(client, cite: str, name: str = "") -> Optional[dict]:
                 out.add(re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", str(c))).lower())
         return out
 
-    def score(case_name: str, cites: set[str], court: str) -> int:
-        s = 0
-        if altkey and altkey in cites:
-            s += 4
-        if name and _name_match_score(name, case_name or "") >= _NAME_MATCH_MIN:
-            s += 2
-        if altkey and (court or "").lower() == _SCOTUS_COURT_ID:
-            s += 1
-        return s
+    def score(case_name: str, cites: set[str], court: str) -> tuple:
+        # Keep the original priority order, but retain the full name score
+        # instead of reducing every acceptable match to the same +2 tie.  Two
+        # short opinions can legitimately begin on the same reporter page
+        # (The Buena Ventura and In re Cooper both bear 243 F. 797); the printed
+        # caption is then the signal that identifies the intended cluster.
+        clean_name = re.sub(r"<[^>]+>", "", case_name or "")
+        name_tier = _match_tier(name, clean_name) if name else -1
+        name_score = _name_match_score(name, clean_name) if name else 0.0
+        query_tokens = _name_tokens(name) if name else []
+        candidate_tokens = _name_tokens(clean_name) if name else []
+        return (
+            bool(altkey and altkey in cites),
+            name_tier,
+            bool(query_tokens and query_tokens == candidate_tokens),
+            name_score,
+            -abs(len(query_tokens) - len(candidate_tokens)),
+            bool(altkey and (court or "").lower() == _SCOTUS_COURT_ID),
+        )
 
     # 1) Resolution via the citation-lookup endpoint (exact; 300 = ambiguous).
     # Try the form the user entered first.  A Cranch citation can also denote a
@@ -12774,6 +12784,83 @@ def _find_scholar_for_item(
     return None, cl_text, f"best candidate similarity {best_sim:.0%}"
 
 
+def _reader_scroll_key_owns(widget) -> bool:
+    """Whether a reader may consume Up/Down from the focused *widget*.
+
+    Arrow keys belong to text fields, selectors, lists, trees, scales, and
+    scrollbars when one of those has focus.  Buttons, labels, the document
+    surface, and the window itself have no useful vertical-arrow action, so the
+    visible reader may use them to scroll.
+    """
+    try:
+        cls = str(widget.winfo_class() or "").lower()
+    except Exception:
+        return True
+    return not any(name in cls for name in (
+        "entry", "spinbox", "combobox", "listbox", "treeview",
+        "scale", "scrollbar",
+    ))
+
+
+def _bind_reader_scroll_keys(win: tk.Misc, scroll_cb) -> None:
+    """Route Up/Down to a reader's visible text or PDF surface.
+
+    ``scroll_cb`` receives ``-1`` for Up and ``+1`` for Down.  Returning
+    ``False`` means there is not yet a surface to scroll (for example while a
+    PDF is loading), in which case the key is left alone.
+    """
+    def handler(event, direction: int):
+        if not _reader_scroll_key_owns(getattr(event, "widget", None)):
+            return None
+        # A secondary Text widget in the same reader (such as the case-details
+        # panel) should scroll itself rather than the main opinion behind it.
+        target = getattr(event, "widget", None)
+        try:
+            if str(target.winfo_class()).lower() == "text":
+                target.yview_scroll(direction, "units")
+                return "break"
+        except (AttributeError, tk.TclError):
+            pass
+        try:
+            handled = scroll_cb(direction)
+        except tk.TclError:
+            return None
+        return None if handled is False else "break"
+
+    win.bind(
+        "<KeyPress-Up>",
+        lambda event: handler(event, -1),
+        add="+",
+    )
+    win.bind(
+        "<KeyPress-Down>",
+        lambda event: handler(event, 1),
+        add="+",
+    )
+
+
+def _bind_text_scroll_keys(win: tk.Misc, txt: tk.Text, scroll_cb=None) -> None:
+    """Give a reader Text widget and its surrounding window Up/Down scrolling."""
+    def scroll_text(direction: int) -> bool:
+        txt.yview_scroll(direction, "units")
+        return True
+
+    # The widget-level binding runs before Tk's Text class binding, preventing
+    # an editable insertion cursor from moving as a side effect.  The window
+    # binding below covers clicks that left focus on a toolbar button.
+    txt.bind(
+        "<KeyPress-Up>",
+        lambda _event: scroll_text(-1) and "break",
+        add="+",
+    )
+    txt.bind(
+        "<KeyPress-Down>",
+        lambda _event: scroll_text(1) and "break",
+        add="+",
+    )
+    _bind_reader_scroll_keys(win, scroll_cb or scroll_text)
+
+
 def _bind_find_keys(win: tk.Misc, open_cb, next_cb, prev_cb) -> None:
     """Bind the find accelerators a reader would actually press.
 
@@ -13365,7 +13452,15 @@ def _page_has_scan_background(page) -> bool:
 
 
 def _pdf_ocr_scan_pages(pdf_bytes: bytes) -> set[int]:
-    """Page indexes whose text layer likely comes from OCR over a scan."""
+    """Page indexes whose OCR geometry is not safe to color.
+
+    Some GovInfo U.S. Reports PDFs (including volume 567) are full-page
+    images, but their hidden ABBYY-style text is accurately positioned. Its
+    oddity is that every glyph has an almost zero-height box and words arrive
+    letter-spaced (``"C i t e  a s: 5 6 7 U. S."``). The extractor repairs
+    that distinctive geometry; those pages can therefore use the ordinary
+    blue citation treatment. Other OCR-over-scan pages remain quiet.
+    """
     import pypdfium2 as pdfium
 
     pages: set[int] = set()
@@ -13375,7 +13470,10 @@ def _pdf_ocr_scan_pages(pdf_bytes: bytes) -> set[int]:
             for i in range(len(doc)):
                 page = doc[i]
                 try:
-                    if _page_has_scan_background(page):
+                    if (
+                        _page_has_scan_background(page)
+                        and not _page_has_repairable_ocr_text(page)
+                    ):
                         pages.add(i)
                 finally:
                     page.close()
@@ -13542,6 +13640,192 @@ def _extract_pdf_text_pages(pdf_bytes: bytes) -> list:
     return _extract_pdf_text_and_style(pdf_bytes)[0]
 
 
+def _degenerate_ocr_metrics(chars: list) -> "Optional[tuple[float, float]]":
+    """Return ``(median glyph width, inferred line gap)`` for the repairable
+    GovInfo/ABBYY hidden-text shape, or ``None`` for ordinary PDF text.
+
+    In the affected U.S. Reports files the OCR font is one point high but its
+    text matrix has effectively no vertical scale: glyph boxes are several PDF
+    points wide and only hundredths of a point tall. That ratio is far outside
+    real typesetting, and gives us a narrow signature that does not rewrite
+    conventional born-digital text or ordinary OCR layers.
+    """
+    import statistics
+
+    boxes = [
+        box
+        for ch, box in (chars or ())
+        if (
+            box is not None
+            and ch
+            and not ch.isspace()
+            and box[2] > box[0]
+            and box[3] > box[1]
+        )
+    ]
+    if len(boxes) < 40:
+        return None
+    widths = [box[2] - box[0] for box in boxes]
+    heights = [box[3] - box[1] for box in boxes]
+    median_width = statistics.median(widths)
+    median_height = statistics.median(heights)
+    if median_width <= 0 or median_height >= 0.08 * median_width:
+        return None
+
+    # Merge tiny baseline jitter before measuring the distance between lines.
+    levels: list[float] = []
+    for y in sorted((box[3] for box in boxes), reverse=True):
+        if not levels or levels[-1] - y > 1.0:
+            levels.append(y)
+    gaps = [
+        upper - lower
+        for upper, lower in zip(levels, levels[1:])
+        if 4.0 <= upper - lower <= 30.0
+    ]
+    line_gap = (
+        statistics.median(gaps)
+        if gaps
+        else max(8.0, median_width * 3.0)
+    )
+    return median_width, line_gap
+
+
+def _page_has_repairable_ocr_text(page) -> bool:
+    """Whether *page* carries the zero-height OCR geometry repaired below.
+
+    Only a prefix is needed to recognize the signature. Keeping this check
+    inside :func:`_pdf_ocr_scan_pages` lets that pass decide whether links may
+    be colored without changing the extraction function's long-standing
+    two-value return type.
+    """
+    tp = None
+    try:
+        tp = page.get_textpage()
+        count = min(tp.count_chars(), 768)
+        if count < 40:
+            return False
+        whole = tp.get_text_range(0, count)
+        aligned = len(whole) == count
+        chars = []
+        for i in range(count):
+            ch = whole[i] if aligned else tp.get_text_range(i, 1)
+            try:
+                box = tp.get_charbox(i)
+            except Exception:
+                box = None
+            chars.append((ch or " ", box))
+        return _degenerate_ocr_metrics(chars) is not None
+    except Exception:
+        return False
+    finally:
+        if tp is not None:
+            try:
+                tp.close()
+            except Exception:
+                pass
+
+
+def _repair_degenerate_ocr_page(
+    chars: list, slants: list,
+) -> "tuple[list, list]":
+    """Repair GovInfo's zero-height, letter-spaced hidden OCR text.
+
+    The returned character stream keeps a parallel italic flag for every
+    character. Artificial inter-letter spaces are removed using the glyph
+    positions, real word/line gaps are retained, and the baseline-only boxes
+    are expanded to the inferred printed line height. Citation detection,
+    text selection, section recognition, and reporter-page alignment can then
+    consume the page exactly like a normal text-bearing PDF.
+    """
+    import statistics
+
+    metrics = _degenerate_ocr_metrics(chars)
+    if metrics is None:
+        return chars, slants
+    _median_width, line_gap = metrics
+    glyph_height = min(14.0, max(6.0, line_gap * 0.72))
+
+    # Build nearest-visible-glyph indexes once. A typical opinion has hundreds
+    # of synthetic spaces per page; rescanning for each one would be quadratic.
+    count = len(chars)
+    previous: list["Optional[int]"] = [None] * count
+    following: list["Optional[int]"] = [None] * count
+    visible = None
+    for i, (ch, box) in enumerate(chars):
+        previous[i] = visible
+        if ch and not ch.isspace() and box is not None:
+            visible = i
+    visible = None
+    for i in range(count - 1, -1, -1):
+        following[i] = visible
+        ch, box = chars[i]
+        if ch and not ch.isspace() and box is not None:
+            visible = i
+
+    expanded: list = []
+    for ch, box in chars:
+        if box is not None and ch and not ch.isspace():
+            baseline = (box[1] + box[3]) / 2.0
+            box = (
+                box[0],
+                baseline - glyph_height * 0.20,
+                box[2],
+                baseline + glyph_height * 0.80,
+            )
+        expanded.append((ch, box))
+
+    out_chars: list = []
+    out_slants: list = []
+    i = 0
+    while i < count:
+        ch, _box = chars[i]
+        if not ch.isspace():
+            out_chars.append(expanded[i])
+            out_slants.append(bool(slants[i]) if i < len(slants) else False)
+            i += 1
+            continue
+
+        end = i + 1
+        while end < count and chars[end][0].isspace():
+            end += 1
+        whitespace = "".join(value for value, _box in chars[i:end])
+        left = previous[i]
+        right = following[end - 1]
+        keep = False
+        value = " "
+        if "\r" in whitespace or "\n" in whitespace:
+            keep, value = True, "\n"
+        elif left is None or right is None:
+            keep = True
+        else:
+            left_ch, left_box = chars[left]
+            right_ch, right_box = chars[right]
+            if abs(left_box[3] - right_box[3]) > max(1.0, line_gap * 0.20):
+                keep, value = True, "\n"
+            else:
+                gap = right_box[0] - left_box[2]
+                width = statistics.median((
+                    left_box[2] - left_box[0],
+                    right_box[2] - right_box[0],
+                ))
+                # Display-cap runs in the Reporter are deliberately tracked
+                # more widely than prose. Wide m/w glyphs also need a little
+                # extra room because this OCR font gives every box one width.
+                threshold = (
+                    1.85
+                    if left_ch.isupper() and right_ch.isupper()
+                    else 1.45
+                )
+                if left_ch in "mMwW" or right_ch in "mMwW":
+                    threshold += 0.20
+                keep = width > 0 and gap >= threshold * width
+        if keep:
+            out_chars.append((value, None))
+            out_slants.append(False)
+        i = end
+    return out_chars, out_slants
+
+
 def _extract_pdf_text_and_style(pdf_bytes: bytes) -> "tuple[list, list]":
     """Extract a PDF's text layer, as ``(pages, italics)``.
 
@@ -13617,6 +13901,7 @@ def _extract_pdf_text_and_style(pdf_bytes: bytes) -> "tuple[list, list]":
                     slants = []
                 finally:
                     page.close()
+            chars, slants = _repair_degenerate_ocr_page(chars, slants)
             pages.append(chars)
             italics.append(slants)
         return pages, italics
@@ -13682,9 +13967,10 @@ def _citation_links_from_visible_pdf_text(
     pdf_bytes: bytes, pages: list, italics: "Optional[list]" = None,
 ) -> "tuple[dict, set[int]]":
     """Citation rectangles for the whole document, plus the page indexes
-    whose text layer is OCR over a scan.  OCR glyph boxes land imprecisely,
-    so the pane renders those pages' links *quietly* — no tint, no
-    recoloring — while keeping them clickable (see
+    whose OCR glyph geometry remains unsuitable for coloring. The repairable
+    zero-height GovInfo layer has already been normalized by extraction; other
+    OCR boxes can land imprecisely, so the pane renders those pages' links
+    *quietly* — no tint, no recoloring — while keeping them clickable (see
     :meth:`_PdfPane.set_citation_links`)."""
     try:
         ocr_pages = _pdf_ocr_scan_pages(pdf_bytes)
@@ -14015,6 +14301,10 @@ class _PdfPane(ttk.Frame):
                     lambda e: self.zoom(1 if e.delta > 0 else -1) or "break")
         canvas.bind("<Control-Button-4>", lambda _e: self.zoom(1) or "break")
         canvas.bind("<Control-Button-5>", lambda _e: self.zoom(-1) or "break")
+        canvas.bind("<KeyPress-Up>",
+                    lambda _e: self.scroll_key(-1) and "break")
+        canvas.bind("<KeyPress-Down>",
+                    lambda _e: self.scroll_key(1) and "break")
         # Take keyboard focus only when the reader intentionally clicks in the
         # PDF.  Focusing on hover can make some platforms raise this window just
         # because the pointer crossed it.
@@ -14212,6 +14502,13 @@ class _PdfPane(ttk.Frame):
 
     def _wheel(self, direction: int) -> None:
         self._canvas.yview_scroll(direction * self._SCROLL_PX, "units")
+
+    def scroll_key(self, direction: int) -> bool:
+        """Scroll one keyboard step; shared by the canvas and its host window."""
+        if self._disposed:
+            return False
+        self._wheel(-1 if direction < 0 else 1)
+        return True
 
     def _render_visible(self) -> None:
         _flush_tk_image_graveyard()
@@ -16094,6 +16391,7 @@ class _ScholarTextWindow:
         _bind_find_keys(win, self._find_open,
                         lambda: self._find_step(+1),
                         lambda: self._find_step(-1))
+        _bind_text_scroll_keys(win, txt, self._scroll_reader)
 
         btn_frame = _ui_frame(win)
         btn_frame.pack(fill="x", padx=12, pady=(2, 10))
@@ -16409,6 +16707,13 @@ class _ScholarTextWindow:
             pane._find_step(delta)
         else:
             self._finder.step(delta)
+
+    def _scroll_reader(self, direction: int) -> bool:
+        """Arrow-key scroll whichever opinion surface is currently visible."""
+        if self._mode == "pdf" and self._pdf_pane is not None:
+            return self._pdf_pane.scroll_key(direction)
+        self._text.yview_scroll(direction, "units")
+        return True
 
     def _zoom(self, delta: int) -> None:
         """In the reader, grow/shrink every font (delta 0 resets to default);
@@ -20984,6 +21289,15 @@ class _ScholarTextWindow:
         elif kind == "cite":
             cite, _, pin = value.partition("@")
             url_val = ""
+            # The citation detector deliberately highlights the caption along
+            # with the reporter cite.  Preserve that text as a disambiguator:
+            # CourtListener can have two short opinions at the same first page.
+            try:
+                ranges = self._text.tag_ranges(tag)
+                snippet = self._text.get(ranges[0], ranges[-1]) if ranges else ""
+            except tk.TclError:
+                snippet = ""
+            name = _citation_link_name(snippet, cite)
         else:
             cite, pin, url_val = value, "", ""
         # CourtListener opinion URL: fetch structured text from CL directly
@@ -22672,7 +22986,7 @@ class _ScholarTextWindow:
     def _open_pdf_cite(self, action: tuple, snippet: str) -> None:
         if self._app is not None:
             _follow_brief_action(self._app, self._win, action,
-                                 self._status_var.set)
+                                 self._status_var.set, snippet=snippet)
         else:
             _open_citation_in_browser(action, snippet)
 
@@ -22828,6 +23142,26 @@ def _parse_citation_line(line: str) -> Optional[tuple[str, str, str]]:
     name = line[: m.start()].strip().rstrip(",;–—- ").strip()
     pin, _pin_end = _pin_after(line, m.end())
     return name, cite, pin
+
+
+def _citation_link_name(snippet: str, cite: str = "") -> str:
+    """Case caption carried by a highlighted citation span.
+
+    Link actions intentionally remain the stable ``("cite", "vol rep page")``
+    shape used throughout the app.  The visible span already includes the name,
+    so click dispatch can recover it here and pass it to CourtListener when an
+    exact reporter page resolves to more than one short opinion.
+    """
+    parsed = _parse_citation_line(re.sub(r"\s+", " ", snippet or "").strip())
+    if not parsed:
+        return ""
+    name, parsed_cite, _pin = parsed
+    if cite:
+        parsed_keys = set(citation_identity_keys({}, parsed_cite))
+        wanted_keys = set(citation_identity_keys({}, cite.split("@", 1)[0]))
+        if parsed_keys and wanted_keys and not (parsed_keys & wanted_keys):
+            return ""
+    return name
 
 
 # A hand-typed statute/regulation lookup: "42 USC 1983(b)", "29 cfr
@@ -23159,6 +23493,13 @@ class _PdfWindow:
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
             self._win.bind(seq, lambda _e: self._zoom(-1))
         self._win.bind("<Control-0>", lambda _e: self._zoom(0))
+        _bind_reader_scroll_keys(
+            self._win,
+            lambda direction: (
+                self._pane.scroll_key(direction)
+                if self._pane is not None else False
+            ),
+        )
 
         entry = self._history_entry()
         if entry is not None and self._app is not None and hasattr(
@@ -23622,7 +23963,7 @@ class _PdfWindow:
     def _open_cite(self, action: tuple, snippet: str) -> None:
         if self._app is not None:
             _follow_brief_action(self._app, self._win, action,
-                                 self._status_var.set)
+                                 self._status_var.set, snippet=snippet)
         else:
             _open_citation_in_browser(action, snippet)
 
@@ -23939,6 +24280,7 @@ class _SlipTextWindow:
         body.insert("1.0", text)
         body.config(state="disabled")  # selectable & copyable, not editable
         self._text = body
+        _bind_text_scroll_keys(win, body)
 
         btns = _ui_frame(win)
         btns.pack(fill="x", padx=12, pady=(0, 10))
@@ -24080,6 +24422,13 @@ class _SlipOpinionWindow:
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
             win.bind(seq, lambda _e: self._zoom(-1))
         win.bind("<Control-0>", lambda _e: self._zoom(0))
+        _bind_reader_scroll_keys(
+            win,
+            lambda direction: (
+                self._pane.scroll_key(direction)
+                if self._pane is not None else False
+            ),
+        )
 
         if app is not None and hasattr(app, "record_case_view"):
             def reopen(
@@ -24306,7 +24655,7 @@ class _SlipOpinionWindow:
     def _open_cite(self, action: tuple, snippet: str) -> None:
         if self._app is not None:
             _follow_brief_action(self._app, self._win, action,
-                                 self._status_var.set)
+                                 self._status_var.set, snippet=snippet)
         else:
             _open_citation_in_browser(action, snippet)
 
@@ -24714,7 +25063,8 @@ def _open_fedcas_citation(app: "CourtListenerGUI", parent: tk.Misc,
 def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
                          action: tuple[str, str],
                          status=lambda _s: None,
-                         prefetch_pdf: bool = True) -> None:
+                         prefetch_pdf: bool = True,
+                         snippet: str = "") -> None:
     """Open whatever a highlighted brief citation points at, reusing the exact
     paths the rest of the app uses — so briefs behave like the opinion reader
     and the Quick Look Up dialog rather than a parallel implementation:
@@ -24743,6 +25093,7 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
         return
 
     cite, _, pin = value.partition("@")
+    name = _citation_link_name(snippet, cite)
     fetcher = app._get_scholar() if _SCHOLAR_AVAILABLE else None
     client = app._get_client() if app._token_var.get().strip() else None
     if fetcher is None and client is None:
@@ -24758,7 +25109,7 @@ def _follow_brief_action(app: "CourtListenerGUI", parent: tk.Misc,
     safe_status(f"Opening {cite}…")
 
     def run() -> None:
-        ok = app._try_open_citation("", cite, pin, fetcher, client,
+        ok = app._try_open_citation(name, cite, pin, fetcher, client,
                                     prefetch_pdf=prefetch_pdf,
                                     view_parent=parent)
         try:
@@ -24834,6 +25185,7 @@ class _BriefTextWindow:
                      lambda _e: txt.config(cursor="hand2"))
         txt.tag_bind("brieflink", "<Leave>", lambda _e: txt.config(cursor=""))
         self._finder = _TextFinder(win, txt, text_frame)
+        _bind_text_scroll_keys(win, txt)
 
         bottom = _ui_frame(win)
         bottom.pack(fill="x", padx=12, pady=(0, 10))
@@ -24882,7 +25234,7 @@ class _BriefTextWindow:
         entry = self._link_actions.get(tag)
         if entry:
             _follow_brief_action(self._app, self._win, entry[0],
-                                 self._status_var.set)
+                                 self._status_var.set, snippet=entry[1])
         return "break"
 
     def _follow_browser(self, tag: str):
@@ -25386,6 +25738,13 @@ class _LinkedPdfWindow:
         for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
             self._win.bind(seq, lambda _e: self._zoom(-1))
         self._win.bind("<Control-0>", lambda _e: self._zoom(0))
+        _bind_reader_scroll_keys(
+            self._win,
+            lambda direction: (
+                self._pane.scroll_key(direction)
+                if self._pane is not None else False
+            ),
+        )
 
         if hasattr(app, "register_secondary_window"):
             def reopen(parent=None, app=app, source=self) -> None:
@@ -25484,7 +25843,7 @@ class _LinkedPdfWindow:
         # prefetch_pdf=False: warming a second big PDF while this viewer's
         # pane is live renders/extracts in parallel and can hang the app.
         _follow_brief_action(self._app, self._win, action, self._safe_status,
-                             prefetch_pdf=False)
+                             prefetch_pdf=False, snippet=snippet)
 
     def _open_cite_browser(self, action: tuple, snippet: str) -> None:
         _open_citation_in_browser(action, snippet)
@@ -25710,9 +26069,13 @@ class _StatuteWindow:
         txt.tag_configure("notebody", font=self._fonts["small"],
                           foreground="#444444")
         for i in range(7):
-            margin = 10 + 26 * i
+            # A slightly wider step keeps deep CFR paragraphs—whose hierarchy
+            # can reach (a)(1)(i)(A)(1)(i)—visibly distinct at a glance.
+            is_cfr = self._doc.kind == "cfr"
+            margin = (8 + 32 * i) if is_cfr else (10 + 26 * i)
             txt.tag_configure(f"ind{i}", lmargin1=margin,
-                              lmargin2=margin + 22, spacing3=6)
+                              lmargin2=margin + (24 if is_cfr else 22),
+                              spacing3=6)
         txt.tag_configure("jumpflash", background="#fff2a8")
         txt.tag_configure("citelink", foreground="#1a56b0")
         txt.tag_bind("citelink", "<Enter>",
@@ -25720,6 +26083,7 @@ class _StatuteWindow:
         txt.tag_bind("citelink", "<Leave>",
                      lambda _e: txt.config(cursor=""))
         self._finder = _TextFinder(win, txt, frame)
+        _bind_text_scroll_keys(win, txt)
 
         btns = _ui_frame(win)
         btns.pack(fill="x", padx=12, pady=(2, 10))
@@ -25785,7 +26149,16 @@ class _StatuteWindow:
                 else None
             lead = m.group(1) if m else ""
             if lead:
-                enums = re.findall(r"\(([^)]+)\)", lead)
+                # One eCFR <P> can open several nested levels separated by
+                # heading dashes, e.g. "(b) ...—(1) ..." or
+                # "(v) ...—(A) ...—(1) ...".  Use the same structural reading
+                # as the parser so pin-cite jumps and Copy + Cite retain the
+                # complete subdivision path, not just the first marker.
+                enums = (
+                    ecfr._structural_enums(text)
+                    if self._doc.kind == "cfr"
+                    else re.findall(r"\(([^)]+)\)", lead)
+                )
                 path[ind:] = enums
                 self._anchors.append((txt.index("end-1c"), tuple(path)))
                 if (target and target_pos is None

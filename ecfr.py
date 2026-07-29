@@ -11,7 +11,7 @@ A section arrives as <DIV8 TYPE="SECTION"> holding a <HEAD>, <P>/<FP>
 paragraphs, and a <CITA> source credit.  Unlike the OLRC's U.S. Code
 pages, the XML does not mark indentation, so nesting is inferred from the
 enumerators themselves following the CFR drafting convention
-(a) -> (1) -> (i) -> (A), resolving the "(i) after (h)" ambiguity by
+(a) -> (1) -> (i) -> (A) -> (1) -> (i), resolving the "(i) after (h)" ambiguity by
 preferring a successor at an open level over starting a deeper one.
 
 ``parse_section_xml`` emits the same (kind, indent, text) stream as
@@ -24,6 +24,7 @@ import datetime as _dt
 import html as _html
 import re
 import threading
+import xml.etree.ElementTree as _ET
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
@@ -235,11 +236,14 @@ _DIV8_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _ELEM_RE = re.compile(
-    r"<(HEAD|P|FP|CITA|SOURCE|AUTH|NOTE)\b[^>]*>(.*?)</\1>",
+    r"<(HEAD|P|FP|HED|PSPACE|CITA|SOURCE|AUTH|NOTE)\b[^>]*>(.*?)</\1>",
     re.IGNORECASE | re.DOTALL,
 )
 _ENUM_LEAD_RE = re.compile(
     r"^((?:\((?:\d{1,3}|[a-zA-Z]{1,5})\)\s*)+)"
+)
+_INLINE_ENUM_RE = re.compile(
+    r"[\u2013\u2014]\s*((?:\((?:\d{1,3}|[a-zA-Z]{1,5})\)\s*)+)"
 )
 
 
@@ -249,9 +253,102 @@ def _clean(fragment: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _structural_enums(text: str) -> list[str]:
+    """Opening subdivision markers represented by one eCFR paragraph.
+
+    Treasury regulations commonly put several logical levels in one ``<P>``:
+    ``(b) Applicable taxpayer—(1) In general`` or even
+    ``(v) Affordable coverage—(A) In general—(1) ...``.  Looking only at the
+    marker at character zero loses the deeper open levels and makes every
+    following sibling appear flush left.  A marker immediately after the CFR's
+    heading dash is part of that opening hierarchy; cross-reference markers in
+    the prose are not.
+    """
+    lead = _ENUM_LEAD_RE.match(text or "")
+    if not lead:
+        return []
+    enums = re.findall(r"\(([^)]+)\)", lead.group(1))
+    for nested in _INLINE_ENUM_RE.finditer(text, lead.end()):
+        enums.extend(re.findall(r"\(([^)]+)\)", nested.group(1)))
+    return enums
+
+
+def _append_body(
+    paras: list[tuple[str, int, str]],
+    text: str,
+    stack: list[tuple[str, str]],
+) -> None:
+    """Append one ordinary CFR paragraph and update its open hierarchy."""
+    # No enumerator means a continuation of the open item, which stays at that
+    # item's depth rather than returning flush left.
+    level = max(len(stack) - 1, 0)
+    enums = _structural_enums(text)
+    if enums:
+        lvl = infer_enum_level(enums, stack, CFR_HIERARCHY)
+        if lvl is not None:
+            level = lvl
+    paras.append(("body", min(level, 6), text))
+
+
+def _section_element(xml: str) -> "_ET.Element | None":
+    """The first ``DIV8 TYPE=SECTION`` in an eCFR response, if XML-valid."""
+    try:
+        root = _ET.fromstring(xml)
+    except _ET.ParseError:
+        return None
+
+    def local_tag(elem: _ET.Element) -> str:
+        return str(elem.tag).rsplit("}", 1)[-1].upper()
+
+    for elem in root.iter():
+        if (local_tag(elem) == "DIV8"
+                and str(elem.attrib.get("TYPE") or "").upper() == "SECTION"):
+            return elem
+    return None
+
+
+def _element_text(elem: _ET.Element) -> str:
+    return re.sub(r"\s+", " ", _html.unescape(
+        "".join(elem.itertext())
+    )).strip()
+
+
 def parse_section_xml(xml: str) -> list[tuple[str, int, str]]:
     """Parse eCFR section XML into the (kind, indent, text) stream used by
     the statute viewer (same contract as us_code.parse_section)."""
+    section = _section_element(xml)
+    if section is not None:
+        paras: list[tuple[str, int, str]] = []
+        stack: list[tuple[str, str]] = []
+        for elem in section:
+            tag = str(elem.tag).rsplit("}", 1)[-1].upper()
+            text = _element_text(elem)
+            if tag == "HEAD" and text:
+                paras.append(("sechead", 0, text))
+            elif tag in ("CITA", "SOURCE") and text:
+                paras.append(("credit", 0, text.strip("[]")))
+            elif tag in ("AUTH", "NOTE") and text:
+                paras.append(("note-body", 0, text))
+            elif tag in ("P", "FP") and text:
+                _append_body(paras, text, stack)
+            elif tag == "EXAMPLE":
+                # EXAMPLE is a self-contained branch below the currently open
+                # CFR paragraph.  Its (i)/(ii) markers must not close or mutate
+                # the regulation's main subdivision stack.
+                base = min(len(stack), 6)
+                for child in elem:
+                    ctag = str(child.tag).rsplit("}", 1)[-1].upper()
+                    ctext = _element_text(child)
+                    if not ctext:
+                        continue
+                    if ctag == "HED":
+                        paras.append(("head", base, ctext))
+                    elif ctag in ("P", "FP", "PSPACE"):
+                        paras.append(("body", min(base + 1, 6), ctext))
+        return paras
+
+    # Defensive fallback for a malformed response: retain the former tolerant
+    # regex parser rather than making the entire section unavailable.
     m = _DIV8_RE.search(xml)
     if not m:
         return []
@@ -269,17 +366,12 @@ def parse_section_xml(xml: str) -> list[tuple[str, int, str]]:
             paras.append(("credit", 0, text.strip("[]")))
         elif tag in ("AUTH", "NOTE"):
             paras.append(("note-body", 0, text))
+        elif tag == "HED":
+            paras.append(("head", min(len(stack), 6), text))
+        elif tag == "PSPACE":
+            paras.append(("body", min(len(stack) + 1, 6), text))
         else:  # P / FP
-            # No enumerator means a continuation of the open item, which
-            # stays at that item's depth rather than returning flush left
-            level = max(len(stack) - 1, 0)
-            lead = _ENUM_LEAD_RE.match(text)
-            if lead:
-                enums = re.findall(r"\(([^)]+)\)", lead.group(1))
-                lvl = infer_enum_level(enums, stack, CFR_HIERARCHY)
-                if lvl is not None:
-                    level = lvl
-            paras.append(("body", min(level, 6), text))
+            _append_body(paras, text, stack)
     return paras
 
 
