@@ -798,6 +798,48 @@ class SurfaceCaseViewTests(unittest.TestCase):
         self.assertFalse(self.app.surface_case_view("case-key"))
 
 
+class StripIconTests(unittest.TestCase):
+    """Save and print sit on the strip as icons, ahead of the zoom controls."""
+
+    def setUp(self):
+        body = next(
+            ast.get_source_segment(SRC, node)
+            for cls in TREE.body
+            if isinstance(cls, ast.ClassDef) and cls.name == "_FloatingPdfWindow"
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_build_bar"
+        )
+        self.body = body
+
+    def test_the_strip_carries_a_save_and_a_print_button(self):
+        self.assertIn('_ui_mini_button(bar, "", self._save', self.body)
+        self.assertIn('_ui_mini_button(bar, "", self._print', self.body)
+
+    def test_they_are_icons_not_words(self):
+        self.assertIn('image=self._strip_icons["save"]', self.body)
+        self.assertIn('image=self._strip_icons["print"]', self.body)
+
+    def test_they_come_before_the_zoom_controls(self):
+        self.assertLess(self.body.index("self._save"),
+                        self.body.index('"−"'))
+        self.assertLess(self.body.index("self._print"),
+                        self.body.index('"−"'))
+
+    def test_the_artwork_is_held_so_tk_does_not_drop_it(self):
+        # An image nothing refers to is garbage collected and the button goes
+        # blank.
+        self.assertIn("self._strip_icons = _pdf_strip_icons(bar)", self.body)
+
+    def test_an_icon_alone_says_what_it_does_on_hover(self):
+        self.assertIn("_HoverTip(save_btn", self.body)
+        self.assertIn("_HoverTip(print_btn", self.body)
+
+    def test_save_and_print_stay_on_the_context_menu_too(self):
+        # Where the accelerators are written down.
+        self.assertIn("Save PDF As…", self.body)
+        self.assertIn("Print…", self.body)
+
+
 class SectionRailGateTests(unittest.TestCase):
     """Which documents get a rail at all — the "only then" of the request."""
 
