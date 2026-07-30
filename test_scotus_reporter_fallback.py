@@ -2,7 +2,9 @@
 
 import datetime as dt
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,6 +12,7 @@ os.environ.setdefault("GETCASES_SKIP_DEPENDENCY_PROMPT", "1")
 
 import courtlistener_gui as gui
 from google_scholar import GoogleScholarFetcher
+from opinion_db import OpinionDB
 
 
 class AgeGateTests(unittest.TestCase):
@@ -280,6 +283,93 @@ class FallbackOrderingTests(unittest.TestCase):
         citing.assert_not_called()
 
 
+class RecoveredCitationPersistenceTests(unittest.TestCase):
+    @staticmethod
+    def _record() -> dict:
+        return {
+            "v": 6,
+            "scholar_id": "123456",
+            "url": (
+                "https://scholar.google.com/"
+                "scholar_case?case=123456"
+            ),
+            "name": "Ramos v. Louisiana",
+            "parties": ["ramos", "louisiana"],
+            "cites": ["140 S. Ct. 1390"],
+            "court": "scotus",
+            "year": "2020",
+            "date_filed": "2020-04-20",
+            "added_at": 1.0,
+            "source": "scholar",
+            "snippet": "",
+            "html_gz": "",
+        }
+
+    def test_database_adds_parallel_cite_and_indexes_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = OpinionDB(
+                Path(folder) / "opinions.jsonl",
+                Path(folder) / "opinions.index.db",
+            )
+            try:
+                self.assertTrue(db.add(self._record()))
+                self.assertTrue(
+                    db.save_parallel_citation("123456", "590 U. S. 83")
+                )
+                self.assertFalse(
+                    db.save_parallel_citation("123456", "590 U.S. 83")
+                )
+                self.assertEqual(
+                    db.stored_citations("123456"),
+                    ["140 S. Ct. 1390", "590 U.S. 83"],
+                )
+                hits = db.find_by_citation(590, "U.S.", 83)
+                self.assertEqual(
+                    [hit["scholar_id"] for hit in hits],
+                    ["123456"],
+                )
+                self.assertEqual(
+                    db.stored_record("123456")["cites"],
+                    ["140 S. Ct. 1390", "590 U.S. 83"],
+                )
+            finally:
+                db.close()
+
+    def test_pdf_item_reuses_saved_parallel_cite(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = OpinionDB(
+                Path(folder) / "opinions.jsonl",
+                Path(folder) / "opinions.index.db",
+            )
+            try:
+                db.add(self._record())
+                db.save_parallel_citation("123456", "590 U.S. 83")
+
+                window = object.__new__(gui._ScholarTextWindow)
+                window._app = SimpleNamespace(
+                    _get_opinion_db=lambda wait=False: db,
+                )
+                window._item = {}
+                window._scholar_url = self._record()["url"]
+                window._is_scotus = True
+                window._blocks = []
+                window._header_cites = ["140 S. Ct. 1390"]
+                window._bb = {
+                    "name": "Ramos v. Louisiana",
+                    "cite": "140 S. Ct. 1390",
+                }
+
+                item = window._pdf_item()
+
+                self.assertEqual(item["scholar_id"], "123456")
+                self.assertEqual(
+                    item["citation"],
+                    ["140 S. Ct. 1390", "590 U.S. 83"],
+                )
+            finally:
+                db.close()
+
+
 class ResolverIntegrationTests(unittest.TestCase):
     class Session:
         headers = {}
@@ -290,11 +380,17 @@ class ResolverIntegrationTests(unittest.TestCase):
     def test_recovered_cite_retries_official_pdf_paths(self):
         app = object.__new__(gui.CourtListenerGUI)
         app._get_scholar = lambda: object()
+        opinion_db = SimpleNamespace(
+            stored_citations=lambda _sid: [],
+            save_parallel_citation=mock.Mock(return_value=True),
+        )
+        app._get_opinion_db = lambda: opinion_db
         item = {
             "caseName": "Ramos v. Louisiana",
             "court_id": "scotus",
             "dateFiled": "2020-04-20",
             "citation": ["140 S. Ct. 1390"],
+            "scholar_id": "123456",
         }
         expected = (
             "https://tile.loc.gov/storage-services/service/ll/"
@@ -329,6 +425,96 @@ class ResolverIntegrationTests(unittest.TestCase):
             url = gui.CourtListenerGUI._resolve_pdf_url(app, None, item)
         self.assertEqual(url, expected)
         self.assertEqual(item["_us_reports_cite"], "590 U.S. 83")
+        opinion_db.save_parallel_citation.assert_called_once_with(
+            "123456", "590 U.S. 83",
+        )
+
+    def test_saved_parallel_cite_is_used_before_late_fallback(self):
+        app = object.__new__(gui.CourtListenerGUI)
+        opinion_db = SimpleNamespace(
+            stored_citations=lambda _sid: [
+                "140 S. Ct. 1390", "590 U.S. 83",
+            ],
+            save_parallel_citation=mock.Mock(return_value=False),
+        )
+        app._get_opinion_db = lambda: opinion_db
+        item = {
+            "caseName": "Ramos v. Louisiana",
+            "court_id": "scotus",
+            "dateFiled": "2020-04-20",
+            "citation": ["140 S. Ct. 1390"],
+            "scholar_id": "123456",
+        }
+        expected = (
+            "https://tile.loc.gov/storage-services/service/ll/"
+            "usrep590/usrep590083/usrep590083.pdf"
+        )
+        with (
+            mock.patch.object(gui, "_anon_session", self.Session()),
+            mock.patch.object(
+                gui, "_us_reports_loc_url",
+                side_effect=lambda cite: (
+                    expected if gui._normalized_us_cite(cite) == "590 U.S. 83"
+                    else None
+                ),
+            ),
+            mock.patch.object(
+                gui, "_us_reports_govinfo_url", return_value=None,
+            ),
+            mock.patch.object(
+                gui.us_reports_pdf, "extract_citation", return_value=None,
+            ),
+            mock.patch.object(
+                gui, "_late_scotus_us_reports_cite",
+            ) as late_fallback,
+        ):
+            url = gui.CourtListenerGUI._resolve_pdf_url(app, None, item)
+
+        self.assertEqual(url, expected)
+        self.assertIn("590 U.S. 83", item["citation"])
+        late_fallback.assert_not_called()
+
+    def test_recovered_cite_is_saved_even_when_pdf_probe_fails(self):
+        app = object.__new__(gui.CourtListenerGUI)
+        app._get_scholar = lambda: object()
+        opinion_db = SimpleNamespace(
+            stored_citations=lambda _sid: [],
+            save_parallel_citation=mock.Mock(return_value=True),
+        )
+        app._get_opinion_db = lambda: opinion_db
+        item = {
+            "caseName": "Ramos v. Louisiana",
+            "court_id": "scotus",
+            "dateFiled": "2020-04-20",
+            "citation": ["140 S. Ct. 1390"],
+            "scholar_id": "123456",
+        }
+        with (
+            mock.patch.object(gui, "_us_reports_loc_url", return_value=None),
+            mock.patch.object(
+                gui, "_us_reports_govinfo_url", return_value=None,
+            ),
+            mock.patch.object(
+                gui.us_reports_pdf, "extract_citation", return_value=None,
+            ),
+            mock.patch.object(
+                gui, "_scotus_slip_pdf_url", return_value=None,
+            ),
+            mock.patch.object(
+                gui, "_courtlistener_pdf_fallback_item", return_value=None,
+            ),
+            mock.patch.object(
+                gui, "_late_scotus_us_reports_cite",
+                return_value="590 U.S. 83",
+            ),
+        ):
+            url = gui.CourtListenerGUI._resolve_pdf_url(app, None, item)
+
+        self.assertIsNone(url)
+        self.assertEqual(item["_us_reports_cite"], "590 U.S. 83")
+        opinion_db.save_parallel_citation.assert_called_once_with(
+            "123456", "590 U.S. 83",
+        )
 
 
 if __name__ == "__main__":

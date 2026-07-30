@@ -6,7 +6,8 @@ dockets and also preserves older case-file pages containing merits and cert
 briefs.  This module combines both sources, removes duplicate links, and keeps
 only the filings useful to an opinion reader:
 
-* cert petition (or jurisdictional statement) and its appendix;
+* an in-forma-pauperis motion, cert petition (or jurisdictional statement),
+  and the petition appendix;
 * brief in opposition/response, cert reply, and cert-stage amicus briefs;
 * joint appendix and party, reply, and amicus briefs on the merits.
 * the oral-argument transcript, when the case page links one.
@@ -90,6 +91,10 @@ _GRANT_RE = re.compile(
     r"postponed to (?:the )?hearing on the merits)\b",
     re.IGNORECASE,
 )
+_BRIEF_COVER_CLASS_RE = re.compile(r"\bbg-brief-([\w-]+)\b")
+_MERITS_COVER_HINTS = {
+    "light_blue", "light_red", "yellow", "light_green", "dark_green",
+}
 
 
 @dataclass(frozen=True)
@@ -175,6 +180,43 @@ def _label(description: str, *, appendix: bool = False) -> str:
     return text.rstrip(".") or "Docket document"
 
 
+def _document_label(
+    description: str,
+    kind: str,
+    *,
+    link_text: str = "",
+) -> str:
+    """A filing-specific label when one docket row contains several files."""
+
+    combined = _clean(f"{description} {link_text}")
+    if kind == "cert_ifp_motion":
+        return "Motion for leave to proceed in forma pauperis"
+    if kind == "cert_petition":
+        if re.search(r"jurisdictional statement", combined, re.IGNORECASE):
+            return "Jurisdictional statement"
+        return "Petition for a writ of certiorari"
+    return _label(
+        description,
+        appendix=(kind == "cert_appendix"),
+    )
+
+
+def _link_description(link_text: str, href: str) -> str:
+    """Visible link text plus its decoded filename, for ambiguous Court rows."""
+
+    filename = unquote(urlsplit(href or "").path.rsplit("/", 1)[-1])
+    filename = re.sub(r"[_+.]+", " ", filename)
+    return _clean(f"{link_text} {filename}")
+
+
+def _cover_hint(node) -> str:
+    """SCOTUSblog's ``bg-brief-*`` cover-color class, normalized."""
+
+    classes = " ".join(node.get("class") or [])
+    match = _BRIEF_COVER_CLASS_RE.search(classes)
+    return match.group(1).replace("-", "_").casefold() if match else ""
+
+
 def _stage_from_text(text: str, current: str) -> str:
     low = text.casefold()
     if (
@@ -204,12 +246,17 @@ def _classify(
     section: str = "",
     side_hint: str = "",
     merits_phase: str = "",
+    cover_hint: str = "",
 ) -> Optional[tuple[str, str, str]]:
     """Return ``(stage, kind, cover)`` or ``None`` for an unwanted filing."""
 
     text = _clean(f"{description} {link_text} {section}")
     low = text.casefold()
+    link_low = link_text.casefold()
     stage = _stage_from_text(text, stage)
+    cover_hint = cover_hint.replace("-", "_").casefold()
+    if cover_hint in _MERITS_COVER_HINTS:
+        stage = "merits"
     section_low = section.casefold()
     if "transcript" in low and "argument" in low:
         return ("merits", "oral_argument_transcript", "plain")
@@ -240,6 +287,11 @@ def _classify(
         return None
 
     if stage == "cert":
+        if re.search(
+            r"\bin forma pauperis\b|\bproceed\s+ifp\b",
+            link_low,
+        ):
+            return ("cert", "cert_ifp_motion", "white")
         if is_amicus:
             return ("cert", "cert_amicus", "cream")
         is_appendix = (
@@ -257,6 +309,10 @@ def _classify(
             return ("cert", "cert_appendix", "white")
         if "reply" in low:
             return ("cert", "cert_reply", "tan")
+        if cover_hint == "orange":
+            # Older SCOTUSblog entries often say only "Brief of respondent";
+            # the orange cover is the page's authoritative opposition label.
+            return ("cert", "cert_opposition", "orange")
         if any(phrase in low for phrase in (
             "brief in opposition",
             "in opposition",
@@ -281,14 +337,22 @@ def _classify(
         return ("merits", "joint_appendix", "tan")
     if is_amicus:
         side = _support_side(text, side_hint)
+        if cover_hint == "dark_green":
+            side = "respondent"
         if (
             side == "neither"
             and "neither party" not in low
-            and merits_phase in ("petitioner", "respondent")
         ):
-            # The Court's docket often omits the supported side from the row.
-            # Its filing sequence still distinguishes the two merits windows.
-            side = merits_phase
+            if cover_hint == "light_green":
+                # Light green can mean petitioner or neither, but never
+                # respondent.  Filing sequence distinguishes the petitioner
+                # window; after that, retain the source's "neither" signal.
+                if merits_phase == "petitioner":
+                    side = "petitioner"
+            elif merits_phase in ("petitioner", "respondent"):
+                # The Court's docket often omits the supported side from the
+                # row.  Its filing sequence distinguishes the merits windows.
+                side = merits_phase
         if side == "respondent":
             cover = "dark_green"
             kind = "merits_amicus_respondent"
@@ -308,6 +372,10 @@ def _classify(
         return None
 
     side = _support_side(text, side_hint)
+    if cover_hint == "light_red":
+        side = "respondent"
+    elif cover_hint == "light_blue":
+        side = "petitioner"
     if side == "respondent":
         return ("merits", "merits_respondent", "light_red")
     if side == "petitioner":
@@ -332,6 +400,7 @@ def parse_official_docket(
     merits_phase = ""
 
     for row in soup.find_all("tr"):
+        was_merits = stage == "merits"
         cells = row.find_all("td", recursive=False)
         if len(cells) < 2:
             continue
@@ -367,10 +436,11 @@ def parse_official_docket(
                 or _EXCLUDED_LINK_RE.search(link_name)
             ):
                 continue
+            link_description = _link_description(link_name, href)
             classified = _classify(
                 description,
                 stage=row_stage,
-                link_text=link_name,
+                link_text=link_description,
                 merits_phase=merits_phase,
             )
             if classified is None:
@@ -379,9 +449,10 @@ def parse_official_docket(
             documents.append(DocketDocument(
                 stage=doc_stage,
                 kind=kind,
-                label=_label(
+                label=_document_label(
                     description,
-                    appendix=(kind == "cert_appendix"),
+                    kind,
+                    link_text=link_description,
                 ),
                 url=href,
                 cover=cover,
@@ -392,7 +463,7 @@ def parse_official_docket(
 
         # The granting row normally has no document, so it must affect the
         # rows after it rather than the classification of a document in it.
-        if _GRANT_RE.search(description):
+        if _GRANT_RE.search(description) and not was_merits:
             stage = "merits"
             merits_phase = ""
 
@@ -471,9 +542,11 @@ def _timeline_documents(
     merits_phase = ""
     timeline_nodes = soup.select('[class*="bg-brief-"]')
     for node in timeline_nodes:
+        was_merits = stage == "merits"
         classes = " ".join(node.get("class") or [])
         if not re.search(r"\bbg-brief-[\w-]+\b", classes):
             continue
+        cover_hint = _cover_hint(node)
         description = ""
         date = ""
         for child in node.find_all(["span", "p"], recursive=True):
@@ -490,6 +563,8 @@ def _timeline_documents(
                 description = _clean(description[len(date):])
 
         row_stage = _stage_from_text(description, stage)
+        if cover_hint in _MERITS_COVER_HINTS:
+            row_stage = "merits"
         low = description.casefold()
         if row_stage == "merits":
             stage = "merits"
@@ -512,20 +587,21 @@ def _timeline_documents(
                 description,
                 stage=row_stage,
                 merits_phase=merits_phase,
+                cover_hint=cover_hint,
             )
             if classified is not None:
                 doc_stage, kind, cover = classified
                 documents.append(DocketDocument(
                     stage=doc_stage,
                     kind=kind,
-                    label=_label(description),
+                    label=_document_label(description, kind),
                     url=href,
                     cover=cover,
                     date=date,
                     docket=normalize_docket(docket),
                     source="SCOTUSblog",
                 ))
-        if _GRANT_RE.search(description):
+        if _GRANT_RE.search(description) and not was_merits:
             stage = "merits"
             merits_phase = ""
     return documents
@@ -586,9 +662,7 @@ def _archived_documents(
                 documents.append(DocketDocument(
                     stage=doc_stage,
                     kind=kind,
-                    label=_label(
-                        label, appendix=(kind == "cert_appendix"),
-                    ),
+                    label=_document_label(label, kind),
                     url=href,
                     cover=cover,
                     docket=normalize_docket(docket),

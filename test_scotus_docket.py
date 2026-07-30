@@ -127,6 +127,30 @@ OFFICIAL_FIXTURE = """
 </table>
 """
 
+RAMOS_INITIAL_FILING_FIXTURE = """
+<table>
+  <tr>
+    <td class="ProceedingDate">Sep 07 2018</td>
+    <td>
+      Petition for a writ of certiorari and motion for leave to proceed in
+      forma pauperis filed. (Response due October 11, 2018)
+      <span class="documentlinks">
+        <a href="/DocketPDF/18/18-5924/63126/20180910110241307_Motion%20for%20Leave%20to%20Proceed%20IFP.Ramos.pdf">
+          Motion for Leave to Proceed in Forma Pauperis
+        </a>
+        <a href="/DocketPDF/18/18-5924/63126/20180910111103199_Evangelisto%20Ramos.cert.%20petition.final.pdf">
+          Petition
+        </a>
+        <a href="/DocketPDF/18/18-5924/63126/20180910111116558_Appendix.Ramos.pdf">
+          Petition
+        </a>
+        <a href="/proof.pdf">Proof of Service</a>
+      </span>
+    </td>
+  </tr>
+</table>
+"""
+
 
 ARCHIVE_FIXTURE = """
 <main>
@@ -184,6 +208,50 @@ ARCHIVE_FIXTURE = """
 </main>
 """
 
+OBERGEFELL_TIMELINE_FIXTURE = """
+<main>
+  <a href="https://cdn.test/cert-response.pdf"
+     class="bg-brief-orange flex items-center">
+    <span>Dec 12, 2014</span>
+    <span>Brief of respondent Richard Hodges, Director, Ohio Department of
+      Health filed.</span>
+  </a>
+  <div class="bg-brief-white flex items-center">
+    <span>Jan 16, 2015</span>
+    <span>Petition GRANTED.</span>
+  </div>
+  <a href="https://cdn.test/petitioner.pdf"
+     class="bg-brief-light-blue flex items-center">
+    <span>Feb 27, 2015</span>
+    <span>Brief of petitioners James Obergefell, et al. filed.</span>
+  </a>
+  <a href="https://cdn.test/amicus-before-argument-order.pdf"
+     class="bg-brief-light-green flex items-center">
+    <span>Mar 5, 2015</span>
+    <span>Brief amicus curiae of Institute for Justice filed. VIDED.</span>
+  </a>
+  <div class="bg-brief-white flex items-center">
+    <span>Mar 6, 2015</span>
+    <span>SET FOR ARGUMENT ON Tuesday, April 28, 2015</span>
+  </div>
+  <a href="https://cdn.test/amicus-after-argument-order.pdf"
+     class="bg-brief-light-green flex items-center">
+    <span>Mar 6, 2015</span>
+    <span>Brief amicus curiae of United States filed. VIDED.</span>
+  </a>
+  <a href="https://cdn.test/respondent.pdf"
+     class="bg-brief-light-red flex items-center">
+    <span>Mar 27, 2015</span>
+    <span>Brief of respondents Richard Hodges, et al. filed.</span>
+  </a>
+  <a href="https://cdn.test/respondent-amicus.pdf"
+     class="bg-brief-dark-green flex items-center">
+    <span>Apr 2, 2015</span>
+    <span>Brief amicus curiae of 100 Scholars of Marriage filed.</span>
+  </a>
+</main>
+"""
+
 
 CURRENT_BLOG_FIXTURE = """
 <main>
@@ -217,6 +285,30 @@ CURRENT_BLOG_FIXTURE = """
 
 
 class OfficialDocketParsingTests(unittest.TestCase):
+    def test_one_initial_row_gets_three_filing_specific_labels(self):
+        documents = scotus_docket.parse_official_docket(
+            RAMOS_INITIAL_FILING_FIXTURE, "18-5924"
+        )
+
+        self.assertEqual(
+            [(document.kind, document.label) for document in documents],
+            [
+                (
+                    "cert_ifp_motion",
+                    "Motion for leave to proceed in forma pauperis",
+                ),
+                (
+                    "cert_petition",
+                    "Petition for a writ of certiorari",
+                ),
+                (
+                    "cert_appendix",
+                    "Appendix to petition for a writ of certiorari",
+                ),
+            ],
+        )
+        self.assertTrue(documents[2].url.endswith("Appendix.Ramos.pdf"))
+
     def test_filters_procedural_filings_and_keeps_requested_documents(self):
         documents = scotus_docket.parse_official_docket(
             OFFICIAL_FIXTURE, "22-451"
@@ -345,6 +437,38 @@ class SCOTUSblogParsingTests(unittest.TestCase):
         self.assertEqual(documents[2].cover, "plain")
         self.assertIn("/argument_transcripts/", documents[2].url)
 
+    def test_older_timeline_uses_cover_hints_without_resetting_filing_side(self):
+        documents = scotus_docket.parse_scotusblog_case(
+            OBERGEFELL_TIMELINE_FIXTURE,
+            "https://www.scotusblog.com/cases/obergefell-v-hodges/",
+            "14-556",
+        )
+        by_file = {
+            document.url.rsplit("/", 1)[-1]: document
+            for document in documents
+        }
+
+        # Older entries omit the words "in opposition"; the orange cover
+        # remains an unambiguous SCOTUSblog classification signal.
+        self.assertEqual(
+            by_file["cert-response.pdf"].kind,
+            "cert_opposition",
+        )
+        # "Set for argument" is a stage signal, not a new merits filing
+        # window.  Amici on both sides of it still support petitioners.
+        self.assertEqual(
+            by_file["amicus-before-argument-order.pdf"].kind,
+            "merits_amicus_petitioner",
+        )
+        self.assertEqual(
+            by_file["amicus-after-argument-order.pdf"].kind,
+            "merits_amicus_petitioner",
+        )
+        self.assertEqual(
+            by_file["respondent-amicus.pdf"].kind,
+            "merits_amicus_respondent",
+        )
+
 
 class _Response:
     def __init__(self, text, status_code=200):
@@ -404,6 +528,16 @@ class DocketFetchAndPanelTests(unittest.TestCase):
         self.assertIn('f"docket_{cover}"', source)
         self.assertIn('f"docket_{document.cover}"', source)
         self.assertIn('"docket_plain", foreground="#25232e"', source)
+
+    def test_right_panel_has_a_fixed_width_and_wraps_its_entries(self):
+        source = Path("courtlistener_gui.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "self._text_frame, width=self._details_panel_w",
+            source,
+        )
+        self.assertIn("f.pack_propagate(False)", source)
+        self.assertIn('f, width=1, wrap="word"', source)
 
 
 if __name__ == "__main__":

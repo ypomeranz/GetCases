@@ -1161,6 +1161,57 @@ class OpinionDB:
             return False
         return self._rewrite_jsonl(str(sid).strip(), record)
 
+    # -- parallel citations ------------------------------------------------
+
+    def stored_citations(self, sid: str) -> list[str]:
+        """Every indexed parallel citation for *sid*, without expanding HTML.
+
+        This is the lightweight read used by the PDF resolver.  In particular,
+        a U.S. Reports cite recovered after Google Scholar first saved an
+        S. Ct.-only opinion becomes available to the next reader before any
+        network lookup runs.
+        """
+        if not sid:
+            return []
+        with self._lock:
+            row = self._db.execute(
+                "SELECT cites_json FROM opinions WHERE scholar_id=?",
+                (str(sid).strip(),),
+            ).fetchone()
+        if row is None:
+            return []
+        try:
+            values = json.loads(row["cites_json"] or "[]")
+        except Exception:
+            return []
+        return _dedupe_cites([str(value) for value in values])
+
+    def save_parallel_citation(self, sid: str, cite: str) -> bool:
+        """Add one reporter citation to a stored opinion.
+
+        The JSONL record is the durable source of truth and the derived
+        citation index is rebuilt by the normal atomic rewrite.  Returns
+        whether the record changed; an invalid or already-known citation is
+        ignored.
+        """
+        if not sid:
+            return False
+        sid = str(sid).strip()
+        normalized = _dedupe_cites([str(cite or "")])
+        if not normalized or _cite_key(normalized[0]) is None:
+            return False
+        new_cite = normalized[0]
+        new_key = _cite_key(new_cite)
+        with self._lock:
+            record = self.stored_record(sid)
+            if record is None:
+                return False
+            existing = [str(value) for value in (record.get("cites") or [])]
+            if any(_cite_key(value) == new_key for value in existing):
+                return False
+            record["cites"] = _dedupe_cites([*existing, new_cite])
+            return self._rewrite_jsonl(sid, record)
+
     # -- reporter pagination ------------------------------------------------
     # A recent Supreme Court opinion reaches Google Scholar long before the
     # bound volume does, so its star pagination is the Supreme Court Reporter's
@@ -1187,17 +1238,21 @@ class OpinionDB:
         if not sid:
             return False
         sid = str(sid).strip()
-        record = self.stored_record(sid)
-        if record is None:
-            return False  # the opinion isn't stored; nothing to attach it to
-        current = record.get(_PAGINATION_FIELD)
-        if current == pagination:
-            return False
-        if pagination is None:
-            record.pop(_PAGINATION_FIELD, None)
-        else:
-            record[_PAGINATION_FIELD] = pagination
-        return self._rewrite_jsonl(sid, record)
+        # Citation recovery and reporter-page alignment can finish on separate
+        # worker threads.  Keep their read/modify/rewrite cycles serialized so
+        # neither enrichment can overwrite the other with an older snapshot.
+        with self._lock:
+            record = self.stored_record(sid)
+            if record is None:
+                return False  # the opinion isn't stored; nothing to attach it to
+            current = record.get(_PAGINATION_FIELD)
+            if current == pagination:
+                return False
+            if pagination is None:
+                record.pop(_PAGINATION_FIELD, None)
+            else:
+                record[_PAGINATION_FIELD] = pagination
+            return self._rewrite_jsonl(sid, record)
 
     def merge_from(self, other_jsonl: os.PathLike | str) -> dict:
         """Merge another ``opinions.jsonl`` into this store.  Opinions whose

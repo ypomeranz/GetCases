@@ -10088,6 +10088,37 @@ class CourtListenerGUI:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _save_scholar_us_reports_cite(self, item: dict, cite: str) -> bool:
+        """Persist a newly known U.S. Reports cite for a Scholar opinion."""
+        us_cite = _normalized_us_cite(cite)
+        if not us_cite:
+            return False
+        sid = str(item.get("scholar_id") or "").strip()
+        if not sid:
+            try:
+                import opinion_db
+                for key in ("scholar_url", "_scholar_url", "url"):
+                    sid = opinion_db.scholar_id_from_url(
+                        str(item.get(key) or "")
+                    ) or ""
+                    if sid:
+                        break
+            except Exception:
+                return False
+        if not sid:
+            return False
+        try:
+            db = self._get_opinion_db()
+            if db is not None and db.save_parallel_citation(sid, us_cite):
+                print(
+                    f"[db] saved parallel cite {us_cite} for "
+                    f"Scholar opinion {sid}"
+                )
+                return True
+        except Exception as exc:
+            print(f"[db] saving U.S. Reports parallel cite failed: {exc}")
+        return False
+
     def _resolve_pdf_url(
         self, client: Optional[CourtListenerClient], item: dict
     ) -> Optional[str]:
@@ -10124,6 +10155,17 @@ class CourtListenerGUI:
             item.get("_skip_pdf_metadata_fallback")
         )
 
+        def _remember_us_reports_cite(cite: str) -> str:
+            """Keep a discovered cite on this resolver copy and in the DB."""
+            normalized = _normalized_us_cite(cite)
+            if (
+                normalized
+                and item.get("_us_reports_cite") != normalized
+            ):
+                item["_us_reports_cite"] = normalized
+                self._save_scholar_us_reports_cite(item, normalized)
+            return normalized
+
         # Determine whether this is a SCOTUS case.
         court_val = str(item.get("court_id") or "")
         is_scotus = "scotus" in court_val
@@ -10148,11 +10190,42 @@ class CourtListenerGUI:
                 print(f"[resolve] {label} check failed ({exc}): {url}")
             return False
 
+        # ``_pdf_item`` normally folds these in before starting the worker.
+        # Repeat the lightweight read here so an opinion-database load that
+        # completed in the meantime is still honored by this resolution pass.
+        scholar_id = str(item.get("scholar_id") or "").strip()
+        if scholar_id:
+            try:
+                db = self._get_opinion_db()
+                saved_cites = (
+                    db.stored_citations(scholar_id) if db is not None else []
+                )
+                raw_cites = item.get("citation") or []
+                merged_cites = (
+                    list(raw_cites)
+                    if isinstance(raw_cites, (list, tuple))
+                    else [raw_cites]
+                )
+                for cite in saved_cites:
+                    if cite not in merged_cites:
+                        merged_cites.append(cite)
+                if merged_cites:
+                    item["citation"] = merged_cites
+            except Exception as exc:
+                print(f"[db] loading saved parallel citations failed: {exc}")
+
         # Gather EVERY citation we know — the search result often exposes only
         # one (frequently a nominative reporter like "19 How. 393"), while the
         # parallel U.S./F. cite that finds a PDF lives on the cluster record.
         all_cites = _gather_all_citations(client, item)
         print(f"[resolve] citations to try: {all_cites}")
+        known_us = next(
+            (_normalized_us_cite(cite) for cite in all_cites
+             if _normalized_us_cite(cite)),
+            "",
+        )
+        if known_us:
+            _remember_us_reports_cite(known_us)
 
         # A SCOTUS opinion opened from Google Scholar sometimes carries only its
         # Supreme Court Reporter ("S. Ct.") cite, not the "U.S." cite every
@@ -10168,6 +10241,7 @@ class CourtListenerGUI:
             print(f"[resolve] S. Ct. cite resolved to U.S. Reports cite: "
                   f"{us_from_sct}")
             all_cites.append(us_from_sct)
+            _remember_us_reports_cite(us_from_sct)
 
         # 0. Official US Reports PDF — try every U.S.-Reports cite among them.
         #    For vols 1-501 the LOC (Library of Congress) CDN scan is preferred,
@@ -10213,13 +10287,13 @@ class CourtListenerGUI:
             for source in sources:
                 url = source(cite)
                 if url is not None:
-                    item["_us_reports_cite"] = _normalized_us_cite(cite)
+                    _remember_us_reports_cite(cite)
                     return url
             local_pdf = us_reports_pdf.extract_citation(cite)
             if local_pdf is not None:
                 url = local_pdf.as_uri()
                 print(f"[resolve] using local US Reports volume: {url}")
-                item["_us_reports_cite"] = _normalized_us_cite(cite)
+                _remember_us_reports_cite(cite)
                 return url
             return None
 
@@ -10328,6 +10402,10 @@ class CourtListenerGUI:
                 retry_item["_skip_pdf_metadata_fallback"] = True
                 url = self._resolve_pdf_url(client, retry_item)
                 if url:
+                    if retry_item.get("_us_reports_cite"):
+                        _remember_us_reports_cite(
+                            str(retry_item["_us_reports_cite"])
+                        )
                     print(
                         "[resolve] using PDF from metadata-matched "
                         "CourtListener cluster"
@@ -10352,6 +10430,7 @@ class CourtListenerGUI:
                 client, fetcher, item, all_cites,
             )
             if recovered_us:
+                _remember_us_reports_cite(recovered_us)
                 print(
                     "[resolve] late U.S. Reports cite recovered: "
                     f"{recovered_us}"
@@ -11495,6 +11574,13 @@ class _DbMatchDialog:
                         for k in ("name", "court", "year", "date_filed", "source"):
                             if not new_rec.get(k) and rec.get(k):
                                 new_rec[k] = rec[k]
+                        # Citation recovery can add a U.S. Reports parallel
+                        # that Scholar's opinion page still omits.  Refreshing
+                        # the HTML must not discard that durable enrichment.
+                        new_rec["cites"] = _odb._dedupe_cites([
+                            *(new_rec.get("cites") or []),
+                            *(rec.get("cites") or []),
+                        ])
                         db.replace(new_rec)
                         changed = len(html) - len(rec.get("html") or "")
                         msg = (f"Updated {name} to the latest Google Scholar "
@@ -21262,7 +21348,13 @@ class _ScholarTextWindow:
 
     def _details_panel(self) -> ttk.Frame:
         if self._details_frame is None:
-            f = ttk.Frame(self._text_frame)
+            # Keep every details view at the same physical width.  In
+            # particular, long docket filing names must wrap inside the panel
+            # rather than letting a child's requested width enlarge it.
+            f = ttk.Frame(
+                self._text_frame, width=self._details_panel_w,
+            )
+            f.pack_propagate(False)
             base_family = tkfont.nametofont("TkDefaultFont").actual("family")
             # Base point sizes (auto-scaled for dense displays); the panel's own
             # A−/A+ control then layers a persisted offset on top of these.
@@ -21330,7 +21422,7 @@ class _ScholarTextWindow:
                 lambda _e: self._refresh_details_view())
 
             body = tk.Text(
-                f, width=38, wrap="word",
+                f, width=1, wrap="word",
                 font=self._details_fonts["body"],
                 state="disabled", padx=8, pady=4, relief="flat",
                 background="#f7f5ef", cursor="",
@@ -21816,7 +21908,7 @@ class _ScholarTextWindow:
         lines: list[tuple] = [
             (
                 "lbl",
-                "Briefs only. Colors match Supreme Court booklet covers.",
+                "Selected filings only. Colors match Supreme Court booklet covers.",
             ),
         ]
         documents = list(result.documents or [])
@@ -23274,7 +23366,18 @@ class _ScholarTextWindow:
             import opinion_db
         except Exception:
             return ""
-        return opinion_db.scholar_id_from_url(self._scholar_url or "") or ""
+        sid = str(getattr(self, "_item", {}).get("scholar_id") or "").strip()
+        if sid:
+            return sid
+        for url in (
+            getattr(self, "_scholar_url", ""),
+            getattr(self, "_item", {}).get("scholar_url", ""),
+            getattr(self, "_item", {}).get("url", ""),
+        ):
+            sid = opinion_db.scholar_id_from_url(str(url or "")) or ""
+            if sid:
+                return sid
+        return ""
 
     def _start_stored_pagination_load(self) -> None:
         """Fetch this opinion's saved reporter pagination and install it."""
@@ -23525,6 +23628,26 @@ class _ScholarTextWindow:
         """The search-result-shaped dict used to resolve a PDF URL.  Falls back
         to the Bluebook citation when this window wasn't opened from a result."""
         item = dict(self._item) if self._item else {}
+        scholar_id = self._opinion_scholar_id()
+        if scholar_id:
+            # The resolver uses this identity to make any citation it discovers
+            # durable.  Carry citations already learned by an earlier session
+            # into the ordinary official-PDF lookup before a network fallback.
+            item["scholar_id"] = scholar_id
+            try:
+                getter = getattr(self._app, "_get_opinion_db", None)
+                try:
+                    db = getter(wait=False) if getter is not None else None
+                except TypeError:
+                    db = getter() if getter is not None else None
+                stored_cites = (
+                    db.stored_citations(scholar_id) if db is not None else []
+                )
+            except Exception as exc:
+                print(f"[db] loading saved parallel citations failed: {exc}")
+                stored_cites = []
+        else:
+            stored_cites = []
         if not (item.get("caseName") or item.get("case_name")):
             # A Scholar-only window may have no CourtListener item, but its
             # parsed/Bluebooked caption is still authoritative enough to pick
@@ -23559,7 +23682,11 @@ class _ScholarTextWindow:
         # Add every parallel reporter cite from the header and the chosen
         # Bluebook cite, so the resolver tries them all (point: Scholar cases
         # list several reporters above the case name).
-        for c in list(self._header_cites) + [self._bb.get("cite", "")]:
+        for c in (
+            list(stored_cites)
+            + list(self._header_cites)
+            + [self._bb.get("cite", "")]
+        ):
             if c and c not in cites:
                 cites.append(c)
         if cites:
