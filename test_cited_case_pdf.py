@@ -94,7 +94,8 @@ APP_NS = _load(
     "CourtListenerGUI",
     ["open_cited_case_pdf", "_cited_case_pdf_item", "_show_cited_case_pdf",
      "_cited_pdf_window_closed", "_warm_case_text",
-     "_request_cited_pdf_analysis"],
+     "_request_cited_pdf_analysis", "_cited_filename_item",
+     "_describe_warmed_case", "_save_cited_pdf", "_print_cited_pdf"],
     {"_citation_link_name": lambda snippet, cite="": snippet.strip(),
      "_cl_item_for_citation": _cl_item_for_citation,
      "_fetch_pdf_bytes": _fetch_pdf_bytes,
@@ -111,10 +112,22 @@ APP_NS = _load(
      "_extract_pdf_text_and_style": lambda data: ([[("c", (0, 0, 1, 1))]], []),
      "_citation_links_from_visible_pdf_text": lambda d, p, i: ({0: ["x"]}, set()),
      "slip_opinion": mock.Mock(detect_sections=lambda pages: []),
+     "_normalized_us_cite": lambda c: (
+         str(c).strip() if re.search(r"\d+\s+U\.?\s?S\.?\s+\d+", str(c))
+         else ""),
+     "_is_redacted_case_pdf": lambda url: "case.law" in (url or ""),
+     "_build_default_filename": lambda item: FILENAMES.append(item) or "NAME",
+     "_named_temp_pdf_path": lambda stem: f"/tmp/{stem}.pdf",
+     "_print_pdf_file": lambda parent, path, status: PRINTED.append(path),
+     "_case_law_print_citation": lambda *a, **kw: "HEADER",
+     "filedialog": mock.Mock(),
+     "messagebox": mock.Mock(),
      },
 )
 
 TEXT_OPENS: list = []
+FILENAMES: list = []
+PRINTED: list = []
 
 
 class _FakeViewer:
@@ -148,9 +161,12 @@ class _App:
         self.resolved_items = []
         self._resolves = resolves
         self.scholar_calls = []
+        self._describe_warmed_case = APP_NS["_describe_warmed_case"]
         for name in ("open_cited_case_pdf", "_cited_case_pdf_item",
                      "_show_cited_case_pdf", "_cited_pdf_window_closed",
-                     "_warm_case_text", "_request_cited_pdf_analysis"):
+                     "_warm_case_text", "_request_cited_pdf_analysis",
+                     "_cited_filename_item", "_save_cited_pdf",
+                     "_print_cited_pdf"):
             setattr(self, name, APP_NS[name].__get__(self))
 
     # --- collaborators ---
@@ -262,12 +278,130 @@ class CitedCasePdfTests(unittest.TestCase):
         self.assertEqual(len(_FakeViewer.opened), 2)
         self.assertEqual(_FakeViewer.opened[1].data, b"%PDF-2")
 
+    def test_the_viewer_can_save_and_print_the_scan(self):
+        self._click()
+        kw = _FakeViewer.opened[0].kw
+        self.assertIsNotNone(kw["on_save"])
+        self.assertIsNotNone(kw["on_print"])
+
     def test_the_scan_gets_clickable_citations_and_search(self):
         self._click()
         analysis = _FakeViewer.opened[0].analyses[0]
         self.assertEqual(analysis["url"],
                          "https://loc.test/usrep410113.pdf")
         self.assertIn(0, analysis["links"])
+
+
+class CitedCaseFilenameTests(unittest.TestCase):
+    """What a cited case's scan is saved and printed as."""
+
+    def setUp(self):
+        FILENAMES.clear(); PRINTED.clear()
+        self.app = _App()
+        self.named = {"data": b"%PDF", "url": "https://loc.test/usrep410113.pdf",
+                      "cite": "410 U.S. 113", "name": "Roe v. Wade",
+                      "record": None}
+
+    def test_before_the_text_arrives_the_citation_names_the_file(self):
+        item = self.app._cited_filename_item(self.named)
+        self.assertEqual(item["caseName"], "Roe v. Wade")
+        self.assertEqual(item["citation"], ["410 U.S. 113"])
+
+    def test_the_opinion_text_supplies_the_bluebook_pieces(self):
+        # A citation and a link caption cannot give a court or a date; the
+        # fetched opinion can.
+        self.named["record"] = {
+            "name": "Roe v. Wade", "cites": ["410 U.S. 113", "93 S. Ct. 705"],
+            "date_filed": "1973-01-22", "year": "1973", "court": "scotus",
+        }
+        item = self.app._cited_filename_item(self.named)
+        self.assertEqual(item["caseName"], "Roe v. Wade")
+        self.assertEqual(item["dateFiled"], "1973-01-22")
+        self.assertEqual(item["court_id"], "scotus")
+        self.assertIn("93 S. Ct. 705", item["citation"])
+
+    def test_a_year_alone_still_dates_the_file(self):
+        self.named["record"] = {"name": "Roe", "cites": [], "year": "1973"}
+        self.assertEqual(
+            self.app._cited_filename_item(self.named)["dateFiled"],
+            "1973-01-01")
+
+    def test_a_us_reports_scan_is_filed_under_the_pages_it_prints(self):
+        self.named["record"] = {"name": "Roe",
+                                "cites": ["93 S. Ct. 705", "410 U.S. 113"]}
+        item = self.app._cited_filename_item(self.named)
+        self.assertEqual(item["_us_reports_cite"], "410 U.S. 113")
+
+    def test_another_reporter_s_scan_is_not(self):
+        self.named.update(url="https://static.case.law/f2d/500/0123-01.pdf",
+                          record={"name": "Smith", "cites": ["500 F.2d 123"]})
+        self.assertNotIn("_us_reports_cite",
+                         self.app._cited_filename_item(self.named))
+
+    def test_the_clicked_citation_is_kept_when_the_text_omits_it(self):
+        self.named["record"] = {"name": "Roe", "cites": ["93 S. Ct. 705"]}
+        self.assertIn("410 U.S. 113",
+                      self.app._cited_filename_item(self.named)["citation"])
+
+    def test_saving_names_the_file_from_that(self):
+        self.app._save_cited_pdf(self.named)
+        self.assertEqual(len(FILENAMES), 1)
+        self.assertEqual(FILENAMES[0]["caseName"], "Roe v. Wade")
+
+    def test_printing_names_it_the_same_way(self):
+        self.app._print_cited_pdf(self.named, pane=None)
+        self.assertEqual(PRINTED, ["/tmp/NAME.pdf"])
+
+    def test_printing_uses_the_rendering_on_screen(self):
+        pane = mock.Mock()
+        self.app._print_cited_pdf(self.named, pane=pane)
+        pane.export_pdf.assert_called_once()
+
+    def test_a_redacted_scan_is_whitened_and_re_lettered_for_paper(self):
+        self.named["url"] = "https://static.case.law/f2d/500/0123-01.pdf"
+        pane = mock.Mock()
+        self.app._print_cited_pdf(self.named, pane=pane)
+        kwargs = pane.export_pdf.call_args.kwargs
+        self.assertTrue(kwargs["whiten_redactions"])
+        self.assertEqual(kwargs["header_cite"], "HEADER")
+
+    def test_a_pane_that_will_not_export_still_prints_the_original(self):
+        pane = mock.Mock()
+        pane.export_pdf.side_effect = RuntimeError("no")
+        self.app._print_cited_pdf(self.named, pane=pane)
+        self.assertEqual(PRINTED, ["/tmp/NAME.pdf"])
+
+    def test_nothing_is_saved_before_there_is_a_scan(self):
+        self.app._save_cited_pdf({"data": None})
+        self.assertEqual(FILENAMES, [])
+
+
+class WarmedCaseRecordTests(unittest.TestCase):
+    """Reading the caption and citations off the opinion fetched behind it."""
+
+    def setUp(self):
+        self.got = []
+        self.app = _App()
+
+    def _describe(self, record, name="Roe"):
+        with mock.patch.dict(
+            "sys.modules",
+            {"opinion_db": mock.Mock(extract_record=lambda u, h: record)},
+        ):
+            self.app._describe_warmed_case(("u", "<html>"), name,
+                                           self.got.append)
+
+    def test_the_record_reaches_the_caller(self):
+        self._describe({"name": "Roe v. Wade", "cites": ["410 U.S. 113"]})
+        self.assertEqual(self.got[0]["name"], "Roe v. Wade")
+
+    def test_the_link_s_own_caption_fills_in_a_missing_one(self):
+        self._describe({"name": "", "cites": []}, name="Roe v. Wade")
+        self.assertEqual(self.got[0]["name"], "Roe v. Wade")
+
+    def test_a_page_with_no_record_reports_nothing(self):
+        self._describe(None)
+        self.assertEqual(self.got, [])
 
 
 class CitedCaseItemTests(unittest.TestCase):

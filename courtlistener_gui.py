@@ -393,17 +393,25 @@ def _style_ui_button(button, primary: bool = False) -> None:
         pass
 
 
-def _ui_mini_button(parent, text: str, command=None, width: int = 30):
+def _ui_mini_button(parent, text: str, command=None, width: int = 30,
+                    image=None):
     """A small, quiet toolbar button, for a strip where the ordinary
     full-height action button would dominate the window (the floating PDF
-    viewer's zoom controls)."""
+    viewer's zoom controls, and its save and print icons)."""
     if _CTK_AVAILABLE:
-        return ctk.CTkButton(
-            parent, text=text, command=command, width=width, height=22,
+        kwargs = dict(
+            text=text, command=command, width=width, height=22,
             corner_radius=6, font=_ui_font(12), fg_color=_UI["window"],
             hover_color=_UI["surface_alt"], text_color=_UI["text"],
             border_width=1, border_color=_UI["border"],
         )
+        if image is not None:
+            kwargs["image"] = image
+        return ctk.CTkButton(parent, **kwargs)
+    if image is not None:
+        # An icon button sizes itself to its artwork; a character width would
+        # only squeeze it.
+        return ttk.Button(parent, text=text, image=image, command=command)
     return ttk.Button(parent, text=text, command=command,
                       width=max(2, round(width / 9)))
 
@@ -1405,6 +1413,66 @@ def _case_tab_close_images(
         return close
 
     return image(hover=False), image(hover=True)
+
+
+_STRIP_ICON_W, _STRIP_ICON_H = 16, 14
+
+
+def _pdf_strip_icons(widget: tk.Misc, color: str = "#3f4650") -> dict:
+    """Save and print artwork for the floating PDF viewer's strip.
+
+    Drawn with Pillow — which the viewer already needs to put a page on screen
+    at all — at four times the size and reduced, so the strokes come out smooth
+    at 16px.  Returned as CTkImages where CustomTkinter is in use, so a
+    high-DPI display scales them; as ordinary PhotoImages otherwise.
+    """
+    from PIL import Image, ImageDraw
+
+    scale = 4
+    box = (_STRIP_ICON_W * scale, _STRIP_ICON_H * scale)
+
+    def start():
+        image = Image.new("RGBA", box, (0, 0, 0, 0))
+        return image, ImageDraw.Draw(image)
+
+    def sheet(draw, left, top, right, bottom) -> None:
+        """A page, outlined."""
+        draw.rectangle(
+            (left * scale, top * scale, right * scale, bottom * scale),
+            outline=color, width=scale,
+        )
+
+    # Save: an arrow coming down into a tray.
+    save, draw = start()
+    draw.rectangle((7 * scale, 0, 8.6 * scale, 6.5 * scale), fill=color)
+    draw.polygon([(3.5 * scale, 5.5 * scale), (12 * scale, 5.5 * scale),
+                  (7.8 * scale, 10.5 * scale)], fill=color)
+    draw.line([(2 * scale, 9 * scale), (2 * scale, 12.5 * scale),
+               (13.5 * scale, 12.5 * scale), (13.5 * scale, 9 * scale)],
+              fill=color, width=scale)
+
+    # Print: a sheet going into the machine, and one coming out below it.
+    printer, draw = start()
+    sheet(draw, 4.5, 0.5, 11, 4.5)
+    body = (1.5 * scale, 4.5 * scale, 14 * scale, 9 * scale)
+    try:
+        draw.rounded_rectangle(body, radius=1.2 * scale, fill=color)
+    except AttributeError:          # Pillow older than 8.2
+        draw.rectangle(body, fill=color)
+    sheet(draw, 4.5, 9, 11, 13)
+
+    def finish(image):
+        small = image.resize((_STRIP_ICON_W, _STRIP_ICON_H), Image.LANCZOS)
+        if _CTK_AVAILABLE:
+            try:
+                return ctk.CTkImage(
+                    light_image=small, size=(_STRIP_ICON_W, _STRIP_ICON_H))
+            except Exception:
+                pass
+        from PIL import ImageTk
+        return ImageTk.PhotoImage(small, master=widget)
+
+    return {"save": finish(save), "print": finish(printer)}
 
 
 from bluebook_names import (
@@ -6571,6 +6639,31 @@ class CourtListenerGUI:
             view._secondary_reopen = reopen
             view._secondary_owner = owner
 
+    def surface_case_view(self, key: str) -> bool:
+        """Bring an already-open view of *key* forward, if there is one.
+
+        What the case name on a floating PDF viewer's strip asks before
+        reopening anything: the reader may have been closed and reopened since,
+        or the reader may never have gone away."""
+        if not key:
+            return False
+        for entry in list(self._open_case_views.values()):
+            if entry.get("key") != key:
+                continue
+            owner = entry.get("owner")
+            surfacer = getattr(owner, "_surface_text_view", None)
+            alive = getattr(owner, "_text_view_alive", None)
+            # Only a view that is genuinely still on screen: asking a closed
+            # one to surface itself would send it back here.
+            if surfacer is None or alive is None or not alive():
+                continue
+            try:
+                surfacer()
+            except tk.TclError:
+                continue
+            return True
+        return False
+
     def _secondary_entry_for_view(self, view):
         return next((
             entry for entry in self._open_case_views.values()
@@ -8672,12 +8765,21 @@ class CourtListenerGUI:
             host = host.winfo_toplevel()
         except (AttributeError, tk.TclError):
             host = self.root
+        # What this case is called, for saving and printing.  The clicked
+        # citation and the link's own caption to begin with; the opinion text
+        # fetched below replaces them with the real caption, the parallel
+        # citations and the decision date a Bluebook filename is built from.
+        named = {"data": data, "url": url, "cite": cite, "name": name,
+                 "record": None}
         # Clicking the name on the strip should land on the text at once, so
         # the ordinary lookup is run now rather than when the reader asks.
-        self._warm_case_text(cite, name)
+        self._warm_case_text(cite, name,
+                             on_record=lambda rec: named.update(record=rec))
         try:
             window = _FloatingPdfWindow(
                 host, data, url, title, margin=margin, app=self,
+                on_save=lambda: self._save_cited_pdf(named, status),
+                on_print=lambda pane: self._print_cited_pdf(named, pane, status),
                 on_cite=lambda act, snip: self.open_cited_case_pdf(
                     host, act, snip, status,
                     fallback=lambda a=act, s=snip: _follow_brief_action(
@@ -8702,11 +8804,16 @@ class CourtListenerGUI:
     def _cited_pdf_window_closed(self, window) -> None:
         self._cited_pdf_windows.discard(window)
 
-    def _warm_case_text(self, cite: str, name: str) -> None:
+    def _warm_case_text(self, cite: str, name: str, on_record=None) -> None:
         """Fetch the cited opinion's text in the background, so the case name
         on the viewer's strip opens a page that is already in hand.  Uses the
         ordinary Google Scholar path, whose result is cached and saved to the
-        opinion database — which is exactly what the click then reads."""
+        opinion database — which is exactly what the click then reads.
+
+        ``on_record`` receives what that page says about the case — its
+        caption, its parallel citations, its court and its decision date — the
+        pieces a Bluebook filename is made of, which a citation and a link's
+        visible text cannot supply on their own."""
         if not cite or not _SCHOLAR_AVAILABLE:
             return
         try:
@@ -8719,12 +8826,127 @@ class CourtListenerGUI:
         def run() -> None:
             try:
                 for lookup_cite in _citation_search_variants(cite):
-                    if fetcher.fetch_by_citation(lookup_cite):
-                        return
+                    fetched = fetcher.fetch_by_citation(lookup_cite)
+                    if not fetched:
+                        continue
+                    if on_record is not None:
+                        self._describe_warmed_case(fetched, name, on_record)
+                    return
             except Exception as exc:
                 print(f"[cite-pdf] warming the text of {cite!r} failed: {exc}")
 
         threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _describe_warmed_case(fetched, name: str, on_record) -> None:
+        """Read the caption, citations and date off a fetched opinion page."""
+        try:
+            import opinion_db
+            page_url, html = fetched
+            record = opinion_db.extract_record(page_url, html)
+        except Exception as exc:
+            print(f"[cite-pdf] reading the fetched opinion failed: {exc}")
+            return
+        if not record:
+            return
+        if name and not record.get("name"):
+            record["name"] = name
+        try:
+            on_record(record)
+        except Exception as exc:
+            print(f"[cite-pdf] naming the case from its text failed: {exc}")
+
+    def _cited_filename_item(self, named: dict) -> dict:
+        """What to file a cited case's scan under.
+
+        The opinion text fetched in the background carries the caption, the
+        parallel citations, the court and the decision date that
+        :func:`_build_default_filename` turns into a Bluebook name.  Until it
+        arrives — or if it never does — the clicked citation and the caption
+        printed in the link stand in."""
+        record = named.get("record") or {}
+        cites = [str(c) for c in (record.get("cites") or []) if c]
+        if named.get("cite") and named["cite"] not in cites:
+            cites.append(named["cite"])
+        year = str(record.get("year") or "")
+        date_filed = str(record.get("date_filed") or "")
+        if not date_filed and year:
+            date_filed = f"{year}-01-01"
+        court = str(record.get("court") or "")
+        item = {
+            "caseName": record.get("name") or named.get("name") or "opinion",
+            "citation": cites,
+            "dateFiled": date_filed,
+            "court_id": court,
+            "court": court,
+        }
+        # A U.S. Reports scan is filed under the pages it actually prints.
+        if _is_us_reports_pdf(named.get("url") or ""):
+            us_cite = next(
+                (_normalized_us_cite(c) for c in cites
+                 if _normalized_us_cite(c)), "")
+            if us_cite:
+                item["_us_reports_cite"] = us_cite
+        return item
+
+    def _save_cited_pdf(self, named: dict, status=lambda _s: None) -> None:
+        """Save a cited case's scan, named the way the reader's own PDFs are."""
+        data = named.get("data")
+        if not data:
+            return
+        default = _build_default_filename(self._cited_filename_item(named))
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            initialfile=f"{default}.pdf",
+            title="Download Opinion PDF",
+            parent=self.root,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "wb") as fh:
+                fh.write(data)
+        except Exception as exc:
+            messagebox.showerror("Download PDF", str(exc), parent=self.root)
+            return
+        try:
+            status(f"Saved PDF to {path}")
+        except tk.TclError:
+            pass
+
+    def _print_cited_pdf(self, named: dict, pane=None,
+                         status=lambda _s: None) -> None:
+        """Print a cited case's scan — the rendering on screen, with a redacted
+        case.law scan whitened and re-lettered as the reader's own printing
+        does."""
+        data = named.get("data")
+        if not data:
+            return
+        url = named.get("url") or ""
+        item = self._cited_filename_item(named)
+        whiten = _is_redacted_case_pdf(url)
+        header = ""
+        if whiten:
+            try:
+                header = _case_law_print_citation(
+                    data, url, item=item, cite_hint=named.get("cite", ""),
+                    client=(self._get_client()
+                            if self._token_var.get().strip() else None))
+            except Exception as exc:
+                print(f"[cite-pdf] header citation failed: {exc}")
+        path = _named_temp_pdf_path(_build_default_filename(item))
+        try:
+            if pane is not None:
+                pane.export_pdf(path, whiten_redactions=whiten,
+                                header_cite=header)
+            else:
+                with open(path, "wb") as fh:
+                    fh.write(data)
+        except Exception:
+            with open(path, "wb") as fh:
+                fh.write(data)
+        _print_pdf_file(self.root, path, status)
 
     def _request_cited_pdf_analysis(self, window, data: bytes, url: str):
         """Give a cited case's viewer the same clickable citations and text
@@ -17022,7 +17244,8 @@ class _FloatingPdfWindow:
     def __init__(self, parent: tk.Misc, data: bytes, url: str, title: str,
                  *, margin: Optional[int] = None, app=None,
                  on_save=None, on_print=None, on_close=None,
-                 on_cite=None, on_cite_browser=None, on_open_text=None) -> None:
+                 on_cite=None, on_cite_browser=None, on_open_text=None,
+                 anchor: "Optional[tk.Misc]" = None) -> None:
         self._app = app
         self._on_save = on_save
         self._on_print = on_print
@@ -17039,10 +17262,14 @@ class _FloatingPdfWindow:
         self._analysed_url = ""   # the URL whose links/text layer are attached
         self._closing = False
 
+        # ``parent`` owns this window's lifetime — Tk destroys a toplevel with
+        # its master, so a viewer meant to outlive the reader that opened it is
+        # given the application's own root instead.  ``anchor`` is only where to
+        # put it on screen.
         self._win = _ui_toplevel(parent)
         _ensure_modern_ttk_styles(self._win)
         self._win.title(title or "PDF")
-        self._place_beside(parent)
+        self._place_beside(anchor if anchor is not None else parent)
         self._win.minsize(self._MIN_W, self._MIN_H)
 
         self._zoom_var = tk.StringVar(master=self._win, value="100%")
@@ -17119,8 +17346,8 @@ class _FloatingPdfWindow:
         return name if len(name) <= limit else name[:limit - 1].rstrip() + "…"
 
     def _build_bar(self) -> None:
-        """The one piece of chrome: zoom controls left, document name right,
-        a hairline under it and nothing else."""
+        """The one piece of chrome: save and print, then the zoom controls,
+        the document name at the right, a hairline under it and nothing else."""
         if _CTK_AVAILABLE:
             bar = ctk.CTkFrame(self._win, fg_color=_UI["surface"],
                                corner_radius=0, height=self._BAR_H)
@@ -17131,8 +17358,20 @@ class _FloatingPdfWindow:
             bar = tk.Frame(self._win, bg=_UI["surface"])
             bar.pack(side="top", fill="x")
         self._bar = bar
+        # Save and print lead the strip, as icons: the two things a reader does
+        # with a scan besides look at it.  Tk drops an image nothing refers to,
+        # so the artwork is kept on the window.
+        self._strip_icons = _pdf_strip_icons(bar)
+        save_btn = _ui_mini_button(bar, "", self._save, width=30,
+                                   image=self._strip_icons["save"])
+        save_btn.pack(side="left", padx=(8, 0), pady=4)
+        _HoverTip(save_btn, lambda: f"Save PDF As…   {_ACCEL}+S", delay=450)
+        print_btn = _ui_mini_button(bar, "", self._print, width=30,
+                                    image=self._strip_icons["print"])
+        print_btn.pack(side="left", padx=(4, 0), pady=4)
+        _HoverTip(print_btn, lambda: f"Print…   {_ACCEL}+P", delay=450)
         _ui_mini_button(bar, "−", lambda: self.zoom(-1)).pack(
-            side="left", padx=(8, 0), pady=4)
+            side="left", padx=(12, 0), pady=4)
         _ui_mini_button(bar, "+", lambda: self.zoom(+1)).pack(
             side="left", padx=(4, 0), pady=4)
         _ui_mini_button(bar, "Fit", lambda: self.zoom(0), width=38).pack(
@@ -18127,10 +18366,6 @@ class _ScholarTextWindow:
             )
         )
         self._win.minsize(430, 300)
-        # A floating PDF viewer belongs to this reader, so it closes with it.
-        # (Its own parent window is the shared tab window when tabs are on,
-        # which outlives a single tab.)
-        self._win.bind("<Destroy>", self._on_reader_destroyed, add="+")
         self._build_ui()
         if self._cl_primary:
             self._render_cl_blocks()
@@ -18257,6 +18492,9 @@ class _ScholarTextWindow:
 
         key = self._history_key()
         label = self._history_label()
+        # Kept so a floating PDF viewer that outlived this window can bring the
+        # text back — the same replay History uses, with no refetch.
+        self._history_reopen = reopen
         app.record_case_view(key, label, reopen, payload=payload)
         if hasattr(app, "register_case_window"):
             app.register_case_window(self, self._win, key, label, reopen)
@@ -25253,8 +25491,13 @@ class _ScholarTextWindow:
             win = self._pdf_float_win = None
         try:
             if win is None:
+                # Owned by the application, not by this reader: closing the
+                # text must leave the scan on screen (the case name on its
+                # strip opens the text again).  The reader is only where to
+                # put the window.
                 win = _FloatingPdfWindow(
-                    self._win.winfo_toplevel(), data, url, title,
+                    self._float_pdf_master(), data, url, title,
+                    anchor=self._float_pdf_anchor(),
                     margin=margin, app=self._app,
                     on_save=self._download_pdf,
                     on_print=self._print_pdf,
@@ -25264,6 +25507,9 @@ class _ScholarTextWindow:
                     on_open_text=self._surface_text_view,
                 )
                 self._pdf_float_win = win
+                holder = getattr(self._app, "_cited_pdf_windows", None)
+                if holder is not None:
+                    holder.add(win)     # nothing else holds it once we are gone
             elif not win.showing(url):
                 # Another reporter's scan chosen from the PDF ▾ menu replaces
                 # what the viewer holds; the same one is only re-surfaced.
@@ -25287,38 +25533,79 @@ class _ScholarTextWindow:
             data, url, lambda result, w=win: w.apply_analysis(result),
         )
 
+    def _float_pdf_master(self):
+        """The window that owns a floating viewer's lifetime: the application
+        root, so the viewer survives this reader being closed."""
+        app = self._app
+        root = getattr(app, "root", None) if app is not None else None
+        if root is not None:
+            return root
+        try:
+            return self._win.winfo_toplevel()
+        except (AttributeError, tk.TclError):
+            return self._win
+
+    def _float_pdf_anchor(self):
+        """The window a floating viewer opens beside — this reader."""
+        try:
+            return self._win.winfo_toplevel()
+        except (AttributeError, tk.TclError):
+            return None
+
+    def _text_view_alive(self) -> bool:
+        try:
+            return bool(self._win.winfo_exists())
+        except (AttributeError, tk.TclError):
+            return False
+
     def _surface_text_view(self) -> None:
-        """Bring this reader forward — what the case name on the floating
-        viewer's strip does when the PDF was opened from the text.  The text is
-        already here, so there is nothing to fetch and nothing to open."""
-        win = self._win
-        if isinstance(win, _CaseTabPage):
+        """Show this case's text — what the case name on the floating viewer's
+        strip does when the scan was opened from the reader.
+
+        Usually the reader is still on screen and is simply brought forward.
+        When it has since been closed — the viewer outlives it — the text is
+        opened again from the ingredients the History entry keeps, so it comes
+        back without being refetched."""
+        if self._text_view_alive():
+            win = self._win
+            if isinstance(win, _CaseTabPage):
+                try:
+                    win._manager.notebook.select(win)
+                    win._manager.surface()
+                except (AttributeError, tk.TclError):
+                    pass
+                return
             try:
-                win._manager.notebook.select(win)
-                win._manager.surface()
+                win.deiconify()
+                win.lift()
+                win.focus_force()
             except (AttributeError, tk.TclError):
                 pass
             return
+        app = self._app
+        if app is None:
+            return
+        # Another window may already be showing this case (the reader was
+        # reopened from History, or this is a second click).
         try:
-            win.deiconify()
-            win.lift()
-            win.focus_force()
-        except (AttributeError, tk.TclError):
-            pass
+            if app.surface_case_view(self._history_key()):
+                return
+        except Exception as exc:
+            print(f"[pdf-window] looking for the open text failed: {exc}")
+        reopen = getattr(self, "_history_reopen", None)
+        if reopen is None:
+            return
+        try:
+            reopen()
+        except Exception as exc:
+            print(f"[pdf-window] reopening the case text failed: {exc}")
 
     def _floating_pdf_closed(self, win) -> None:
         if self._pdf_float_win is win:
             self._pdf_float_win = None
-
-    def _on_reader_destroyed(self, event) -> None:
-        """Take the floating PDF viewer down with the reader that opened it.
-        A window's <Destroy> also reaches its descendants, so only the reader's
-        own host counts."""
-        if getattr(event, "widget", None) is not self._win:
-            return
-        win, self._pdf_float_win = self._pdf_float_win, None
-        if win is not None:
-            win.close()
+        holder = getattr(self._app, "_cited_pdf_windows", None)
+        if holder is not None:
+            holder.discard(win)
 
     def _show_pdf(self, data: bytes, url: str) -> None:
         if self._pdf_opens_in_separate_window():
@@ -25403,18 +25690,35 @@ class _ScholarTextWindow:
         self._apply_button_bar_compact()
         self._status_var.set("Showing the official PDF of the opinion.")
 
+    def _live_parent(self):
+        """A window to hang a dialog on.  This reader's own while it is open —
+        but a floating PDF viewer outlives it, and Save and Print still work
+        from there, so the application root stands in once it has closed."""
+        if self._text_view_alive():
+            return self._win
+        root = getattr(self._app, "root", None) if self._app is not None else None
+        return root if root is not None else self._win
+
+    def _safe_status(self, text: str) -> None:
+        """Report progress, if there is still a status bar to report it to."""
+        try:
+            self._status_var.set(text)
+        except tk.TclError:
+            pass
+
     def _download_pdf(self) -> None:
         """Save the original PDF currently being viewed."""
         data = getattr(self, "_pdf_bytes", None)
         if not data:
             return
+        parent = self._live_parent()
         default = _build_default_filename(self._pdf_filename_item())
         path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
             initialfile=f"{default}.pdf",
             title="Download Opinion PDF",
-            parent=self._win,
+            parent=parent,
         )
         if not path:
             return
@@ -25422,9 +25726,9 @@ class _ScholarTextWindow:
             with open(path, "wb") as fh:
                 fh.write(data)
         except Exception as exc:
-            messagebox.showerror("Download PDF", str(exc), parent=self._win)
+            messagebox.showerror("Download PDF", str(exc), parent=parent)
             return
-        self._status_var.set(f"Saved PDF to {path}")
+        self._safe_status(f"Saved PDF to {path}")
 
     def _print_pdf(self, pane: "Optional[_PdfPane]" = None) -> None:
         """Print the PDF currently being viewed — the re-spaced/centered
@@ -25465,7 +25769,7 @@ class _ScholarTextWindow:
         except Exception:
             with open(path, "wb") as fh:
                 fh.write(data)
-        _print_pdf_file(self._win, path, self._status_var.set)
+        _print_pdf_file(self._live_parent(), path, self._safe_status)
 
     def _open_pdf_cite(self, action: tuple, snippet: str) -> None:
         """Follow a citation clicked on a page of the PDF.  A reader working
@@ -25475,15 +25779,15 @@ class _ScholarTextWindow:
         if self._app is None:
             _open_citation_in_browser(action, snippet)
             return
+        parent = self._live_parent()
         opened = self._app.open_cited_case_pdf(
-            self._win, action, snippet, self._status_var.set,
+            parent, action, snippet, self._safe_status,
             fallback=lambda: _follow_brief_action(
-                self._app, self._win, action, self._status_var.set,
-                snippet=snippet),
+                self._app, parent, action, self._safe_status, snippet=snippet),
         )
         if not opened:      # not a case citation — a statute, a rule, a docket
-            _follow_brief_action(self._app, self._win, action,
-                                 self._status_var.set, snippet=snippet)
+            _follow_brief_action(self._app, parent, action,
+                                 self._safe_status, snippet=snippet)
 
     def _open_pdf_cite_browser(self, action: tuple, snippet: str) -> None:
         _open_citation_in_browser(action, snippet)
