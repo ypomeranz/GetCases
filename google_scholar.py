@@ -1937,7 +1937,8 @@ class GoogleScholarFetcher:
         return url
 
     def search_cases(
-        self, query: str, limit: int = 10, courts=None,
+        self, query: str, limit: int = 10, courts=None, *,
+        allow_db_fallback: bool = True,
     ) -> list["ScholarResult"]:
         """
         Search Scholar case law and return parsed results: title, case URL,
@@ -1948,6 +1949,9 @@ class GoogleScholarFetcher:
         unreachable or blocking the IP (the request raises, or the results page
         comes back empty), the search falls back to the local opinion database
         so an already-collected corpus still answers the query offline.
+        ``allow_db_fallback=False`` returns only rows actually found on the
+        Google results page; callers inspecting that page's parallel citations
+        use it so a local record cannot masquerade as a fresh Scholar result.
         """
         selected_courts = tuple(sorted({
             str(court).strip().lower() for court in (courts or ()) if court
@@ -1972,7 +1976,7 @@ class GoogleScholarFetcher:
             except Exception as exc:
                 print(f"[scholar] search request failed: {exc}")
                 results = []
-        if not results:
+        if not results and allow_db_fallback:
             # Scholar gave us nothing (blocked, rate-limited, or a genuine
             # miss): serve candidates from the local opinion database instead.
             # These are deliberately not cached, so a later online search —
@@ -1986,6 +1990,8 @@ class GoogleScholarFetcher:
                     f"{len(db_results)} result(s) from the local opinion database"
                 )
             return db_results
+        if not results:
+            return []
         self._search_cache[key] = results
         return results[:limit]
 

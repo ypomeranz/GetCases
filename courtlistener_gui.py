@@ -3730,6 +3730,365 @@ def _us_reports_cite_via_courtlistener(
     return None
 
 
+def _more_than_four_years_old(
+    item: dict, today: Optional[_dt.date] = None,
+) -> bool:
+    """Whether *item* was decided strictly more than four years ago.
+
+    A complete filing date is preferred.  A bare year is usable only when even
+    December 31 of that year is beyond the cutoff, which keeps a case near the
+    four-year boundary out of this comparatively expensive fallback.
+    """
+    current = today or _dt.date.today()
+    try:
+        cutoff = current.replace(year=current.year - 4)
+    except ValueError:  # February 29
+        cutoff = current.replace(year=current.year - 4, day=28)
+    raw = str(
+        item.get("dateFiled") or item.get("date_filed")
+        or item.get("decision_date") or item.get("year") or ""
+    ).strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw[:10]):
+            return _dt.date.fromisoformat(raw[:10]) < cutoff
+        if re.fullmatch(r"\d{4}", raw):
+            return _dt.date(int(raw), 12, 31) < cutoff
+    except ValueError:
+        pass
+    return False
+
+
+def _us_reports_cite_from_scholar_parallel(
+    fetcher, case_name: str, sct_cite: str,
+) -> Optional[str]:
+    """Inspect the initial Google Scholar results page for a parallel U.S. cite.
+
+    The result must itself bear the requested S. Ct. cite and have a close case
+    name.  The snippet is deliberately excluded because it can quote unrelated
+    authorities; Scholar prints a result's parallel citations in its title or
+    green byline.
+    """
+    if fetcher is None or not case_name or not sct_cite:
+        return None
+    clean_name = re.sub(r"<[^>]+>", " ", case_name)
+    clean_name = re.sub(r"\s+", " ", clean_name).strip()
+    query = f'{clean_name} "{sct_cite}"'
+    try:
+        results = fetcher.search_cases(
+            query,
+            limit=10,
+            courts={_SCOTUS_COURT_ID},
+            allow_db_fallback=False,
+        )
+    except Exception as exc:
+        print(f"[resolve] Google Scholar parallel-cite search failed: {exc}")
+        return None
+    for result in results:
+        title = re.sub(r"<[^>]+>", " ", str(getattr(result, "title", "") or ""))
+        source = re.sub(r"<[^>]+>", " ", str(getattr(result, "source", "") or ""))
+        try:
+            bears_sct = _scholar_bears_citation(result, sct_cite)
+        except Exception:
+            bears_sct = bool(
+                _SCT_CITE_RE.search(f"{title} ; {source}")
+                and re.sub(r"\s+", "", sct_cite).lower()
+                in re.sub(r"\s+", "", f"{title} ; {source}").lower()
+            )
+        if not bears_sct:
+            continue
+        if _name_match_score(clean_name, title) < _NAME_MATCH_MIN:
+            continue
+        us_cite = _normalized_us_cite(f"{title} ; {source}")
+        if us_cite:
+            print(
+                f"[resolve] Google Scholar parallel cite for "
+                f"{sct_cite}: {us_cite}"
+            )
+            return us_cite
+    return None
+
+
+_OPINION_API_ID_RE = re.compile(r"/opinions/(\d+)/?")
+
+
+def _opinion_id(value) -> Optional[int]:
+    """An opinion API id from an integer, record, or API URL."""
+    if isinstance(value, dict):
+        value = value.get("id") or value.get("resource_uri") or value.get("url")
+    try:
+        if isinstance(value, int) or str(value).isdigit():
+            return int(value)
+    except (TypeError, ValueError):
+        return None
+    match = _OPINION_API_ID_RE.search(str(value or ""))
+    return int(match.group(1)) if match else None
+
+
+def _cited_opinion_ids(
+    client, item: dict, case_name: str, sct_cite: str,
+) -> list[int]:
+    """Opinion ids for the target cluster, for CourtListener's ``cites`` field."""
+    ids: list[int] = []
+
+    def add(value) -> None:
+        opinion_id = _opinion_id(value)
+        if opinion_id is not None and opinion_id not in ids:
+            ids.append(opinion_id)
+
+    opinions = item.get("opinions") or []
+    if isinstance(opinions, dict):
+        opinions = [opinions]
+    # Combined/lead opinions are the citation-graph target most often.  Keep
+    # every writing as a fallback because some citations point to a separate
+    # lead opinion rather than the cluster's combined document.
+    type_priority = {
+        "combined-opinion": 0, "010combined": 0,
+        "lead-opinion": 1, "020lead": 1,
+        "unanimous-opinion": 2, "plurality-opinion": 3,
+    }
+    for opinion in sorted(
+        (op for op in opinions if isinstance(op, dict)),
+        key=lambda op: type_priority.get(str(op.get("type") or ""), 9),
+    ):
+        add(opinion)
+
+    cluster_id = item.get("cluster_id")
+    if not cluster_id:
+        try:
+            matched = _cl_item_for_citation(client, sct_cite, name=case_name)
+        except Exception:
+            matched = None
+        cluster_id = (matched or {}).get("cluster_id")
+    if cluster_id:
+        try:
+            cluster = client.get_cluster(
+                int(cluster_id), fields="sub_opinions",
+            )
+            for opinion in cluster.get("sub_opinions") or []:
+                add(opinion)
+        except Exception as exc:
+            print(
+                f"[resolve] citing-opinion target cluster fetch failed: {exc}"
+            )
+    return ids
+
+
+def _target_name_near_citation(
+    text: str, cite_start: int, case_name: str,
+) -> bool:
+    """Whether a short-form target name appears just before a reporter cite."""
+    context = text[max(0, cite_start - 180):cite_start]
+    # A semicolon separates authorities in a citation string; a target name on
+    # its left cannot identify the U.S. cite belonging to the case on its right.
+    context = context.rsplit(";", 1)[-1]
+    context_tokens = set(_name_tokens(context))
+    parties = _name_parties(case_name)
+    if not parties or not context_tokens:
+        return False
+    distinctive = [party for party in parties if not _is_common_party(party)]
+    if distinctive:
+        return any(
+            _party_overlap(party, context_tokens) >= 0.6
+            for party in distinctive
+        )
+    return all(
+        _party_overlap(party, context_tokens) >= 0.6 for party in parties
+    )
+
+
+def _us_reports_cite_in_citing_text(
+    text: str, case_name: str, sct_cite: str,
+) -> Optional[str]:
+    """Recover the target's U.S. cite from one later citing opinion.
+
+    A parallel citation beside the exact S. Ct. cite is strongest.  Later
+    opinions often drop the S. Ct. reporter entirely, so a U.S. cite preceded
+    by a recognizable short form of the target case name is also accepted.
+    """
+    plain = _html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    plain = re.sub(r"\s+", " ", plain)
+    sct_match = _SCT_CITE_RE.search(sct_cite or "")
+    target_sct = (
+        (sct_match.group(0) if sct_match else sct_cite).strip()
+    )
+    target_sct_key = re.sub(r"[\W_]+", "", target_sct).lower()
+    sct_occurrences = [
+        match for match in _SCT_CITE_RE.finditer(plain)
+        if re.sub(r"[\W_]+", "", match.group(0)).lower() == target_sct_key
+    ]
+    us_occurrences = list(_US_CITE_RE.finditer(plain))
+
+    for sct in sct_occurrences:
+        nearby: list[tuple[int, re.Match]] = []
+        for us in us_occurrences:
+            if us.end() <= sct.start():
+                gap = plain[us.end():sct.start()]
+            elif sct.end() <= us.start():
+                gap = plain[sct.end():us.start()]
+            else:
+                gap = ""
+            distance = min(
+                abs(us.end() - sct.start()),
+                abs(sct.end() - us.start()),
+            )
+            if distance <= 220 and ";" not in gap:
+                nearby.append((distance, us))
+        if nearby:
+            match = min(nearby, key=lambda row: row[0])[1]
+            return f"{match.group(1)} U.S. {match.group(2)}"
+
+    for us in us_occurrences:
+        if _target_name_near_citation(plain, us.start(), case_name):
+            return f"{us.group(1)} U.S. {us.group(2)}"
+    return None
+
+
+def _result_opinion_ids(
+    result: dict, target_ids: set[int],
+) -> list[int]:
+    """Citing sub-opinions in a CourtListener search result, best first."""
+    matching: list[int] = []
+    other: list[int] = []
+    opinions = result.get("opinions") or []
+    if isinstance(opinions, dict):
+        opinions = [opinions]
+    for opinion in opinions:
+        if not isinstance(opinion, dict):
+            continue
+        opinion_id = _opinion_id(opinion)
+        if opinion_id is None:
+            continue
+        raw_cites = opinion.get("cites") or []
+        cited = {
+            int(value) for value in raw_cites
+            if str(value).isdigit()
+        }
+        bucket = matching if cited & target_ids else other
+        if opinion_id not in bucket:
+            bucket.append(opinion_id)
+    return matching + other
+
+
+def _next_search_cursor(next_url: str) -> Optional[str]:
+    """Cursor query value from a CourtListener search response's next URL."""
+    if not next_url:
+        return None
+    parsed = urllib.parse.urlparse(next_url)
+    return urllib.parse.parse_qs(parsed.query).get("cursor", [None])[0]
+
+
+def _us_reports_cite_from_citing_opinions(
+    client, item: dict, case_name: str, sct_cite: str, *,
+    batch_size: int = 10, limit: int = 50,
+) -> Optional[str]:
+    """Check at most 50 CourtListener citing cases, ten at a time.
+
+    The citation graph is queried through the search API's ``cites`` field.
+    Within every ten-result page, the most recent case is loaded first.  Each
+    full citing opinion is inspected until it supplies the target's U.S.
+    Reports citation, or five pages / 50 unique citing cases are exhausted.
+    """
+    if client is None or not case_name or not sct_cite:
+        return None
+    target_ids = _cited_opinion_ids(client, item, case_name, sct_cite)
+    if not target_ids:
+        return None
+    target_set = set(target_ids)
+    terms = [f"cites:{opinion_id}" for opinion_id in target_ids]
+    query = terms[0] if len(terms) == 1 else f"({' OR '.join(terms)})"
+    cursor = None
+    seen_cursors: set[str] = set()
+    seen_results: set[str] = set()
+    checked = 0
+
+    while checked < limit:
+        try:
+            data = client.search(
+                query,
+                type="o",
+                cursor=cursor,
+                page_size=batch_size,
+                extra={"order_by": "dateFiled desc"},
+            )
+        except Exception as exc:
+            print(f"[resolve] CourtListener citing-opinion search failed: {exc}")
+            return None
+        batch = list(data.get("results") or [])[:batch_size]
+        batch.sort(
+            key=lambda result: str(
+                result.get("dateFiled") or result.get("date_filed") or ""
+            ),
+            reverse=True,
+        )
+        for result in batch:
+            result_key = str(
+                result.get("cluster_id") or result.get("id")
+                or tuple(_result_opinion_ids(result, target_set))
+            )
+            if result_key in seen_results:
+                continue
+            seen_results.add(result_key)
+            checked += 1
+            for opinion_id in _result_opinion_ids(result, target_set):
+                try:
+                    text = client.get_opinion_text(opinion_id)
+                except Exception as exc:
+                    print(
+                        f"[resolve] citing opinion {opinion_id} fetch failed: "
+                        f"{exc}"
+                    )
+                    continue
+                us_cite = _us_reports_cite_in_citing_text(
+                    text, case_name, sct_cite,
+                )
+                if us_cite:
+                    print(
+                        f"[resolve] citing opinion {opinion_id} supplied "
+                        f"{sct_cite} -> {us_cite}"
+                    )
+                    return us_cite
+            if checked >= limit:
+                break
+        next_cursor = _next_search_cursor(str(data.get("next") or ""))
+        if (
+            checked >= limit or not batch or not next_cursor
+            or next_cursor in seen_cursors
+        ):
+            break
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    return None
+
+
+def _late_scotus_us_reports_cite(
+    client, fetcher, item: dict, cites: list[str], *,
+    today: Optional[_dt.date] = None,
+) -> Optional[str]:
+    """Run the expensive old-SCOTUS citation fallback in its required order."""
+    if any(_US_CITE_RE.search(cite) for cite in cites):
+        return None
+    sct_cite = next(
+        (cite for cite in cites if _SCT_CITE_RE.search(cite)), None,
+    )
+    if not sct_cite or not _more_than_four_years_old(item, today=today):
+        return None
+    case_name = re.sub(
+        r"<[^>]+>", " ",
+        str(item.get("caseName") or item.get("case_name") or ""),
+    )
+    case_name = re.sub(r"\s+", " ", case_name).strip()
+    if not case_name:
+        return None
+    scholar_cite = _us_reports_cite_from_scholar_parallel(
+        fetcher, case_name, sct_cite,
+    )
+    if scholar_cite:
+        return scholar_cite
+    return _us_reports_cite_from_citing_opinions(
+        client, item, case_name, sct_cite,
+    )
+
+
 def _cl_item_for_name(client, name: str) -> Optional[dict]:
     """Resolve a case *name* to the best-matching CourtListener cluster as a
     search-result-shaped item (or None).  The fallback for locating a cited case
@@ -9753,6 +10112,10 @@ class CourtListenerGUI:
         7. If the sparse saved record had no CourtListener ids, resolve it on
            CourtListener by citation or by SCOTUS name + year/docket and retry
            that matched cluster's PDF fields.
+        8. For a SCOTUS decision more than four years old, inspect Google
+           Scholar's initial result-page parallel citations, then up to 50
+           CourtListener citing cases (ten at a time, newest first) for a
+           missing U.S. Reports cite and retry the official-report PDF paths.
         """
         storage_base = "https://storage.courtlistener.com/"
         item.pop("_case_law_pdf_choices", None)
@@ -9833,7 +10196,8 @@ class CourtListenerGUI:
                 return loc_url
             return None
 
-        for cite in all_cites:
+        def _try_official_us_reports(cite: str) -> Optional[str]:
+            """Try every official-report source for one U.S. citation."""
             m = _US_CITE_RE.search(cite)
             loc_preferred = bool(m) and int(m.group(1)) <= _LOC_PREFERRED_MAX
             sources = (
@@ -9856,6 +10220,12 @@ class CourtListenerGUI:
                 url = local_pdf.as_uri()
                 print(f"[resolve] using local US Reports volume: {url}")
                 item["_us_reports_cite"] = _normalized_us_cite(cite)
+                return url
+            return None
+
+        for cite in all_cites:
+            url = _try_official_us_reports(cite)
+            if url is not None:
                 return url
 
         # 0.5. Non-SCOTUS: the Harvard CAP static.case.law copy.  Try every
@@ -9962,6 +10332,32 @@ class CourtListenerGUI:
                         "[resolve] using PDF from metadata-matched "
                         "CourtListener cluster"
                     )
+                    return url
+
+            # 8. Older S. Ct.-only decisions sometimes acquire a U.S. Reports
+            # cite years after Scholar and CourtListener created their target
+            # records.  Once every ordinary PDF and slip-opinion path has
+            # missed, recover that cite from Scholar's result page or from
+            # later citing opinions, then retry only the official-report paths.
+            fetcher = None
+            if _SCHOLAR_AVAILABLE:
+                try:
+                    fetcher = self._get_scholar()
+                except Exception as exc:
+                    print(
+                        "[resolve] Google Scholar fallback unavailable: "
+                        f"{exc}"
+                    )
+            recovered_us = _late_scotus_us_reports_cite(
+                client, fetcher, item, all_cites,
+            )
+            if recovered_us:
+                print(
+                    "[resolve] late U.S. Reports cite recovered: "
+                    f"{recovered_us}"
+                )
+                url = _try_official_us_reports(recovered_us)
+                if url is not None:
                     return url
 
         return None
