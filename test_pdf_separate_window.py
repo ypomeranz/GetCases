@@ -335,6 +335,7 @@ class _Reader:
         self.refreshed = 0
         self.errors = []
         self.analysis_requests = []
+        self.surfaced_text = 0
         for name in ("_pdf_opens_in_separate_window", "_show_pdf_floating",
                      "_show_pdf", "_floating_pdf_closed",
                      "_on_reader_destroyed"):
@@ -369,6 +370,9 @@ class _Reader:
 
     def _open_pdf_cite_browser(self, action, snippet):
         pass
+
+    def _surface_text_view(self):
+        self.surfaced_text += 1
 
 
 class RoutingTests(unittest.TestCase):
@@ -407,6 +411,8 @@ class FloatingHandoffTests(unittest.TestCase):
         self.assertEqual(kw["on_print"], reader._print_pdf)
         self.assertEqual(kw["on_cite"], reader._open_pdf_cite)
         self.assertEqual(kw["on_close"], reader._floating_pdf_closed)
+        # The case name on the strip goes back to the text this PDF came from.
+        self.assertEqual(kw["on_open_text"], reader._surface_text_view)
 
     def test_it_opens_off_the_reader_s_own_os_window(self):
         # In tabbed mode the reader is a notebook page, which cannot parent a

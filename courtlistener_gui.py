@@ -5994,6 +5994,9 @@ class CourtListenerGUI:
         self._pdf_separate_var = tk.BooleanVar(
             master=self.root, value=self._pdf_separate_window
         )
+        # Viewers opened by following a citation inside a PDF; they belong to
+        # no reader, so the app holds them until they are closed.
+        self._cited_pdf_windows: set = set()
 
         # Recently viewed cases, most recent first, for the "History ▾"
         # dropdown every case window carries: {"key", "label", "reopen"}.
@@ -8555,6 +8558,204 @@ class CourtListenerGUI:
 
         self._post_root(open_pdf)
 
+    # ------------------------------------------------------------------
+    # Following a citation clicked inside a PDF
+    # ------------------------------------------------------------------
+
+    def open_cited_case_pdf(self, parent: tk.Misc, action: tuple,
+                            snippet: str = "",
+                            status=lambda _s: None, fallback=None) -> bool:
+        """Follow a citation clicked *inside a PDF* to the cited case's own
+        PDF, in a viewer window of its own.
+
+        Reading a scan and clicking through it, the reader is after the cited
+        opinion as it was printed — so the scan is looked for first, by the
+        routes the PDF button already uses (see ``_resolve_pdf_url``): the
+        official U.S. Reports scan whenever a U.S. cite is known — including
+        one recovered through CourtListener's parallel citations from a
+        Supreme Court Reporter or nominative cite — the Harvard
+        static.case.law scan for everything else, supremecourt.gov's
+        slip-opinion archive for a decision too recent to be in any reporter
+        (matched on its docket), and CourtListener's own stored copy last.
+
+        ``fallback`` runs when none of them has a scan, so a citation with no
+        PDF anywhere opens as text exactly as clicking it always did.  Returns
+        whether the lookup was started; it finishes on a worker thread.
+        """
+        kind, value = action if isinstance(action, tuple) else ("", "")
+        if kind != "cite":
+            return False
+        cite, _, pin = str(value).partition("@")
+        cite = cite.strip()
+        if not cite:
+            return False
+        name = _citation_link_name(snippet, cite)
+        client = self._get_client() if self._token_var.get().strip() else None
+
+        def safe_status(text: str) -> None:
+            try:
+                status(text)
+            except tk.TclError:
+                pass
+
+        def give_up(reason: str) -> None:
+            safe_status(reason)
+            if fallback is not None:
+                try:
+                    fallback()
+                except tk.TclError:
+                    pass
+
+        label = name or cite
+        safe_status(f"Looking for a PDF of {label}…")
+
+        def run() -> None:
+            url = ""
+            try:
+                item = self._cited_case_pdf_item(client, cite, name)
+                url = self._resolve_pdf_url(client, item) or ""
+            except Exception as exc:
+                print(f"[cite-pdf] resolving {cite!r} failed: {exc}")
+            fetched = None
+            if url:
+                try:
+                    fetched = _fetch_pdf_bytes(url, client=client, timeout=30)
+                except Exception as exc:
+                    print(f"[cite-pdf] fetching {url} failed: {exc}")
+            if fetched is None:
+                self._post_root(
+                    lambda: give_up(f"No PDF found for {label} — "
+                                    "opening the text instead."))
+                return
+            data, final_url = fetched
+            self._post_root(
+                lambda: self._show_cited_case_pdf(
+                    parent, data, final_url, cite, pin, name, action,
+                    snippet, safe_status,
+                )
+            )
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def _cited_case_pdf_item(self, client, cite: str, name: str) -> dict:
+        """A search-result-shaped record for a cited case, good enough for the
+        PDF resolver.  CourtListener's own cluster at this citation when it has
+        one — it carries the court, the decision date, the docket number and
+        the parallel U.S. Reports cite the official scan is keyed on — else the
+        citation and the case name alone."""
+        item: dict = {}
+        if client is not None:
+            try:
+                item = dict(_cl_item_for_citation(client, cite, name=name) or {})
+            except Exception as exc:
+                print(f"[cite-pdf] CourtListener lookup for {cite!r}: {exc}")
+        cites = [str(c) for c in (item.get("citation") or [])]
+        # The cite as printed, and — for an old nominative cite — its modern
+        # U.S. Reports form, which is what the official scans are filed under.
+        for extra in (cite, _us_reports_cite(cite) or ""):
+            if extra and extra not in cites:
+                cites.append(extra)
+        item["citation"] = cites
+        if name and not (item.get("caseName") or item.get("case_name")):
+            item["caseName"] = name
+        return item
+
+    def _show_cited_case_pdf(self, parent, data: bytes, url: str, cite: str,
+                             pin: str, name: str, action: tuple,
+                             snippet: str, status) -> None:
+        """Put a cited case's scan on screen, with its text warming behind it."""
+        title = f"{name} — {cite}" if name and cite else (cite or name or "PDF")
+        margin = _PdfPane._MARGIN * 3 if _is_us_reports_pdf(url) else None
+        host = self.root if parent is None else parent
+        try:
+            host = host.winfo_toplevel()
+        except (AttributeError, tk.TclError):
+            host = self.root
+        # Clicking the name on the strip should land on the text at once, so
+        # the ordinary lookup is run now rather than when the reader asks.
+        self._warm_case_text(cite, name)
+        try:
+            window = _FloatingPdfWindow(
+                host, data, url, title, margin=margin, app=self,
+                on_cite=lambda act, snip: self.open_cited_case_pdf(
+                    host, act, snip, status,
+                    fallback=lambda a=act, s=snip: _follow_brief_action(
+                        self, host, a, status, snippet=s),
+                ),
+                on_cite_browser=_open_citation_in_browser,
+                on_open_text=lambda: _follow_brief_action(
+                    self, host, action, status, snippet=snippet),
+                on_close=self._cited_pdf_window_closed,
+            )
+        except Exception as exc:
+            status(f"Could not show the PDF of {cite}: {exc}")
+            return
+        self._cited_pdf_windows.add(window)
+        window.surface()
+        status(f"Showing the PDF of {cite}"
+               + (f" at {_pin_display(pin)}" if pin else "") + ".")
+        key = self._request_cited_pdf_analysis(window, data, url)
+        if key is None:
+            return
+
+    def _cited_pdf_window_closed(self, window) -> None:
+        self._cited_pdf_windows.discard(window)
+
+    def _warm_case_text(self, cite: str, name: str) -> None:
+        """Fetch the cited opinion's text in the background, so the case name
+        on the viewer's strip opens a page that is already in hand.  Uses the
+        ordinary Google Scholar path, whose result is cached and saved to the
+        opinion database — which is exactly what the click then reads."""
+        if not cite or not _SCHOLAR_AVAILABLE:
+            return
+        try:
+            fetcher = self._get_scholar()
+        except Exception:
+            fetcher = None
+        if fetcher is None:
+            return
+
+        def run() -> None:
+            try:
+                for lookup_cite in _citation_search_variants(cite):
+                    if fetcher.fetch_by_citation(lookup_cite):
+                        return
+            except Exception as exc:
+                print(f"[cite-pdf] warming the text of {cite!r} failed: {exc}")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _request_cited_pdf_analysis(self, window, data: bytes, url: str):
+        """Give a cited case's viewer the same clickable citations and text
+        search the opinion reader's PDFs get."""
+        def run() -> None:
+            pages: list = []
+            italics: list = []
+            links: dict = {}
+            quiet: set = set()
+            sections: list = []
+            try:
+                pages, italics = _extract_pdf_text_and_style(data)
+            except Exception as exc:
+                print(f"[cite-pdf] text extraction failed: {exc}")
+            if any(pages or []):
+                try:
+                    links, quiet = _citation_links_from_visible_pdf_text(
+                        data, pages, italics)
+                except Exception as exc:
+                    print(f"[cite-pdf] citation scan failed: {exc}")
+                try:
+                    sections = slip_opinion.detect_sections(pages)
+                except Exception as exc:
+                    print(f"[cite-pdf] section detection failed: {exc}")
+            result = {"url": url, "pages": pages, "links": links,
+                      "quiet": quiet, "sections": sections}
+            self._post_root(lambda: window.apply_analysis(result))
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
     def _try_open_citation(self, name: str, cite: str, pin: str,
                            fetcher, client, prefetch_pdf: bool = True,
                            view_parent: "Optional[tk.Misc]" = None) -> bool:
@@ -10210,7 +10411,13 @@ class CourtListenerGUI:
         """
         storage_base = "https://storage.courtlistener.com/"
         item.pop("_case_law_pdf_choices", None)
-        item.pop("_us_reports_cite", None)
+        # A U.S. Reports cite the caller already holds — saved beside the
+        # opinion in the database, or printed in its header.  Every official
+        # report path keys on one, so this is tried before anything goes
+        # looking for a cite on CourtListener or Google Scholar.
+        given_us_cite = _normalized_us_cite(
+            str(item.pop("_us_reports_cite", "") or "")
+        )
         skip_metadata_fallback = bool(
             item.get("_skip_pdf_metadata_fallback")
         )
@@ -10249,59 +10456,6 @@ class CourtListenerGUI:
             except Exception as exc:
                 print(f"[resolve] {label} check failed ({exc}): {url}")
             return False
-
-        # ``_pdf_item`` normally folds these in before starting the worker.
-        # Repeat the lightweight read here so an opinion-database load that
-        # completed in the meantime is still honored by this resolution pass.
-        scholar_id = str(item.get("scholar_id") or "").strip()
-        if scholar_id:
-            try:
-                db = self._get_opinion_db()
-                saved_cites = (
-                    db.stored_citations(scholar_id) if db is not None else []
-                )
-                raw_cites = item.get("citation") or []
-                merged_cites = (
-                    list(raw_cites)
-                    if isinstance(raw_cites, (list, tuple))
-                    else [raw_cites]
-                )
-                for cite in saved_cites:
-                    if cite not in merged_cites:
-                        merged_cites.append(cite)
-                if merged_cites:
-                    item["citation"] = merged_cites
-            except Exception as exc:
-                print(f"[db] loading saved parallel citations failed: {exc}")
-
-        # Gather EVERY citation we know — the search result often exposes only
-        # one (frequently a nominative reporter like "19 How. 393"), while the
-        # parallel U.S./F. cite that finds a PDF lives on the cluster record.
-        all_cites = _gather_all_citations(client, item)
-        print(f"[resolve] citations to try: {all_cites}")
-        known_us = next(
-            (_normalized_us_cite(cite) for cite in all_cites
-             if _normalized_us_cite(cite)),
-            "",
-        )
-        if known_us:
-            _remember_us_reports_cite(known_us)
-
-        # A SCOTUS opinion opened from Google Scholar sometimes carries only its
-        # Supreme Court Reporter ("S. Ct.") cite, not the "U.S." cite every
-        # official-PDF path below keys on.  Ask CourtListener whether that
-        # S. Ct. cite has a parallel U.S. Reports cite and, if so, try it too —
-        # that's what lets "PDF" reach the official opinion scan.
-        is_scotus = is_scotus or any(
-            _US_CITE_RE.search(c) or _SCT_CITE_RE.search(c)
-            for c in all_cites
-        )
-        us_from_sct = _us_reports_cite_via_courtlistener(client, all_cites)
-        if us_from_sct and us_from_sct not in all_cites:
-            print(f"[resolve] S. Ct. cite resolved to U.S. Reports cite: "
-                  f"{us_from_sct}")
-            all_cites.append(us_from_sct)
-            _remember_us_reports_cite(us_from_sct)
 
         # 0. Official US Reports PDF — try every U.S.-Reports cite among them.
         #    For vols 1-501 the LOC (Library of Congress) CDN scan is preferred,
@@ -10356,6 +10510,71 @@ class CourtListenerGUI:
                 _remember_us_reports_cite(cite)
                 return url
             return None
+
+        # A U.S. Reports cite the caller already holds is tried before any
+        # network lookup at all: it is what every official-report path keys on,
+        # and it came from the opinion's own record.  Only when it finds
+        # nothing does the search below — the cluster's parallel cites, then
+        # CourtListener and Google Scholar — get a turn.
+        if given_us_cite:
+            print(f"[resolve] trying the known U.S. Reports cite first: "
+                  f"{given_us_cite}")
+            url = _try_official_us_reports(given_us_cite)
+            if url is not None:
+                return url
+
+        # ``_pdf_item`` normally folds these in before starting the worker.
+        # Repeat the lightweight read here so an opinion-database load that
+        # completed in the meantime is still honored by this resolution pass.
+        scholar_id = str(item.get("scholar_id") or "").strip()
+        if scholar_id:
+            try:
+                db = self._get_opinion_db()
+                saved_cites = (
+                    db.stored_citations(scholar_id) if db is not None else []
+                )
+                raw_cites = item.get("citation") or []
+                merged_cites = (
+                    list(raw_cites)
+                    if isinstance(raw_cites, (list, tuple))
+                    else [raw_cites]
+                )
+                for cite in saved_cites:
+                    if cite not in merged_cites:
+                        merged_cites.append(cite)
+                if merged_cites:
+                    item["citation"] = merged_cites
+            except Exception as exc:
+                print(f"[db] loading saved parallel citations failed: {exc}")
+
+        # Gather EVERY citation we know — the search result often exposes only
+        # one (frequently a nominative reporter like "19 How. 393"), while the
+        # parallel U.S./F. cite that finds a PDF lives on the cluster record.
+        all_cites = _gather_all_citations(client, item)
+        print(f"[resolve] citations to try: {all_cites}")
+        known_us = next(
+            (_normalized_us_cite(cite) for cite in all_cites
+             if _normalized_us_cite(cite)),
+            "",
+        )
+        if known_us:
+            _remember_us_reports_cite(known_us)
+
+        # A SCOTUS opinion opened from Google Scholar sometimes carries only its
+        # Supreme Court Reporter ("S. Ct.") cite, not the "U.S." cite every
+        # official-PDF path below keys on.  Ask CourtListener whether that
+        # S. Ct. cite has a parallel U.S. Reports cite and, if so, try it too —
+        # that's what lets "PDF" reach the official opinion scan.
+        is_scotus = is_scotus or any(
+            _US_CITE_RE.search(c) or _SCT_CITE_RE.search(c)
+            for c in all_cites
+        )
+        us_from_sct = _us_reports_cite_via_courtlistener(client, all_cites)
+        if us_from_sct and us_from_sct not in all_cites:
+            print(f"[resolve] S. Ct. cite resolved to U.S. Reports cite: "
+                  f"{us_from_sct}")
+            all_cites.append(us_from_sct)
+            _remember_us_reports_cite(us_from_sct)
 
         for cite in all_cites:
             url = _try_official_us_reports(cite)
@@ -16803,13 +17022,17 @@ class _FloatingPdfWindow:
     def __init__(self, parent: tk.Misc, data: bytes, url: str, title: str,
                  *, margin: Optional[int] = None, app=None,
                  on_save=None, on_print=None, on_close=None,
-                 on_cite=None, on_cite_browser=None) -> None:
+                 on_cite=None, on_cite_browser=None, on_open_text=None) -> None:
         self._app = app
         self._on_save = on_save
         self._on_print = on_print
         self._on_close = on_close
         self._on_cite = on_cite
         self._on_cite_browser = on_cite_browser
+        # Clicking the case name on the strip opens this case's *text*: the
+        # reader the PDF was opened from, or — for a case reached by following
+        # a citation — the opinion text fetched the way the app always does.
+        self._on_open_text = on_open_text
         self._url = url
         self._bytes = data
         self._pane: Optional[_PdfPane] = None
@@ -16923,9 +17146,28 @@ class _FloatingPdfWindow:
         name_lbl = _ui_label(bar, size=11, muted=True, anchor="e",
                              textvariable=self._name_var)
         name_lbl.pack(side="right", padx=(8, 10))
+        self._name_label = name_lbl
         if not _CTK_AVAILABLE:
             for lbl in (zoom_lbl, name_lbl):
                 lbl.configure(bg=_UI["surface"])   # match the strip, not a card
+        if self._on_open_text is not None:
+            # The name is the way back to the opinion's text — the one thing on
+            # the strip worth clicking, so it is coloured like the links in the
+            # page below it.
+            self._style_name_as_link(_UI["accent"])
+            try:
+                name_lbl.configure(cursor="hand2")
+            except tk.TclError:
+                pass
+            _bind_recursive(name_lbl, "<Button-1>",
+                            lambda _e: self._open_text())
+            _bind_recursive(name_lbl, "<Enter>",
+                            lambda _e: self._style_name_as_link(
+                                _UI["accent_dim"]))
+            _bind_recursive(name_lbl, "<Leave>",
+                            lambda _e: self._style_name_as_link(_UI["accent"]))
+            _HoverTip(name_lbl, lambda: "Open the text of this opinion",
+                      delay=500)
         if _CTK_AVAILABLE:
             rule = ctk.CTkFrame(self._win, fg_color=_UI["border"],
                                 corner_radius=0, height=1)
@@ -16941,6 +17183,38 @@ class _FloatingPdfWindow:
         self._bar_menu = menu
         for seq in ("<Button-3>", "<Button-2>"):  # Button-2 is the Mac right-click
             _bind_recursive(bar, seq, self._post_bar_menu)
+
+    def _style_name_as_link(self, color: str) -> None:
+        label = getattr(self, "_name_label", None)
+        if label is None:
+            return
+        try:
+            if _CTK_AVAILABLE:
+                label.configure(text_color=color)
+            else:
+                label.configure(fg=color)
+        except (tk.TclError, ValueError):
+            pass
+
+    #: A click lands on the strip's name once, but arrives more than once: a
+    #: CustomTkinter label forwards a binding to the canvas and label it is
+    #: drawn from, and the click is bound over that whole subtree so no part of
+    #: the name is dead to it.  Openings this close together are the same click
+    #: (or a double-click), and must not open the opinion twice.
+    _OPEN_TEXT_DEBOUNCE = 0.4    # seconds
+
+    def _open_text(self) -> None:
+        """Show this case's opinion text (the clicked name on the strip)."""
+        if self._on_open_text is None:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_opened_text_at", 0.0) < self._OPEN_TEXT_DEBOUNCE:
+            return
+        self._opened_text_at = now
+        try:
+            self._on_open_text()
+        except Exception as exc:
+            print(f"[pdf-window] opening the case text failed: {exc}")
 
     def _post_bar_menu(self, event) -> None:
         try:
@@ -24497,6 +24771,7 @@ class _ScholarTextWindow:
     def _pdf_item(self) -> dict:
         """The search-result-shaped dict used to resolve a PDF URL.  Falls back
         to the Bluebook citation when this window wasn't opened from a result."""
+        self._adopt_stored_us_reports_cite()
         item = dict(self._item) if self._item else {}
         scholar_id = self._opinion_scholar_id()
         if scholar_id:
@@ -24559,9 +24834,48 @@ class _ScholarTextWindow:
         ):
             if c and c not in cites:
                 cites.append(c)
+        # A U.S. Reports cite already known — saved beside this opinion in the
+        # database, or printed in its header — is what every official-report
+        # path keys on, so it leads.  Otherwise a case stored under its S. Ct.
+        # cite would send the resolver looking for a U.S. cite on Google
+        # Scholar and CourtListener that was sitting in the record all along.
+        known_us = self._us_reports_cite or next(
+            (_normalized_us_cite(c) for c in cites if _normalized_us_cite(c)),
+            "",
+        )
+        if known_us:
+            item["_us_reports_cite"] = known_us
+            cites = [known_us] + [c for c in cites
+                                  if _normalized_us_cite(c) != known_us]
         if cites:
             item["citation"] = cites
         return item
+
+    def _adopt_stored_us_reports_cite(self) -> None:
+        """Take the U.S. Reports cite the opinion database already holds for
+        this case.  An opinion saved under its Supreme Court Reporter cite
+        gains its U.S. cite later; reading it here means the reader knows the
+        official reporter before anything goes looking for it."""
+        if self._us_reports_cite:
+            return
+        scholar_id = self._opinion_scholar_id()
+        if not scholar_id or self._app is None:
+            return
+        try:
+            getter = getattr(self._app, "_get_opinion_db", None)
+            try:
+                db = getter(wait=False) if getter is not None else None
+            except TypeError:
+                db = getter() if getter is not None else None
+            stored = db.stored_citations(scholar_id) if db is not None else []
+        except Exception as exc:
+            print(f"[db] loading saved parallel citations failed: {exc}")
+            return
+        for cite in stored:
+            normalized = _normalized_us_cite(cite)
+            if normalized:
+                self._us_reports_cite = normalized
+                return
 
     # Federal Appendix reporter: "F. App'x", "F.App'x", "Fed. Appx.", etc.
     # (straight or typographic apostrophe).
@@ -24947,6 +25261,7 @@ class _ScholarTextWindow:
                     on_close=self._floating_pdf_closed,
                     on_cite=self._open_pdf_cite,
                     on_cite_browser=self._open_pdf_cite_browser,
+                    on_open_text=self._surface_text_view,
                 )
                 self._pdf_float_win = win
             elif not win.showing(url):
@@ -24971,6 +25286,25 @@ class _ScholarTextWindow:
         self._active_pdf_analysis_key = self._request_pdf_analysis(
             data, url, lambda result, w=win: w.apply_analysis(result),
         )
+
+    def _surface_text_view(self) -> None:
+        """Bring this reader forward — what the case name on the floating
+        viewer's strip does when the PDF was opened from the text.  The text is
+        already here, so there is nothing to fetch and nothing to open."""
+        win = self._win
+        if isinstance(win, _CaseTabPage):
+            try:
+                win._manager.notebook.select(win)
+                win._manager.surface()
+            except (AttributeError, tk.TclError):
+                pass
+            return
+        try:
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+        except (AttributeError, tk.TclError):
+            pass
 
     def _floating_pdf_closed(self, win) -> None:
         if self._pdf_float_win is win:
@@ -25134,11 +25468,22 @@ class _ScholarTextWindow:
         _print_pdf_file(self._win, path, self._status_var.set)
 
     def _open_pdf_cite(self, action: tuple, snippet: str) -> None:
-        if self._app is not None:
+        """Follow a citation clicked on a page of the PDF.  A reader working
+        through a scan wants the cited opinion as it was printed, so its own
+        PDF is looked for first and opened in a viewer of its own; a citation
+        with no scan anywhere falls back to the text, as before."""
+        if self._app is None:
+            _open_citation_in_browser(action, snippet)
+            return
+        opened = self._app.open_cited_case_pdf(
+            self._win, action, snippet, self._status_var.set,
+            fallback=lambda: _follow_brief_action(
+                self._app, self._win, action, self._status_var.set,
+                snippet=snippet),
+        )
+        if not opened:      # not a case citation — a statute, a rule, a docket
             _follow_brief_action(self._app, self._win, action,
                                  self._status_var.set, snippet=snippet)
-        else:
-            _open_citation_in_browser(action, snippet)
 
     def _open_pdf_cite_browser(self, action: tuple, snippet: str) -> None:
         _open_citation_in_browser(action, snippet)
