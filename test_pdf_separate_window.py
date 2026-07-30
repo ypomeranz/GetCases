@@ -142,8 +142,12 @@ class _FakePane:
     def set_section_marks(self, sections):
         self.marks = sections
 
+    on_zoom = None
+
     def zoom(self, delta):
         self.zoomed.append(delta)
+        if self.on_zoom is not None:
+            self.on_zoom(self.zoom_percent())
 
     def zoom_percent(self):
         return 125 if self.zoomed else 100
@@ -534,7 +538,7 @@ class FloatingHandoffTests(unittest.TestCase):
 VIEWER_NS = _load(
     "_FloatingPdfWindow",
     ["_short_name", "showing", "apply_analysis", "zoom", "alive", "close",
-     "_on_destroy", "_save", "_print"],
+     "_on_destroy", "_save", "_print", "_show_zoom"],
 )
 
 
@@ -559,8 +563,11 @@ class _Viewer:
         self._on_print = self.printed.append
         self._on_close = self.closed_with.append
         for name in ("_short_name", "showing", "apply_analysis", "zoom",
-                     "alive", "close", "_on_destroy", "_save", "_print"):
+                     "alive", "close", "_on_destroy", "_save", "_print",
+                     "_show_zoom"):
             setattr(self, name, VIEWER_NS[name].__get__(self))
+        # set_pdf wires the pane's zoom reports to the strip's percentage.
+        self._pane.on_zoom = self._show_zoom
 
 
 class ShortNameTests(unittest.TestCase):
@@ -585,6 +592,13 @@ class ViewerTests(unittest.TestCase):
         viewer = _Viewer()
         viewer.zoom(+1)
         self.assertEqual(viewer._pane.zoomed, [1])
+        self.assertEqual(viewer._zoom_var.get(), "125%")
+
+    def test_the_level_follows_a_zoom_the_strip_did_not_ask_for(self):
+        # Ctrl-wheel over the page zooms the pane directly; the percentage on
+        # the strip has to follow it, not just its own buttons.
+        viewer = _Viewer()
+        viewer._pane.zoom(+1)
         self.assertEqual(viewer._zoom_var.get(), "125%")
 
     def test_zoom_before_a_page_is_loaded_is_harmless(self):
@@ -747,6 +761,9 @@ class _FakeCanvas:
         self.width = 620
         self.pointer = (6, 0)
         self.view = 0.0
+        self.region_w = 620
+        self.x = 0
+        self.scrolled_y = 0
 
     # --- canvas drawing ---
     def delete(self, _what):
@@ -800,6 +817,53 @@ class _FakeCanvas:
     def yview_moveto(self, frac):
         self.view = frac
 
+    def yview_scroll(self, amount, _what):
+        self.scrolled_y += amount
+
+    # --- horizontal viewport over the scrollregion (xscrollincrement=1) ---
+    def configure(self, **kw):
+        region = kw.get("scrollregion")
+        if region:
+            self.region_w = region[2]
+            self._clamp_x()
+
+    def _max_x(self):
+        return max(0, self.region_w - self.width)
+
+    def _clamp_x(self):
+        self.x = max(0, min(self._max_x(), self.x))
+
+    def xview(self):
+        total = max(1, self.region_w)
+        return (self.x / total, min(1.0, (self.x + self.width) / total))
+
+    def xview_moveto(self, frac):
+        self.x = frac * max(1, self.region_w)
+        self._clamp_x()
+
+    def xview_scroll(self, amount, _what):
+        self.x += amount
+        self._clamp_x()
+
+    def canvasx(self, screen_x):
+        return self.x + screen_x
+
+
+class _FakeScrollbar:
+    def __init__(self):
+        self.mapped = False
+        self.packed = None
+        self.set_to = None
+
+    def pack(self, **kw):
+        self.mapped, self.packed = True, kw
+
+    def pack_forget(self):
+        self.mapped = False
+
+    def set(self, first, last):
+        self.set_to = (first, last)
+
 
 _Tk.Canvas = _FakeCanvas   # the rail builds its own canvas
 
@@ -808,7 +872,10 @@ PANE_NS = _load(
     "_PdfPane",
     ["set_section_marks", "has_section_marks", "_section_doc_y",
      "_draw_section_rail", "_section_at_rail_y", "_rail_tip_text",
-     "_on_rail_click", "fit_to_view", "_refit_by"],
+     "_on_rail_click", "fit_to_view", "_refit_by", "_update_scrollregion",
+     "_show_hsb", "_x_overflow", "_x_center", "_center_x_at", "_hwheel",
+     "_shift_wheel", "_wheel", "_scroll_x_into_view", "_notify_zoom",
+     "zoom_percent"],
     {"_PDF_PART_COLORS": _PART_COLORS,
      "_wash_hex": WASH_NS["_wash_hex"],
      "_HoverTip": lambda *a, **kw: None},
@@ -828,8 +895,9 @@ class _Pane:
     _ZOOM_MIN_W = 240
     _ZOOM_MAX_W = 3200
     _AUTOFIT_SLOP = 3
+    _SCROLL_PX = 60
 
-    def __init__(self, pages=10, page_h=100):
+    def __init__(self, pages=10, page_h=100, cap=None):
         # A ten-page document: page i occupies [i*100, i*100 + 88].
         self._slots = [(i * page_h, page_h - _Pane._PAD, (0, 0, 1, 1), 1.0)
                        for i in range(pages)]
@@ -839,9 +907,14 @@ class _Pane:
         self._rail_spans = []
         self._base_w = 600
         self._target_w = 600
+        self._fit_cap = cap          # None = autofit (fill the room available)
+        self.zooms_reported = []
+        self._on_zoom = self.zooms_reported.append
         self._canvas = _FakeCanvas()
         self._vsb = object()
         self._body = object()
+        self._hsb = _FakeScrollbar()
+        self._hsb_on = False
         self.scrolled = []
         self.layouts = 0
         self.renders = 0
@@ -849,7 +922,10 @@ class _Pane:
         for name in ("set_section_marks", "has_section_marks",
                      "_section_doc_y", "_draw_section_rail",
                      "_section_at_rail_y", "_rail_tip_text", "_on_rail_click",
-                     "fit_to_view", "_refit_by"):
+                     "fit_to_view", "_refit_by", "_update_scrollregion",
+                     "_show_hsb", "_x_overflow", "_x_center", "_center_x_at",
+                     "_hwheel", "_shift_wheel", "_wheel",
+                     "_scroll_x_into_view", "_notify_zoom", "zoom_percent"):
             setattr(self, name, PANE_NS[name].__get__(self))
 
     # --- what the extracted methods call back into ---
@@ -933,21 +1009,29 @@ class RailBuildTests(unittest.TestCase):
         self.assertIs(self.pane._rail, rail)
         self.assertFalse(rail.destroyed)
 
-    def test_the_pages_make_room_for_the_rail(self):
-        # A page still sized to the whole canvas would be clipped by it.
-        self.pane.set_section_marks(SECTIONS)
-        self.assertEqual(self.pane._base_w, 600 - _Pane._RAIL_W)
-        self.assertEqual(self.pane._target_w, 600 - _Pane._RAIL_W)
+    def _refit_scheduled(self):
+        return [fn.__name__ for fn, _a in self.pane.idle]
 
-    def test_the_pages_get_the_room_back_when_it_goes(self):
+    def test_the_pages_are_re_fitted_to_the_column_the_rail_leaves(self):
+        # A page still sized to the whole canvas would be clipped by the strip.
         self.pane.set_section_marks(SECTIONS)
+        self.assertIn("fit_to_view", self._refit_scheduled())
+        self.pane._canvas.width -= _Pane._RAIL_W    # Tk narrows the canvas
+        self.pane.fit_to_view()
+        self.assertLessEqual(self.pane._target_w + 2 * _Pane._PAD,
+                             self.pane._canvas.width)
+
+    def test_the_pages_are_re_fitted_again_when_the_rail_goes(self):
+        self.pane.set_section_marks(SECTIONS)
+        self.pane.idle.clear()
         self.pane.set_section_marks([])
-        self.assertEqual(self.pane._base_w, 600)
+        self.assertIn("fit_to_view", self._refit_scheduled())
 
     def test_a_zoomed_pane_keeps_its_zoom_when_the_rail_appears(self):
         self.pane._target_w = 900          # zoomed to 150%
         self.pane.set_section_marks(SECTIONS)
-        self.assertEqual(self.pane._base_w, 587)
+        self.pane._canvas.width -= _Pane._RAIL_W
+        self.pane.fit_to_view()
         self.assertEqual(round(self.pane._target_w / self.pane._base_w, 2), 1.5)
 
 
@@ -1113,6 +1197,155 @@ class FitToViewTests(unittest.TestCase):
         self.pane._canvas.winfo_width = mock.Mock(side_effect=Exception("gone"))
         self.pane.fit_to_view()   # must not raise
         self.assertEqual(self.pane.layouts, 0)
+
+
+class HorizontalScrollTests(unittest.TestCase):
+    """A page zoomed past the width of its window has to be reachable."""
+
+    def setUp(self):
+        self.pane = _Pane()
+        self.canvas = self.pane._canvas
+        self.canvas.width = 620
+
+    def _zoom_to(self, target_w):
+        self.pane._target_w = target_w
+        self.pane._update_scrollregion()
+
+    def test_a_page_that_fits_shows_no_scrollbar(self):
+        self._zoom_to(500)
+        self.assertFalse(self.pane._hsb_on)
+        self.assertFalse(self.pane._hsb.mapped)
+
+    def test_a_page_wider_than_the_window_raises_one(self):
+        self._zoom_to(900)
+        self.assertTrue(self.pane._hsb_on)
+        self.assertTrue(self.pane._hsb.mapped)
+
+    def test_the_scrollbar_meets_the_vertical_one_in_the_corner(self):
+        self._zoom_to(900)
+        packed = self.pane._hsb.packed
+        self.assertEqual(packed["side"], "bottom")
+        self.assertEqual(packed["fill"], "x")
+        # Before the canvas, so neither scrollbar runs under the other.
+        self.assertIs(packed["before"], self.canvas)
+
+    def test_the_whole_page_is_inside_the_scrollregion(self):
+        self._zoom_to(900)
+        self.assertEqual(self.canvas.region_w, 900 + 2 * _Pane._PAD)
+
+    def test_a_narrower_page_still_spans_the_viewport(self):
+        # Otherwise a centred page would jitter under spurious scrolling.
+        self._zoom_to(400)
+        self.assertEqual(self.canvas.region_w, 620)
+
+    def test_zooming_back_in_takes_the_scrollbar_away_and_pans_home(self):
+        self._zoom_to(900)
+        self.pane._hwheel(1)
+        self.assertGreater(self.canvas.x, 0)
+        self._zoom_to(500)
+        self.assertFalse(self.pane._hsb.mapped)
+        self.assertEqual(self.canvas.x, 0)   # nothing left to pan to
+
+    def test_the_far_edge_of_a_zoomed_page_can_be_reached(self):
+        self._zoom_to(900)
+        self.canvas.xview_moveto(1.0)
+        page_right = _Pane._PAD + 900
+        self.assertLessEqual(page_right, self.canvas.canvasx(0) + 620 + 1)
+
+    def test_panning_moves_one_scroll_step(self):
+        self._zoom_to(900)
+        self.pane._hwheel(1)
+        self.assertEqual(self.canvas.x, _Pane._SCROLL_PX)
+        self.pane._hwheel(-1)
+        self.assertEqual(self.canvas.x, 0)
+
+    def test_panning_a_page_that_fits_does_nothing_at_all(self):
+        self._zoom_to(500)
+        self.assertIsNone(self.pane._hwheel(1))
+        self.assertEqual(self.canvas.x, 0)
+
+    def test_panning_stops_at_the_edges(self):
+        self._zoom_to(900)
+        for _ in range(40):
+            self.pane._hwheel(1)
+        self.assertEqual(self.canvas.x, 900 + 2 * _Pane._PAD - 620)
+        for _ in range(40):
+            self.pane._hwheel(-1)
+        self.assertEqual(self.canvas.x, 0)
+
+    def test_shift_wheel_pans_a_zoomed_page(self):
+        self._zoom_to(900)
+        self.assertEqual(self.pane._shift_wheel(1), "break")
+        self.assertEqual(self.canvas.x, _Pane._SCROLL_PX)
+
+    def test_shift_wheel_still_scrolls_when_there_is_nothing_to_pan(self):
+        # It scrolled the document before there was anything to pan; it must
+        # not become a dead key on a page that fits.
+        self._zoom_to(500)
+        self.pane._shift_wheel(1)
+        self.assertEqual(self.canvas.x, 0)
+        self.assertGreater(self.canvas.scrolled_y, 0)
+
+    def test_a_zoom_keeps_the_same_column_in_the_middle(self):
+        self._zoom_to(900)
+        self.pane._center_x_at(0.5)
+        self.assertAlmostEqual(self.pane._x_center(), 0.5, places=2)
+
+    def test_centring_clamps_at_the_ends(self):
+        self._zoom_to(900)
+        self.pane._center_x_at(0.0)
+        self.assertEqual(self.canvas.x, 0)
+        self.pane._center_x_at(1.0)
+        self.assertAlmostEqual(self.canvas.x, 900 + 2 * _Pane._PAD - 620,
+                               delta=1)
+
+    def test_a_page_that_fits_is_centred_on_its_middle(self):
+        self._zoom_to(400)
+        self.assertAlmostEqual(self.pane._x_center(), 0.5, places=2)
+
+
+class ScrollIntoViewTests(unittest.TestCase):
+    """A find match on a zoomed page is panned to, not just scrolled to."""
+
+    def setUp(self):
+        self.pane = _Pane()
+        self.canvas = self.pane._canvas
+        self.canvas.width = 620
+        self.pane._target_w = 1200
+        self.pane._update_scrollregion()
+
+    def test_a_match_already_on_screen_is_left_alone(self):
+        self.pane._scroll_x_into_view(100, 200)
+        self.assertEqual(self.canvas.x, 0)
+
+    def test_a_match_off_to_the_right_is_brought_in(self):
+        self.pane._scroll_x_into_view(900, 1000)
+        left = self.canvas.canvasx(0)
+        self.assertLessEqual(1000, left + 620)
+        self.assertLessEqual(left, 900)
+
+    def test_a_match_off_to_the_left_is_brought_in(self):
+        self.canvas.xview_moveto(1.0)
+        self.pane._scroll_x_into_view(50, 120)
+        self.assertLessEqual(self.canvas.canvasx(0), 50)
+
+    def test_it_pans_the_least_it_can(self):
+        # Coming from the left, a match just off the right edge should end up
+        # at the right of the view, not centred or flush left.
+        self.pane._scroll_x_into_view(700, 760)
+        self.assertAlmostEqual(self.canvas.canvasx(0) + 620,
+                               760 + _Pane._PAD, delta=1)
+
+    def test_a_match_wider_than_the_view_shows_its_start(self):
+        self.pane._scroll_x_into_view(300, 1100)
+        self.assertAlmostEqual(self.canvas.canvasx(0), 300 - _Pane._PAD,
+                               delta=1)
+
+    def test_nothing_moves_on_a_page_that_fits(self):
+        self.pane._target_w = 400
+        self.pane._update_scrollregion()
+        self.pane._scroll_x_into_view(300, 380)
+        self.assertEqual(self.canvas.x, 0)
 
 
 class WashTests(unittest.TestCase):

@@ -15302,9 +15302,13 @@ class _PdfPane(ttk.Frame):
                  margin: Optional[int] = None,
                  link_style: str = "tint",
                  uniform_crop: bool = False,
-                 autofit: bool = False) -> None:
+                 autofit: bool = False, on_zoom=None) -> None:
         super().__init__(parent)
         self._disposed = False
+        # Told the new percentage whenever the zoom changes, however it was
+        # changed — a host showing the level (the floating viewer's strip) has
+        # to follow Ctrl-wheel over the page too, not just its own buttons.
+        self._on_zoom = on_zoom
         import pypdfium2 as pdfium
         from PIL import ImageTk  # noqa: F401  (availability check at construct)
         _flush_tk_image_graveyard()
@@ -15352,25 +15356,35 @@ class _PdfPane(ttk.Frame):
         self._rail = None
         self._sections: list = []
         self._rail_spans: list = []
-        # ``autofit``: keep fit-to-window fitted to the room the pages actually
-        # have, re-measuring whenever the canvas is resized (a window resize, or
-        # the parts rail claiming its column).  Off by default — a pane inside a
-        # reader keeps the width it was given, so the reader's own zoom sticks
-        # across window resizes.
+        # How fit-to-window tracks the room the pages actually have, re-measured
+        # whenever the canvas is resized.  ``autofit`` fills that room, whatever
+        # it is — for a window that is nothing but the page.  Otherwise the
+        # caller's *width* is a cap: the pages are narrowed when there is less
+        # room than that (a window narrower than the caller could guess, or a
+        # strip packed beside them) and widened back up to it, never past it.
         self._autofit = bool(autofit)
-        self._autofit_after: Optional[str] = None
+        self._fit_cap: Optional[int] = None if autofit else self._base_w
+        self._refit_after: Optional[str] = None
 
         # The canvas lives in a body frame so a find bar can sit above it.
         body = ttk.Frame(self)
         body.pack(side="top", fill="both", expand=True)
         self._body = body
+        # Both scroll increments are 1px, so a wheel notch or an arrow key moves
+        # the same distance on either axis (see _SCROLL_PX).
         canvas = tk.Canvas(body, bg="#d9d9d9", highlightthickness=0,
-                           yscrollincrement=1)
+                           yscrollincrement=1, xscrollincrement=1)
         vsb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=self._on_yview)
         vsb.pack(side="right", fill="y")
+        # A zoomed-in page is wider than the viewport, so it needs a horizontal
+        # scrollbar to be reachable at all — but only then: it is packed and
+        # unpacked by _update_scrollregion, so a page that fits shows nothing.
+        hsb = ttk.Scrollbar(body, orient="horizontal", command=canvas.xview)
+        canvas.configure(xscrollcommand=hsb.set)
         canvas.pack(side="left", fill="both", expand=True)
-        self._canvas, self._vsb = canvas, vsb
+        self._canvas, self._vsb, self._hsb = canvas, vsb, hsb
+        self._hsb_on = False
 
         # Detect each page's content box once with a quick low-resolution render
         # (independent of zoom), so the wide blank margins of court PDFs are
@@ -15407,10 +15421,23 @@ class _PdfPane(ttk.Frame):
                     lambda e: self.zoom(1 if e.delta > 0 else -1) or "break")
         canvas.bind("<Control-Button-4>", lambda _e: self.zoom(1) or "break")
         canvas.bind("<Control-Button-5>", lambda _e: self.zoom(-1) or "break")
+        # Shift + wheel pans a zoomed page sideways, as does a trackpad's own
+        # sideways swipe (X11 reports those as buttons 6 and 7 — a button number
+        # Tk 8.6 refuses outright, so those two are bound only where they take).
+        canvas.bind("<Shift-MouseWheel>", self._on_shift_wheel)
+        canvas.bind("<Shift-Button-4>", lambda _e: self._shift_wheel(-1))
+        canvas.bind("<Shift-Button-5>", lambda _e: self._shift_wheel(1))
+        for seq, step in (("<Button-6>", -1), ("<Button-7>", 1)):
+            try:
+                canvas.bind(seq, lambda _e, s=step: self._hwheel(s))
+            except tk.TclError:
+                pass
         canvas.bind("<KeyPress-Up>",
                     lambda _e: self.scroll_key(-1) and "break")
         canvas.bind("<KeyPress-Down>",
                     lambda _e: self.scroll_key(1) and "break")
+        canvas.bind("<KeyPress-Left>", lambda _e: self._hwheel(-1))
+        canvas.bind("<KeyPress-Right>", lambda _e: self._hwheel(1))
         # Take keyboard focus only when the reader intentionally clicks in the
         # PDF.  Focusing on hover can make some platforms raise this window just
         # because the pointer crossed it.
@@ -15445,23 +15472,36 @@ class _PdfPane(ttk.Frame):
             top_frac = self._canvas.yview()[0]
         except tk.TclError:
             top_frac = 0.0
+        x_center = self._x_center()
         self._target_w = new_w
         self._layout()
         try:
             self._canvas.yview_moveto(top_frac)  # keep the same place in the doc
         except tk.TclError:
             pass
+        # …and the same column of it: zooming in on a page wider than the view
+        # should magnify what is in the middle, not jump to the left margin.
+        self._center_x_at(x_center)
         self._render_visible()
+        self._notify_zoom()
+
+    def _notify_zoom(self) -> None:
+        if self._on_zoom is None:
+            return
+        try:
+            self._on_zoom(self.zoom_percent())
+        except Exception as exc:
+            print(f"[pdf] zoom callback failed: {exc}")
 
     def fit_to_view(self) -> None:
         """Re-measure fit-to-window from the room the pages actually have.
 
-        The fit width is set once at construction, from the caller's estimate
-        of how wide its window would be.  Call this whenever that estimate can
-        have gone stale — the window opened or was resized to another width, or
-        a strip appeared beside the pages and took a column of it — so a page
-        is never left clipped by the canvas edge.  A no-op when the fit is
-        already right, so it is cheap to call speculatively."""
+        The width the caller passed is only its estimate of the window it was
+        building; the canvas can turn out narrower (a small screen, a resize, a
+        strip packed beside the pages), and a page sized to the estimate is then
+        clipped at the canvas edge.  Re-measuring keeps 100% meaning "as wide as
+        fits", and keeps the reader's zoom ratio on top of it.  A no-op when the
+        fit is already right, so it is cheap to call speculatively."""
         try:
             view_w = self._canvas.winfo_width()
         except tk.TclError:
@@ -15469,6 +15509,8 @@ class _PdfPane(ttk.Frame):
         if view_w <= 1:
             return          # not laid out yet — nothing to measure against
         want = max(self._ZOOM_MIN_W, view_w - 2 * self._PAD)
+        if self._fit_cap is not None:
+            want = min(want, self._fit_cap)
         if abs(want - self._base_w) <= self._AUTOFIT_SLOP:
             return
         self._refit_by(want - self._base_w)
@@ -15494,6 +15536,7 @@ class _PdfPane(ttk.Frame):
         except tk.TclError:
             pass
         self._render_visible()
+        self._notify_zoom()   # the ratio held, but rounding may have moved it
 
     def _page_left(self) -> int:
         """Left x for each page so it's centred when the canvas is wider than
@@ -15514,8 +15557,56 @@ class _PdfPane(ttk.Frame):
             view_w = 0
         # Span the viewport when the page is narrower than it, so the centred
         # page stays put with no spurious horizontal scrolling.
-        width = max(view_w, self._target_w + 2 * self._PAD)
+        content_w = self._target_w + 2 * self._PAD
+        width = max(view_w, content_w)
         self._canvas.configure(scrollregion=(0, 0, width, self._content_h))
+        self._show_hsb(view_w > 1 and content_w > view_w)
+
+    def _show_hsb(self, needed: bool) -> None:
+        """Pack the horizontal scrollbar only while the page overflows the
+        viewport, so a page that fits is framed by nothing but its own margin.
+
+        Decided from the layout numbers rather than from the scroll callback:
+        packing a scrollbar changes the viewport, and a bar that hid or showed
+        itself from inside its own ``xscrollcommand`` could oscillate."""
+        needed = bool(needed)
+        if needed == self._hsb_on:
+            return
+        self._hsb_on = needed
+        try:
+            if needed:
+                # Before the canvas in the packing order, so the two scrollbars
+                # meet in the corner instead of one running under the other.
+                self._hsb.pack(side="bottom", fill="x", before=self._canvas)
+            else:
+                self._hsb.pack_forget()
+                self._canvas.xview_moveto(0.0)   # nothing left to pan to
+        except tk.TclError:
+            pass
+
+    def _x_overflow(self) -> bool:
+        """Whether the page is wider than the viewport at the current zoom."""
+        return self._hsb_on
+
+    def _center_x_at(self, center: float) -> None:
+        """Pan so *center* (a fraction of the page's width) sits in the middle
+        of the viewport — how a zoom keeps looking at the same column."""
+        try:
+            first, last = self._canvas.xview()
+            span = last - first
+            self._canvas.xview_moveto(
+                max(0.0, min(1.0 - span, center - span / 2))
+            )
+        except (tk.TclError, ValueError):
+            pass
+
+    def _x_center(self) -> float:
+        """The fraction of the page's width currently in the middle of view."""
+        try:
+            first, last = self._canvas.xview()
+        except (tk.TclError, ValueError):
+            return 0.5
+        return (first + last) / 2
 
     def _layout(self) -> None:
         """(Re)build one white slot per page at the current zoom, centred."""
@@ -15572,25 +15663,24 @@ class _PdfPane(ttk.Frame):
                     self._canvas.move(oid, dx, 0)
         self._update_scrollregion()
         self._render_visible()
-        if self._autofit:
-            self._schedule_autofit()
+        self._schedule_refit()
 
-    def _schedule_autofit(self) -> None:
+    def _schedule_refit(self) -> None:
         """Coalesce the resizes of a window drag into one re-fit."""
-        if self._autofit_after is not None:
+        if self._refit_after is not None:
             try:
-                self.after_cancel(self._autofit_after)
+                self.after_cancel(self._refit_after)
             except tk.TclError:
                 pass
-            self._autofit_after = None
+            self._refit_after = None
         try:
-            self._autofit_after = self.after(self._AUTOFIT_DELAY,
-                                             self._run_autofit)
+            self._refit_after = self.after(self._AUTOFIT_DELAY,
+                                           self._run_refit)
         except tk.TclError:
             pass
 
-    def _run_autofit(self) -> None:
-        self._autofit_after = None
+    def _run_refit(self) -> None:
+        self._refit_after = None
         self.fit_to_view()
 
     def _content_frac(self, img) -> tuple:
@@ -15673,6 +15763,37 @@ class _PdfPane(ttk.Frame):
 
     def _wheel(self, direction: int) -> None:
         self._canvas.yview_scroll(direction * self._SCROLL_PX, "units")
+
+    def _shift_wheel(self, direction: int) -> str:
+        """Shift + wheel pans a zoomed page sideways; with nothing to pan it
+        scrolls the document, exactly as the unmodified wheel would."""
+        if self._hwheel(direction) is None:
+            self._wheel(direction)
+        return "break"
+
+    def _on_shift_wheel(self, e) -> str:
+        return self._shift_wheel(-1 if getattr(e, "delta", 0) > 0 else 1)
+
+    def _hwheel(self, direction: int):
+        """Pan sideways, or return None when the page has no width to spare."""
+        if not self._x_overflow():
+            return None      # nothing to pan; leave the event to the window
+        try:
+            self._canvas.xview_scroll(direction * self._SCROLL_PX, "units")
+        except tk.TclError:
+            return None
+        self._render_visible()
+        return "break"
+
+    def take_focus(self) -> None:
+        """Give the page canvas the keyboard.  For a window whose only content
+        is the PDF: the arrow keys — including Left/Right panning, which is
+        bound on the canvas alone so it cannot hijack arrows elsewhere — then
+        work without the reader having to click the page first."""
+        try:
+            self._canvas.focus_set()
+        except tk.TclError:
+            pass
 
     def scroll_key(self, direction: int) -> bool:
         """Scroll one keyboard step; shared by the canvas and its host window."""
@@ -15913,7 +16034,7 @@ class _PdfPane(ttk.Frame):
             if self._rail is not None:
                 self._rail.destroy()
                 self._rail = None
-                self._refit_by(self._RAIL_W)   # the pages get the room back
+                self.after_idle(self.fit_to_view)  # pages get the room back
             return
         self._sections = sections
         if self._rail is None:
@@ -15927,11 +16048,11 @@ class _PdfPane(ttk.Frame):
             rail.bind("<Button-1>", self._on_rail_click)
             self._rail = rail
             _HoverTip(rail, self._rail_tip_text, delay=320, follow_motion=True)
-            # The rail takes its width out of the page area, so narrow the
-            # pages by it now rather than leaving one clipped by the strip that
-            # just appeared.  (An autofit pane re-measures for itself when the
-            # canvas actually shrinks; this keeps the rest correct too.)
-            self._refit_by(-self._RAIL_W)
+            # The rail takes its column out of the page area; re-fit the pages
+            # to what is left rather than leaving one clipped by the strip that
+            # just appeared.  The canvas resize behind it re-fits again, and
+            # both compute the same absolute width, so the two agree.
+            self.after_idle(self.fit_to_view)
         self._draw_section_rail()
 
     def has_section_marks(self) -> bool:
@@ -16289,15 +16410,41 @@ class _PdfPane(ttk.Frame):
         pi, rects = self._search_matches[mi]
         if pi >= len(self._slots) or not rects:
             return
-        _x0, y0, _x1, _y1 = self._rect_to_canvas(pi, rects[0])
+        x0, y0, x1, _y1 = self._rect_to_canvas(pi, rects[0])
         try:
             view_h = self._canvas.winfo_height() or 1
         except tk.TclError:
             return
         target = max(0.0, y0 - view_h / 3.0)
         self._canvas.yview_moveto(min(1.0, target / max(1, self._content_h)))
+        self._scroll_x_into_view(x0, x1)
         self._render_visible()
         self._redraw_search()
+
+    def _scroll_x_into_view(self, x0: float, x1: float) -> None:
+        """Pan the least amount that brings the canvas span x0..x1 on screen —
+        for a find match on a zoomed page scrolled off to one side."""
+        if not self._x_overflow():
+            return
+        try:
+            view_w = self._canvas.winfo_width() or 1
+            left = self._canvas.canvasx(0)
+        except tk.TclError:
+            return
+        right = left + view_w
+        if x0 >= left and x1 <= right:
+            return
+        if x1 - x0 >= view_w:
+            new_left = x0 - self._PAD          # wider than the view: show its start
+        elif x0 < left:
+            new_left = x0 - self._PAD
+        else:
+            new_left = x1 - view_w + self._PAD
+        total = max(1.0, float(self._target_w + 2 * self._PAD))
+        try:
+            self._canvas.xview_moveto(max(0.0, min(1.0, new_left / total)))
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------------------------
     # Text selection (drag over the page to select; Ctrl-C copies) — uses
@@ -16834,10 +16981,12 @@ class _FloatingPdfWindow:
         # is what this viewer is for.
         width = max((avail or self._W) - 30, self._MIN_W - 40)
         pane = _PdfPane(self._body, data, width=width, margin=margin,
-                        link_style="recolor", uniform_crop=True, autofit=True)
+                        link_style="recolor", uniform_crop=True, autofit=True,
+                        on_zoom=self._show_zoom)
         pane.pack(fill="both", expand=True)
+        pane.take_focus()   # the page is all there is here: the keys are its own
         self._pane = pane
-        self._zoom_var.set(f"{pane.zoom_percent()}%")
+        self._show_zoom(pane.zoom_percent())
 
     def showing(self, url: str) -> bool:
         """True when *url* is already the document on screen here."""
@@ -16893,6 +17042,11 @@ class _FloatingPdfWindow:
     # Zoom, focus, lifecycle
     # ------------------------------------------------------------------
 
+    def _show_zoom(self, percent: int) -> None:
+        """Keep the strip's percentage current — the pane reports every change,
+        so Ctrl-wheel over the page shows up here as well as the buttons do."""
+        self._zoom_var.set(f"{int(percent)}%")
+
     def zoom(self, delta: int) -> None:
         """Zoom in (+1), out (-1), or back to fit-to-window (0)."""
         pane = self._pane
@@ -16900,7 +17054,6 @@ class _FloatingPdfWindow:
             return
         try:
             pane.zoom(delta)
-            self._zoom_var.set(f"{pane.zoom_percent()}%")
         except tk.TclError:
             pass
 

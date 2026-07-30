@@ -69,6 +69,8 @@ Click **Scholar** to fetch the full opinion from Google Scholar (often richer th
 
 When the opinion in that window carries **separate writings**, a slim rail appears just inside the scrollbar mapping them: each part covers the stretch of the document it occupies, in its own color (blue for the Court’s opinion, green for a concurrence, red for a dissent, grey for a syllabus), with a solid marker on its first line. Dragging the scrollbar you can see how far down the dissent starts; hovering names the part and its page, and clicking jumps straight to it. The parts come from the same detector the **Side panel** parts list uses, and the rail appears only for an opinion that actually has a concurrence, dissent or other separate writing – a lone majority gets no rail.
 
+In every PDF view, zooming in past the width of the window brings up a horizontal scrollbar so the whole page stays reachable: pan with it, with Shift+wheel (or a trackpad’s sideways swipe), or with ← and → after clicking the page. Zooming keeps whatever column is in the middle of the view rather than jumping to the margin, a search result off to one side is panned into view along with being scrolled to, and the bar disappears again as soon as the page fits. **Fit** (or Ctrl/Cmd+0) returns to a page sized to the window – and the page is re-fitted whenever the room it has changes, so it is never left clipped by a window narrower than it.
+
 Quick Lookup (Ctrl+S)
 Instant citation lookup: paste a case citation (410 U.S. 113), a statute (42 USC 1983), a regulation (29 CFR 1614.105), or a Federal Rule (FRE 404), and open the source directly.
 
