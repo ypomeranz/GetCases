@@ -18052,14 +18052,12 @@ class _ScholarTextWindow:
 
     def _build_ui(self) -> None:
         win = self._win
-        lbl_style = "Modern.TLabel" if _CTK_AVAILABLE else "TLabel"
         muted_style = "ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel"
         entry_style = "Modern.TEntry" if _CTK_AVAILABLE else "TEntry"
-        combo_style = "Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox"
 
         # The source bar (a read-only field naming where this text came from)
         # starts hidden; the Window menu's "Show Source Bar" item packs it in
-        # above the "Viewing" row via _apply_source_bar_visibility.
+        # above the opinion via _apply_source_bar_visibility.
         url_frame = _ui_frame(win)
         self._source_bar = url_frame
         self._source_bar_var = tk.BooleanVar(value=False)
@@ -18075,31 +18073,9 @@ class _ScholarTextWindow:
             side="left", fill="x", expand=True, padx=(8, 0)
         )
 
-        # Part navigation: what you're viewing, and a selector to filter
-        view_frame = _ui_frame(win)
-        self._view_frame = view_frame
-        view_frame.pack(fill="x", padx=12, pady=(8, 0))
-        ttk.Label(view_frame, text="Viewing", style=muted_style).pack(side="left")
-        self._view_label_var = tk.StringVar(value="Full opinion")
-        self._view_label = ttk.Label(
-            view_frame,
-            textvariable=self._view_label_var,
-            style=lbl_style,
-            font=("TkDefaultFont", 11, "bold"),
-        )
-        self._view_label.pack(side="left", padx=(6, 12))
-        part_values = ["Full opinion"] + [
-            f"{i + 1}. {p.label}" for i, p in enumerate(self._parts)
-        ]
-        self._part_combo = ttk.Combobox(
-            view_frame, state="readonly", width=44, values=part_values,
-            style=combo_style,
-        )
-        self._part_combo.current(0)
-        self._part_combo.pack(side="right")
-        self._part_combo.bind("<<ComboboxSelected>>", self._on_part_selected)
-        if len(self._parts) <= 1:
-            self._part_combo.config(state="disabled")
+        # No part-picker row: the strip down the right names every separate
+        # writing and jumps to it, and the tinted background says which one you
+        # are reading — a selector and a "Viewing" label only said it again.
 
         text_frame = ttk.Frame(win)
         text_frame.pack(fill="both", expand=True, padx=8, pady=4)
@@ -18461,18 +18437,6 @@ class _ScholarTextWindow:
                     btn.configure(height=30 if compact else 34)
                 except tk.TclError:
                     pass
-
-    def _set_view_color(self, color: str) -> None:
-        """Recolour the "Viewing" label to mark a concurrence/dissent — via the
-        right option for whichever widget kind the label is (a ttk.Label styled
-        with a modern theme here, so ``foreground`` applies)."""
-        try:
-            if isinstance(self._view_label, ttk.Label):
-                self._view_label.configure(foreground=color)
-            else:
-                self._view_label.configure(text_color=color)
-        except tk.TclError:
-            pass
 
     def _find_pane(self) -> Optional["_PdfPane"]:
         """The PDF pane, when the PDF is what's on screen and it has a text
@@ -19685,7 +19649,6 @@ class _ScholarTextWindow:
         self._reset_fn_regions()  # unsets the marks the old notes used
         self._part_regions: list[tuple[str, str, int]] = []
         self._rendered_parts = self._parts  # parts list _part_regions indexes
-        self._scroll_part: Optional[int] = None
         self._fn_ref_pos: dict[str, str] = {}  # footnote id → in-text marker index
         self._fn_def_pos: dict[str, str] = {}  # footnote id → body marker index
         self._reset_page_marks()   # star page → a mark on its marker
@@ -19696,16 +19659,11 @@ class _ScholarTextWindow:
         self._last_cite_action = None
         self._pending_id = None
         self._const_linked = set()
-        # Keep the part selector in step with the parts being rendered — the
-        # Scholar parts may differ from the CourtListener ones when this window
-        # opened on CL and later switched to a found Scholar match.
-        self._part_combo.config(values=["Full opinion"] + [
-            f"{i + 1}. {p.label}" for i, p in enumerate(self._parts)
-        ])
         if (self._current_part is not None
                 and self._current_part >= len(self._parts)):
+            # The Scholar parts can differ from the CourtListener ones when this
+            # window opened on CL and later switched to a found Scholar match.
             self._current_part = None  # CL part index out of range for Scholar
-            self._part_combo.current(0)
         if not self._parts:
             txt.insert("1.0", self._scholar_text)
         else:
@@ -19753,16 +19711,6 @@ class _ScholarTextWindow:
         self._print_btn.pack_forget()  # text view: no Print button
         self._zoom_out_btn.configure(text="A−")
         self._zoom_in_btn.configure(text="A+")
-        if len(self._parts) > 1:
-            self._part_combo.config(state="readonly")
-        if self._current_part is None:
-            self._view_label_var.set("Full opinion")
-            self._set_view_color("black")
-        else:
-            part = self._parts[self._current_part]
-            self._view_label_var.set(part.label)
-            self._set_view_color(
-                self._PART_LABEL_COLORS.get(part.kind, "black"))
         extra = f" | {self._note}" if self._note else ""
         self._status_var.set(
             f"{len(self._scholar_text):,} characters | Google Scholar version{extra}"
@@ -19777,54 +19725,11 @@ class _ScholarTextWindow:
         self._install_current_location_map()
         self._restore_pending_text_location()
 
-    def _on_part_selected(self, _event=None) -> None:
-        idx = self._part_combo.current()
-        self._current_part = None if idx <= 0 else idx - 1
-        if self._cl_primary or self._mode == "courtlistener":
-            self._render_cl_blocks()
-        else:
-            self._render_scholar()
-
     def _on_yscroll(self, first: str, last: str) -> None:
-        """Keep the scrollbar in sync and, in the full-opinion view, colour the
-        top-of-window label to name the part now at the top of the page."""
         vsb = getattr(self, "_vsb", None)
         if vsb is not None:
             vsb.set(first, last)
-        self._update_scroll_part()
         self._draw_page_column()
-
-    def _update_scroll_part(self) -> None:
-        """In the full-opinion view, name+colour the part at the top of the
-        viewport (so scrolling into a concurrence/dissent colours the header).
-        A single selected part keeps its fixed label, so this no-ops there."""
-        if getattr(self, "_current_part", None) is not None:
-            return
-        parts = getattr(self, "_rendered_parts", None)
-        regions = self._part_region_indices()
-        if not parts or not regions:
-            return
-        txt = self._text
-        try:
-            top = txt.index("@0,0")
-        except tk.TclError:
-            return
-        pi = None
-        for rs, rend, p in regions:
-            if txt.compare(top, ">=", rs) and txt.compare(top, "<", rend):
-                pi = p
-                break
-        if pi is None or pi == getattr(self, "_scroll_part", None):
-            return
-        self._scroll_part = pi
-        kind = parts[pi].kind
-        if kind in ("concurrence", "dissent", "separate"):
-            self._view_label_var.set(parts[pi].label)
-            self._set_view_color(
-                self._PART_LABEL_COLORS.get(kind, "black"))
-        else:
-            self._view_label_var.set("Full opinion")
-            self._set_view_color("black")
 
     # ------------------------------------------------------------------
     # Text justification
@@ -20291,15 +20196,19 @@ class _ScholarTextWindow:
             h = txt.winfo_height()
         w = self._PARTMAP_W
         # Ideal vertical position of each marker (proportional to where the part
-        # begins in the document).
-        top, bot = 6, max(6, h - 6)
+        # begins in the document).  A label hangs *below* its marker, so the
+        # last marker has to stop a label's height short of the bottom edge —
+        # a short dissent at the very end of the opinion sits there, and its
+        # name would otherwise be drawn off the map altogether.
+        gap = self._partmap_font.metrics("linespace") + 3
+        top = 6
+        bot = max(top, h - gap - 6)
         ys = [max(top, min(bot, int(self._ypixels(rs) / total * h)))
               for rs, _kind, _label in marks]
         # Several short separate opinions clustered at the end would overlap, so
         # enforce a minimum gap: push collisions down, and if that runs off the
         # bottom, pack the run upward from the bottom edge.  The markers then no
         # longer line up exactly with the text, but every label stays readable.
-        gap = self._partmap_font.metrics("linespace") + 3
         for i in range(1, len(ys)):
             if ys[i] - ys[i - 1] < gap:
                 ys[i] = ys[i - 1] + gap
@@ -20309,17 +20218,38 @@ class _ScholarTextWindow:
                 if ys[i + 1] - ys[i] < gap:
                     ys[i] = ys[i + 1] - gap
             ys[0] = max(ys[0], top)
+        drawn: list[list] = []   # [y, y_bottom, start index, [canvas ids]]
         for (rs, kind, label), y in zip(marks, ys):
             color = self._PARTMAP_COLORS.get(kind, "black")
-            canvas.create_line(2, y, w - 2, y, fill=color, width=2)
-            canvas.create_rectangle(2, y, 8, y + 10, fill=color, outline=color)
+            ids = [
+                canvas.create_line(2, y, w - 2, y, fill=color, width=2),
+                canvas.create_rectangle(2, y, 8, y + 10,
+                                        fill=color, outline=color),
+            ]
             short = self._partmap_short_label(label, kind)
             tid = canvas.create_text(11, y + 1, anchor="nw", text=short,
                                      fill=color, font=self._partmap_font,
                                      width=w - 13)
+            ids.append(tid)
             bbox = canvas.bbox(tid)
             y2 = bbox[3] if bbox else y + 14
-            self._partmap_rows.append((y, y2, rs))
+            drawn.append([y, y2, rs, ids])
+        # A label's real height is only known once it is drawn — a long name
+        # wraps to a second line, taller than the single line reserved above.
+        # Walk up from the bottom lifting any marker whose label runs past the
+        # edge of the map (or into the marker below it), so the writing that
+        # falls off is never the last one — a short dissent at the end of the
+        # opinion is exactly the one that would have.
+        limit = h - 2
+        for row in reversed(drawn):
+            y, y2, _rs, ids = row
+            shift = min(y2 - limit, y - top)
+            if shift > 0:
+                for item in ids:
+                    canvas.move(item, 0, -shift)
+                row[0], row[1] = y - shift, y2 - shift
+            limit = min(limit, row[0] - 3)
+        self._partmap_rows = [(y, y2, rs) for y, y2, rs, _ids in drawn]
 
     @staticmethod
     def _partmap_short_label(label: str, kind: str) -> str:
@@ -20370,13 +20300,6 @@ class _ScholarTextWindow:
     def _render_cl_blocks(self) -> None:
         """Render CourtListener opinion parts with full block formatting."""
         parts = self._cl_parts or self._parts
-        # Update part selector to reflect CL parts
-        part_values = ["Full opinion"] + [
-            f"{i + 1}. {p.label}" for i, p in enumerate(parts)
-        ]
-        self._part_combo.config(values=part_values)
-        if self._current_part is None:
-            self._part_combo.current(0)
         txt = self._text
         txt.config(state="normal")
         self._reset_location_render_marks()
@@ -20389,7 +20312,6 @@ class _ScholarTextWindow:
         self._reset_fn_regions()  # unsets the marks the old notes used
         self._part_regions: list[tuple[str, str, int]] = []
         self._rendered_parts = parts  # parts list _part_regions indexes
-        self._scroll_part: Optional[int] = None
         self._fn_ref_pos: dict[str, str] = {}
         self._fn_def_pos: dict[str, str] = {}
         self._reset_page_marks()
@@ -20449,18 +20371,6 @@ class _ScholarTextWindow:
         self._print_btn.pack_forget()
         self._zoom_out_btn.configure(text="A−")
         self._zoom_in_btn.configure(text="A+")
-        if len(parts) > 1:
-            self._part_combo.config(state="readonly")
-        else:
-            self._part_combo.config(state="disabled")
-        if self._current_part is None:
-            self._view_label_var.set("Full opinion")
-            self._set_view_color("black")
-        else:
-            part = parts[self._current_part]
-            self._view_label_var.set(part.label)
-            self._set_view_color(
-                self._PART_LABEL_COLORS.get(part.kind, "black"))
         char_count = len(self._cl_text or self._scholar_text or "")
         self._status_var.set(
             f"{char_count:,} characters | {self._primary_source_label} version"
@@ -20510,9 +20420,6 @@ class _ScholarTextWindow:
         self._zoom_out_btn.configure(text="A−")
         self._zoom_in_btn.configure(text="A+")
         self._hide_cl_button()
-        self._part_combo.config(state="disabled")
-        self._view_label_var.set(f"{self._primary_source_label} text")
-        self._set_view_color("black")
         self._status_var.set(
             f"{len(self._cl_text or ''):,} characters | "
             f"{self._primary_source_label} version"
@@ -22313,14 +22220,14 @@ class _ScholarTextWindow:
 
     def _apply_source_bar_visibility(self) -> None:
         """Show or hide the source bar to match _source_bar_var, keeping it
-        anchored above the "Viewing" row when shown."""
+        anchored above the opinion when shown."""
         bar = getattr(self, "_source_bar", None)
         if bar is None:
             return
         try:
             if self._source_bar_var.get():
                 bar.pack(fill="x", padx=12, pady=(12, 0),
-                         before=self._view_frame)
+                         before=self._text_frame)
             else:
                 bar.pack_forget()
         except tk.TclError:
@@ -22340,12 +22247,73 @@ class _ScholarTextWindow:
             self._apply_pdf_parts_visibility()
             return
         self._details_on = on
+        # Resize before re-packing, and without flushing the layout in between,
+        # so Tk lays the window out once: the reader never sees the opinion
+        # re-wrapped into an intermediate width.
+        self._resize_for_details(1 if on else -1)
         if on:
             self._details_panel().pack(side="right", fill="y",
                                        before=self._vsb)
             self._refresh_details_view()
         elif self._details_frame is not None:
             self._details_frame.pack_forget()
+
+    def _window_is_maximized(self) -> bool:
+        """Whether the window has no room to grow — maximized, or already as
+        wide as the desktop.  Window managers disagree about how they say so,
+        so all three answers are consulted."""
+        win = self._win
+        try:
+            if str(win.state()) == "zoomed":       # Windows
+                return True
+        except (AttributeError, tk.TclError):
+            pass
+        try:
+            if bool(win.attributes("-zoomed")):    # X11
+                return True
+        except (AttributeError, tk.TclError, TypeError):
+            pass
+        try:                                       # macOS says neither
+            _left, _top, work_w, _work_h = _work_area(win)
+            return win.winfo_width() >= work_w - 16
+        except (AttributeError, tk.TclError):
+            return False
+
+    def _resize_for_details(self, delta: int) -> None:
+        """Give the side panel a column of its own instead of taking one from
+        the opinion: the window grows by the panel's width when it opens and
+        shrinks back when it closes, so the text keeps its measure and is not
+        re-wrapped.
+
+        Growing past the right edge of the desktop is allowed — the reader can
+        move the window, which beats re-flowing the opinion under them.  It is
+        skipped only where there is nothing to grow: a maximized window (the
+        panel then takes its width from the text, as it always did), and a tab
+        in the shared window, whose size is not one view's to change."""
+        if delta == 0 or isinstance(self._win, _CaseTabPage):
+            return
+        if self._window_is_maximized():
+            return
+        try:
+            # The window manager's own geometry string round-trips exactly;
+            # rebuilding one from winfo_x/y drifts by the title bar on some
+            # window managers.  Deliberately no update_idletasks() — a flush
+            # here is what would make the intermediate width visible.
+            spec = str(self._win.wm_geometry())
+            width = self._win.winfo_width()
+        except (AttributeError, tk.TclError):
+            return
+        match = re.match(r"^(\d+)x(\d+)([+-]\d+[+-]\d+)$", spec)
+        if not match or width <= 1:
+            return
+        height, position = match.group(2), match.group(3)
+        new_width = max(430, width + delta * self._details_panel_w)
+        if new_width == width:
+            return
+        try:
+            self._win.geometry(f"{new_width}x{height}{position}")
+        except tk.TclError:
+            pass
 
     def _sync_details_checkbox(self) -> None:
         """Point the "Side panel" checkbox at the setting for the view now
@@ -24960,9 +24928,6 @@ class _ScholarTextWindow:
                 )
             )
         self._hide_pdf_button()  # the toggle below is the way back from the PDF
-        self._part_combo.config(state="disabled")
-        self._view_label_var.set("PDF of opinion")
-        self._set_view_color("black")
         self._source_var.set(url)
         # Returning from the PDF goes back to whichever text view we came from:
         # the Scholar text, or — for a CourtListener-primary window — the CL text.
@@ -25088,10 +25053,6 @@ class _ScholarTextWindow:
                         # The PDF can be scrolled into another writing. Show the
                         # full opinion so that target exists in the rendering.
                         self._current_part = None
-                        try:
-                            self._part_combo.current(0)
-                        except tk.TclError:
-                            pass
         holder = getattr(self, "_pdf_holder", None)
         if holder is not None:
             holder.destroy()  # takes the pane and its parts strip with it
@@ -25105,7 +25066,7 @@ class _ScholarTextWindow:
         if self._pre_pdf_mode == "courtlistener":
             self._render_courtlistener_view()
         else:
-            self._render_scholar()  # restores label, combo and "PDF"
+            self._render_scholar()  # restores the buttons and "PDF"
 
     def _on_pdf_error(self, msg: str) -> None:
         if self._pre_pdf_mode == "courtlistener" and self._mode != "pdf":
