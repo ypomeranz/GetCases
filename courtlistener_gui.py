@@ -393,6 +393,21 @@ def _style_ui_button(button, primary: bool = False) -> None:
         pass
 
 
+def _ui_mini_button(parent, text: str, command=None, width: int = 30):
+    """A small, quiet toolbar button, for a strip where the ordinary
+    full-height action button would dominate the window (the floating PDF
+    viewer's zoom controls)."""
+    if _CTK_AVAILABLE:
+        return ctk.CTkButton(
+            parent, text=text, command=command, width=width, height=22,
+            corner_radius=6, font=_ui_font(12), fg_color=_UI["window"],
+            hover_color=_UI["surface_alt"], text_color=_UI["text"],
+            border_width=1, border_color=_UI["border"],
+        )
+    return ttk.Button(parent, text=text, command=command,
+                      width=max(2, round(width / 9)))
+
+
 def _ui_button_enable(button, enabled: bool) -> None:
     """Enable or grey out a shared button (CTk and ttk agree on ``state``)."""
     button.configure(state="normal" if enabled else "disabled")
@@ -5959,6 +5974,15 @@ class CourtListenerGUI:
         self._detached_tab_windows: set[_CaseTabsWindow] = set()
         self._open_case_views: dict[int, dict] = {}
 
+        # "View PDF" either swaps the scan into the opinion window (the
+        # default) or floats it in its own minimal viewer, off the reader.
+        self._pdf_separate_window = bool(
+            config.get("pdf_separate_window", False)
+        )
+        self._pdf_separate_var = tk.BooleanVar(
+            master=self.root, value=self._pdf_separate_window
+        )
+
         # Recently viewed cases, most recent first, for the "History ▾"
         # dropdown every case window carries: {"key", "label", "reopen"}.
         # Deduped by key (a re-view moves the case to the front), capped.
@@ -6433,6 +6457,13 @@ class CourtListenerGUI:
                 bool(self._case_tabs_var.get())
             ),
         )
+        menu.add_checkbutton(
+            label="View PDF in Separate Window",
+            variable=self._pdf_separate_var,
+            command=lambda: self.set_pdf_separate_window(
+                bool(self._pdf_separate_var.get())
+            ),
+        )
         # Opinion viewers expose their (default-hidden) source bar here.
         source_owner = getattr(view, "_source_bar_control", None)
         if source_owner is not None and hasattr(source_owner, "_source_bar_var"):
@@ -6447,6 +6478,23 @@ class CourtListenerGUI:
             else "Close Window",
             command=(view.destroy if view is not None else lambda: None),
         )
+
+    def pdf_opens_in_separate_window(self) -> bool:
+        """Whether "View PDF" floats the scan in its own minimal viewer rather
+        than showing it inside the opinion window."""
+        return bool(getattr(self, "_pdf_separate_window", False))
+
+    def set_pdf_separate_window(self, enabled: bool) -> None:
+        """Remember the reader's choice of where a PDF opens.  Views already on
+        screen are left alone — the setting applies from the next PDF opened."""
+        enabled = bool(enabled)
+        self._pdf_separate_var.set(enabled)
+        if enabled == self._pdf_separate_window:
+            return
+        self._pdf_separate_window = enabled
+        config = _load_config()
+        config["pdf_separate_window"] = enabled
+        _save_config(config)
 
     def new_case_view_host(self, parent: tk.Misc):
         """Compatibility name for opinion viewers."""
@@ -16335,6 +16383,323 @@ def _is_redacted_case_pdf(url: "Optional[str]") -> bool:
     return "case.law" in (url or "").lower()
 
 
+class _FloatingPdfWindow:
+    """A small, Preview-style window showing nothing but the PDF.
+
+    This is what an opinion's "PDF" button opens once Window ▸ *View PDF in
+    Separate Window* is ticked: rather than the scan taking the reader's place
+    behind a full window of chrome, the page gets a window of its own — one
+    quiet strip along the top carrying the zoom controls and the document's
+    name, and the page under it on a small margin.  Nothing else: no button
+    bar, no side panels, no status line.  Save and Print stay reachable from
+    the strip's context menu and the usual accelerators, and Ctrl/Cmd-F
+    searches the page whenever the PDF has a text layer.
+
+    Always a real top-level window, never a page in the shared tabbed case
+    window — floating clear of the reader is the whole point of the mode.
+    """
+
+    _W = 720     # preferred size, clamped to the usable desktop in _place_beside
+    _H = 880
+    _MIN_W = 380
+    _MIN_H = 280
+    _BAR_H = 30  # the top strip: one 22px button row plus its padding
+
+    def __init__(self, parent: tk.Misc, data: bytes, url: str, title: str,
+                 *, margin: Optional[int] = None, app=None,
+                 on_save=None, on_print=None, on_close=None,
+                 on_cite=None, on_cite_browser=None) -> None:
+        self._app = app
+        self._on_save = on_save
+        self._on_print = on_print
+        self._on_close = on_close
+        self._on_cite = on_cite
+        self._on_cite_browser = on_cite_browser
+        self._url = url
+        self._bytes = data
+        self._pane: Optional[_PdfPane] = None
+        self._analysed_url = ""   # the URL whose links/text layer are attached
+        self._closing = False
+
+        self._win = _ui_toplevel(parent)
+        _ensure_modern_ttk_styles(self._win)
+        self._win.title(title or "PDF")
+        self._place_beside(parent)
+        self._win.minsize(self._MIN_W, self._MIN_H)
+
+        self._zoom_var = tk.StringVar(master=self._win, value="100%")
+        self._name_var = tk.StringVar(master=self._win, value="")
+        self._build_bar()
+        self._body = ttk.Frame(self._win)
+        self._body.pack(side="top", fill="both", expand=True)
+
+        # Cmd and Control are separate modifiers in Tk, so a Mac keyboard needs
+        # its own bindings for the same accelerators.
+        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>",
+                    "<Command-plus>", "<Command-equal>"):
+            self._win.bind(seq, lambda _e: self.zoom(+1))
+        for seq in ("<Control-minus>", "<Control-KP_Subtract>",
+                    "<Command-minus>"):
+            self._win.bind(seq, lambda _e: self.zoom(-1))
+        for seq in ("<Control-0>", "<Command-0>"):
+            self._win.bind(seq, lambda _e: self.zoom(0))
+        for seq in ("<Control-w>", "<Command-w>"):
+            self._win.bind(seq, lambda _e: self.close())
+        for seq in ("<Control-s>", "<Command-s>"):
+            self._win.bind(seq, lambda _e: self._save())
+        for seq in ("<Control-p>", "<Command-p>"):
+            self._win.bind(seq, lambda _e: self._print())
+        _bind_reader_scroll_keys(
+            self._win,
+            lambda direction: (
+                self._pane.scroll_key(direction)
+                if self._pane is not None else False
+            ),
+        )
+        self._win.bind("<Destroy>", self._on_destroy, add="+")
+        try:
+            self.set_pdf(data, url, title, margin=margin)
+        except Exception:
+            self.close()
+            raise
+
+    # ------------------------------------------------------------------
+    # Geometry and the top strip
+    # ------------------------------------------------------------------
+
+    def _place_beside(self, anchor: "Optional[tk.Misc]") -> None:
+        """Open next to the reader rather than over it — keeping the page from
+        covering the text is the point of the mode.  Falls back to the right
+        edge of the desktop when neither side of the reader has room."""
+        left, top, work_w, work_h = _work_area(self._win)
+        w = max(self._MIN_W, min(self._W, max(self._MIN_W, work_w - 32)))
+        h = max(self._MIN_H, min(self._H, max(self._MIN_H, work_h - 72)))
+        x = left + max(16, work_w - w - 24)
+        y = top + 24
+        try:
+            if anchor is not None and anchor.winfo_exists():
+                anchor.update_idletasks()
+                ax, aw = anchor.winfo_rootx(), anchor.winfo_width()
+                if left + work_w - (ax + aw) >= w + 24:
+                    x = ax + aw + 12          # room to the reader's right
+                elif ax - left >= w + 24:
+                    x = ax - w - 12           # …or to its left
+                y = max(top + 16,
+                        min(anchor.winfo_rooty(), top + work_h - h - 24))
+        except tk.TclError:
+            pass
+        try:
+            self._win.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _short_name(title: str, limit: int = 58) -> str:
+        """The document name for the strip: long Bluebook captions are elided
+        so they never squeeze the zoom controls (the title bar keeps it whole)."""
+        name = re.sub(r"\s+", " ", title or "").strip()
+        return name if len(name) <= limit else name[:limit - 1].rstrip() + "…"
+
+    def _build_bar(self) -> None:
+        """The one piece of chrome: zoom controls left, document name right,
+        a hairline under it and nothing else."""
+        if _CTK_AVAILABLE:
+            bar = ctk.CTkFrame(self._win, fg_color=_UI["surface"],
+                               corner_radius=0, height=self._BAR_H)
+            bar.pack(side="top", fill="x")
+            bar.pack_propagate(False)   # a strip of fixed, minimal height
+        else:
+            # Plain ttk buttons are taller; let the strip size to them.
+            bar = tk.Frame(self._win, bg=_UI["surface"])
+            bar.pack(side="top", fill="x")
+        self._bar = bar
+        _ui_mini_button(bar, "−", lambda: self.zoom(-1)).pack(
+            side="left", padx=(8, 0), pady=4)
+        _ui_mini_button(bar, "+", lambda: self.zoom(+1)).pack(
+            side="left", padx=(4, 0), pady=4)
+        _ui_mini_button(bar, "Fit", lambda: self.zoom(0), width=38).pack(
+            side="left", padx=(6, 0), pady=4)
+        zoom_lbl = _ui_label(bar, size=11, muted=True, anchor="w",
+                             textvariable=self._zoom_var)
+        zoom_lbl.pack(side="left", padx=(8, 0))
+        # The name sits at the far right, muted: identification, not a heading.
+        # Packed last, so the zoom controls win the space when the window is
+        # narrow and a long caption is simply clipped at the strip's edge.
+        name_lbl = _ui_label(bar, size=11, muted=True, anchor="e",
+                             textvariable=self._name_var)
+        name_lbl.pack(side="right", padx=(8, 10))
+        if not _CTK_AVAILABLE:
+            for lbl in (zoom_lbl, name_lbl):
+                lbl.configure(bg=_UI["surface"])   # match the strip, not a card
+        if _CTK_AVAILABLE:
+            rule = ctk.CTkFrame(self._win, fg_color=_UI["border"],
+                                corner_radius=0, height=1)
+        else:
+            rule = tk.Frame(self._win, bg=_UI["border"], height=1)
+        rule.pack(side="top", fill="x")
+        # Save/Print are kept off the strip; a right-click on it offers them.
+        menu = tk.Menu(self._win, tearoff=0)
+        menu.add_command(label=f"Save PDF As…\t{_ACCEL}+S", command=self._save)
+        menu.add_command(label=f"Print…\t{_ACCEL}+P", command=self._print)
+        menu.add_separator()
+        menu.add_command(label=f"Close\t{_ACCEL}+W", command=self.close)
+        self._bar_menu = menu
+        for seq in ("<Button-3>", "<Button-2>"):  # Button-2 is the Mac right-click
+            _bind_recursive(bar, seq, self._post_bar_menu)
+
+    def _post_bar_menu(self, event) -> None:
+        try:
+            self._bar_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._bar_menu.grab_release()
+
+    # ------------------------------------------------------------------
+    # Contents
+    # ------------------------------------------------------------------
+
+    def set_pdf(self, data: bytes, url: str, title: str = "",
+                *, margin: Optional[int] = None) -> None:
+        """Show *data* here, replacing whatever was on screen — a second click
+        on the PDF button (or another reporter's scan) reuses this window
+        instead of stacking another one on top of it."""
+        old, self._pane = self._pane, None
+        if old is not None:
+            old.destroy()
+        self._bytes = data
+        self._url = url
+        self._analysed_url = ""   # the new pane has no links or text layer yet
+        if title:
+            self._win.title(title)
+        self._name_var.set(self._short_name(title or self._win.title()))
+        try:
+            self._win.update_idletasks()
+        except tk.TclError:
+            pass
+        try:
+            avail = self._win.winfo_width()
+        except tk.TclError:
+            avail = 0
+        # The pane's fit-to-window width is fixed at construction; leave room
+        # for its scrollbar so the page is not clipped at 100%.
+        width = max((avail or 720) - 30, self._MIN_W - 40)
+        pane = _PdfPane(self._body, data, width=width, margin=margin,
+                        link_style="recolor", uniform_crop=True)
+        pane.pack(fill="both", expand=True)
+        self._pane = pane
+        self._zoom_var.set(f"{pane.zoom_percent()}%")
+
+    def showing(self, url: str) -> bool:
+        """True when *url* is already the document on screen here."""
+        return bool(self._pane is not None and url and self._url == url)
+
+    def apply_analysis(self, result: dict) -> None:
+        """Wire the owner's cached analysis of this PDF into the pane: blue
+        clickable citations, and Ctrl/Cmd-F search plus drag-select over the
+        text layer.  Ignored once the window has moved on to another scan."""
+        pane = self._pane
+        if pane is None or not self.alive():
+            return
+        analysed = result.get("url") or ""
+        if analysed and analysed != self._url:
+            return
+        if self._analysed_url == self._url:
+            return  # already attached; re-linking would re-render every page
+        self._analysed_url = self._url
+        pages = result.get("pages", [])
+        if not any(pages or []):
+            return  # a scan with no text layer: nothing to attach
+        links = result.get("links", {})
+        if links:
+            pane.set_citation_links(
+                links, self._on_cite, self._on_cite_browser,
+                quiet_pages=result.get("quiet", set()),
+            )
+        pane.enable_find(pages, bind_keys=True)
+
+    def scroll_to_page(self, page: int, y_pt: Optional[float] = None) -> None:
+        """Open on the page the reader was on in the text, once laid out."""
+        def go(pane=self._pane) -> None:
+            if self._pane is pane and pane is not None:
+                pane.scroll_to_page(page, y_pt)
+
+        try:
+            self._win.after_idle(go)
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------------
+    # Zoom, focus, lifecycle
+    # ------------------------------------------------------------------
+
+    def zoom(self, delta: int) -> None:
+        """Zoom in (+1), out (-1), or back to fit-to-window (0)."""
+        pane = self._pane
+        if pane is None:
+            return
+        try:
+            pane.zoom(delta)
+            self._zoom_var.set(f"{pane.zoom_percent()}%")
+        except tk.TclError:
+            pass
+
+    def alive(self) -> bool:
+        try:
+            return bool(self._win.winfo_exists())
+        except (AttributeError, tk.TclError):
+            return False
+
+    def surface(self) -> None:
+        """Bring the viewer forward — a re-click on PDF should show the page
+        even when the window is behind the reader or minimized."""
+        if not self.alive():
+            return
+        try:
+            self._win.deiconify()
+            self._win.lift()
+            self._win.focus_force()
+        except tk.TclError:
+            return
+        if sys.platform == "win32" and self._app is not None:
+            forcer = getattr(self._app, "_win_force_foreground", None)
+            if forcer is not None:
+                forcer(self._win)
+
+    def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            self._win.destroy()
+        except tk.TclError:
+            pass
+
+    def _on_destroy(self, event) -> None:
+        # Toplevel bindings fire for descendants too; only the window closing
+        # means the viewer is gone.
+        if getattr(event, "widget", None) is not self._win:
+            return
+        self._closing = True
+        self._pane = None
+        if self._on_close is not None:
+            try:
+                self._on_close(self)
+            except Exception as exc:
+                print(f"[pdf-window] close handler failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # Save / Print — delegated to the reader that opened this window, which
+    # knows the Bluebook filename and the redaction handling for the scan.
+    # ------------------------------------------------------------------
+
+    def _save(self) -> None:
+        if self._on_save is not None:
+            self._on_save()
+
+    def _print(self) -> None:
+        if self._on_print is not None:
+            self._on_print(self._pane)
+
+
 # ---------------------------------------------------------------------------
 # Printed running head for redacted case.law scans
 # ---------------------------------------------------------------------------
@@ -16911,6 +17276,9 @@ class _ScholarTextWindow:
         self._mode = "courtlistener" if self._cl_primary else "scholar"
         self._pdf_pane: Optional[_PdfPane] = None  # set while viewing the PDF
         self._pdf_holder: Optional[ttk.Frame] = None  # pane + parts strip
+        # The minimal floating viewer this window's PDFs go to under
+        # Window ▸ "View PDF in Separate Window"; reused for every scan.
+        self._pdf_float_win: "Optional[_FloatingPdfWindow]" = None
         # The separate-opinions strip inside that holder, once the text layer
         # has revealed the parts; toggled by the "Side panel" checkbox.
         self._pdf_parts_nav: Optional[ttk.Frame] = None
@@ -17070,6 +17438,10 @@ class _ScholarTextWindow:
             )
         )
         self._win.minsize(430, 300)
+        # A floating PDF viewer belongs to this reader, so it closes with it.
+        # (Its own parent window is the shared tab window when tabs are on,
+        # which outlives a single tab.)
+        self._win.bind("<Destroy>", self._on_reader_destroyed, add="+")
         self._build_ui()
         if self._cl_primary:
             self._render_cl_blocks()
@@ -24044,7 +24416,82 @@ class _ScholarTextWindow:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _pdf_opens_in_separate_window(self) -> bool:
+        """Whether the app is set to float PDFs in their own minimal viewer."""
+        getter = getattr(self._app, "pdf_opens_in_separate_window", None)
+        if getter is None:
+            return False
+        try:
+            return bool(getter())
+        except Exception:
+            return False
+
+    def _show_pdf_floating(self, data: bytes, url: str) -> None:
+        """Open the scan in the minimal floating viewer, leaving this window on
+        the opinion text.  The reader keeps both: the text where it was and the
+        page beside it, opened at the place the text was scrolled to."""
+        switch_target = self._consume_pdf_switch_target(url)
+        self._pdf_url = url
+        self._pdf_bytes = data
+        self._pdf_located = True
+        margin = _PdfPane._MARGIN * 3 if _is_us_reports_pdf(url) else None
+        title = self._title_citation() or self._win.title()
+        win = self._pdf_float_win
+        if win is not None and not win.alive():
+            win = self._pdf_float_win = None
+        try:
+            if win is None:
+                win = _FloatingPdfWindow(
+                    self._win.winfo_toplevel(), data, url, title,
+                    margin=margin, app=self._app,
+                    on_save=self._download_pdf,
+                    on_print=self._print_pdf,
+                    on_close=self._floating_pdf_closed,
+                    on_cite=self._open_pdf_cite,
+                    on_cite_browser=self._open_pdf_cite_browser,
+                )
+                self._pdf_float_win = win
+            elif not win.showing(url):
+                # Another reporter's scan chosen from the PDF ▾ menu replaces
+                # what the viewer holds; the same one is only re-surfaced.
+                win.set_pdf(data, url, title, margin=margin)
+        except Exception as exc:  # pragma: no cover - render/lib failure
+            self._pdf_float_win = None
+            self._on_pdf_error(str(exc))
+            return
+        win.surface()
+        if switch_target is not None:
+            page, y_pt = switch_target
+            win.scroll_to_page(page, y_pt)
+        # The text view never went away, so put back whichever control was
+        # greyed out while the PDF was being fetched.
+        self._refresh_pdf_button()
+        self._status_var.set(
+            "Showing the official PDF in its own window "
+            f"({_ACCEL}+W closes it)."
+        )
+        self._active_pdf_analysis_key = self._request_pdf_analysis(
+            data, url, lambda result, w=win: w.apply_analysis(result),
+        )
+
+    def _floating_pdf_closed(self, win) -> None:
+        if self._pdf_float_win is win:
+            self._pdf_float_win = None
+
+    def _on_reader_destroyed(self, event) -> None:
+        """Take the floating PDF viewer down with the reader that opened it.
+        A window's <Destroy> also reaches its descendants, so only the reader's
+        own host counts."""
+        if getattr(event, "widget", None) is not self._win:
+            return
+        win, self._pdf_float_win = self._pdf_float_win, None
+        if win is not None:
+            win.close()
+
     def _show_pdf(self, data: bytes, url: str) -> None:
+        if self._pdf_opens_in_separate_window():
+            self._show_pdf_floating(data, url)
+            return
         switch_target = self._consume_pdf_switch_target(url)
         _clamp_toplevel_to_work_area(
             self._win, min_width=430, min_height=300, bottom_gap=72
@@ -24150,15 +24597,19 @@ class _ScholarTextWindow:
             return
         self._status_var.set(f"Saved PDF to {path}")
 
-    def _print_pdf(self) -> None:
+    def _print_pdf(self, pane: "Optional[_PdfPane]" = None) -> None:
         """Print the PDF currently being viewed — the re-spaced/centered
         rendering shown on screen, falling back to the original scan.  A
         redacted case.law scan gets its black redaction boxes whitened so
         they don't waste ink on paper, and its running-head line re-lettered
-        with the Bluebook citation the redaction took away."""
+        with the Bluebook citation the redaction took away.
+
+        ``pane`` names the rendering to print when it is not this window's own
+        — the floating viewer prints the page it is showing."""
         data = getattr(self, "_pdf_bytes", None)
         if not data:
             return
+        pane = pane if pane is not None else self._pdf_pane
         whiten = _is_redacted_case_pdf(self._pdf_url)
         header = ""
         if whiten:
@@ -24176,8 +24627,8 @@ class _ScholarTextWindow:
         path = _named_temp_pdf_path(
             _build_default_filename(self._pdf_filename_item()))
         try:
-            if self._pdf_pane is not None:
-                self._pdf_pane.export_pdf(
+            if pane is not None:
+                pane.export_pdf(
                     path, whiten_redactions=whiten, header_cite=header)
             else:
                 with open(path, "wb") as fh:

@@ -65,6 +65,8 @@ Double‑click a row to download the opinion as PDF (or .txt if no PDF is availa
 
 Click **Scholar** to fetch the full opinion from Google Scholar (often richer than CourtListener’s HTML); the button on the Scholar view reads **CourtListener** and switches back. Under a PDF both read **Text**.
 
+**PDF** shows the official scan in place of the text, and **Text** brings the text back at the passage the PDF was left on. Tick **Window → View PDF in Separate Window** and the scan instead opens in a small window of its own – the page under one thin strip carrying the zoom controls (**−**, **+**, **Fit**, and Ctrl/Cmd +, −, 0), and nothing else: the opinion text stays on screen beside it. Citations in the page are still clickable, Ctrl/Cmd+F still searches it, and Save (Ctrl/Cmd+S), Print (Ctrl/Cmd+P) and Close (Ctrl/Cmd+W) are on the strip’s right‑click menu. The setting is remembered between sessions, and the viewer closes with the opinion window that opened it.
+
 Quick Lookup (Ctrl+S)
 Instant citation lookup: paste a case citation (410 U.S. 113), a statute (42 USC 1983), a regulation (29 CFR 1614.105), or a Federal Rule (FRE 404), and open the source directly.
 
