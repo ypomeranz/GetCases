@@ -21374,6 +21374,10 @@ class _ScholarTextWindow:
                     f"docket_{cover}", background=color,
                     foreground="#25232e", spacing1=3, spacing3=1,
                 )
+            body.tag_configure(
+                "docket_plain", foreground="#25232e",
+                spacing1=3, spacing3=1,
+            )
             self._details_text = body
             self._details_frame = f
             self._apply_details_fonts()   # honor the persisted zoom choice

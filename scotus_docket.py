@@ -9,6 +9,7 @@ only the filings useful to an opinion reader:
 * cert petition (or jurisdictional statement) and its appendix;
 * brief in opposition/response, cert reply, and cert-stage amicus briefs;
 * joint appendix and party, reply, and amicus briefs on the merits.
+* the oral-argument transcript, when the case page links one.
 
 It deliberately omits certificates, proofs of service, extension motions,
 waivers, orders, transcripts, records, and other docket administration.
@@ -210,6 +211,8 @@ def _classify(
     low = text.casefold()
     stage = _stage_from_text(text, stage)
     section_low = section.casefold()
+    if "transcript" in low and "argument" in low:
+        return ("merits", "oral_argument_transcript", "plain")
     is_amicus = (
         bool(re.search(r"\bamic(?:us|i)\b", low))
         or "amicus brief" in section_low
@@ -594,6 +597,32 @@ def _archived_documents(
     return documents
 
 
+def _transcript_documents(
+    soup: BeautifulSoup, base_url: str, docket: str
+) -> list[DocketDocument]:
+    """Find the official oral-argument transcript linked in case metadata."""
+
+    documents: list[DocketDocument] = []
+    for link in soup.find_all("a", href=True):
+        href = _valid_document_url(link.get("href"), base_url)
+        if not href or not re.search(
+            r"/oral_arguments/argument_transcripts/[^?#]+\.pdf(?:[?#].*)?$",
+            href,
+            flags=re.IGNORECASE,
+        ):
+            continue
+        documents.append(DocketDocument(
+            stage="merits",
+            kind="oral_argument_transcript",
+            label="Oral argument transcript",
+            url=href,
+            cover="plain",
+            docket=normalize_docket(docket),
+            source="SCOTUSblog",
+        ))
+    return documents
+
+
 def parse_scotusblog_case(
     html: str, base_url: str, docket: str = ""
 ) -> list[DocketDocument]:
@@ -602,7 +631,8 @@ def parse_scotusblog_case(
     soup = BeautifulSoup(html or "", "html.parser")
     current = _timeline_documents(soup, base_url, docket)
     archived = _archived_documents(soup, base_url, docket)
-    return _dedupe_and_order(current + archived)
+    transcripts = _transcript_documents(soup, base_url, docket)
+    return _dedupe_and_order(current + archived + transcripts)
 
 
 def _canonical_url(url: str) -> str:

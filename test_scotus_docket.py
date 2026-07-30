@@ -211,6 +211,7 @@ CURRENT_BLOG_FIXTURE = """
     <span>Sep 29, 2023</span>
     <span>Brief amicus curiae of Public Citizen filed.</span>
   </a>
+  <a href="https://www.supremecourt.gov/oral_arguments/argument_transcripts/2023/22-451_114p.pdf"></a>
 </main>
 """
 
@@ -221,7 +222,7 @@ class OfficialDocketParsingTests(unittest.TestCase):
             OFFICIAL_FIXTURE, "22-451"
         )
 
-        self.assertEqual(len(documents), 11)
+        self.assertEqual(len(documents), 12)
         self.assertEqual(
             [document.kind for document in documents[:5]],
             [
@@ -240,7 +241,10 @@ class OfficialDocketParsingTests(unittest.TestCase):
         self.assertNotIn("extension.pdf", {document.url for document in documents})
         self.assertNotIn("certificate.pdf", {document.url for document in documents})
         self.assertNotIn("proof.pdf", {document.url for document in documents})
-        self.assertNotIn("transcript.pdf", {document.url for document in documents})
+        transcript = documents[-1]
+        self.assertEqual(transcript.kind, "oral_argument_transcript")
+        self.assertEqual(transcript.cover, "plain")
+        self.assertEqual(transcript.url, "https://court.test/transcript.pdf")
 
     def test_merits_colors_follow_party_and_filing_sequence(self):
         documents = scotus_docket.parse_official_docket(
@@ -333,10 +337,13 @@ class SCOTUSblogParsingTests(unittest.TestCase):
             "22-451",
         )
 
-        self.assertEqual(len(documents), 2)
+        self.assertEqual(len(documents), 3)
         self.assertEqual(documents[0].kind, "cert_petition")
         self.assertEqual(documents[0].date, "Nov 10, 2022")
         self.assertEqual(documents[1].kind, "merits_petitioner")
+        self.assertEqual(documents[2].kind, "oral_argument_transcript")
+        self.assertEqual(documents[2].cover, "plain")
+        self.assertIn("/argument_transcripts/", documents[2].url)
 
 
 class _Response:
@@ -374,7 +381,7 @@ class DocketFetchAndPanelTests(unittest.TestCase):
 
         result = scotus_docket.fetch_case_docket("22-451", session=session)
 
-        self.assertEqual(len(result.documents), 12)
+        self.assertEqual(len(result.documents), 14)
         self.assertEqual(
             sum(
                 document.url == "https://court.test/petition.pdf"
@@ -396,6 +403,7 @@ class DocketFetchAndPanelTests(unittest.TestCase):
         self.assertIn('elif mode == "docket":', source)
         self.assertIn('f"docket_{cover}"', source)
         self.assertIn('f"docket_{document.cover}"', source)
+        self.assertIn('"docket_plain", foreground="#25232e"', source)
 
 
 if __name__ == "__main__":
