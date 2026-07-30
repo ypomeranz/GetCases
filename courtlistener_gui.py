@@ -6571,6 +6571,31 @@ class CourtListenerGUI:
             view._secondary_reopen = reopen
             view._secondary_owner = owner
 
+    def surface_case_view(self, key: str) -> bool:
+        """Bring an already-open view of *key* forward, if there is one.
+
+        What the case name on a floating PDF viewer's strip asks before
+        reopening anything: the reader may have been closed and reopened since,
+        or the reader may never have gone away."""
+        if not key:
+            return False
+        for entry in list(self._open_case_views.values()):
+            if entry.get("key") != key:
+                continue
+            owner = entry.get("owner")
+            surfacer = getattr(owner, "_surface_text_view", None)
+            alive = getattr(owner, "_text_view_alive", None)
+            # Only a view that is genuinely still on screen: asking a closed
+            # one to surface itself would send it back here.
+            if surfacer is None or alive is None or not alive():
+                continue
+            try:
+                surfacer()
+            except tk.TclError:
+                continue
+            return True
+        return False
+
     def _secondary_entry_for_view(self, view):
         return next((
             entry for entry in self._open_case_views.values()
@@ -17022,7 +17047,8 @@ class _FloatingPdfWindow:
     def __init__(self, parent: tk.Misc, data: bytes, url: str, title: str,
                  *, margin: Optional[int] = None, app=None,
                  on_save=None, on_print=None, on_close=None,
-                 on_cite=None, on_cite_browser=None, on_open_text=None) -> None:
+                 on_cite=None, on_cite_browser=None, on_open_text=None,
+                 anchor: "Optional[tk.Misc]" = None) -> None:
         self._app = app
         self._on_save = on_save
         self._on_print = on_print
@@ -17039,10 +17065,14 @@ class _FloatingPdfWindow:
         self._analysed_url = ""   # the URL whose links/text layer are attached
         self._closing = False
 
+        # ``parent`` owns this window's lifetime — Tk destroys a toplevel with
+        # its master, so a viewer meant to outlive the reader that opened it is
+        # given the application's own root instead.  ``anchor`` is only where to
+        # put it on screen.
         self._win = _ui_toplevel(parent)
         _ensure_modern_ttk_styles(self._win)
         self._win.title(title or "PDF")
-        self._place_beside(parent)
+        self._place_beside(anchor if anchor is not None else parent)
         self._win.minsize(self._MIN_W, self._MIN_H)
 
         self._zoom_var = tk.StringVar(master=self._win, value="100%")
@@ -18127,10 +18157,6 @@ class _ScholarTextWindow:
             )
         )
         self._win.minsize(430, 300)
-        # A floating PDF viewer belongs to this reader, so it closes with it.
-        # (Its own parent window is the shared tab window when tabs are on,
-        # which outlives a single tab.)
-        self._win.bind("<Destroy>", self._on_reader_destroyed, add="+")
         self._build_ui()
         if self._cl_primary:
             self._render_cl_blocks()
@@ -18257,6 +18283,9 @@ class _ScholarTextWindow:
 
         key = self._history_key()
         label = self._history_label()
+        # Kept so a floating PDF viewer that outlived this window can bring the
+        # text back — the same replay History uses, with no refetch.
+        self._history_reopen = reopen
         app.record_case_view(key, label, reopen, payload=payload)
         if hasattr(app, "register_case_window"):
             app.register_case_window(self, self._win, key, label, reopen)
@@ -25253,8 +25282,13 @@ class _ScholarTextWindow:
             win = self._pdf_float_win = None
         try:
             if win is None:
+                # Owned by the application, not by this reader: closing the
+                # text must leave the scan on screen (the case name on its
+                # strip opens the text again).  The reader is only where to
+                # put the window.
                 win = _FloatingPdfWindow(
-                    self._win.winfo_toplevel(), data, url, title,
+                    self._float_pdf_master(), data, url, title,
+                    anchor=self._float_pdf_anchor(),
                     margin=margin, app=self._app,
                     on_save=self._download_pdf,
                     on_print=self._print_pdf,
@@ -25264,6 +25298,9 @@ class _ScholarTextWindow:
                     on_open_text=self._surface_text_view,
                 )
                 self._pdf_float_win = win
+                holder = getattr(self._app, "_cited_pdf_windows", None)
+                if holder is not None:
+                    holder.add(win)     # nothing else holds it once we are gone
             elif not win.showing(url):
                 # Another reporter's scan chosen from the PDF ▾ menu replaces
                 # what the viewer holds; the same one is only re-surfaced.
@@ -25287,38 +25324,79 @@ class _ScholarTextWindow:
             data, url, lambda result, w=win: w.apply_analysis(result),
         )
 
+    def _float_pdf_master(self):
+        """The window that owns a floating viewer's lifetime: the application
+        root, so the viewer survives this reader being closed."""
+        app = self._app
+        root = getattr(app, "root", None) if app is not None else None
+        if root is not None:
+            return root
+        try:
+            return self._win.winfo_toplevel()
+        except (AttributeError, tk.TclError):
+            return self._win
+
+    def _float_pdf_anchor(self):
+        """The window a floating viewer opens beside — this reader."""
+        try:
+            return self._win.winfo_toplevel()
+        except (AttributeError, tk.TclError):
+            return None
+
+    def _text_view_alive(self) -> bool:
+        try:
+            return bool(self._win.winfo_exists())
+        except (AttributeError, tk.TclError):
+            return False
+
     def _surface_text_view(self) -> None:
-        """Bring this reader forward — what the case name on the floating
-        viewer's strip does when the PDF was opened from the text.  The text is
-        already here, so there is nothing to fetch and nothing to open."""
-        win = self._win
-        if isinstance(win, _CaseTabPage):
+        """Show this case's text — what the case name on the floating viewer's
+        strip does when the scan was opened from the reader.
+
+        Usually the reader is still on screen and is simply brought forward.
+        When it has since been closed — the viewer outlives it — the text is
+        opened again from the ingredients the History entry keeps, so it comes
+        back without being refetched."""
+        if self._text_view_alive():
+            win = self._win
+            if isinstance(win, _CaseTabPage):
+                try:
+                    win._manager.notebook.select(win)
+                    win._manager.surface()
+                except (AttributeError, tk.TclError):
+                    pass
+                return
             try:
-                win._manager.notebook.select(win)
-                win._manager.surface()
+                win.deiconify()
+                win.lift()
+                win.focus_force()
             except (AttributeError, tk.TclError):
                 pass
             return
+        app = self._app
+        if app is None:
+            return
+        # Another window may already be showing this case (the reader was
+        # reopened from History, or this is a second click).
         try:
-            win.deiconify()
-            win.lift()
-            win.focus_force()
-        except (AttributeError, tk.TclError):
-            pass
+            if app.surface_case_view(self._history_key()):
+                return
+        except Exception as exc:
+            print(f"[pdf-window] looking for the open text failed: {exc}")
+        reopen = getattr(self, "_history_reopen", None)
+        if reopen is None:
+            return
+        try:
+            reopen()
+        except Exception as exc:
+            print(f"[pdf-window] reopening the case text failed: {exc}")
 
     def _floating_pdf_closed(self, win) -> None:
         if self._pdf_float_win is win:
             self._pdf_float_win = None
-
-    def _on_reader_destroyed(self, event) -> None:
-        """Take the floating PDF viewer down with the reader that opened it.
-        A window's <Destroy> also reaches its descendants, so only the reader's
-        own host counts."""
-        if getattr(event, "widget", None) is not self._win:
-            return
-        win, self._pdf_float_win = self._pdf_float_win, None
-        if win is not None:
-            win.close()
+        holder = getattr(self._app, "_cited_pdf_windows", None)
+        if holder is not None:
+            holder.discard(win)
 
     def _show_pdf(self, data: bytes, url: str) -> None:
         if self._pdf_opens_in_separate_window():
@@ -25403,18 +25481,35 @@ class _ScholarTextWindow:
         self._apply_button_bar_compact()
         self._status_var.set("Showing the official PDF of the opinion.")
 
+    def _live_parent(self):
+        """A window to hang a dialog on.  This reader's own while it is open —
+        but a floating PDF viewer outlives it, and Save and Print still work
+        from there, so the application root stands in once it has closed."""
+        if self._text_view_alive():
+            return self._win
+        root = getattr(self._app, "root", None) if self._app is not None else None
+        return root if root is not None else self._win
+
+    def _safe_status(self, text: str) -> None:
+        """Report progress, if there is still a status bar to report it to."""
+        try:
+            self._status_var.set(text)
+        except tk.TclError:
+            pass
+
     def _download_pdf(self) -> None:
         """Save the original PDF currently being viewed."""
         data = getattr(self, "_pdf_bytes", None)
         if not data:
             return
+        parent = self._live_parent()
         default = _build_default_filename(self._pdf_filename_item())
         path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
             initialfile=f"{default}.pdf",
             title="Download Opinion PDF",
-            parent=self._win,
+            parent=parent,
         )
         if not path:
             return
@@ -25422,9 +25517,9 @@ class _ScholarTextWindow:
             with open(path, "wb") as fh:
                 fh.write(data)
         except Exception as exc:
-            messagebox.showerror("Download PDF", str(exc), parent=self._win)
+            messagebox.showerror("Download PDF", str(exc), parent=parent)
             return
-        self._status_var.set(f"Saved PDF to {path}")
+        self._safe_status(f"Saved PDF to {path}")
 
     def _print_pdf(self, pane: "Optional[_PdfPane]" = None) -> None:
         """Print the PDF currently being viewed — the re-spaced/centered
@@ -25465,7 +25560,7 @@ class _ScholarTextWindow:
         except Exception:
             with open(path, "wb") as fh:
                 fh.write(data)
-        _print_pdf_file(self._win, path, self._status_var.set)
+        _print_pdf_file(self._live_parent(), path, self._safe_status)
 
     def _open_pdf_cite(self, action: tuple, snippet: str) -> None:
         """Follow a citation clicked on a page of the PDF.  A reader working
@@ -25475,15 +25570,15 @@ class _ScholarTextWindow:
         if self._app is None:
             _open_citation_in_browser(action, snippet)
             return
+        parent = self._live_parent()
         opened = self._app.open_cited_case_pdf(
-            self._win, action, snippet, self._status_var.set,
+            parent, action, snippet, self._safe_status,
             fallback=lambda: _follow_brief_action(
-                self._app, self._win, action, self._status_var.set,
-                snippet=snippet),
+                self._app, parent, action, self._safe_status, snippet=snippet),
         )
         if not opened:      # not a case citation — a statute, a rule, a docket
-            _follow_brief_action(self._app, self._win, action,
-                                 self._status_var.set, snippet=snippet)
+            _follow_brief_action(self._app, parent, action,
+                                 self._safe_status, snippet=snippet)
 
     def _open_pdf_cite_browser(self, action: tuple, snippet: str) -> None:
         _open_citation_in_browser(action, snippet)

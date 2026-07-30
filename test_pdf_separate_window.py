@@ -215,7 +215,7 @@ class _InWindow(Exception):
 APP_NS = _load(
     "CourtListenerGUI",
     ["populate_window_menu", "pdf_opens_in_separate_window",
-     "set_pdf_separate_window"],
+     "set_pdf_separate_window", "surface_case_view"],
     {"_load_config": lambda: dict(APP_CONFIG),
      "_save_config": lambda data: APP_CONFIG.update(data)},
 )
@@ -228,9 +228,12 @@ class _App:
         self._case_tabs_enabled = False
         self._pdf_separate_window = separate
         self._pdf_separate_var = _Var(separate)
+        self.root = _FakeHost()
+        self._cited_pdf_windows: set = set()
         self.tabs_calls = []
+        self._open_case_views: dict = {}
         for name in ("populate_window_menu", "pdf_opens_in_separate_window",
-                     "set_pdf_separate_window"):
+                     "set_pdf_separate_window", "surface_case_view"):
             setattr(self, name, APP_NS[name].__get__(self))
 
     def set_case_tabs_enabled(self, enabled):
@@ -297,7 +300,8 @@ class WindowMenuTests(unittest.TestCase):
 READER_NS = _load(
     "_ScholarTextWindow",
     ["_pdf_opens_in_separate_window", "_show_pdf_floating", "_show_pdf",
-     "_floating_pdf_closed", "_on_reader_destroyed"],
+     "_floating_pdf_closed", "_surface_text_view", "_text_view_alive",
+     "_float_pdf_master", "_float_pdf_anchor"],
     {"_PdfPane": _FakePane,
      "_FloatingPdfWindow": _FakeFloatingWindow,
      "_is_us_reports_pdf": lambda url: "usrep" in (url or "").lower(),
@@ -310,14 +314,28 @@ READER_NS = _load(
 class _FakeHost:
     """The reader's host: a Toplevel, or a page in the shared tab window."""
 
-    def __init__(self, top=None):
+    def __init__(self, top=None, alive=True):
         self._top = top or self
+        self._alive = alive
+        self.surfaced = 0
 
     def winfo_toplevel(self):
         return self._top
 
+    def winfo_exists(self):
+        return self._alive
+
     def title(self, value=None):
         return "Untitled Opinion" if value is None else None
+
+    def deiconify(self):
+        self.surfaced += 1
+
+    def lift(self):
+        pass
+
+    def focus_force(self):
+        pass
 
 
 class _Reader:
@@ -335,10 +353,12 @@ class _Reader:
         self.refreshed = 0
         self.errors = []
         self.analysis_requests = []
-        self.surfaced_text = 0
+        self.reopened = 0
+        self._history_reopen = self._count_reopen
         for name in ("_pdf_opens_in_separate_window", "_show_pdf_floating",
                      "_show_pdf", "_floating_pdf_closed",
-                     "_on_reader_destroyed"):
+                     "_surface_text_view", "_text_view_alive",
+                     "_float_pdf_master", "_float_pdf_anchor"):
             setattr(self, name, READER_NS[name].__get__(self))
 
     # --- collaborators the extracted methods call ---
@@ -348,6 +368,9 @@ class _Reader:
 
     def _title_citation(self):
         return "Roe v. Wade, 410 U.S. 113 (1973)"
+
+    def _history_key(self):
+        return "case-key"
 
     def _refresh_pdf_button(self):
         self.refreshed += 1
@@ -371,8 +394,10 @@ class _Reader:
     def _open_pdf_cite_browser(self, action, snippet):
         pass
 
-    def _surface_text_view(self):
-        self.surfaced_text += 1
+    def _count_reopen(self):
+        self.reopened += 1
+
+
 
 
 class RoutingTests(unittest.TestCase):
@@ -413,15 +438,6 @@ class FloatingHandoffTests(unittest.TestCase):
         self.assertEqual(kw["on_close"], reader._floating_pdf_closed)
         # The case name on the strip goes back to the text this PDF came from.
         self.assertEqual(kw["on_open_text"], reader._surface_text_view)
-
-    def test_it_opens_off_the_reader_s_own_os_window(self):
-        # In tabbed mode the reader is a notebook page, which cannot parent a
-        # window; the shared Toplevel behind it can.
-        reader = _Reader()
-        top = object()
-        reader._win = _FakeHost(top=top)
-        reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
-        self.assertIs(_FakeFloatingWindow.opened[0].parent, top)
 
     def test_the_window_is_named_for_the_case(self):
         reader = _Reader()
@@ -499,6 +515,41 @@ class FloatingHandoffTests(unittest.TestCase):
         reader._floating_pdf_closed(object())
         self.assertIs(reader._pdf_float_win, live)
 
+    def test_the_name_on_the_strip_surfaces_the_reader_while_it_is_open(self):
+        reader = _Reader()
+        reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
+        reader._surface_text_view()
+        self.assertEqual(reader._win.surfaced, 1)
+        self.assertEqual(reader.reopened, 0)
+
+    def test_and_reopens_the_text_once_the_reader_has_been_closed(self):
+        # The viewer outlives the reader, so the name has to bring the text
+        # back rather than doing nothing.
+        reader = _Reader()
+        reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
+        reader._win._alive = False
+        reader._surface_text_view()
+        self.assertEqual(reader.reopened, 1)
+
+    def test_it_prefers_a_window_already_showing_that_case(self):
+        # Reopened from History, or a second click on the name.
+        reader = _Reader()
+        reader._win._alive = False
+        live = _Reader()
+        live._app = reader._app
+        reader._app._open_case_views[id(live)] = {
+            "owner": live, "view": live._win, "key": "case-key",
+        }
+        reader._surface_text_view()
+        self.assertEqual(live._win.surfaced, 1)
+        self.assertEqual(reader.reopened, 0)
+
+    def test_a_reader_with_nothing_recorded_reopens_nothing(self):
+        reader = _Reader()
+        reader._win._alive = False
+        reader._history_reopen = None
+        reader._surface_text_view()      # must not raise
+
     def test_the_citation_and_search_analysis_is_routed_to_the_viewer(self):
         reader = _Reader()
         reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
@@ -519,22 +570,36 @@ class FloatingHandoffTests(unittest.TestCase):
         self.assertEqual(reader.errors, ["no pypdfium2"])
         self.assertIsNone(reader._pdf_float_win)
 
-    def test_closing_the_reader_closes_its_pdf_window(self):
+    def test_closing_the_reader_leaves_the_pdf_window_open(self):
+        # The scan is a window in its own right; the reader going away must
+        # not take it with it.
         reader = _Reader()
         reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
         win = reader._pdf_float_win
-        reader._on_reader_destroyed(mock.Mock(widget=reader._win))
-        self.assertFalse(win.alive())
-        self.assertIsNone(reader._pdf_float_win)
-
-    def test_a_child_widget_going_away_leaves_the_pdf_window_alone(self):
-        # <Destroy> on a window also fires for every widget inside it.
-        reader = _Reader()
-        reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
-        win = reader._pdf_float_win
-        reader._on_reader_destroyed(mock.Mock(widget=object()))
+        reader._win._alive = False           # the reader was closed
         self.assertTrue(win.alive())
-        self.assertIs(reader._pdf_float_win, win)
+
+    def test_the_viewer_is_owned_by_the_app_not_the_reader(self):
+        # Tk destroys a toplevel with its master, so the master has to be
+        # something that outlives this reader.
+        reader = _Reader()
+        reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
+        self.assertIs(_FakeFloatingWindow.opened[0].parent, reader._app.root)
+
+    def test_it_still_opens_beside_the_reader(self):
+        reader = _Reader()
+        top = _FakeHost()
+        reader._win = _FakeHost(top=top)
+        reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
+        self.assertIs(_FakeFloatingWindow.opened[0].kw["anchor"], top)
+
+    def test_the_app_holds_the_viewer_once_the_reader_cannot(self):
+        reader = _Reader()
+        reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
+        win = reader._pdf_float_win
+        self.assertIn(win, reader._app._cited_pdf_windows)
+        reader._floating_pdf_closed(win)
+        self.assertNotIn(win, reader._app._cited_pdf_windows)
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +758,44 @@ class ViewerTests(unittest.TestCase):
         viewer = _Viewer()
         viewer._save()
         self.assertEqual(viewer.saved, 1)
+
+
+class SurfaceCaseViewTests(unittest.TestCase):
+    """Finding a window already showing a case, before reopening one."""
+
+    def setUp(self):
+        self.app = _App()
+
+    def _register(self, reader, key="case-key"):
+        self.app._open_case_views[id(reader)] = {
+            "owner": reader, "view": reader._win, "key": key,
+        }
+        return reader
+
+    def test_it_surfaces_the_view_registered_under_that_key(self):
+        reader = self._register(_Reader())
+        self.assertTrue(self.app.surface_case_view("case-key"))
+        self.assertEqual(reader._win.surfaced, 1)
+
+    def test_a_key_nothing_is_showing_finds_nothing(self):
+        self._register(_Reader())
+        self.assertFalse(self.app.surface_case_view("another-case"))
+
+    def test_no_key_finds_nothing(self):
+        self.assertFalse(self.app.surface_case_view(""))
+
+    def test_a_view_that_has_been_closed_is_passed_over(self):
+        # Asking a closed reader to surface itself would send it straight back
+        # here looking for one — so it is never asked.
+        reader = self._register(_Reader())
+        reader._win._alive = False
+        self.assertFalse(self.app.surface_case_view("case-key"))
+        self.assertEqual(reader._win.surfaced, 0)
+
+    def test_something_that_is_not_a_reader_is_passed_over(self):
+        self.app._open_case_views[1] = {"owner": object(), "view": object(),
+                                        "key": "case-key"}
+        self.assertFalse(self.app.surface_case_view("case-key"))
 
 
 class SectionRailGateTests(unittest.TestCase):
