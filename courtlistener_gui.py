@@ -18083,7 +18083,11 @@ class _ScholarTextWindow:
         self._fonts["base"] = base
         self._family = base.actual("family")
         self._base_size = base.actual("size")
-        txt = tk.Text(text_frame, wrap="word", font=base, padx=14, pady=10)
+        # The opinion sits in a holder of its own, so its width can be held
+        # fixed while the side panel opens beside it (see _pin_text_width).
+        holder = ttk.Frame(text_frame)
+        self._text_holder = holder
+        txt = tk.Text(holder, wrap="word", font=base, padx=14, pady=10)
         self._text = txt
         vsb = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=self._on_yscroll)
@@ -18103,7 +18107,8 @@ class _ScholarTextWindow:
         self._pagecol.pack(side="left", fill="y")
         vsb.pack(side="right", fill="y")
         self._partmap.pack(side="right", fill="y")
-        txt.pack(side="left", fill="both", expand=True)
+        holder.pack(side="left", fill="both", expand=True)
+        txt.pack(fill="both", expand=True)
         txt.bind("<Configure>", lambda _e: self._on_text_configure())
         self._partmap.bind("<Button-1>", self._on_partmap_click)
         self._partmap.bind("<Enter>", lambda _e: self._partmap.config(cursor="hand2"))
@@ -19736,8 +19741,19 @@ class _ScholarTextWindow:
     # ------------------------------------------------------------------
 
     def _on_text_configure(self) -> None:
-        """Reflow display-line justification and redraw side gutters on resize."""
-        self._schedule_text_justify()
+        """Reflow display-line justification and redraw side gutters on resize.
+
+        Tk reports a <Configure> for a re-pack even when nothing about the
+        widget's size changed.  Justification depends only on the width, and
+        rebuilding it repaints the whole opinion, so it is redone only when the
+        width really moved; the gutters track the height too, and are cheap."""
+        try:
+            width = self._text.winfo_width()
+        except tk.TclError:
+            width = None
+        if width is None or width != getattr(self, "_justified_width", None):
+            self._justified_width = width
+            self._schedule_text_justify()
         self._schedule_gutter_redraw()
 
     def _justification_enabled(self) -> bool:
@@ -22247,16 +22263,114 @@ class _ScholarTextWindow:
             self._apply_pdf_parts_visibility()
             return
         self._details_on = on
-        # Resize before re-packing, and without flushing the layout in between,
-        # so Tk lays the window out once: the reader never sees the opinion
-        # re-wrapped into an intermediate width.
-        self._resize_for_details(1 if on else -1)
+        if not self._pin_text_width():
+            # Nowhere to grow — a maximized window, or a tab in the shared one.
+            # The panel takes its width from the opinion, as it always did.
+            self._show_details_panel(on)
+            return
+        # Tk applies a pack change and a window resize in separate layout
+        # passes, and a window manager answers a resize request in its own
+        # time.  With the opinion's width pinned across both, it is never
+        # given the panel's width in between — which is what used to re-wrap
+        # and repaint the whole text, twice, on every toggle.
+        if on:
+            self._resize_for_details(+1)
+            self._when_resized(self._open_details_panel)
+        else:
+            self._show_details_panel(False)
+            self._resize_for_details(-1)
+            self._when_resized(self._unpin_text_width)
+
+    def _show_details_panel(self, on: bool) -> None:
+        """Pack or unpack the side panel itself."""
         if on:
             self._details_panel().pack(side="right", fill="y",
                                        before=self._vsb)
             self._refresh_details_view()
         elif self._details_frame is not None:
-            self._details_frame.pack_forget()
+            try:
+                self._details_frame.pack_forget()
+            except tk.TclError:
+                pass
+
+    def _open_details_panel(self) -> None:
+        """Fill the column the window just grew by, and let the opinion follow
+        the window's width again."""
+        self._show_details_panel(True)
+        self._unpin_text_width()
+
+    def _pin_text_width(self) -> bool:
+        """Hold the opinion at the width it has now, so a two-step layout
+        cannot re-wrap it in between.  False when the window cannot grow
+        anyway, in which case there is nothing to protect the text from."""
+        holder = getattr(self, "_text_holder", None)
+        if holder is None or not self._can_resize_for_details():
+            return False
+        try:
+            width = holder.winfo_width()
+            if width <= 1:
+                return False        # not laid out yet; nothing to pin
+            holder.configure(width=width)
+            holder.pack_propagate(False)
+            holder.pack_configure(expand=False)
+        except tk.TclError:
+            return False
+        return True
+
+    def _unpin_text_width(self) -> None:
+        """Let the opinion follow the window's width again.  Its share is the
+        same as it was pinned at — the window grew by exactly the panel — so
+        this changes nothing on screen."""
+        holder = getattr(self, "_text_holder", None)
+        if holder is None:
+            return
+        try:
+            holder.pack_propagate(True)
+            holder.pack_configure(expand=True)
+            holder.configure(width=0)   # back to taking what pack gives it
+        except tk.TclError:
+            pass
+
+    def _when_resized(self, done, tries: int = 20, step_ms: int = 15) -> None:
+        """Run *done* once the window has taken the width last asked for — or
+        after a moment, should the window manager decline to give it.
+
+        A new window size is recorded before its children are laid out again,
+        and the re-layout is only queued; packing the panel in between would
+        have it share out the *old* width.  So the pending layout is flushed
+        first — safe here, because the opinion's width is pinned across it."""
+        target = getattr(self, "_details_resize_target", None)
+
+        def finish() -> None:
+            try:
+                self._win.update_idletasks()
+            except tk.TclError:
+                pass
+            done()
+
+        def check(n: int = 0) -> None:
+            try:
+                landed = (target is None
+                          or abs(self._win.winfo_width() - target) <= 2)
+            except tk.TclError:
+                return
+            if landed or n >= tries:
+                finish()
+                return
+            try:
+                self._win.after(step_ms, check, n + 1)
+            except tk.TclError:
+                pass
+
+        try:
+            self._win.after(1, check)
+        except tk.TclError:
+            finish()
+
+    def _can_resize_for_details(self) -> bool:
+        """Whether this window has room to widen for the panel at all."""
+        return not (isinstance(self._win, _CaseTabPage)
+                    or self._window_is_maximized())
 
     def _window_is_maximized(self) -> bool:
         """Whether the window has no room to grow — maximized, or already as
@@ -22290,15 +22404,13 @@ class _ScholarTextWindow:
         skipped only where there is nothing to grow: a maximized window (the
         panel then takes its width from the text, as it always did), and a tab
         in the shared window, whose size is not one view's to change."""
-        if delta == 0 or isinstance(self._win, _CaseTabPage):
-            return
-        if self._window_is_maximized():
+        self._details_resize_target = None
+        if delta == 0 or not self._can_resize_for_details():
             return
         try:
             # The window manager's own geometry string round-trips exactly;
             # rebuilding one from winfo_x/y drifts by the title bar on some
-            # window managers.  Deliberately no update_idletasks() — a flush
-            # here is what would make the intermediate width visible.
+            # window managers.
             spec = str(self._win.wm_geometry())
             width = self._win.winfo_width()
         except (AttributeError, tk.TclError):
@@ -22313,7 +22425,10 @@ class _ScholarTextWindow:
         try:
             self._win.geometry(f"{new_width}x{height}{position}")
         except tk.TclError:
-            pass
+            return
+        # What _when_resized waits for before packing the panel into the room
+        # this asked for.
+        self._details_resize_target = new_width
 
     def _sync_details_checkbox(self) -> None:
         """Point the "Side panel" checkbox at the setting for the view now

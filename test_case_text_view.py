@@ -102,7 +102,10 @@ PANEL_W = 300
 
 DETAILS_NS = _load(
     "_ScholarTextWindow",
-    ["_toggle_details", "_resize_for_details", "_window_is_maximized"],
+    ["_toggle_details", "_resize_for_details", "_window_is_maximized",
+     "_can_resize_for_details", "_pin_text_width", "_unpin_text_width",
+     "_when_resized", "_show_details_panel", "_open_details_panel",
+     "_on_text_configure"],
     {"_CaseTabPage": type("_CaseTabPage", (), {}),
      "_work_area": lambda _w: (0, 0, 1600, 900)},
 )
@@ -139,6 +142,16 @@ class _FakeWindow:
             self.width, self.height = int(m.group(1)), int(m.group(2))
             self.x, self.y = int(m.group(3)), int(m.group(4))
 
+    # --- the deferred half of the toggle ---
+    def after(self, _ms, fn, *a):
+        """The window manager answers at once here, so the wait resolves on
+        the spot; the real one polls until the size lands."""
+        fn(*a)
+        return "timer"
+
+    def update_idletasks(self):
+        pass
+
 
 class _Panel:
     def __init__(self):
@@ -152,6 +165,33 @@ class _Panel:
         self.forgotten += 1
 
 
+class _Holder:
+    """The frame the opinion sits in, whose width the toggle pins."""
+
+    def __init__(self, width=684):
+        self.width = width
+        self.requested = None
+        self.propagate = True
+        self.expand = True
+
+    def winfo_width(self):
+        return self.width
+
+    def configure(self, **kw):
+        if "width" in kw:
+            self.requested = kw["width"]
+
+    def pack_propagate(self, flag):
+        self.propagate = flag
+
+    def pack_configure(self, **kw):
+        if "expand" in kw:
+            self.expand = kw["expand"]
+
+    def pinned(self):
+        return not self.expand and not self.propagate
+
+
 class _Reader:
     def __init__(self, mode="scholar", win=None):
         self._win = win or _FakeWindow()
@@ -162,16 +202,25 @@ class _Reader:
         self._details_var = mock.Mock()
         self._details_var.get.return_value = True
         self._details_frame = _Panel()
+        self._text_holder = _Holder()
         self._vsb = object()
         self.order = []
         self.refreshed = 0
         for name in ("_toggle_details", "_resize_for_details",
-                     "_window_is_maximized"):
+                     "_window_is_maximized", "_can_resize_for_details",
+                     "_pin_text_width", "_unpin_text_width", "_when_resized",
+                     "_show_details_panel", "_open_details_panel"):
             setattr(self, name, DETAILS_NS[name].__get__(self))
 
     def _details_panel(self):
         self.order.append("pack")
         return self._details_frame
+
+    def _pin_and_record(self):
+        """_pin_text_width, remembering whether the pin was on at pack time."""
+        pinned = self._pin_text_width()
+        self.order.append(f"pin={pinned}")
+        return pinned
 
     def _refresh_details_view(self):
         self.refreshed += 1
@@ -247,12 +296,124 @@ class SidePanelWidthTests(unittest.TestCase):
         self.assertEqual(reader.order, ["pack"])
         self.assertEqual(reader.refreshed, 1)
 
+    def test_the_opinion_is_pinned_while_the_window_and_panel_move(self):
+        # Tk applies the pack and the resize in separate layout passes, so
+        # without a pin the opinion is briefly given the panel's width — the
+        # re-wrap and repaint the reader used to see.
+        reader = _Reader()
+        reader._details_panel = lambda: (reader.order.append(
+            f"pack while pinned={reader._text_holder.pinned()}"),
+            reader._details_frame)[1]
+        reader._toggle_details()
+        self.assertIn("pack while pinned=True", reader.order)
+
+    def test_the_pin_is_the_width_the_opinion_already_had(self):
+        reader = _Reader()
+        reader._text_holder.width = 684
+        reader._pin_text_width()
+        self.assertEqual(reader._text_holder.requested, 684)
+        self.assertTrue(reader._text_holder.pinned())
+
+    def test_the_opinion_follows_the_window_again_afterwards(self):
+        reader = _Reader()
+        reader._toggle_details()
+        self.assertFalse(reader._text_holder.pinned())
+        self.assertEqual(reader._text_holder.requested, 0)
+
+    def test_the_panel_is_packed_only_once_the_window_has_grown(self):
+        # Packing it against the old width is what squeezed the opinion.
+        widths = []
+        reader = _Reader()
+        reader._details_panel = lambda: (widths.append(reader._win.width),
+                                         reader._details_frame)[1]
+        reader._toggle_details()
+        self.assertEqual(widths, [860 + PANEL_W])
+
+    def test_closing_unpacks_the_panel_before_the_window_shrinks(self):
+        # The other way round would squeeze the opinion just the same.
+        reader = _Reader()
+        reader._toggle_details()
+        order = []
+        reader._details_frame.pack_forget = lambda: order.append("unpack")
+        original = reader._win.geometry
+        reader._win.geometry = lambda spec: (order.append("shrink"),
+                                             original(spec))[1]
+        reader._details_var.get.return_value = False
+        reader._toggle_details()
+        self.assertEqual(order, ["unpack", "shrink"])
+
+    def test_a_window_with_no_room_does_not_pin_anything(self):
+        # Nothing to protect the text from: the panel takes its width as
+        # before, and the holder is left to share the space normally.
+        win = _FakeWindow()
+        win.zoomed = True
+        reader = _Reader(win=win)
+        reader._toggle_details()
+        self.assertFalse(reader._text_holder.pinned())
+        self.assertIsNone(reader._text_holder.requested)
+        self.assertIsNotNone(reader._details_frame.packed)
+
+    def test_an_unlaid_out_holder_is_not_pinned(self):
+        reader = _Reader()
+        reader._text_holder.width = 1        # not on screen yet
+        self.assertFalse(reader._pin_text_width())
+        self.assertIsNotNone(reader._details_frame.packed is None or True)
+
     def test_the_pdf_view_s_own_panel_is_untouched_by_any_of_this(self):
         reader = _Reader(mode="pdf")
         reader._toggle_details()
         self.assertEqual(reader._win.applied, [])
         self.assertTrue(reader._pdf_parts_on)
         self.assertEqual(reader.order, ["pdf-strip"])
+
+
+class _JustifyReader:
+    """Just what _on_text_configure touches."""
+
+    def __init__(self, width=684):
+        self._text = mock.Mock()
+        self._text.winfo_width.return_value = width
+        self.justifies = 0
+        self.gutters = 0
+        self._on_text_configure = DETAILS_NS["_on_text_configure"].__get__(self)
+
+    def _schedule_text_justify(self):
+        self.justifies += 1
+
+    def _schedule_gutter_redraw(self):
+        self.gutters += 1
+
+
+class ReJustifyTests(unittest.TestCase):
+    """Tk reports a <Configure> for a re-pack even when nothing resized, and
+    rebuilding the justification repaints the whole opinion."""
+
+    def test_a_width_that_did_not_change_does_not_re_justify(self):
+        reader = _JustifyReader()
+        reader._on_text_configure()      # first pass records the width
+        reader._on_text_configure()      # the re-pack the side panel causes
+        reader._on_text_configure()
+        self.assertEqual(reader.justifies, 1)
+
+    def test_a_real_resize_still_re_justifies(self):
+        reader = _JustifyReader()
+        reader._on_text_configure()
+        reader._text.winfo_width.return_value = 520
+        reader._on_text_configure()
+        self.assertEqual(reader.justifies, 2)
+
+    def test_the_gutters_are_redrawn_either_way(self):
+        # They track the height and the scroll position too, and are cheap.
+        reader = _JustifyReader()
+        reader._on_text_configure()
+        reader._on_text_configure()
+        self.assertEqual(reader.gutters, 2)
+
+    def test_an_unmeasurable_text_still_re_justifies(self):
+        reader = _JustifyReader()
+        reader._text.winfo_width.side_effect = _Tk.TclError("gone")
+        reader._on_text_configure()
+        self.assertEqual(reader.justifies, 1)
 
 
 # ---------------------------------------------------------------------------
