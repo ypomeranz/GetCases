@@ -758,6 +758,15 @@ _REPORTER_FAMILIES = (
         ("Wn. App.", "Wash App", "Wn App", "Wash.App.", "Wn.App."),
         ("Wash. App.", "Wn. App."), "wash-app",
     ),
+    _ReporterFamily(
+        "Johns. Ch.",
+        (
+            "John. Ch.", "John. Chan.", "Johns. Chan.",
+            "John Ch", "John Chan", "Johns Ch", "Johns Chan",
+        ),
+        ("Johns. Ch.", "John. Chan.", "Johns. Chan."),
+        "johns-ch",
+    ),
     # Spelled-out nineteenth-century lower-federal reporters are normalized
     # by the link detector, but declaring them here also makes database,
     # override, and direct-search identity bidirectional.
@@ -842,6 +851,9 @@ def _valid_case_reporter(rep: str) -> bool:
         return False  # a law review, not a reporter — no case to open
     if _AG_OPINION_RE.search(rep or ""):
         return False  # an Attorney General opinion, not a decided case
+    family = reporter_family(rep)
+    if family is not None and family.canonical == "Johns. Ch.":
+        return True
     if key in _PLAIN_CASE_REPORTERS or key.endswith("lexis"):
         return True
     return "." in (rep or "")
@@ -855,6 +867,8 @@ def case_match_text(m: re.Match) -> str:
     dual cite ("4 Wheat. [17 U. S.] 438" -> "4 Wheat. 438", "5 U.S. (1
     Cranch) 137" -> "5 U.S. 137"), plus the OCR hyphen sometimes glued to
     the page ("21 Wall. (88 U. S.)-597" -> "21 Wall. 597")."""
+    if canonical_reporter(m.group(2)) == "Johns. Ch.":
+        return f"{m.group(1)} Johns. Ch. {m.group(3)}"
     s = re.sub(r"\s+", " ", m.group(0)).replace("U. S.", "U.S.").replace("’", "'")
     s = re.sub(r"\s*[\[(][^\])]*[\])]\s*", " ", s)
     s = re.sub(r"\s[-–—]\s*(?=\d)", " ", s)
@@ -1042,8 +1056,9 @@ _RECAP_AFTER_RE = re.compile(
 # The case name before the citation — for the viewer's window title, and,
 # when the citation prints no docket number, as the RECAP search key itself.
 _RECAP_NAME_BODY = (
-    r"([A-Z][\w.,'’&() -]{1,80}?\sv\.\s[\w.,'’&() -]{1,60}?|"
-    r"In\s+re\s+[\w.,'’&() -]{2,60}?)"
+    r"([A-Z][\w.,'’&()/ -]{1,180}?\sv\.?\s"
+    r"[\w.,'’&()/ -]{1,140}?|"
+    r"In\s+re\s+[\w.,'’&()/ -]{2,140}?)"
 )
 # … followed by the docket number ("Care One …, No. 12-6371, 2024 WL …"):
 _RECAP_NAME_RE = re.compile(
@@ -1125,7 +1140,7 @@ def iter_recap_cites(text: str) -> list[tuple[int, int, "str | None"]]:
         key = (m.group(1), norm_reporter(m.group(2)), m.group(3))
         info = index.setdefault(
             key, {"cite": re.sub(r"\s+", " ", m.group(0))})
-        before = re.sub(r"\s+", " ", text[max(0, m.start() - 90):m.start()])
+        before = re.sub(r"\s+", " ", text[max(0, m.start() - 260):m.start()])
         dm = _RECAP_DOCKET_RE.search(before)
         if dm:
             info.setdefault("docket", dm.group(1).strip())
@@ -1139,7 +1154,7 @@ def iter_recap_cites(text: str) -> list[tuple[int, int, "str | None"]]:
             if name:
                 info.setdefault("name", name)
         am = _RECAP_AFTER_RE.match(
-            re.sub(r"\s+", " ", text[m.end():m.end() + 110]))
+            re.sub(r"\s+", " ", text[m.end():m.end() + 180]))
         if am:
             info.setdefault(
                 "court_raw", re.sub(r"\s+", " ", am.group(1)).strip())
@@ -1195,7 +1210,7 @@ def iter_docket_cites(text: str) -> list[tuple[int, int, str]]:
         fields = {"docket": m.group(1).strip(),
                   "date": f"{m.group(6)}-{mon:02d}-{int(m.group(5)):02d}",
                   "court": court_id}
-        before = re.sub(r"\s+", " ", text[max(0, m.start() - 90):m.start()])
+        before = re.sub(r"\s+", " ", text[max(0, m.start() - 260):m.start()])
         nm = _RECAP_NAME_END_RE.search(before)
         if nm:
             name = _clean_case_name(nm.group(1))

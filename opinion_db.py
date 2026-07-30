@@ -60,7 +60,7 @@ from bluebook_names import (
     strip_related_case_note,
 )
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 # Record field holding the reporter pagination recovered from an official scan
 # (see :meth:`OpinionDB.save_pagination`).  Records written before this field
@@ -74,7 +74,7 @@ _PAGINATION_FIELD = "us_pagination"
 _OPINION_COLUMNS = (
     "scholar_id", "url", "name", "court", "year", "date_filed",
     "line_offset", "line_length", "cites_json", "parties_json",
-    "added_at", "source",
+    "snippet", "added_at", "source",
 )
 
 # How much of an opinion's HTML the indexer expands.  It reads only the
@@ -146,6 +146,12 @@ def _prose_text(blocks: list, cap: int = 40000) -> str:
         if total > cap:
             break
     return "\n".join(out)
+
+
+def _opinion_snippet(blocks: list, limit: int = 300) -> str:
+    """Normalized beginning of the opinion prose for search-result previews."""
+    text = re.sub(r"\s+", " ", _prose_text(blocks, cap=limit * 3)).strip()
+    return text[:limit].rstrip()
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +541,7 @@ def extract_record(
         "dockets": _header_dockets(blocks),
         "added_at": time.time(),
         "source": item.get("source") or "scholar",
+        "snippet": _opinion_snippet(blocks),
         "html_gz": _gz_pack(html),
     }
 
@@ -684,6 +691,7 @@ class OpinionDB:
                     line_length  INTEGER,
                     cites_json   TEXT,
                     parties_json TEXT,
+                    snippet      TEXT,
                     added_at     REAL,
                     source       TEXT
                 );
@@ -870,18 +878,22 @@ class OpinionDB:
         court = str(rec.get("court") or "").strip().lower()
         if not court:
             court = _court_from_cites(cites) or _court_from_header(blocks)
+        snippet = str(rec.get("snippet") or "").strip()
+        if not snippet and blocks:
+            snippet = _opinion_snippet(blocks)
 
         self._db.execute(
             "INSERT OR REPLACE INTO opinions (scholar_id, url, name, court, year, "
             "date_filed, line_offset, line_length, cites_json, "
-            "parties_json, added_at, source) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "parties_json, snippet, added_at, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 sid, rec.get("url", ""), rec.get("name", ""), court,
                 year, date_filed,
                 int(offset), int(length),
                 json.dumps(cites, ensure_ascii=False),
                 json.dumps(parties, ensure_ascii=False),
+                snippet,
                 rec.get("added_at") or time.time(), rec.get("source", "scholar"),
             ),
         )
@@ -1149,6 +1161,57 @@ class OpinionDB:
             return False
         return self._rewrite_jsonl(str(sid).strip(), record)
 
+    # -- parallel citations ------------------------------------------------
+
+    def stored_citations(self, sid: str) -> list[str]:
+        """Every indexed parallel citation for *sid*, without expanding HTML.
+
+        This is the lightweight read used by the PDF resolver.  In particular,
+        a U.S. Reports cite recovered after Google Scholar first saved an
+        S. Ct.-only opinion becomes available to the next reader before any
+        network lookup runs.
+        """
+        if not sid:
+            return []
+        with self._lock:
+            row = self._db.execute(
+                "SELECT cites_json FROM opinions WHERE scholar_id=?",
+                (str(sid).strip(),),
+            ).fetchone()
+        if row is None:
+            return []
+        try:
+            values = json.loads(row["cites_json"] or "[]")
+        except Exception:
+            return []
+        return _dedupe_cites([str(value) for value in values])
+
+    def save_parallel_citation(self, sid: str, cite: str) -> bool:
+        """Add one reporter citation to a stored opinion.
+
+        The JSONL record is the durable source of truth and the derived
+        citation index is rebuilt by the normal atomic rewrite.  Returns
+        whether the record changed; an invalid or already-known citation is
+        ignored.
+        """
+        if not sid:
+            return False
+        sid = str(sid).strip()
+        normalized = _dedupe_cites([str(cite or "")])
+        if not normalized or _cite_key(normalized[0]) is None:
+            return False
+        new_cite = normalized[0]
+        new_key = _cite_key(new_cite)
+        with self._lock:
+            record = self.stored_record(sid)
+            if record is None:
+                return False
+            existing = [str(value) for value in (record.get("cites") or [])]
+            if any(_cite_key(value) == new_key for value in existing):
+                return False
+            record["cites"] = _dedupe_cites([*existing, new_cite])
+            return self._rewrite_jsonl(sid, record)
+
     # -- reporter pagination ------------------------------------------------
     # A recent Supreme Court opinion reaches Google Scholar long before the
     # bound volume does, so its star pagination is the Supreme Court Reporter's
@@ -1175,17 +1238,21 @@ class OpinionDB:
         if not sid:
             return False
         sid = str(sid).strip()
-        record = self.stored_record(sid)
-        if record is None:
-            return False  # the opinion isn't stored; nothing to attach it to
-        current = record.get(_PAGINATION_FIELD)
-        if current == pagination:
-            return False
-        if pagination is None:
-            record.pop(_PAGINATION_FIELD, None)
-        else:
-            record[_PAGINATION_FIELD] = pagination
-        return self._rewrite_jsonl(sid, record)
+        # Citation recovery and reporter-page alignment can finish on separate
+        # worker threads.  Keep their read/modify/rewrite cycles serialized so
+        # neither enrichment can overwrite the other with an older snapshot.
+        with self._lock:
+            record = self.stored_record(sid)
+            if record is None:
+                return False  # the opinion isn't stored; nothing to attach it to
+            current = record.get(_PAGINATION_FIELD)
+            if current == pagination:
+                return False
+            if pagination is None:
+                record.pop(_PAGINATION_FIELD, None)
+            else:
+                record[_PAGINATION_FIELD] = pagination
+            return self._rewrite_jsonl(sid, record)
 
     def merge_from(self, other_jsonl: os.PathLike | str) -> dict:
         """Merge another ``opinions.jsonl`` into this store.  Opinions whose
@@ -1321,6 +1388,7 @@ class OpinionDB:
             "court": row["court"],
             "year": row["year"],
             "date_filed": row["date_filed"],
+            "snippet": row["snippet"] or str(stored.get("snippet") or ""),
             "html": html,
             "text": _blocks_text(blocks) if blocks else "",
             "cites": json.loads(row["cites_json"] or "[]"),
@@ -1345,7 +1413,8 @@ class OpinionDB:
         placeholders = ",".join("?" * len(reporters))
         with self._lock:
             rows = self._db.execute(
-                "SELECT o.scholar_id, o.name, o.court, o.year, o.url, o.cites_json FROM citations c JOIN opinions o "
+                "SELECT o.scholar_id, o.name, o.court, o.year, o.url, "
+                "o.cites_json, o.snippet FROM citations c JOIN opinions o "
                 "ON o.scholar_id=c.scholar_id "
                 f"WHERE c.reporter IN ({placeholders}) "
                 "AND c.vol=? AND c.page=? "
@@ -1364,7 +1433,8 @@ class OpinionDB:
         placeholders = ",".join("?" * len(toks))
         with self._lock:
             rows = self._db.execute(
-                f"SELECT o.scholar_id, o.name, o.court, o.year, o.url, o.cites_json FROM parties p JOIN opinions o "
+                f"SELECT o.scholar_id, o.name, o.court, o.year, o.url, "
+                f"o.cites_json, o.snippet FROM parties p JOIN opinions o "
                 f"ON o.scholar_id=p.scholar_id "
                 f"WHERE p.token IN ({placeholders}) "
                 f"GROUP BY o.scholar_id "
@@ -1389,7 +1459,9 @@ class OpinionDB:
         placeholders = ",".join("?" * len(toks))
         with self._lock:
             rows = self._db.execute(
-                f"SELECT o.scholar_id, o.name, o.court, o.year, o.url, o.cites_json, COUNT(DISTINCT p.token) AS _n "
+                f"SELECT o.scholar_id, o.name, o.court, o.year, o.url, "
+                f"o.cites_json, o.snippet, "
+                f"COUNT(DISTINCT p.token) AS _n "
                 f"FROM parties p JOIN opinions o ON o.scholar_id=p.scholar_id "
                 f"WHERE p.token IN ({placeholders}) "
                 f"GROUP BY o.scholar_id "
@@ -1428,6 +1500,7 @@ class OpinionDB:
             "court": row["court"],
             "year": row["year"],
             "url": row["url"],
+            "snippet": row["snippet"] or "",
         }
 
     @staticmethod
@@ -1441,6 +1514,7 @@ class OpinionDB:
             "court": rec.get("court", ""),
             "year": rec.get("year", ""),
             "url": rec.get("url", ""),
+            "snippet": rec.get("snippet", ""),
         }
 
     def close(self) -> None:

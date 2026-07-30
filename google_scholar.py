@@ -62,6 +62,123 @@ except ImportError as exc:  # pragma: no cover
 
 SCHOLAR_BASE = "https://scholar.google.com"
 
+# Google Scholar's "Select courts" form encodes jurisdictions as opaque
+# numeric values in ``as_sdt``.  These are the current form values, keyed by
+# the CourtListener ids used by the application's shared court picker.
+_SCHOLAR_COURT_IDS: dict[str, tuple[str, ...]] = {
+    # Federal appellate courts (the paired values retain historical C.C.A.
+    # opinions alongside the modern Court of Appeals).
+    "scotus": ("60",),
+    "ca1": ("119", "105"), "ca2": ("122", "107"),
+    "ca3": ("123", "108"), "ca4": ("124", "109"),
+    "ca5": ("125", "110"), "ca6": ("126", "111"),
+    "ca7": ("127", "112"), "ca8": ("128", "113"),
+    "ca9": ("129", "114"), "ca10": ("120", "106"),
+    "ca11": ("121",), "cadc": ("130",), "cafc": ("131",),
+
+    # Federal district courts.
+    "akd": ("134",), "almd": ("316",), "alnd": ("317",),
+    "alsd": ("318",), "ared": ("319",), "arwd": ("320",),
+    "azd": ("135",), "cacd": ("321",), "caed": ("322",),
+    "cand": ("323",), "casd": ("324",), "cod": ("137",),
+    "ctd": ("138",), "ded": ("139",), "dcd": ("140",),
+    "flmd": ("325",), "flnd": ("326",), "flsd": ("327",),
+    "gamd": ("328",), "gand": ("329",), "gasd": ("330",),
+    "gud": ("141",), "hid": ("142",), "idd": ("143",),
+    "ilcd": ("331",), "ilnd": ("332",), "ilsd": ("333",),
+    "innd": ("334",), "insd": ("335",), "iand": ("336",),
+    "iasd": ("337",), "ksd": ("144",), "kyed": ("338",),
+    "kywd": ("339",), "laed": ("340",), "lamd": ("341",),
+    "lawd": ("342",), "med": ("145",), "mdd": ("146",),
+    "mad": ("147",), "mied": ("343",), "miwd": ("344",),
+    "mnd": ("148",), "msnd": ("345",), "mssd": ("346",),
+    "moed": ("347",), "mowd": ("348",), "mtd": ("149",),
+    "ned": ("150",), "nvd": ("151",), "nhd": ("152",),
+    "njd": ("153",), "nmd": ("154",), "nyed": ("349",),
+    "nynd": ("350",), "nysd": ("351",), "nywd": ("352",),
+    "nced": ("353",), "ncmd": ("354",), "ncwd": ("355",),
+    "ndd": ("155",), "ohnd": ("356",), "ohsd": ("357",),
+    "oked": ("358",), "oknd": ("359",), "okwd": ("360",),
+    "ord": ("156",), "paed": ("361",), "pamd": ("362",),
+    "pawd": ("363",), "prd": ("157",), "rid": ("158",),
+    "scd": ("159",), "sdd": ("160",), "tned": ("364",),
+    "tnmd": ("365",), "tnwd": ("366",), "txed": ("367",),
+    "txnd": ("368",), "txsd": ("369",), "txwd": ("370",),
+    "utd": ("161",), "vtd": ("162",), "vaed": ("371",),
+    "vawd": ("372",), "vid": ("163",), "waed": ("373",),
+    "wawd": ("374",), "wvnd": ("375",), "wvsd": ("376",),
+    "wied": ("377",), "wiwd": ("378",), "wyd": ("164",),
+
+    # Specialized federal courts represented in Scholar.
+    "cit": ("190",), "uscfc": ("188",), "tax": ("192",),
+    "bap1": ("379",), "bap2": ("380",), "bap6": ("381",),
+    "bap8": ("382",), "bap9": ("383",), "bap10": ("384",),
+
+    # State appellate courts.
+    "ala": ("64",), "alacrimapp": ("63",), "alacivapp": ("62",),
+    "alaska": ("66",), "alaskactapp": ("65",),
+    "ariz": ("68",), "arizctapp": ("67",),
+    "ark": ("71",), "arkctapp": ("70",),
+    "cal": ("104",), "calctapp": ("103",),
+    "colo": ("116",), "coloctapp": ("115",),
+    "conn": ("118",), "connappct": ("117",),
+    "del": ("133",), "delch": ("132",), "delsuperct": ("385",),
+    "dc": ("165",), "fla": ("168",), "fladistctapp": ("167",),
+    "ga": ("170",), "gactapp": ("169",),
+    "haw": ("172",), "hawapp": ("171",),
+    "idaho": ("174",), "idahoctapp": ("173",),
+    "ill": ("176",), "illappct": ("175",),
+    "ind": ("179",), "indctapp": ("178",),
+    "iowa": ("182",), "iowactapp": ("181",),
+    "kan": ("184",), "kanctapp": ("183",),
+    "ky": ("186",), "kyctapp": ("185",),
+    "la": ("187",), "lactapp": ("386",), "me": ("193",),
+    "md": ("194",), "mdctspecapp": ("195",),
+    "mass": ("197",), "massappct": ("196",),
+    "mich": ("199",), "michctapp": ("198",),
+    "minn": ("201",), "minnctapp": ("200",),
+    "miss": ("203",), "missctapp": ("202",),
+    "mo": ("205",), "moctapp": ("204",), "mont": ("206",),
+    "neb": ("208",), "nebctapp": ("207",), "nev": ("209",),
+    "nh": ("210",), "nj": ("212",), "njsuperctappdiv": ("211",),
+    "nm": ("214",), "nmctapp": ("213",),
+    "ny": ("216",), "nyappdiv": ("215",),
+    "nc": ("218",), "ncctapp": ("217",), "nd": ("220",),
+    "ohio": ("222",), "ohioctapp": ("221",),
+    "okla": ("226",), "oklacrimapp": ("225",),
+    "oklacivapp": ("224",), "or": ("228",), "orctapp": ("227",),
+    "pa": ("230",), "pasuperct": ("388",), "pacommwct": ("229",),
+    "ri": ("231",), "sc": ("233",), "scctapp": ("232",),
+    "sd": ("234",), "tenn": ("237",), "tennctapp": ("235",),
+    "tenncrimapp": ("236",), "tex": ("241",),
+    "texcrimapp": ("240",), "texapp": ("238",),
+    "utah": ("243",), "utahctapp": ("242",), "vt": ("244",),
+    "va": ("246",), "vactapp": ("245",),
+    "wash": ("248",), "washctapp": ("247",), "wva": ("249",),
+    "wis": ("251",), "wisctapp": ("250",), "wyo": ("252",),
+}
+
+
+def scholar_jurisdiction_value(courts=None) -> Optional[str]:
+    """Google Scholar ``as_sdt`` value for selected CourtListener court ids.
+
+    ``None`` means the caller requested only courts Scholar does not expose.
+    With no selection, Scholar's all-jurisdictions case-law value is returned.
+    """
+    selected = {
+        str(court).strip().lower() for court in (courts or ()) if court
+    }
+    if not selected:
+        return "2006"
+    values: list[str] = []
+    seen: set[str] = set()
+    for court in sorted(selected):
+        for value in _SCHOLAR_COURT_IDS.get(court, ()):
+            if value not in seen:
+                seen.add(value)
+                values.append(value)
+    return "4," + ",".join(values) if values else None
+
 # ---------------------------------------------------------------------------
 # Browser impersonation
 # ---------------------------------------------------------------------------
@@ -1604,7 +1721,7 @@ class GoogleScholarFetcher:
         # Per-session memory cache for search-results pages (not persisted:
         # rankings change, and re-searching identical queries within a
         # session is the case worth optimizing).
-        self._search_cache: dict[str, list[ScholarResult]] = {}
+        self._search_cache: dict[tuple[str, tuple[str, ...]], list[ScholarResult]] = {}
 
         # The scholar_case URL found on the results page when the opinion page
         # then failed to load (search succeeded, case page didn't) — consumed
@@ -1819,41 +1936,62 @@ class GoogleScholarFetcher:
         self._post_search_failure = None
         return url
 
-    def search_cases(self, query: str, limit: int = 10) -> list["ScholarResult"]:
+    def search_cases(
+        self, query: str, limit: int = 10, courts=None, *,
+        allow_db_fallback: bool = True,
+    ) -> list["ScholarResult"]:
         """
-        Search Scholar case law (all state and federal courts) and return
-        parsed results: title, case URL, byline, and snippet.
+        Search Scholar case law and return parsed results: title, case URL,
+        byline, and snippet. ``courts`` accepts the CourtListener court ids
+        used by the application's jurisdiction picker.
 
         Results are cached in memory for the session.  When Google Scholar is
         unreachable or blocking the IP (the request raises, or the results page
         comes back empty), the search falls back to the local opinion database
         so an already-collected corpus still answers the query offline.
+        ``allow_db_fallback=False`` returns only rows actually found on the
+        Google results page; callers inspecting that page's parallel citations
+        use it so a local record cannot masquerade as a fresh Scholar result.
         """
-        key = query.strip()
+        selected_courts = tuple(sorted({
+            str(court).strip().lower() for court in (courts or ()) if court
+        }))
+        key = (query.strip(), selected_courts)
         if key in self._search_cache:
             return self._search_cache[key][:limit]
-        url = f"{SCHOLAR_BASE}/scholar?q={quote_plus(query)}&as_sdt=2006"
-        print(f"[scholar] searching {url}")
-        try:
-            resp = self._get(url)
-            self._last_search_url = url
-            results = self._parse_results(resp.text)
-            print(f"[scholar] parsed {len(results)} case results")
-        except Exception as exc:
-            print(f"[scholar] search request failed: {exc}")
+        jurisdiction = scholar_jurisdiction_value(selected_courts)
+        if jurisdiction is None:
             results = []
-        if not results:
+        else:
+            url = (
+                f"{SCHOLAR_BASE}/scholar?q={quote_plus(query)}"
+                f"&as_sdt={jurisdiction}"
+            )
+            print(f"[scholar] searching {url}")
+            try:
+                resp = self._get(url)
+                self._last_search_url = url
+                results = self._parse_results(resp.text)
+                print(f"[scholar] parsed {len(results)} case results")
+            except Exception as exc:
+                print(f"[scholar] search request failed: {exc}")
+                results = []
+        if not results and allow_db_fallback:
             # Scholar gave us nothing (blocked, rate-limited, or a genuine
             # miss): serve candidates from the local opinion database instead.
             # These are deliberately not cached, so a later online search —
             # once the block clears — supersedes them.
-            db_results = self._db_search_results(query, limit)
+            db_results = self._db_search_results(
+                query, limit, selected_courts,
+            )
             if db_results:
                 print(
                     f"[scholar] Google Scholar returned nothing; serving "
                     f"{len(db_results)} result(s) from the local opinion database"
                 )
             return db_results
+        if not results:
+            return []
         self._search_cache[key] = results
         return results[:limit]
 
@@ -1912,7 +2050,9 @@ class GoogleScholarFetcher:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [c for _s, c in scored]
 
-    def _db_search_results(self, query: str, limit: int) -> list["ScholarResult"]:
+    def _db_search_results(
+        self, query: str, limit: int, courts=(),
+    ) -> list["ScholarResult"]:
         """Search the local opinion database and adapt its hits into
         ``ScholarResult`` rows (the offline fallback for :meth:`search_cases`).
 
@@ -1931,6 +2071,14 @@ class GoogleScholarFetcher:
             except Exception as exc:
                 print(f"[scholar] opinion-DB search failed: {exc}")
                 return []
+        selected = {
+            str(court).strip().lower() for court in (courts or ()) if court
+        }
+        if selected:
+            hits = [
+                hit for hit in hits
+                if str(hit.get("court") or "").strip().lower() in selected
+            ]
         out: list[ScholarResult] = []
         for hit in hits[:limit]:
             sid = hit.get("scholar_id") or ""
@@ -1943,7 +2091,7 @@ class GoogleScholarFetcher:
                     title=title,
                     url=url,
                     source=self._db_summary_byline(hit),
-                    snippet="",
+                    snippet=str(hit.get("snippet") or ""),
                 )
             )
         return out

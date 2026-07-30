@@ -17,6 +17,7 @@ Token lookup order:
 
 from __future__ import annotations
 
+import datetime as _dt
 import difflib
 import gc
 import html as _html
@@ -1729,6 +1730,11 @@ class _SavedStatuteDoc:
 
     def __init__(self, data: dict) -> None:
         self.paras = [tuple(p) for p in (data.get("paras") or []) if len(p) == 3]
+        self.para_styles = [
+            [tuple(style) for style in styles if len(style) == 3]
+            for styles in (data.get("para_styles") or [])
+        ]
+        self.site_formatting = bool(data.get("site_formatting", False))
         self.url = str(data.get("url", ""))
         self.title = str(data.get("title", ""))
         self.set_key = data.get("set_key")
@@ -2177,6 +2183,47 @@ def _scholar_parallel_cites(client, item: dict, exclude: str) -> list[str]:
 _REPORTER_SERIES_RE = re.compile(r"\b\d*(?:2d|3d|4th|5th|6th)\b\.?|\b\d+\b")
 
 _SCOTUS_REPORTERS = {"U.S.", "S. Ct.", "S.Ct.", "L. Ed.", "L. Ed. 2d", "L.Ed.", "L.Ed.2d"}
+
+
+def _court_result_label(item: dict) -> str:
+    """Short court label for a CourtListener result-table row.
+
+    Search results carry both a formal court name (often much too long for the
+    main table) and a stable CourtListener court ID.  Prefer the repository's
+    Bluebook map for that ID, then CourtListener's own citation string, then
+    derive a Bluebook abbreviation from the formal name.
+    """
+    raw_id = str(item.get("court_id") or "").strip().lower()
+    raw_name = str(item.get("court") or "").strip()
+    if not raw_id and raw_name.lower() in _COURT_BLUEBOOK:
+        raw_id = raw_name.lower()
+
+    if raw_id == "scotus" or _CAP_SCOTUS_RE.match(raw_name):
+        return "SCOTUS"
+
+    mapped = _COURT_BLUEBOOK.get(raw_id, "")
+    if mapped:
+        return mapped
+
+    supplied = str(
+        item.get("court_citation_string")
+        or item.get("court_abbreviation")
+        or ""
+    ).strip()
+    if supplied:
+        return supplied
+
+    derived = (
+        _bluebook_court_from_name(raw_name)
+        or _bluebook_federal_trial_court(raw_name)
+    )
+    if derived:
+        return derived
+
+    # A short value is likely already an abbreviation.  Retain a formal name
+    # only as the last resort; it is more intelligible than an unknown opaque
+    # court ID.
+    return raw_name or raw_id.upper()
 
 
 def _court_for_paren(citation: str, court_id: str, fallback: str = "") -> str:
@@ -3683,6 +3730,365 @@ def _us_reports_cite_via_courtlistener(
     return None
 
 
+def _more_than_four_years_old(
+    item: dict, today: Optional[_dt.date] = None,
+) -> bool:
+    """Whether *item* was decided strictly more than four years ago.
+
+    A complete filing date is preferred.  A bare year is usable only when even
+    December 31 of that year is beyond the cutoff, which keeps a case near the
+    four-year boundary out of this comparatively expensive fallback.
+    """
+    current = today or _dt.date.today()
+    try:
+        cutoff = current.replace(year=current.year - 4)
+    except ValueError:  # February 29
+        cutoff = current.replace(year=current.year - 4, day=28)
+    raw = str(
+        item.get("dateFiled") or item.get("date_filed")
+        or item.get("decision_date") or item.get("year") or ""
+    ).strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw[:10]):
+            return _dt.date.fromisoformat(raw[:10]) < cutoff
+        if re.fullmatch(r"\d{4}", raw):
+            return _dt.date(int(raw), 12, 31) < cutoff
+    except ValueError:
+        pass
+    return False
+
+
+def _us_reports_cite_from_scholar_parallel(
+    fetcher, case_name: str, sct_cite: str,
+) -> Optional[str]:
+    """Inspect the initial Google Scholar results page for a parallel U.S. cite.
+
+    The result must itself bear the requested S. Ct. cite and have a close case
+    name.  The snippet is deliberately excluded because it can quote unrelated
+    authorities; Scholar prints a result's parallel citations in its title or
+    green byline.
+    """
+    if fetcher is None or not case_name or not sct_cite:
+        return None
+    clean_name = re.sub(r"<[^>]+>", " ", case_name)
+    clean_name = re.sub(r"\s+", " ", clean_name).strip()
+    query = f'{clean_name} "{sct_cite}"'
+    try:
+        results = fetcher.search_cases(
+            query,
+            limit=10,
+            courts={_SCOTUS_COURT_ID},
+            allow_db_fallback=False,
+        )
+    except Exception as exc:
+        print(f"[resolve] Google Scholar parallel-cite search failed: {exc}")
+        return None
+    for result in results:
+        title = re.sub(r"<[^>]+>", " ", str(getattr(result, "title", "") or ""))
+        source = re.sub(r"<[^>]+>", " ", str(getattr(result, "source", "") or ""))
+        try:
+            bears_sct = _scholar_bears_citation(result, sct_cite)
+        except Exception:
+            bears_sct = bool(
+                _SCT_CITE_RE.search(f"{title} ; {source}")
+                and re.sub(r"\s+", "", sct_cite).lower()
+                in re.sub(r"\s+", "", f"{title} ; {source}").lower()
+            )
+        if not bears_sct:
+            continue
+        if _name_match_score(clean_name, title) < _NAME_MATCH_MIN:
+            continue
+        us_cite = _normalized_us_cite(f"{title} ; {source}")
+        if us_cite:
+            print(
+                f"[resolve] Google Scholar parallel cite for "
+                f"{sct_cite}: {us_cite}"
+            )
+            return us_cite
+    return None
+
+
+_OPINION_API_ID_RE = re.compile(r"/opinions/(\d+)/?")
+
+
+def _opinion_id(value) -> Optional[int]:
+    """An opinion API id from an integer, record, or API URL."""
+    if isinstance(value, dict):
+        value = value.get("id") or value.get("resource_uri") or value.get("url")
+    try:
+        if isinstance(value, int) or str(value).isdigit():
+            return int(value)
+    except (TypeError, ValueError):
+        return None
+    match = _OPINION_API_ID_RE.search(str(value or ""))
+    return int(match.group(1)) if match else None
+
+
+def _cited_opinion_ids(
+    client, item: dict, case_name: str, sct_cite: str,
+) -> list[int]:
+    """Opinion ids for the target cluster, for CourtListener's ``cites`` field."""
+    ids: list[int] = []
+
+    def add(value) -> None:
+        opinion_id = _opinion_id(value)
+        if opinion_id is not None and opinion_id not in ids:
+            ids.append(opinion_id)
+
+    opinions = item.get("opinions") or []
+    if isinstance(opinions, dict):
+        opinions = [opinions]
+    # Combined/lead opinions are the citation-graph target most often.  Keep
+    # every writing as a fallback because some citations point to a separate
+    # lead opinion rather than the cluster's combined document.
+    type_priority = {
+        "combined-opinion": 0, "010combined": 0,
+        "lead-opinion": 1, "020lead": 1,
+        "unanimous-opinion": 2, "plurality-opinion": 3,
+    }
+    for opinion in sorted(
+        (op for op in opinions if isinstance(op, dict)),
+        key=lambda op: type_priority.get(str(op.get("type") or ""), 9),
+    ):
+        add(opinion)
+
+    cluster_id = item.get("cluster_id")
+    if not cluster_id:
+        try:
+            matched = _cl_item_for_citation(client, sct_cite, name=case_name)
+        except Exception:
+            matched = None
+        cluster_id = (matched or {}).get("cluster_id")
+    if cluster_id:
+        try:
+            cluster = client.get_cluster(
+                int(cluster_id), fields="sub_opinions",
+            )
+            for opinion in cluster.get("sub_opinions") or []:
+                add(opinion)
+        except Exception as exc:
+            print(
+                f"[resolve] citing-opinion target cluster fetch failed: {exc}"
+            )
+    return ids
+
+
+def _target_name_near_citation(
+    text: str, cite_start: int, case_name: str,
+) -> bool:
+    """Whether a short-form target name appears just before a reporter cite."""
+    context = text[max(0, cite_start - 180):cite_start]
+    # A semicolon separates authorities in a citation string; a target name on
+    # its left cannot identify the U.S. cite belonging to the case on its right.
+    context = context.rsplit(";", 1)[-1]
+    context_tokens = set(_name_tokens(context))
+    parties = _name_parties(case_name)
+    if not parties or not context_tokens:
+        return False
+    distinctive = [party for party in parties if not _is_common_party(party)]
+    if distinctive:
+        return any(
+            _party_overlap(party, context_tokens) >= 0.6
+            for party in distinctive
+        )
+    return all(
+        _party_overlap(party, context_tokens) >= 0.6 for party in parties
+    )
+
+
+def _us_reports_cite_in_citing_text(
+    text: str, case_name: str, sct_cite: str,
+) -> Optional[str]:
+    """Recover the target's U.S. cite from one later citing opinion.
+
+    A parallel citation beside the exact S. Ct. cite is strongest.  Later
+    opinions often drop the S. Ct. reporter entirely, so a U.S. cite preceded
+    by a recognizable short form of the target case name is also accepted.
+    """
+    plain = _html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    plain = re.sub(r"\s+", " ", plain)
+    sct_match = _SCT_CITE_RE.search(sct_cite or "")
+    target_sct = (
+        (sct_match.group(0) if sct_match else sct_cite).strip()
+    )
+    target_sct_key = re.sub(r"[\W_]+", "", target_sct).lower()
+    sct_occurrences = [
+        match for match in _SCT_CITE_RE.finditer(plain)
+        if re.sub(r"[\W_]+", "", match.group(0)).lower() == target_sct_key
+    ]
+    us_occurrences = list(_US_CITE_RE.finditer(plain))
+
+    for sct in sct_occurrences:
+        nearby: list[tuple[int, re.Match]] = []
+        for us in us_occurrences:
+            if us.end() <= sct.start():
+                gap = plain[us.end():sct.start()]
+            elif sct.end() <= us.start():
+                gap = plain[sct.end():us.start()]
+            else:
+                gap = ""
+            distance = min(
+                abs(us.end() - sct.start()),
+                abs(sct.end() - us.start()),
+            )
+            if distance <= 220 and ";" not in gap:
+                nearby.append((distance, us))
+        if nearby:
+            match = min(nearby, key=lambda row: row[0])[1]
+            return f"{match.group(1)} U.S. {match.group(2)}"
+
+    for us in us_occurrences:
+        if _target_name_near_citation(plain, us.start(), case_name):
+            return f"{us.group(1)} U.S. {us.group(2)}"
+    return None
+
+
+def _result_opinion_ids(
+    result: dict, target_ids: set[int],
+) -> list[int]:
+    """Citing sub-opinions in a CourtListener search result, best first."""
+    matching: list[int] = []
+    other: list[int] = []
+    opinions = result.get("opinions") or []
+    if isinstance(opinions, dict):
+        opinions = [opinions]
+    for opinion in opinions:
+        if not isinstance(opinion, dict):
+            continue
+        opinion_id = _opinion_id(opinion)
+        if opinion_id is None:
+            continue
+        raw_cites = opinion.get("cites") or []
+        cited = {
+            int(value) for value in raw_cites
+            if str(value).isdigit()
+        }
+        bucket = matching if cited & target_ids else other
+        if opinion_id not in bucket:
+            bucket.append(opinion_id)
+    return matching + other
+
+
+def _next_search_cursor(next_url: str) -> Optional[str]:
+    """Cursor query value from a CourtListener search response's next URL."""
+    if not next_url:
+        return None
+    parsed = urllib.parse.urlparse(next_url)
+    return urllib.parse.parse_qs(parsed.query).get("cursor", [None])[0]
+
+
+def _us_reports_cite_from_citing_opinions(
+    client, item: dict, case_name: str, sct_cite: str, *,
+    batch_size: int = 10, limit: int = 50,
+) -> Optional[str]:
+    """Check at most 50 CourtListener citing cases, ten at a time.
+
+    The citation graph is queried through the search API's ``cites`` field.
+    Within every ten-result page, the most recent case is loaded first.  Each
+    full citing opinion is inspected until it supplies the target's U.S.
+    Reports citation, or five pages / 50 unique citing cases are exhausted.
+    """
+    if client is None or not case_name or not sct_cite:
+        return None
+    target_ids = _cited_opinion_ids(client, item, case_name, sct_cite)
+    if not target_ids:
+        return None
+    target_set = set(target_ids)
+    terms = [f"cites:{opinion_id}" for opinion_id in target_ids]
+    query = terms[0] if len(terms) == 1 else f"({' OR '.join(terms)})"
+    cursor = None
+    seen_cursors: set[str] = set()
+    seen_results: set[str] = set()
+    checked = 0
+
+    while checked < limit:
+        try:
+            data = client.search(
+                query,
+                type="o",
+                cursor=cursor,
+                page_size=batch_size,
+                extra={"order_by": "dateFiled desc"},
+            )
+        except Exception as exc:
+            print(f"[resolve] CourtListener citing-opinion search failed: {exc}")
+            return None
+        batch = list(data.get("results") or [])[:batch_size]
+        batch.sort(
+            key=lambda result: str(
+                result.get("dateFiled") or result.get("date_filed") or ""
+            ),
+            reverse=True,
+        )
+        for result in batch:
+            result_key = str(
+                result.get("cluster_id") or result.get("id")
+                or tuple(_result_opinion_ids(result, target_set))
+            )
+            if result_key in seen_results:
+                continue
+            seen_results.add(result_key)
+            checked += 1
+            for opinion_id in _result_opinion_ids(result, target_set):
+                try:
+                    text = client.get_opinion_text(opinion_id)
+                except Exception as exc:
+                    print(
+                        f"[resolve] citing opinion {opinion_id} fetch failed: "
+                        f"{exc}"
+                    )
+                    continue
+                us_cite = _us_reports_cite_in_citing_text(
+                    text, case_name, sct_cite,
+                )
+                if us_cite:
+                    print(
+                        f"[resolve] citing opinion {opinion_id} supplied "
+                        f"{sct_cite} -> {us_cite}"
+                    )
+                    return us_cite
+            if checked >= limit:
+                break
+        next_cursor = _next_search_cursor(str(data.get("next") or ""))
+        if (
+            checked >= limit or not batch or not next_cursor
+            or next_cursor in seen_cursors
+        ):
+            break
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    return None
+
+
+def _late_scotus_us_reports_cite(
+    client, fetcher, item: dict, cites: list[str], *,
+    today: Optional[_dt.date] = None,
+) -> Optional[str]:
+    """Run the expensive old-SCOTUS citation fallback in its required order."""
+    if any(_US_CITE_RE.search(cite) for cite in cites):
+        return None
+    sct_cite = next(
+        (cite for cite in cites if _SCT_CITE_RE.search(cite)), None,
+    )
+    if not sct_cite or not _more_than_four_years_old(item, today=today):
+        return None
+    case_name = re.sub(
+        r"<[^>]+>", " ",
+        str(item.get("caseName") or item.get("case_name") or ""),
+    )
+    case_name = re.sub(r"\s+", " ", case_name).strip()
+    if not case_name:
+        return None
+    scholar_cite = _us_reports_cite_from_scholar_parallel(
+        fetcher, case_name, sct_cite,
+    )
+    if scholar_cite:
+        return scholar_cite
+    return _us_reports_cite_from_citing_opinions(
+        client, item, case_name, sct_cite,
+    )
+
+
 def _cl_item_for_name(client, name: str) -> Optional[dict]:
     """Resolve a case *name* to the best-matching CourtListener cluster as a
     search-result-shaped item (or None).  The fallback for locating a cited case
@@ -4163,6 +4569,260 @@ def _is_scotus_order_item(item: dict) -> bool:
                   default=None)
     cites_count = len(main_op.get("cites") or []) if main_op else 0
     return cites_count <= 2
+
+
+def _courtlistener_main_opinion(item: dict) -> dict:
+    """The opinion represented most strongly by a CourtListener search hit."""
+    return max(
+        item.get("opinions") or [],
+        key=lambda opinion: len(opinion.get("cites") or []),
+        default={},
+    )
+
+
+def _courtlistener_result_snippet(item: dict, limit: int = 300) -> str:
+    """Plain-text search snippet carried by a CourtListener result."""
+    main_op = _courtlistener_main_opinion(item)
+    raw = (
+        main_op.get("snippet")
+        or item.get("snippet")
+        or item.get("text")
+        or ""
+    )
+    text = _html.unescape(re.sub(r"<[^>]+>", " ", str(raw)))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[:limit].rstrip() + "…"
+    return text
+
+
+_CL_OPINION_ID_RE = re.compile(r"/opinions?/(\d+)(?:/|$)")
+_CL_FRONT_MATTER_RE = re.compile(
+    r"^(?:"
+    r"(?:chief\s+)?justice\s+\S+.*(?:delivered|announced|filed|concurring|"
+    r"dissenting)|"
+    r"per\s+curiam\.?|"
+    r"(?:argued|submitted|decided|filed)\b|"
+    r"(?:no\.?|nos\.?|docket\s+no\.?)\s+\S+|"
+    r"(?:appeal|certiorari)\s+from\b|"
+    r"(?:before|present):\s|"
+    r"(?:counsel|attorneys?)\s+for\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _courtlistener_opinion_id(item: dict) -> Optional[int]:
+    """Return the main nested opinion ID from a search-shaped result."""
+    opinion = _courtlistener_main_opinion(item)
+    for value in (
+        opinion.get("id"),
+        opinion.get("resource_uri"),
+        opinion.get("absolute_url"),
+        opinion.get("download_url"),
+    ):
+        if isinstance(value, int):
+            return value
+        value = str(value or "").strip()
+        if value.isdigit():
+            return int(value)
+        match = _CL_OPINION_ID_RE.search(value)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _courtlistener_opinion_preview(raw: str, limit: int = 300) -> str:
+    """Extract the first real prose paragraph from a full CL opinion.
+
+    Search snippets highlight the matching text.  For a case-name search that
+    is usually the caption, so Spotlight instead fetches the opinion itself
+    and skips captions, court/date headings, and opinion-author bylines.
+    """
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+
+    paragraphs: list[tuple[str, str]] = []
+    if re.search(r"<[A-Za-z][^>]*>", raw):
+        blocks, _footnotes = _parse_cl_html(raw)
+        paragraphs = [
+            (str(getattr(block, "kind", "para")), block.text())
+            for block in blocks
+        ]
+    else:
+        # CourtListener's plain_text field uses blank lines for paragraph
+        # breaks and single newlines for hard wrapping within a paragraph.
+        for chunk in re.split(r"(?:\r?\n\s*){2,}", raw):
+            paragraphs.append(("para", re.sub(r"\s*\r?\n\s*", " ", chunk)))
+
+    fallback = ""
+    for kind, paragraph in paragraphs:
+        text = _html.unescape(re.sub(r"<[^>]+>", " ", str(paragraph)))
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or kind in {"center", "heading"}:
+            continue
+        if not fallback and len(text) >= 30:
+            fallback = text
+        # Skip the common front matter that is not opinion prose.
+        if _CL_FRONT_MATTER_RE.search(text):
+            continue
+        if re.search(r"\b(?:v\.?|versus)\s+", text, re.IGNORECASE):
+            caption_probe = re.sub(
+                r"\b(?:v\.?|versus)\s+", " versus ", text,
+                flags=re.IGNORECASE,
+            )
+            if not re.search(r"[.!?]", caption_probe):
+                continue
+        letters = [char for char in text if char.isalpha()]
+        if letters and len(text.split()) < 20:
+            upper_ratio = sum(char.isupper() for char in letters) / len(letters)
+            if upper_ratio > 0.78:
+                continue
+        # A substantive paragraph normally has at least a short sentence.  We
+        # still retain the first longer candidate as a fallback for unusually
+        # terse or poorly segmented source material.
+        if len(text) < 40 or len(text.split()) < 7:
+            continue
+        return text[:limit].rstrip() + ("…" if len(text) > limit else "")
+
+    if fallback:
+        return fallback[:limit].rstrip() + ("…" if len(fallback) > limit else "")
+    return ""
+
+
+def _courtlistener_full_opinion_preview(
+    client: CourtListenerClient, item: dict, limit: int = 300,
+) -> str:
+    """Fetch and summarize the main opinion for one Spotlight result."""
+    opinion_ids: list[int] = []
+    direct_id = _courtlistener_opinion_id(item)
+    if direct_id is not None:
+        opinion_ids.append(direct_id)
+
+    if not opinion_ids:
+        cluster_id = item.get("cluster_id") or item.get("id")
+        if cluster_id:
+            cluster = client.get_cluster(int(cluster_id), fields="sub_opinions")
+            for ref in cluster.get("sub_opinions") or []:
+                if isinstance(ref, int):
+                    opinion_ids.append(ref)
+                    continue
+                match = _CL_OPINION_ID_RE.search(str(ref or ""))
+                if match:
+                    opinion_ids.append(int(match.group(1)))
+
+    for opinion_id in opinion_ids:
+        preview = _courtlistener_opinion_preview(
+            client.get_opinion_text(opinion_id), limit=limit,
+        )
+        if preview:
+            return preview
+    return ""
+
+
+def _courtlistener_search_pages(
+    client: CourtListenerClient,
+    query: str,
+    *,
+    max_results: Optional[int],
+    **search_kwargs,
+):
+    """Yield cursor-paginated search pages capped at an exact result total.
+
+    CourtListener's search endpoint pages at no more than 20 results and may
+    return 20 even when a smaller ``page_size`` is requested.  The main-window
+    selector therefore controls the total locally: pages are followed until
+    the requested count is reached, and the last page is sliced as needed.
+
+    Each yielded tuple is ``(page, done, exhausted)``.  ``done`` means the UI
+    should stop loading; ``exhausted`` distinguishes reaching the end of the
+    API result set from intentionally stopping at the user's limit.
+    """
+    if max_results is not None and max_results <= 0:
+        return
+
+    loaded = 0
+    cursor = None
+    seen_cursors: set[str] = set()
+    while True:
+        data = client.search(
+            query,
+            cursor=cursor,
+            page_size=20,
+            **search_kwargs,
+        )
+        api_results = list(data.get("results") or [])
+        results = api_results
+        if max_results is not None:
+            remaining = max_results - loaded
+            results = api_results[:remaining]
+        loaded += len(results)
+
+        next_url = data.get("next") or ""
+        next_cursor = None
+        if next_url:
+            parsed = urllib.parse.urlparse(next_url)
+            next_cursor = urllib.parse.parse_qs(
+                parsed.query
+            ).get("cursor", [None])[0]
+
+        exhausted = (
+            not next_cursor
+            or next_cursor in seen_cursors
+            or not api_results
+        )
+        limit_reached = (
+            max_results is not None and loaded >= max_results
+        )
+        done = exhausted or limit_reached
+        page = dict(data)
+        page["results"] = results
+        yield page, done, exhausted
+        if done:
+            break
+
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+
+def _main_view_scotus_order(
+    item: dict, today: Optional[_dt.date] = None,
+) -> bool:
+    """Whether the main search should put a SCOTUS row in its orders pane.
+
+    CourtListener's inbound ``citeCount`` is the stronger minor-order signal
+    once an opinion has had time to be cited. Decisions from the trailing
+    twelve months retain the former outbound-citation heuristic because even a
+    merits opinion can legitimately have no inbound citations yet.
+    """
+    court_val = str(item.get("court_id") or item.get("court") or "").lower()
+    if "scotus" not in court_val:
+        return False
+
+    current = today or _dt.date.today()
+    try:
+        cutoff = current.replace(year=current.year - 1)
+    except ValueError:  # February 29
+        cutoff = current.replace(year=current.year - 1, day=28)
+    filed_raw = str(item.get("dateFiled") or item.get("date_filed") or "")[:10]
+    try:
+        filed = _dt.date.fromisoformat(filed_raw)
+    except ValueError:
+        filed = None
+
+    if filed is not None and filed >= cutoff:
+        opinions = item.get("opinions") or []
+        main_op = max(
+            opinions,
+            key=lambda opinion: len(opinion.get("cites") or []),
+            default=None,
+        )
+        return (
+            main_op is not None
+            and len(main_op.get("cites") or []) <= 2
+        )
+    return _is_scotus_order_item(item)
 
 
 # --- Jurisdiction hint parsing ----------------------------------------------
@@ -5264,12 +5924,15 @@ class CourtListenerGUI:
         self._scholar_results: list = []  # ScholarResult objects
         self._selected_courts: set[str] = set()  # empty = all courts
         self._search_thread: Optional[threading.Thread] = None
+        self._search_generation = 0
         self._scholar: Optional["GoogleScholarFetcher"] = None
         self._opinion_db = None          # opinion_db.OpinionDB (lazy)
         self._opinion_db_failed = False  # don't retry a broken DB every call
         self._opinion_db_loading = False
         self._opinion_db_thread: Optional[threading.Thread] = None
         self._opinion_db_lock = threading.RLock()
+        self._spotlight_snippet_cache: dict[str, str] = {}
+        self._spotlight_snippet_lock = threading.Lock()
 
         self._preview_cache: dict[int, str] = {}  # result index → snippet text
         self._sort_state: dict[int, tuple[str, bool]] = {}  # tree id → (col, reverse)
@@ -6058,11 +6721,16 @@ class CourtListenerGUI:
             side="left", padx=4
         )
 
-        ttk.Label(row2, text="  Max results:").pack(side="left")
-        self._page_size_var = tk.IntVar(value=20)
-        ttk.Spinbox(
-            row2, from_=5, to=20, textvariable=self._page_size_var, width=5
-        ).pack(side="left", padx=4)
+        ttk.Label(row2, text="  CourtListener results:").pack(side="left")
+        self._result_limit_var = tk.StringVar(value="20")
+        self._result_limit_combo = ttk.Combobox(
+            row2,
+            textvariable=self._result_limit_var,
+            values=("5", "10", "20", "50", "100", "200", "All"),
+            state="normal",
+            width=5,
+        )
+        self._result_limit_combo.pack(side="left", padx=4)
 
         # --- Results area: left trees + right preview ---
         results_frame = ttk.LabelFrame(self.root, text="Results", padding=6)
@@ -6147,7 +6815,7 @@ class CourtListenerGUI:
         ttk.Separator(orders_sep, orient="horizontal").pack(fill="x")
         ttk.Label(
             orders_sep,
-            text="Orders  (≤ 2 citations)",
+            text="Likely minor orders",
             foreground="gray",
             font=("TkDefaultFont", 9, "italic"),
         ).pack(anchor="w", pady=(2, 0))
@@ -6520,7 +7188,9 @@ class CourtListenerGUI:
             statute = _parse_statute_query(query)
             if statute:
                 self._close_quick_popup()
-                _open_statute_action(self.root, statute, app=self)
+                _open_statute_action(
+                    self.root, statute, self._status_var.set, app=self,
+                )
                 return
 
             # 1b. English Reports citation ("156 Eng. Rep. 145", "95 E.R. 807"):
@@ -6721,62 +7391,111 @@ class CourtListenerGUI:
         return _UI["badge"] if court_id == "scotus" else _UI["badge_alt"]
 
     def _spot_build_row(self, parent, court_abbr: str, tier_color: str,
-                        display_name: str, detail_text: str) -> dict:
+                        display_name: str, detail_text: str,
+                        snippet: str = "", year: str = "") -> dict:
         """Create one spotlight result row and return the widgets the caller
         needs to bind clicks and re-colour on highlight.  Builds a rounded,
         themed card when CustomTkinter is present, or the plain-Tk row otherwise.
         """
         if _CTK_AVAILABLE:
-            row = ctk.CTkFrame(parent, corner_radius=10,
-                               fg_color=_UI["window"], height=54)
+            row = ctk.CTkFrame(
+                parent, corner_radius=10, fg_color=_UI["window"],
+                height=72,
+            )
             row.pack(side="top", fill="x", padx=10, pady=(4, 0))
             row.pack_propagate(False)
-            badge = ctk.CTkLabel(
-                row, text=court_abbr, fg_color=tier_color, corner_radius=6,
-                text_color="#ffffff", font=_ui_font(11, "bold"),
-                width=78, height=36,
+            badge = ctk.CTkFrame(
+                row, fg_color=tier_color, corner_radius=6,
+                width=78, height=44,
             )
             badge.pack(side="left", padx=(10, 12), pady=9)
+            badge.pack_propagate(False)
+            badge_court = ctk.CTkLabel(
+                badge, text=court_abbr, fg_color="transparent",
+                text_color="#ffffff", font=_ui_font(11, "bold"), height=19,
+            )
+            badge_court.pack(fill="x", pady=(3, 0))
+            badge_year = ctk.CTkLabel(
+                badge, text=year, fg_color="transparent",
+                text_color="#ffffff", font=_ui_font(10), height=15,
+            )
+            badge_year.pack(fill="x", pady=(0, 3))
             text_frame = ctk.CTkFrame(row, fg_color="transparent")
             text_frame.pack(side="left", fill="both", expand=True, padx=(0, 12))
+            header_frame = ctk.CTkFrame(
+                text_frame, fg_color="transparent",
+            )
+            header_frame.pack(fill="x", pady=(7, 0))
+            detail_lbl = ctk.CTkLabel(
+                header_frame, text=detail_text, fg_color="transparent",
+                text_color=_UI["muted"], font=_ui_font(11), anchor="e",
+            )
+            detail_lbl.pack(side="right", padx=(12, 0))
             name_lbl = ctk.CTkLabel(
-                text_frame, text=display_name, fg_color="transparent",
+                header_frame, text=display_name, fg_color="transparent",
                 text_color=_UI["text"], font=_ui_font(14), anchor="w",
             )
-            name_lbl.pack(fill="x", pady=(7, 0))
-            detail_lbl = ctk.CTkLabel(
-                text_frame, text=detail_text, fg_color="transparent",
-                text_color=_UI["muted"], font=_ui_font(11), anchor="w",
+            name_lbl.pack(side="left", fill="x", expand=True)
+            snippet_lbl = ctk.CTkLabel(
+                text_frame, text=snippet, fg_color="transparent",
+                text_color=_UI["muted"], font=_ui_font(10), anchor="w",
             )
-            detail_lbl.pack(fill="x")
+            snippet_lbl.pack(fill="x", pady=(2, 6))
             return {
-                "row": row, "badge": badge, "text_frame": text_frame,
-                "name": name_lbl, "detail": detail_lbl, "modern": True,
+                "row": row, "badge": badge, "badge_court": badge_court,
+                "badge_year": badge_year, "year": year,
+                "text_frame": text_frame,
+                "header_frame": header_frame,
+                "name": name_lbl, "detail": detail_lbl,
+                "snippet": snippet_lbl, "modern": True,
             }
-        row = tk.Frame(parent, bg="#ffffff", height=52, cursor="hand2")
+        row = tk.Frame(
+            parent, bg="#ffffff", height=68,
+            cursor="hand2",
+        )
         row.pack(side="top", fill="x", padx=4, pady=(2, 0))
         row.pack_propagate(False)
-        badge = tk.Label(
-            row, text=court_abbr, bg=tier_color, fg="#ffffff",
-            font=("TkDefaultFont", 10, "bold"), padx=6, pady=2,
-            anchor="center", width=8,
+        badge = tk.Frame(
+            row, bg=tier_color, width=76, height=46,
         )
         badge.pack(side="left", padx=(6, 8))
+        badge.pack_propagate(False)
+        badge_court = tk.Label(
+            badge, text=court_abbr, bg=tier_color, fg="#ffffff",
+            font=("TkDefaultFont", 10, "bold"), anchor="center",
+        )
+        badge_court.pack(fill="x", pady=(3, 0))
+        badge_year = tk.Label(
+            badge, text=year, bg=tier_color, fg="#ffffff",
+            font=("TkDefaultFont", 9), anchor="center",
+        )
+        badge_year.pack(fill="x", pady=(0, 3))
         text_frame = tk.Frame(row, bg="#ffffff")
         text_frame.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        header_frame = tk.Frame(text_frame, bg="#ffffff")
+        header_frame.pack(fill="x")
+        detail_lbl = tk.Label(
+            header_frame, text=detail_text, bg="#ffffff", fg="#888888",
+            font=("TkDefaultFont", 8), anchor="e",
+        )
+        detail_lbl.pack(side="right", padx=(10, 0))
         name_lbl = tk.Label(
-            text_frame, text=display_name, bg="#ffffff", fg="#222222",
+            header_frame, text=display_name, bg="#ffffff", fg="#222222",
             font=("TkDefaultFont", 10), anchor="w",
         )
-        name_lbl.pack(fill="x")
-        detail_lbl = tk.Label(
-            text_frame, text=detail_text, bg="#ffffff", fg="#888888",
+        name_lbl.pack(side="left", fill="x", expand=True)
+        snippet_lbl = tk.Label(
+            text_frame, text=snippet, bg="#ffffff", fg="#888888",
             font=("TkDefaultFont", 8), anchor="w",
         )
-        detail_lbl.pack(fill="x")
+        snippet_lbl.pack(fill="x")
         return {
-            "row": row, "badge": badge, "text_frame": text_frame,
-            "name": name_lbl, "detail": detail_lbl, "modern": False,
+            "row": row, "badge": badge, "badge_court": badge_court,
+            "badge_year": badge_year, "year": year,
+            "text_frame": text_frame,
+            "header_frame": header_frame,
+            "name": name_lbl, "detail": detail_lbl,
+            "snippet": snippet_lbl, "modern": False,
         }
 
     @staticmethod
@@ -6796,9 +7515,24 @@ class CourtListenerGUI:
         color = self._spot_tier_color(court_id)
         try:
             if r["modern"]:
-                r["badge"].configure(text=text, fg_color=color)
+                r["badge"].configure(fg_color=color)
+                r["badge_court"].configure(text=text)
             else:
-                r["badge"].config(text=text, bg=color)
+                r["badge"].config(bg=color)
+                r["badge_court"].config(text=text, bg=color)
+                r["badge_year"].config(bg=color)
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _spot_set_badge_year(r: dict, year: str) -> None:
+        """Update the smaller year line without disturbing the court label."""
+        r["year"] = year
+        try:
+            if r["modern"]:
+                r["badge_year"].configure(text=year)
+            else:
+                r["badge_year"].config(text=year)
         except tk.TclError:
             pass
 
@@ -6810,7 +7544,13 @@ class CourtListenerGUI:
             )
             return
         bg = "#d0e0f0" if selected else "#ffffff"
-        for w in (r["row"], r["text_frame"], r["name"], r["detail"]):
+        for w in (
+            r["row"], r["text_frame"], r.get("header_frame"),
+            r["name"], r["detail"],
+            r.get("snippet"),
+        ):
+            if w is None:
+                continue
             try:
                 w.config(bg=bg)
             except tk.TclError:
@@ -6841,7 +7581,7 @@ class CourtListenerGUI:
         # reachable by wheel or arrow keys instead of spilling off-screen.
         max_rows = 10
         pw = 600 if _CTK_AVAILABLE else 580
-        row_unit = 58 if _CTK_AVAILABLE else 54  # one row including its top gap
+        row_unit = 76 if _CTK_AVAILABLE else 70  # snippet-bearing row + gap
         sx = popup.winfo_screenwidth()
         sy = popup.winfo_screenheight()
         pos_x = (sx - pw) // 2
@@ -6960,10 +7700,8 @@ class CourtListenerGUI:
         shown: list[dict] = []
         bucket_counts: dict[str, int] = {}
 
-        def _detail_text(cite: str, year: str, source_label: str) -> str:
+        def _detail_text(cite: str, source_label: str) -> str:
             detail = f"{cite}" if cite else ""
-            if year:
-                detail = f"{detail} ({year})" if detail else f"({year})"
             if source_label:
                 sep = "  ·  " if _CTK_AVAILABLE else "  — "
                 detail = (f"{detail}{sep}{source_label}"
@@ -6971,7 +7709,7 @@ class CourtListenerGUI:
             return detail
 
         def _replace_row(r: dict, cite: str, year: str, source_label: str,
-                         open_fn) -> None:
+                         open_fn, snippet: str = "") -> None:
             # A preferred source (Google Scholar) took over an already-shown
             # row: swap its opener and re-label the detail line.  Badge and name
             # stay — it is the same case, so they already match.  The row does
@@ -6980,7 +7718,10 @@ class CourtListenerGUI:
             r["open_fn"] = open_fn
             try:
                 r["detail"].configure(
-                    text=_detail_text(cite, year, source_label))
+                    text=_detail_text(cite, source_label))
+                self._spot_set_badge_year(r, year)
+                if snippet and r.get("snippet") is not None:
+                    r["snippet"].configure(text=snippet)
             except tk.TclError:
                 pass
 
@@ -7019,7 +7760,8 @@ class CourtListenerGUI:
 
         def _add_result(bucket: str, court_id: str, name: str, cite: str,
                         year: str, source_label: str, open_fn,
-                        opinion_id: str = "") -> None:
+                        opinion_id: str = "", snippet: str = "",
+                        snippet_loader=None) -> None:
             # Ignore results streaming in from a superseded search.
             if my_gen != self._spotlight_generation:
                 return
@@ -7045,7 +7787,7 @@ class CourtListenerGUI:
                     if _prefer_source(bucket, entry["bucket"]):
                         old_bucket = entry["bucket"]
                         _replace_row(entry["row"], cite, year, source_label,
-                                     open_fn)
+                                     open_fn, snippet)
                         entry["bucket"] = bucket
                         entry["row"]["bucket"] = bucket
                         if old_bucket != bucket:
@@ -7083,11 +7825,15 @@ class CourtListenerGUI:
             court_abbr = "…" if resolving else self._spot_court_label(court_id)
 
             display_name = name[:80] + ("…" if len(name) > 80 else "")
-            detail = _detail_text(cite, year, source_label)
+            detail = _detail_text(cite, source_label)
+            snippet = re.sub(r"\s+", " ", snippet or "").strip()
+            if len(snippet) > 150:
+                snippet = snippet[:150].rstrip() + "…"
 
             r = self._spot_build_row(
                 rows_frame, court_abbr,
                 self._spot_tier_color(court_id), display_name, detail,
+                snippet=snippet, year=year,
             )
             _bind_wheel(r["row"])
             r["open_fn"] = open_fn
@@ -7100,6 +7846,48 @@ class CourtListenerGUI:
             # find one for the badge without holding anything back.
             if resolving:
                 _resolve_court(r, cite, name)
+
+            # A CourtListener search hit's snippet is commonly just the party
+            # names because those are the matched terms.  Once the row is on
+            # screen, fetch its full opinion on a worker and replace that
+            # placeholder with the first actual prose paragraph.
+            if snippet_loader is not None:
+                original_bucket = bucket
+
+                def load_better_snippet() -> None:
+                    try:
+                        better = snippet_loader()
+                    except Exception as exc:
+                        print(f"[spot-snippet] opinion preview failed: {exc}")
+                        return
+                    better = re.sub(r"\s+", " ", better or "").strip()
+                    if not better:
+                        return
+                    if len(better) > 150:
+                        better = better[:150].rstrip() + "…"
+
+                    def apply() -> None:
+                        if my_gen != self._spotlight_generation:
+                            return
+                        if not any(candidate is r for candidate in result_rows):
+                            return
+                        # Scholar may have taken this duplicate row over while
+                        # the CL opinion was loading; preserve Scholar's text.
+                        if r.get("bucket") != original_bucket:
+                            return
+                        try:
+                            r["snippet"].configure(text=better)
+                        except tk.TclError:
+                            pass
+
+                    try:
+                        self.root.after(0, apply)
+                    except (tk.TclError, RuntimeError):
+                        pass
+
+                threading.Thread(
+                    target=load_better_snippet, daemon=True,
+                ).start()
 
             def on_click(_e=None, _r=r) -> None:
                 self._close_quick_popup()
@@ -7341,6 +8129,7 @@ class CourtListenerGUI:
                     0, _add_result, "scholar", court_id, r.title, cite, year,
                     "Scholar", make_opener(),
                     _scholar_result_identity(r.url),
+                    r.snippet,
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
@@ -7413,6 +8202,11 @@ class CourtListenerGUI:
                 cite_str = _pick_citation(item.get("citation", []))
                 date = item.get("dateFiled") or item.get("date_filed") or ""
                 year = date[:4] if len(date) >= 4 else ""
+                preview_key = (
+                    f"opinion:{_courtlistener_opinion_id(item)}"
+                    if _courtlistener_opinion_id(item) is not None
+                    else f"cluster:{item.get('cluster_id') or item.get('id')}"
+                )
 
                 def make_opener(it=item, nm=case_name):
                     def open_it():
@@ -7437,9 +8231,33 @@ class CourtListenerGUI:
                         threading.Thread(target=run, daemon=True).start()
                     return open_it
 
+                def make_snippet_loader(it=item, key=preview_key):
+                    def load() -> str:
+                        with self._spotlight_snippet_lock:
+                            cached = self._spotlight_snippet_cache.get(key)
+                        if cached is not None:
+                            return cached
+                        preview = _courtlistener_full_opinion_preview(
+                            client, it,
+                        )
+                        if preview:
+                            with self._spotlight_snippet_lock:
+                                self._spotlight_snippet_cache[key] = preview
+                        return preview
+                    return load
+
+                nested_opinion_id = _courtlistener_opinion_id(item)
+                identity = (
+                    f"courtlistener:{nested_opinion_id}"
+                    if nested_opinion_id is not None
+                    else ""
+                )
+
                 self.root.after(
                     0, _add_result, bucket, court_id, case_name, cite_str,
-                    year, "CourtListener", make_opener(),
+                    year, "CourtListener", make_opener(), identity,
+                    _courtlistener_result_snippet(item),
+                    make_snippet_loader(),
                 )
             search_done[0] += 1
             self.root.after(0, _update_status)
@@ -7508,6 +8326,7 @@ class CourtListenerGUI:
                         0, _add_result, "opiniondb", court_id, name, cite,
                         year, "Opinion database", make_opener(),
                         f"scholar:{sid}" if sid else "",
+                        str(hit.get("snippet") or ""),
                     )
             finally:
                 search_done[0] += 1
@@ -8862,7 +9681,7 @@ class CourtListenerGUI:
         """Return the tuple of column values for inserting a row into the tree."""
         case_name = item.get("caseName") or item.get("case_name") or "(unknown)"
         case_name = re.sub(r"<[^>]+>", "", case_name).strip()
-        court = item.get("court") or item.get("court_id") or ""
+        court = _court_result_label(item)
         date_filed = item.get("dateFiled") or item.get("date_filed") or ""
         citation_str = _pick_citation(item.get("citation", []))
         status = item.get("status") or item.get("precedentialStatus") or ""
@@ -8986,11 +9805,31 @@ class CourtListenerGUI:
                 if token:
                     client = self._get_client()
 
-        # CourtListener accepts space-separated court IDs; empty set = all
-        court = " ".join(sorted(self._selected_courts)) or None
+        # Snapshot the jurisdiction selection for both providers.  The Scholar
+        # request runs on its own thread, so it should not observe a later
+        # picker change midway through this search.
+        selected_courts = frozenset(self._selected_courts)
+        # CourtListener accepts space-separated court IDs; empty set = all.
+        court = " ".join(sorted(selected_courts)) or None
         date_from = self._date_from_var.get().strip() or None
         date_to = self._date_to_var.get().strip() or None
-        page_size = self._page_size_var.get()
+        limit_text = self._result_limit_var.get().strip()
+        if limit_text.lower() == "all":
+            max_results = None
+        else:
+            try:
+                max_results = int(limit_text)
+                if max_results <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning(
+                    "Invalid Result Count",
+                    "CourtListener results must be a positive whole number "
+                    'or "All".',
+                )
+                return
+        self._search_generation += 1
+        search_generation = self._search_generation
 
         # Clear previous results
         self._search_btn.config(state="disabled")
@@ -9017,11 +9856,16 @@ class CourtListenerGUI:
 
             def scholar_run() -> None:
                 try:
-                    res = fetcher.search_cases(query, limit=15)
+                    res = fetcher.search_cases(
+                        query, limit=15, courts=selected_courts,
+                    )
                 except Exception as exc:
                     print(f"[scholar] search failed: {exc}")
                     res = []
-                self.root.after(0, self._on_scholar_search_results, res)
+                self.root.after(
+                    0, self._on_scholar_search_results, res,
+                    search_generation,
+                )
 
             threading.Thread(target=scholar_run, daemon=True).start()
         else:
@@ -9040,29 +9884,47 @@ class CourtListenerGUI:
 
         def run() -> None:
             try:
-                data = client.search(
+                for data, done, exhausted in _courtlistener_search_pages(
+                    client,
                     query,
+                    max_results=max_results,
                     type="o",
                     court=court,
                     date_filed_min=date_from,
                     date_filed_max=date_to,
                     highlight=True,
-                    page_size=page_size,
-                )
-                self.root.after(0, self._on_results, data)
+                ):
+                    self.root.after(
+                        0, self._on_results_page, data, done,
+                        search_generation, max_results, exhausted,
+                    )
             except CourtListenerError as exc:
-                self.root.after(0, self._on_error, str(exc))
+                self.root.after(
+                    0, self._on_error, str(exc), search_generation,
+                )
             except Exception as exc:
-                self.root.after(0, self._on_error, f"Unexpected error: {exc}")
+                self.root.after(
+                    0, self._on_error, f"Unexpected error: {exc}",
+                    search_generation,
+                )
 
         self._search_thread = threading.Thread(target=run, daemon=True)
         self._search_thread.start()
 
-    def _on_results(self, data: dict) -> None:
-        self._search_btn.config(state="normal")
+    def _on_results_page(
+        self, data: dict, done: bool = True,
+        generation: Optional[int] = None,
+        requested_limit: Optional[int] = None,
+        exhausted: Optional[bool] = None,
+    ) -> None:
+        if generation is not None and generation != self._search_generation:
+            return
+        if done:
+            self._search_btn.config(state="normal")
         results = data.get("results", [])
         count = data.get("count", len(results))
-        self._results = results
+        first_index = len(self._results)
+        self._results.extend(results)
         # Normalize citations from the API: strip any HTML tags (<mark>, etc.)
         # immediately so every downstream consumer gets clean plain-text strings.
         for item in results:
@@ -9072,37 +9934,51 @@ class CourtListenerGUI:
             elif raw:
                 item["citation"] = re.sub(r"<[^>]+>", "", str(raw)).strip()
 
-        for i, item in enumerate(results):
-            # Each search result has an 'opinions' list.  The opinion with the
-            # most outbound citations is the main opinion for this cluster.
-            opinions = item.get("opinions") or []
-            main_op = max(opinions, key=lambda o: len(o.get("cites") or []), default=None)
+        for page_index, item in enumerate(results):
+            i = first_index + page_index
+            text = _courtlistener_result_snippet(item)
+            if text:
+                self._preview_cache[i] = text
 
-            # Preview text comes from the main opinion's snippet field.
-            if main_op:
-                raw = main_op.get("snippet") or ""
-                text = re.sub(r"<[^>]+>", "", raw).strip()
-                if text:
-                    self._preview_cache[i] = text
-
-            # Route to orders tree only for SCOTUS cases with ≤ 2 outbound
-            # citations.  Published orders don't exist for lower courts, so
-            # we leave everything else in the main tree.
-            court_val = str(item.get("court_id") or "")
-            cites_count = len(main_op.get("cites") or []) if main_op else None
+            # Published minor orders are a SCOTUS-only distinction.
             row = self._format_row(item)
-            if "scotus" in court_val and cites_count is not None and cites_count <= 2:
+            if _main_view_scotus_order(item):
                 self._orders_tree.insert("", "end", iid=str(i), values=row)
             else:
                 self._tree.insert("", "end", iid=str(i), values=row)
 
-        if results:
+        loaded = len(self._results)
+        if loaded:
+            if done:
+                stopped_at_limit = (
+                    requested_limit is not None
+                    and loaded >= requested_limit
+                    and count > loaded
+                    and exhausted is False
+                )
+                if stopped_at_limit:
+                    progress = (
+                        f"Loaded requested {loaded:,} of {count:,} "
+                        "matching results. "
+                    )
+                else:
+                    progress = f"Loaded all {loaded:,} results. "
+            else:
+                target = (
+                    min(count, requested_limit)
+                    if requested_limit is not None else count
+                )
+                progress = f"Loaded {loaded:,} of {target:,} results… "
             self._status_var.set(
-                f"Showing {len(results)} of {count:,} results. "
-                "Select a row and click Download PDF (or double-click)."
+                progress
+                + "Select a row and click Download PDF (or double-click)."
             )
-        else:
+        elif done:
             self._status_var.set("No results found.")
+
+    def _on_results(self, data: dict) -> None:
+        """Compatibility wrapper for a complete, single search response."""
+        self._on_results_page(data, True)
 
     def _set_preview(self, text: str) -> None:
         self._preview_text.config(state="normal")
@@ -9117,7 +9993,11 @@ class CourtListenerGUI:
             text if text else "(No preview available — download PDF for full opinion)"
         )
 
-    def _on_error(self, message: str) -> None:
+    def _on_error(
+        self, message: str, generation: Optional[int] = None,
+    ) -> None:
+        if generation is not None and generation != self._search_generation:
+            return
         self._search_btn.config(state="normal")
         self._status_var.set(f"Error: {message}")
         messagebox.showerror("API Error", message)
@@ -9208,6 +10088,37 @@ class CourtListenerGUI:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _save_scholar_us_reports_cite(self, item: dict, cite: str) -> bool:
+        """Persist a newly known U.S. Reports cite for a Scholar opinion."""
+        us_cite = _normalized_us_cite(cite)
+        if not us_cite:
+            return False
+        sid = str(item.get("scholar_id") or "").strip()
+        if not sid:
+            try:
+                import opinion_db
+                for key in ("scholar_url", "_scholar_url", "url"):
+                    sid = opinion_db.scholar_id_from_url(
+                        str(item.get(key) or "")
+                    ) or ""
+                    if sid:
+                        break
+            except Exception:
+                return False
+        if not sid:
+            return False
+        try:
+            db = self._get_opinion_db()
+            if db is not None and db.save_parallel_citation(sid, us_cite):
+                print(
+                    f"[db] saved parallel cite {us_cite} for "
+                    f"Scholar opinion {sid}"
+                )
+                return True
+        except Exception as exc:
+            print(f"[db] saving U.S. Reports parallel cite failed: {exc}")
+        return False
+
     def _resolve_pdf_url(
         self, client: Optional[CourtListenerClient], item: dict
     ) -> Optional[str]:
@@ -9232,6 +10143,10 @@ class CourtListenerGUI:
         7. If the sparse saved record had no CourtListener ids, resolve it on
            CourtListener by citation or by SCOTUS name + year/docket and retry
            that matched cluster's PDF fields.
+        8. For a SCOTUS decision more than four years old, inspect Google
+           Scholar's initial result-page parallel citations, then up to 50
+           CourtListener citing cases (ten at a time, newest first) for a
+           missing U.S. Reports cite and retry the official-report PDF paths.
         """
         storage_base = "https://storage.courtlistener.com/"
         item.pop("_case_law_pdf_choices", None)
@@ -9239,6 +10154,17 @@ class CourtListenerGUI:
         skip_metadata_fallback = bool(
             item.get("_skip_pdf_metadata_fallback")
         )
+
+        def _remember_us_reports_cite(cite: str) -> str:
+            """Keep a discovered cite on this resolver copy and in the DB."""
+            normalized = _normalized_us_cite(cite)
+            if (
+                normalized
+                and item.get("_us_reports_cite") != normalized
+            ):
+                item["_us_reports_cite"] = normalized
+                self._save_scholar_us_reports_cite(item, normalized)
+            return normalized
 
         # Determine whether this is a SCOTUS case.
         court_val = str(item.get("court_id") or "")
@@ -9264,11 +10190,42 @@ class CourtListenerGUI:
                 print(f"[resolve] {label} check failed ({exc}): {url}")
             return False
 
+        # ``_pdf_item`` normally folds these in before starting the worker.
+        # Repeat the lightweight read here so an opinion-database load that
+        # completed in the meantime is still honored by this resolution pass.
+        scholar_id = str(item.get("scholar_id") or "").strip()
+        if scholar_id:
+            try:
+                db = self._get_opinion_db()
+                saved_cites = (
+                    db.stored_citations(scholar_id) if db is not None else []
+                )
+                raw_cites = item.get("citation") or []
+                merged_cites = (
+                    list(raw_cites)
+                    if isinstance(raw_cites, (list, tuple))
+                    else [raw_cites]
+                )
+                for cite in saved_cites:
+                    if cite not in merged_cites:
+                        merged_cites.append(cite)
+                if merged_cites:
+                    item["citation"] = merged_cites
+            except Exception as exc:
+                print(f"[db] loading saved parallel citations failed: {exc}")
+
         # Gather EVERY citation we know — the search result often exposes only
         # one (frequently a nominative reporter like "19 How. 393"), while the
         # parallel U.S./F. cite that finds a PDF lives on the cluster record.
         all_cites = _gather_all_citations(client, item)
         print(f"[resolve] citations to try: {all_cites}")
+        known_us = next(
+            (_normalized_us_cite(cite) for cite in all_cites
+             if _normalized_us_cite(cite)),
+            "",
+        )
+        if known_us:
+            _remember_us_reports_cite(known_us)
 
         # A SCOTUS opinion opened from Google Scholar sometimes carries only its
         # Supreme Court Reporter ("S. Ct.") cite, not the "U.S." cite every
@@ -9284,6 +10241,7 @@ class CourtListenerGUI:
             print(f"[resolve] S. Ct. cite resolved to U.S. Reports cite: "
                   f"{us_from_sct}")
             all_cites.append(us_from_sct)
+            _remember_us_reports_cite(us_from_sct)
 
         # 0. Official US Reports PDF — try every U.S.-Reports cite among them.
         #    For vols 1-501 the LOC (Library of Congress) CDN scan is preferred,
@@ -9312,7 +10270,8 @@ class CourtListenerGUI:
                 return loc_url
             return None
 
-        for cite in all_cites:
+        def _try_official_us_reports(cite: str) -> Optional[str]:
+            """Try every official-report source for one U.S. citation."""
             m = _US_CITE_RE.search(cite)
             loc_preferred = bool(m) and int(m.group(1)) <= _LOC_PREFERRED_MAX
             sources = (
@@ -9328,13 +10287,19 @@ class CourtListenerGUI:
             for source in sources:
                 url = source(cite)
                 if url is not None:
-                    item["_us_reports_cite"] = _normalized_us_cite(cite)
+                    _remember_us_reports_cite(cite)
                     return url
             local_pdf = us_reports_pdf.extract_citation(cite)
             if local_pdf is not None:
                 url = local_pdf.as_uri()
                 print(f"[resolve] using local US Reports volume: {url}")
-                item["_us_reports_cite"] = _normalized_us_cite(cite)
+                _remember_us_reports_cite(cite)
+                return url
+            return None
+
+        for cite in all_cites:
+            url = _try_official_us_reports(cite)
+            if url is not None:
                 return url
 
         # 0.5. Non-SCOTUS: the Harvard CAP static.case.law copy.  Try every
@@ -9437,10 +10402,41 @@ class CourtListenerGUI:
                 retry_item["_skip_pdf_metadata_fallback"] = True
                 url = self._resolve_pdf_url(client, retry_item)
                 if url:
+                    if retry_item.get("_us_reports_cite"):
+                        _remember_us_reports_cite(
+                            str(retry_item["_us_reports_cite"])
+                        )
                     print(
                         "[resolve] using PDF from metadata-matched "
                         "CourtListener cluster"
                     )
+                    return url
+
+            # 8. Older S. Ct.-only decisions sometimes acquire a U.S. Reports
+            # cite years after Scholar and CourtListener created their target
+            # records.  Once every ordinary PDF and slip-opinion path has
+            # missed, recover that cite from Scholar's result page or from
+            # later citing opinions, then retry only the official-report paths.
+            fetcher = None
+            if _SCHOLAR_AVAILABLE:
+                try:
+                    fetcher = self._get_scholar()
+                except Exception as exc:
+                    print(
+                        "[resolve] Google Scholar fallback unavailable: "
+                        f"{exc}"
+                    )
+            recovered_us = _late_scotus_us_reports_cite(
+                client, fetcher, item, all_cites,
+            )
+            if recovered_us:
+                _remember_us_reports_cite(recovered_us)
+                print(
+                    "[resolve] late U.S. Reports cite recovered: "
+                    f"{recovered_us}"
+                )
+                url = _try_official_us_reports(recovered_us)
+                if url is not None:
                     return url
 
         return None
@@ -9709,7 +10705,11 @@ class CourtListenerGUI:
             print(f"[update] post-update merge failed "
                   f"(will retry next launch): {exc}")
 
-    def _on_scholar_search_results(self, results: list) -> None:
+    def _on_scholar_search_results(
+        self, results: list, generation: Optional[int] = None,
+    ) -> None:
+        if generation is not None and generation != self._search_generation:
+            return
         self._scholar_results = results
         for row in self._scholar_tree.get_children():
             self._scholar_tree.delete(row)
@@ -10574,6 +11574,13 @@ class _DbMatchDialog:
                         for k in ("name", "court", "year", "date_filed", "source"):
                             if not new_rec.get(k) and rec.get(k):
                                 new_rec[k] = rec[k]
+                        # Citation recovery can add a U.S. Reports parallel
+                        # that Scholar's opinion page still omits.  Refreshing
+                        # the HTML must not discard that durable enrichment.
+                        new_rec["cites"] = _odb._dedupe_cites([
+                            *(new_rec.get("cites") or []),
+                            *(rec.get("cites") or []),
+                        ])
                         db.replace(new_rec)
                         changed = len(html) - len(rec.get("html") or "")
                         msg = (f"Updated {name} to the latest Google Scholar "
@@ -16346,6 +17353,8 @@ class _ScholarTextWindow:
         self._details_related: Optional[tuple] = None  # cached (title, lines)
         self._recent_loaded = False
         self._details_recent: Optional[tuple] = None  # cached (title, lines)
+        self._docket_loaded = False
+        self._details_docket: Optional[tuple] = None  # cached (title, lines)
 
         txt.tag_configure("center", justify="center")
         txt.tag_configure("blockquote", lmargin1=36, lmargin2=36, rmargin=36)
@@ -20339,7 +21348,13 @@ class _ScholarTextWindow:
 
     def _details_panel(self) -> ttk.Frame:
         if self._details_frame is None:
-            f = ttk.Frame(self._text_frame)
+            # Keep every details view at the same physical width.  In
+            # particular, long docket filing names must wrap inside the panel
+            # rather than letting a child's requested width enlarge it.
+            f = ttk.Frame(
+                self._text_frame, width=self._details_panel_w,
+            )
+            f.pack_propagate(False)
             base_family = tkfont.nametofont("TkDefaultFont").actual("family")
             # Base point sizes (auto-scaled for dense displays); the panel's own
             # A−/A+ control then layers a persisted offset on top of these.
@@ -20380,7 +21395,8 @@ class _ScholarTextWindow:
 
             # What the panel shows: the case details (Oyez line-up/summary,
             # falling back to CourtListener's cluster record, then to whatever
-            # the open text reveals), the Court's most recent decisions, the
+            # the open text reveals), the selected Supreme Court case's
+            # filtered docket briefs, the Court's most recent decisions, the
             # case's appellate family (appeals, decision below, remand
             # proceedings), or the opinion's detected outline.  Case details
             # and the recent-decisions list are separate views now, not one
@@ -20390,10 +21406,13 @@ class _ScholarTextWindow:
             ttk.Label(mode_row, text="Show",
                       style="ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel",
                       ).pack(side="left")
+            mode_values = ["Case details"]
+            if self._is_scotus:
+                mode_values.append("Docket")
+            mode_values.extend(("Recent SCOTUS", "Related cases", "Outline"))
             self._details_mode_combo = ttk.Combobox(
                 mode_row, state="readonly", width=16,
-                values=("Case details", "Recent SCOTUS", "Related cases",
-                        "Outline"),
+                values=tuple(mode_values),
                 style="Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox",
             )
             self._details_mode_combo.current(0)
@@ -20403,7 +21422,7 @@ class _ScholarTextWindow:
                 lambda _e: self._refresh_details_view())
 
             body = tk.Text(
-                f, width=38, wrap="word",
+                f, width=1, wrap="word",
                 font=self._details_fonts["body"],
                 state="disabled", padx=8, pady=4, relief="flat",
                 background="#f7f5ef", cursor="",
@@ -20434,6 +21453,23 @@ class _ScholarTextWindow:
                                foreground=self._CONCUR_COLOR, spacing1=8)
             body.tag_configure("oldiss", font=self._details_fonts["h"],
                                foreground=self._DISSENT_COLOR, spacing1=8)
+            # Supreme Court booklet-cover colors, matching SCOTUSblog's docket
+            # legend.  The colored background applies to the linked brief name
+            # itself, while the date beneath it stays muted and uncolored.
+            try:
+                import scotus_docket
+                docket_colors = scotus_docket.COVER_COLORS
+            except Exception:
+                docket_colors = {}
+            for cover, color in docket_colors.items():
+                body.tag_configure(
+                    f"docket_{cover}", background=color,
+                    foreground="#25232e", spacing1=3, spacing3=1,
+                )
+            body.tag_configure(
+                "docket_plain", foreground="#25232e",
+                spacing1=3, spacing3=1,
+            )
             self._details_text = body
             self._details_frame = f
             self._apply_details_fonts()   # honor the persisted zoom choice
@@ -20554,8 +21590,7 @@ class _ScholarTextWindow:
             self._pdf_parts_nav = None
 
     def _details_mode(self) -> str:
-        """The side panel's selected view: "case", "recent", "related" or
-        "outline"."""
+        """The selected side-panel view."""
         combo = getattr(self, "_details_mode_combo", None)
         try:
             if combo is not None:
@@ -20566,6 +21601,8 @@ class _ScholarTextWindow:
                     return "related"
                 if sel == "Recent SCOTUS":
                     return "recent"
+                if sel == "Docket":
+                    return "docket"
         except tk.TclError:
             pass
         return "case"
@@ -20581,6 +21618,8 @@ class _ScholarTextWindow:
             self._show_related_cases()
         elif mode == "recent":
             self._show_recent_scotus()
+        elif mode == "docket":
+            self._show_scotus_docket()
         else:
             self._show_case_details()
 
@@ -20838,6 +21877,136 @@ class _ScholarTextWindow:
                 print(f"[details] recent decisions: {exc}")
                 lines = [("lbl", f"Could not load recent decisions: {exc}")]
             self._post(self._apply_recent_scotus, title, lines)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Side panel: the selected Supreme Court case's filtered docket
+    # ------------------------------------------------------------------
+
+    def _show_scotus_docket(self) -> None:
+        """Show cached docket lines or begin the two-source lookup."""
+        cached = getattr(self, "_details_docket", None)
+        if cached is not None:
+            self._apply_details(*cached)
+        elif not self._docket_loaded:
+            self._load_scotus_docket()
+        else:
+            self._set_details([("lbl", "Loading docket briefs\u2026")])
+
+    def _apply_scotus_docket(
+        self, title: str, lines: list[tuple],
+    ) -> None:
+        """Cache a completed docket lookup and show it if still selected."""
+        self._details_docket = (title, lines)
+        if self._details_mode() == "docket":
+            self._apply_details(title, lines)
+
+    @staticmethod
+    def _details_lines_docket(result) -> list[tuple]:
+        """Render a ``scotus_docket.CaseDocket`` in brief-stage order."""
+        lines: list[tuple] = [
+            (
+                "lbl",
+                "Selected filings only. Colors match Supreme Court booklet covers.",
+            ),
+        ]
+        documents = list(result.documents or [])
+        for stage, heading in (
+            ("cert", "Cert stage"),
+            ("merits", "Merits stage"),
+        ):
+            stage_documents = [
+                document for document in documents
+                if document.stage == stage
+            ]
+            if not stage_documents:
+                continue
+            lines.append(("h", heading))
+            for document in stage_documents:
+                lines.append((
+                    f"docket_{document.cover}",
+                    document.label,
+                    document.url,
+                ))
+                sub = " \u00b7 ".join(
+                    value for value in (
+                        document.date,
+                        (
+                            f"No. {document.docket}"
+                            if len(result.dockets) > 1 and document.docket
+                            else ""
+                        ),
+                    )
+                    if value
+                )
+                if sub:
+                    lines.append(("lbl", sub))
+
+        if not documents:
+            lines.append((
+                "lbl",
+                "No cert-stage or merits-stage brief files were found "
+                "in the online dockets.",
+            ))
+
+        source_links: list[tuple[str, str]] = []
+        for docket, url in zip(result.dockets, result.official_urls):
+            if url:
+                source_links.append((
+                    f"Full Supreme Court docket \u00b7 No. {docket}", url,
+                ))
+        if result.scotusblog_url:
+            source_links.append(("SCOTUSblog case file", result.scotusblog_url))
+        if source_links:
+            lines.append(("h", "Sources"))
+            for label, url in source_links:
+                lines.append(("", label, url))
+
+        try:
+            import scotus_docket
+            lines.append((
+                "",
+                "Official cover-color chart",
+                scotus_docket.BOOKLET_COLOR_CHART_URL,
+            ))
+        except Exception:
+            pass
+        return lines
+
+    def _load_scotus_docket(self) -> None:
+        """Fetch Court and SCOTUSblog docket files without blocking the UI."""
+        self._docket_loaded = True
+        if getattr(self, "_details_title_var", None) is not None:
+            self._details_title_var.set("Supreme Court Docket")
+        self._set_details([("lbl", "Loading docket briefs\u2026")])
+
+        item = self._pdf_item()
+        docket_text = _item_docket_text(item)
+        dockets = tuple(sorted(_scotus_docket_tokens(docket_text)))
+        name = self._bb.get("name", "")
+
+        def run() -> None:
+            title = "Supreme Court Docket"
+            if dockets:
+                title += " \u00b7 " + ", ".join(f"No. {d}" for d in dockets)
+            try:
+                import scotus_docket
+                if dockets:
+                    result = scotus_docket.fetch_case_docket(
+                        dockets, name=name, session=_anon_session,
+                    )
+                    lines = self._details_lines_docket(result)
+                else:
+                    lines = [(
+                        "lbl",
+                        "No Supreme Court docket number was found in this "
+                        "opinion.",
+                    )]
+            except Exception as exc:
+                print(f"[details] Supreme Court docket: {exc}")
+                lines = [("lbl", f"Could not load the docket: {exc}")]
+            self._post(self._apply_scotus_docket, title, lines)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -22197,7 +23366,18 @@ class _ScholarTextWindow:
             import opinion_db
         except Exception:
             return ""
-        return opinion_db.scholar_id_from_url(self._scholar_url or "") or ""
+        sid = str(getattr(self, "_item", {}).get("scholar_id") or "").strip()
+        if sid:
+            return sid
+        for url in (
+            getattr(self, "_scholar_url", ""),
+            getattr(self, "_item", {}).get("scholar_url", ""),
+            getattr(self, "_item", {}).get("url", ""),
+        ):
+            sid = opinion_db.scholar_id_from_url(str(url or "")) or ""
+            if sid:
+                return sid
+        return ""
 
     def _start_stored_pagination_load(self) -> None:
         """Fetch this opinion's saved reporter pagination and install it."""
@@ -22448,6 +23628,26 @@ class _ScholarTextWindow:
         """The search-result-shaped dict used to resolve a PDF URL.  Falls back
         to the Bluebook citation when this window wasn't opened from a result."""
         item = dict(self._item) if self._item else {}
+        scholar_id = self._opinion_scholar_id()
+        if scholar_id:
+            # The resolver uses this identity to make any citation it discovers
+            # durable.  Carry citations already learned by an earlier session
+            # into the ordinary official-PDF lookup before a network fallback.
+            item["scholar_id"] = scholar_id
+            try:
+                getter = getattr(self._app, "_get_opinion_db", None)
+                try:
+                    db = getter(wait=False) if getter is not None else None
+                except TypeError:
+                    db = getter() if getter is not None else None
+                stored_cites = (
+                    db.stored_citations(scholar_id) if db is not None else []
+                )
+            except Exception as exc:
+                print(f"[db] loading saved parallel citations failed: {exc}")
+                stored_cites = []
+        else:
+            stored_cites = []
         if not (item.get("caseName") or item.get("case_name")):
             # A Scholar-only window may have no CourtListener item, but its
             # parsed/Bluebooked caption is still authoritative enough to pick
@@ -22482,7 +23682,11 @@ class _ScholarTextWindow:
         # Add every parallel reporter cite from the header and the chosen
         # Bluebook cite, so the resolver tries them all (point: Scholar cases
         # list several reporters above the case name).
-        for c in list(self._header_cites) + [self._bb.get("cite", "")]:
+        for c in (
+            list(stored_cites)
+            + list(self._header_cites)
+            + [self._bb.get("cite", "")]
+        ):
             if c and c not in cites:
                 cites.append(c)
         if cites:
@@ -25884,13 +27088,13 @@ class _StatuteWindow:
     the eCFR (www.ecfr.gov).  Both sources are parsed into the same
     (kind, indent, text) stream, so one window serves both.
 
-    Formatting follows the statutory hierarchy: the section heading and
-    subdivision headings are bold, inline enumerators ("(a)", "(1)(A)")
-    are bold, and each nesting level is indented with a hanging indent so
-    wrapped lines stay aligned under their text.  When the citation that
-    opened the window pin-cites a subdivision ("§ 922(g)(1)"), the view
-    scrolls there and flashes it.  Source credit is shown small below the
-    text; long editorial/statutory notes sit behind a toggle.
+    C.F.R. formatting follows eCFR's own ``indent-N`` and inline emphasis
+    markup.  Other sources use the shared statutory hierarchy: subdivision
+    headings and inline enumerators are bold, and every nesting level has a
+    hanging indent so wrapped lines align under their text.  When the citation
+    that opened the window pin-cites a subdivision ("§ 922(g)(1)"), the view
+    scrolls there and flashes it.  Source credit is shown small below the text;
+    long editorial/statutory notes sit behind a toggle.
     """
 
     def __init__(
@@ -25899,7 +27103,10 @@ class _StatuteWindow:
         self._app = app
         self._doc = doc
         self._highlight = tuple(highlight)
-        self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
+        self._has_notes = any(
+            entry and str(entry[0]).startswith("note")
+            for entry in doc.paras
+        )
         self._neighbors: tuple = (None, None)
         self._link_actions: dict[str, tuple[str, str]] = {}
         self._link_n = 0
@@ -25946,6 +27153,12 @@ class _StatuteWindow:
         try:
             local = {
                 "paras": _json_ready([list(p) for p in doc.paras]),
+                "para_styles": _json_ready(
+                    getattr(doc, "para_styles", []),
+                ),
+                "site_formatting": bool(
+                    getattr(doc, "site_formatting", False),
+                ),
                 "url": doc.url,
                 "kind": doc.kind,
                 "title": getattr(doc, "title", ""),
@@ -26047,6 +27260,10 @@ class _StatuteWindow:
         self._fonts = {
             "base": tkfont.Font(family=fam, size=s),
             "bold": tkfont.Font(family=fam, size=s, weight="bold"),
+            "italic": tkfont.Font(family=fam, size=s, slant="italic"),
+            "bolditalic": tkfont.Font(
+                family=fam, size=s, weight="bold", slant="italic",
+            ),
             "sechead": tkfont.Font(family=fam, size=s + 2, weight="bold"),
             "small": tkfont.Font(family=fam, size=max(s - 2, 8)),
         }
@@ -26062,6 +27279,11 @@ class _StatuteWindow:
                           spacing1=4, spacing3=12)
         txt.tag_configure("headline", font=self._fonts["bold"], spacing1=8)
         txt.tag_configure("enum", font=self._fonts["bold"])
+        txt.tag_configure("inline-bold", font=self._fonts["bold"])
+        txt.tag_configure("inline-italic", font=self._fonts["italic"])
+        txt.tag_configure(
+            "inline-bolditalic", font=self._fonts["bolditalic"],
+        )
         txt.tag_configure("credit", font=self._fonts["small"],
                           foreground="#555555", spacing1=14)
         txt.tag_configure("notehead", font=self._fonts["bold"],
@@ -26069,13 +27291,20 @@ class _StatuteWindow:
         txt.tag_configure("notebody", font=self._fonts["small"],
                           foreground="#444444")
         for i in range(7):
-            # A slightly wider step keeps deep CFR paragraphs—whose hierarchy
-            # can reach (a)(1)(i)(A)(1)(i)—visibly distinct at a glance.
             is_cfr = self._doc.kind == "cfr"
-            margin = (8 + 32 * i) if is_cfr else (10 + 26 * i)
-            txt.tag_configure(f"ind{i}", lmargin1=margin,
-                              lmargin2=margin + (24 if is_cfr else 22),
-                              spacing3=6)
+            if is_cfr:
+                # Match eCFR's .indent-N rule: each level adds 32 px, with
+                # the marker hanging 40 px left of wrapped paragraph text.
+                txt.tag_configure(
+                    f"ind{i}", lmargin1=22 + 32 * i,
+                    lmargin2=62 + 32 * i, spacing3=6,
+                )
+            else:
+                margin = 10 + 26 * i
+                txt.tag_configure(
+                    f"ind{i}", lmargin1=margin,
+                    lmargin2=margin + 22, spacing3=6,
+                )
         txt.tag_configure("jumpflash", background="#fff2a8")
         txt.tag_configure("citelink", foreground="#1a56b0")
         txt.tag_bind("citelink", "<Enter>",
@@ -26138,10 +27367,20 @@ class _StatuteWindow:
         # (position, enumerator path) per enumerated paragraph, for the
         # pin-cite jump and for citing a selection in _copy_cite
         self._anchors: list[tuple[str, tuple]] = []
-        for kind, ind, text in self._doc.paras:
+        para_styles = getattr(self._doc, "para_styles", [])
+        site_formatting = bool(
+            self._doc.kind == "cfr"
+            and getattr(self._doc, "site_formatting", False)
+        )
+        for para_index, (kind, ind, text) in enumerate(self._doc.paras):
             if kind.startswith("note") and not show_notes:
                 continue
-            text = educate_quotes(text)
+            styles = (
+                para_styles[para_index]
+                if para_index < len(para_styles) else []
+            )
+            if not site_formatting:
+                text = educate_quotes(text)
             indtag = f"ind{min(ind, 6)}"
             # Track the enumerator path: a paragraph at indent level N
             # replaces the path from depth N down.
@@ -26175,7 +27414,23 @@ class _StatuteWindow:
                         target_pos = txt.index("end-1c")
                 txt.insert("end", text + "\n", ("headline", indtag))
             elif kind == "body":
-                if lead:
+                if site_formatting:
+                    para_start = txt.index("end-1c")
+                    self._insert_refs(text, (indtag,))
+                    for start, end, style in styles:
+                        if style not in ("bold", "italic", "bolditalic"):
+                            continue
+                        try:
+                            start_i, end_i = int(start), int(end)
+                        except (TypeError, ValueError):
+                            continue
+                        if 0 <= start_i < end_i <= len(text):
+                            txt.tag_add(
+                                f"inline-{style}",
+                                f"{para_start}+{start_i}c",
+                                f"{para_start}+{end_i}c",
+                            )
+                elif lead:
                     txt.insert("end", lead.rstrip() + " ",
                                ("enum", indtag))
                     self._insert_refs(text[len(lead):].lstrip(), (indtag,))
@@ -26361,7 +27616,10 @@ class _StatuteWindow:
         """Show another section in this same window (prev/next nav)."""
         self._doc = doc
         self._highlight = tuple(highlight)
-        self._has_notes = any(k.startswith("note") for k, _i, _t in doc.paras)
+        self._has_notes = any(
+            entry and str(entry[0]).startswith("note")
+            for entry in doc.paras
+        )
         self._notes_btn.configure(
             state="normal" if self._has_notes else "disabled")
         self._win.title(f"{doc.label} — {doc.source_name}")

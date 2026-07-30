@@ -7,12 +7,11 @@ The versioner API serves one section as XML:
         ?part={P}&section={S}
 
 with {date} taken from /api/versioner/v1/titles.json ("up_to_date_as_of").
-A section arrives as <DIV8 TYPE="SECTION"> holding a <HEAD>, <P>/<FP>
-paragraphs, and a <CITA> source credit.  Unlike the OLRC's U.S. Code
-pages, the XML does not mark indentation, so nesting is inferred from the
-enumerators themselves following the CFR drafting convention
-(a) -> (1) -> (i) -> (A) -> (1) -> (i), resolving the "(i) after (h)" ambiguity by
-preferring a successor at an open level over starting a deeper one.
+A section's human-readable page supplies the eCFR's authoritative
+``indent-N`` classes and inline emphasis.  The XML endpoint supplies source
+credits and remains the formatting fallback; because its <P>/<FP> elements do
+not mark indentation, that fallback infers nesting from the enumerators using
+the CFR drafting convention (a) -> (1) -> (i) -> (A) -> (1) -> (i).
 
 ``parse_section_xml`` emits the same (kind, indent, text) stream as
 ``us_code.parse_section`` so one viewer window renders both sources.
@@ -26,6 +25,7 @@ import re
 import threading
 import xml.etree.ElementTree as _ET
 from dataclasses import dataclass, field
+from html.parser import HTMLParser as _HTMLParser
 
 # ---------------------------------------------------------------------------
 # Citation recognition
@@ -67,6 +67,10 @@ _HEADERS = {
     ),
     "Accept": "application/xml",
 }
+_HTML_HEADERS = {
+    **_HEADERS,
+    "Accept": "text/html,application/xhtml+xml",
+}
 
 _API = "https://www.ecfr.gov/api/versioner/v1"
 
@@ -78,6 +82,11 @@ class CfrSection:
     url: str          # human-readable eCFR page, for "Open in Browser"
     date: str         # the issue date the text reflects
     paras: list[tuple[str, int, str]] = field(default_factory=list)
+    # Inline style ranges per paragraph: (start, end, bold|italic|bolditalic).
+    # Keeping these separate preserves the shared three-field ``paras``
+    # contract used by the other statute sources and older saved records.
+    para_styles: list[list[tuple[int, int, str]]] = field(default_factory=list)
+    site_formatting: bool = False
 
     @property
     def label(self) -> str:
@@ -162,26 +171,61 @@ def load_section(title: str, section: str) -> CfrSection:
     last_err = "section not found"
     for cand in candidates:
         part = cand.split(".", 1)[0]
+        human_url = (
+            f"https://www.ecfr.gov/current/title-{title}/section-{cand}"
+        )
+        site_paras: list[tuple[str, int, str]] = []
+        site_styles: list[list[tuple[int, int, str]]] = []
+        try:
+            site_resp = requests.get(
+                human_url, headers=_HTML_HEADERS, timeout=30,
+            )
+            if site_resp.status_code != 404:
+                site_resp.raise_for_status()
+                site_paras, site_styles = parse_section_html(
+                    site_resp.text, cand,
+                )
+        except Exception as exc:
+            last_err = str(exc)
+
         api_url = (f"{_API}/full/{date}/title-{title}.xml"
                    f"?part={part}&section={cand}")
+        xml_paras: list[tuple[str, int, str]] = []
         try:
             resp = requests.get(api_url, headers=_HEADERS, timeout=30)
             if resp.status_code == 404:
                 last_err = f"no such section {title} C.F.R. § {cand}"
-                continue
-            resp.raise_for_status()
+            else:
+                resp.raise_for_status()
+                # The API omits the charset in its Content-Type; the XML
+                # declaration itself identifies the payload as UTF-8.
+                xml_paras = parse_section_xml(
+                    resp.content.decode("utf-8", "replace")
+                )
         except Exception as exc:
-            raise RuntimeError(f"ecfr.gov: {exc}") from exc
-        # The API omits the charset in its Content-Type, which would make
-        # requests fall back to Latin-1 and render "§" as "Â§"; the XML
-        # itself is UTF-8.
-        paras = parse_section_xml(resp.content.decode("utf-8", "replace"))
+            if not site_paras:
+                raise RuntimeError(f"ecfr.gov: {exc}") from exc
+            last_err = str(exc)
+
+        if site_paras:
+            # The website supplies authoritative indentation and inline
+            # emphasis; retain credits/notes that are available only in XML.
+            extras = [
+                para for para in xml_paras
+                if para[0] in ("credit", "note-head", "note-body")
+            ]
+            paras = [*site_paras, *extras]
+            para_styles = [*site_styles, *([[]] * len(extras))]
+        else:
+            paras = xml_paras
+            para_styles = [[] for _para in paras]
         if paras:
             doc = CfrSection(
                 title=title, section=cand, date=date,
-                url=f"https://www.ecfr.gov/current/title-{title}/"
-                    f"section-{cand}",
+                url=human_url,
                 paras=paras,
+                para_styles=para_styles,
+                site_formatting=bool(site_paras),
             )
             with _lock:
                 _cache[key] = doc
@@ -245,6 +289,141 @@ _ENUM_LEAD_RE = re.compile(
 _INLINE_ENUM_RE = re.compile(
     r"[\u2013\u2014]\s*((?:\((?:\d{1,3}|[a-zA-Z]{1,5})\)\s*)+)"
 )
+
+
+def _normalized_styled_text(
+    segments: list[tuple[str, frozenset[str]]],
+) -> tuple[str, list[tuple[int, int, str]]]:
+    """Collapse HTML whitespace while retaining contiguous emphasis ranges."""
+    chars: list[str] = []
+    styles_at: list[frozenset[str]] = []
+    for raw, styles in segments:
+        for char in raw:
+            if char.isspace():
+                if chars and chars[-1] != " ":
+                    chars.append(" ")
+                    styles_at.append(styles)
+            else:
+                chars.append(char)
+                styles_at.append(styles)
+    while chars and chars[-1] == " ":
+        chars.pop()
+        styles_at.pop()
+
+    ranges: list[tuple[int, int, str]] = []
+    start = 0
+    while start < len(chars):
+        active = styles_at[start]
+        end = start + 1
+        while end < len(chars) and styles_at[end] == active:
+            end += 1
+        if active:
+            style = (
+                "bolditalic"
+                if {"bold", "italic"}.issubset(active)
+                else "bold" if "bold" in active else "italic"
+            )
+            ranges.append((start, end, style))
+        start = end
+    return "".join(chars), ranges
+
+
+class _SectionHTMLParser(_HTMLParser):
+    """Read one rendered eCFR ``div.section`` without the surrounding chrome."""
+
+    def __init__(self, section: str = "") -> None:
+        super().__init__(convert_charrefs=True)
+        self.section = str(section or "")
+        self.paras: list[tuple[str, int, str]] = []
+        self.para_styles: list[list[tuple[int, int, str]]] = []
+        self._section_depth = 0
+        self._capture = ""
+        self._capture_indent = 0
+        self._segments: list[tuple[str, frozenset[str]]] = []
+        self._styles: list[str] = []
+
+    @staticmethod
+    def _attrs(attrs) -> dict[str, str]:
+        return {str(key): str(value or "") for key, value in attrs}
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag = tag.lower()
+        attributes = self._attrs(attrs)
+        if tag == "div":
+            if self._section_depth:
+                self._section_depth += 1
+            else:
+                classes = set(attributes.get("class", "").split())
+                ident = attributes.get("id", "")
+                if "section" in classes and (
+                    not self.section or ident == self.section
+                ):
+                    self._section_depth = 1
+            return
+        if not self._section_depth:
+            return
+        if not self._capture and tag in ("h4", "p"):
+            self._capture = tag
+            self._segments = []
+            self._styles = []
+            if tag == "p":
+                match = re.search(
+                    r"(?:^|\s)indent-(\d+)(?:\s|$)",
+                    attributes.get("class", ""),
+                )
+                self._capture_indent = max(
+                    0, int(match.group(1)) - 1,
+                ) if match else 0
+            return
+        if not self._capture:
+            return
+        if tag in ("strong", "b"):
+            self._styles.append("bold")
+        elif tag in ("em", "i"):
+            self._styles.append("italic")
+        elif tag == "br":
+            self._segments.append((" ", frozenset(self._styles)))
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if self._capture and tag == self._capture:
+            text, ranges = _normalized_styled_text(self._segments)
+            if text:
+                kind = "sechead" if tag == "h4" else "body"
+                indent = 0 if tag == "h4" else min(self._capture_indent, 6)
+                self.paras.append((kind, indent, text))
+                self.para_styles.append(ranges)
+            self._capture = ""
+            self._segments = []
+            self._styles = []
+        elif self._capture and tag in ("strong", "b", "em", "i"):
+            style = "bold" if tag in ("strong", "b") else "italic"
+            for index in range(len(self._styles) - 1, -1, -1):
+                if self._styles[index] == style:
+                    del self._styles[index]
+                    break
+        if tag == "div" and self._section_depth:
+            self._section_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._capture and data:
+            self._segments.append((data, frozenset(self._styles)))
+
+
+def parse_section_html(
+    html: str, section: str = "",
+) -> tuple[
+    list[tuple[str, int, str]],
+    list[list[tuple[int, int, str]]],
+]:
+    """Parse the eCFR website's authoritative indentation/emphasis markup."""
+    parser = _SectionHTMLParser(section)
+    try:
+        parser.feed(html or "")
+        parser.close()
+    except Exception:
+        return [], []
+    return parser.paras, parser.para_styles
 
 
 def _clean(fragment: str) -> str:
