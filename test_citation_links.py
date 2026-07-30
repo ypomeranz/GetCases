@@ -1068,7 +1068,8 @@ class IdChainTests(unittest.TestCase):
 def _load_filename_builder():
     src = pathlib.Path(__file__).with_name("courtlistener_gui.py").read_text()
     tree = ast.parse(src)
-    wanted = ("_pick_citation", "_build_default_filename", "_normalized_us_cite")
+    wanted = ("_pick_citation", "_bluebook_display_name",
+              "_build_default_filename", "_normalized_us_cite")
     found = {n.name: ast.get_source_segment(src, n)
              for n in tree.body
              if isinstance(n, ast.FunctionDef) and n.name in wanted}

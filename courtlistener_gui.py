@@ -2372,9 +2372,9 @@ def _court_for_paren(citation: str, court_id: str, fallback: str = "") -> str:
     return abbr
 
 
-def _build_default_filename(item: dict) -> str:
+def _bluebook_display_name(item: dict) -> str:
     """
-    Return a sanitized default filename (without extension) for saving an opinion.
+    The opinion's Bluebook citation as a line of text.
 
     Format: ``Case Name, Reporter Cite (Court YEAR)``
     The court abbreviation follows Bluebook rule 10.4 — omitted for SCOTUS
@@ -2425,13 +2425,40 @@ def _build_default_filename(item: dict) -> str:
     raw_name = ", ".join(main_parts)
     if paren:
         raw_name = f"{raw_name} {paren}" if raw_name else paren
+    return raw_name
 
-    # Sanitize: keep alphanumeric, spaces, and common filename-safe punctuation
+
+def _build_default_filename(item: dict) -> str:
+    """A sanitized file name for an opinion — its Bluebook citation, with
+    anything a file system would object to replaced."""
     safe = "".join(
         c if c.isalnum() or c in " .,()-_'&" else "_"
-        for c in raw_name
+        for c in _bluebook_display_name(item)
     )[:120].strip()
     return safe
+
+
+def _scan_citation_item(item: dict, url: str, printed_us_cite: str = "") -> dict:
+    """*item* narrowed to the reporter the scan on screen actually prints.
+
+    A case commonly carries three or four parallel citations, and naming a
+    window — or a saved file — after all of them describes pages the reader is
+    not looking at.  A U.S. Reports scan is filed under its U.S. cite: the one
+    the pagination in it belongs to, printed on the page when the analysis
+    could read it, else the U.S. cite among those known.  Any other scan keeps
+    the ordinary preference order.
+    """
+    narrowed = dict(item)
+    us_cite = _normalized_us_cite(printed_us_cite or "")
+    if not us_cite and _is_us_reports_pdf(url):
+        us_cite = next(
+            (_normalized_us_cite(c) for c in (item.get("citation") or [])
+             if _normalized_us_cite(c)),
+            "",
+        )
+    if us_cite:
+        narrowed["_us_reports_cite"] = us_cite
+    return narrowed
 
 
 def _named_temp_pdf_path(stem: str) -> str:
@@ -8771,10 +8798,16 @@ class CourtListenerGUI:
         # citations and the decision date a Bluebook filename is built from.
         named = {"data": data, "url": url, "cite": cite, "name": name,
                  "record": None}
-        # Clicking the name on the strip should land on the text at once, so
-        # the ordinary lookup is run now rather than when the reader asks.
-        self._warm_case_text(cite, name,
-                             on_record=lambda rec: named.update(record=rec))
+
+        def described(record: dict) -> None:
+            """The text has loaded: name the window properly."""
+            named["record"] = record
+            self._post_root(lambda: self._retitle_cited_pdf(named))
+
+        # The text is fetched now rather than when the reader asks for it, so
+        # the case name opens a page already in hand — and so the window can be
+        # titled with the case's real citation rather than the clicked one.
+        self._warm_case_text(cite, name, on_record=described)
         try:
             window = _FloatingPdfWindow(
                 host, data, url, title, margin=margin, app=self,
@@ -8793,13 +8826,26 @@ class CourtListenerGUI:
         except Exception as exc:
             status(f"Could not show the PDF of {cite}: {exc}")
             return
+        named["window"] = window
         self._cited_pdf_windows.add(window)
+        if named.get("record"):        # the text beat the scan on screen
+            self._retitle_cited_pdf(named)
         window.surface()
         status(f"Showing the PDF of {cite}"
                + (f" at {_pin_display(pin)}" if pin else "") + ".")
         key = self._request_cited_pdf_analysis(window, data, url)
         if key is None:
             return
+
+    def _retitle_cited_pdf(self, named: dict) -> None:
+        """Restate a cited case's window title as its Bluebook citation, once
+        the opinion text has said what that is."""
+        window = named.get("window")
+        if window is None or not window.alive():
+            return
+        title = _bluebook_display_name(self._cited_filename_item(named))
+        if title:
+            window.set_title(title)
 
     def _cited_pdf_window_closed(self, window) -> None:
         self._cited_pdf_windows.discard(window)
@@ -17273,7 +17319,6 @@ class _FloatingPdfWindow:
         self._win.minsize(self._MIN_W, self._MIN_H)
 
         self._zoom_var = tk.StringVar(master=self._win, value="100%")
-        self._name_var = tk.StringVar(master=self._win, value="")
         self._build_bar()
         self._body = ttk.Frame(self._win)
         self._body.pack(side="top", fill="both", expand=True)
@@ -17338,13 +17383,6 @@ class _FloatingPdfWindow:
         except tk.TclError:
             pass
 
-    @staticmethod
-    def _short_name(title: str, limit: int = 58) -> str:
-        """The document name for the strip: long Bluebook captions are elided
-        so they never squeeze the zoom controls (the title bar keeps it whole)."""
-        name = re.sub(r"\s+", " ", title or "").strip()
-        return name if len(name) <= limit else name[:limit - 1].rstrip() + "…"
-
     def _build_bar(self) -> None:
         """The one piece of chrome: save and print, then the zoom controls,
         the document name at the right, a hairline under it and nothing else."""
@@ -17379,34 +17417,10 @@ class _FloatingPdfWindow:
         zoom_lbl = _ui_label(bar, size=11, muted=True, anchor="w",
                              textvariable=self._zoom_var)
         zoom_lbl.pack(side="left", padx=(8, 0))
-        # The name sits at the far right, muted: identification, not a heading.
-        # Packed last, so the zoom controls win the space when the window is
-        # narrow and a long caption is simply clipped at the strip's edge.
-        name_lbl = _ui_label(bar, size=11, muted=True, anchor="e",
-                             textvariable=self._name_var)
-        name_lbl.pack(side="right", padx=(8, 10))
-        self._name_label = name_lbl
         if not _CTK_AVAILABLE:
-            for lbl in (zoom_lbl, name_lbl):
-                lbl.configure(bg=_UI["surface"])   # match the strip, not a card
-        if self._on_open_text is not None:
-            # The name is the way back to the opinion's text — the one thing on
-            # the strip worth clicking, so it is coloured like the links in the
-            # page below it.
-            self._style_name_as_link(_UI["accent"])
-            try:
-                name_lbl.configure(cursor="hand2")
-            except tk.TclError:
-                pass
-            _bind_recursive(name_lbl, "<Button-1>",
-                            lambda _e: self._open_text())
-            _bind_recursive(name_lbl, "<Enter>",
-                            lambda _e: self._style_name_as_link(
-                                _UI["accent_dim"]))
-            _bind_recursive(name_lbl, "<Leave>",
-                            lambda _e: self._style_name_as_link(_UI["accent"]))
-            _HoverTip(name_lbl, lambda: "Open the text of this opinion",
-                      delay=500)
+            zoom_lbl.configure(bg=_UI["surface"])  # match the strip, not a card
+        # The case is named in the window's own title bar, in the reporter
+        # these pages print — there is nothing for the strip to repeat.
         if _CTK_AVAILABLE:
             rule = ctk.CTkFrame(self._win, fg_color=_UI["border"],
                                 corner_radius=0, height=1)
@@ -17422,18 +17436,6 @@ class _FloatingPdfWindow:
         self._bar_menu = menu
         for seq in ("<Button-3>", "<Button-2>"):  # Button-2 is the Mac right-click
             _bind_recursive(bar, seq, self._post_bar_menu)
-
-    def _style_name_as_link(self, color: str) -> None:
-        label = getattr(self, "_name_label", None)
-        if label is None:
-            return
-        try:
-            if _CTK_AVAILABLE:
-                label.configure(text_color=color)
-            else:
-                label.configure(fg=color)
-        except (tk.TclError, ValueError):
-            pass
 
     #: A click lands on the strip's name once, but arrives more than once: a
     #: CustomTkinter label forwards a binding to the canvas and label it is
@@ -17465,6 +17467,18 @@ class _FloatingPdfWindow:
     # Contents
     # ------------------------------------------------------------------
 
+    def set_title(self, title: str) -> None:
+        """Rename the window — what the opinion text, once it has loaded in the
+        background, is able to say properly: the case in Bluebook form, cited
+        to the reporter these pages print."""
+        title = re.sub(r"\s+", " ", title or "").strip()
+        if not title:
+            return
+        try:
+            self._win.title(title)
+        except tk.TclError:
+            pass
+
     def set_pdf(self, data: bytes, url: str, title: str = "",
                 *, margin: Optional[int] = None) -> None:
         """Show *data* here, replacing whatever was on screen — a second click
@@ -17478,7 +17492,6 @@ class _FloatingPdfWindow:
         self._analysed_url = ""   # the new pane has no links or text layer yet
         if title:
             self._win.title(title)
-        self._name_var.set(self._short_name(title or self._win.title()))
         try:
             self._win.update_idletasks()
         except tk.TclError:
@@ -25485,7 +25498,7 @@ class _ScholarTextWindow:
         self._pdf_bytes = data
         self._pdf_located = True
         margin = _PdfPane._MARGIN * 3 if _is_us_reports_pdf(url) else None
-        title = self._title_citation() or self._win.title()
+        title = self._scan_window_title(url)
         win = self._pdf_float_win
         if win is not None and not win.alive():
             win = self._pdf_float_win = None
@@ -25530,8 +25543,20 @@ class _ScholarTextWindow:
             f"({_ACCEL}+W closes it)."
         )
         self._active_pdf_analysis_key = self._request_pdf_analysis(
-            data, url, lambda result, w=win: w.apply_analysis(result),
+            data, url,
+            lambda result, w=win, u=url: (
+                w.apply_analysis(result), w.set_title(self._scan_window_title(u))
+            ),
         )
+
+    def _scan_window_title(self, url: str) -> str:
+        """What to call a floating viewer showing this scan: the case in
+        Bluebook form, cited to the reporter these pages actually print rather
+        than to every parallel reporter the case carries."""
+        item = _scan_citation_item(
+            self._filename_item(), url, self._shown_us_reports_cite())
+        return (_bluebook_display_name(item)
+                or self._title_citation() or self._win.title())
 
     def _float_pdf_master(self):
         """The window that owns a floating viewer's lifetime: the application
