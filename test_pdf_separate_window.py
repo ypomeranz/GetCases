@@ -5,6 +5,11 @@ Window-menu setting ticked, the "PDF" button instead hands the scan to
 ``_FloatingPdfWindow`` — a small Preview-style window that is nothing but the
 page under a thin strip of zoom controls — and leaves the reader on the text.
 
+Because that window has no parts panel, an opinion carrying separate writings
+gets them mapped onto a slim rail beside the scrollbar instead
+(``_PdfPane.set_section_marks``), so a reader dragging the thumb can see how
+far down a concurrence or dissent begins.
+
 The methods are lifted out of ``courtlistener_gui`` with ``ast`` (importing it
 needs tkinter, absent on a headless run) and driven against stubs.
 """
@@ -30,6 +35,13 @@ class _Tk:
     Menu = Misc = Frame = Toplevel = object
 
 
+def _base_ns(extra=None) -> dict:
+    ns = {"tk": _Tk, "sys": sys, "re": re, "Optional": typing.Optional,
+          "_CaseTabPage": type("_CaseTabPage", (), {}), "_ACCEL": "Ctrl"}
+    ns.update(extra or {})
+    return ns
+
+
 def _load(cls: str, names, extra=None) -> dict:
     """Exec the named methods of *cls* into a namespace built from stubs."""
     body = next(n.body for n in TREE.body
@@ -39,12 +51,37 @@ def _load(cls: str, names, extra=None) -> dict:
     missing = [n for n in names if n not in found]
     if missing:
         raise AssertionError(f"not found on {cls}: {missing}")
-    ns = {"tk": _Tk, "sys": sys, "re": re, "Optional": typing.Optional,
-          "_CaseTabPage": type("_CaseTabPage", (), {}), "_ACCEL": "Ctrl"}
-    ns.update(extra or {})
+    ns = _base_ns(extra)
     for name in names:
         # A decorator (@staticmethod) is not part of the FunctionDef segment,
         # so an extracted static method is exec'd as a plain function.
+        exec(found[name], ns)
+    return ns
+
+
+def _class_attr(cls: str, name: str):
+    """The value of a simple class-level assignment, read from the source so a
+    test asserts on the real thing rather than a restatement of it."""
+    body = next(n.body for n in TREE.body
+                if isinstance(n, ast.ClassDef) and n.name == cls)
+    for node in body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            return eval(ast.get_source_segment(SRC, node.value),  # noqa: S307
+                        {"frozenset": frozenset})
+    raise AssertionError(f"{cls} has no {name}")
+
+
+def _load_functions(names, extra=None) -> dict:
+    """Exec the named module-level functions into a stub namespace."""
+    found = {n.name: ast.get_source_segment(SRC, n) for n in TREE.body
+             if isinstance(n, ast.FunctionDef) and n.name in names}
+    missing = [n for n in names if n not in found]
+    if missing:
+        raise AssertionError(f"module-level functions not found: {missing}")
+    ns = _base_ns(extra)
+    for name in names:
         exec(found[name], ns)
     return ns
 
@@ -98,8 +135,12 @@ class _FakePane:
         self.links = None
         self.find_pages = None
         self.find_bind = None
+        self.marks = None
         self.scrolled = []
         self.destroyed = False
+
+    def set_section_marks(self, sections):
+        self.marks = sections
 
     def zoom(self, delta):
         self.zoomed.append(delta)
@@ -498,6 +539,8 @@ VIEWER_NS = _load(
 
 
 class _Viewer:
+    _SEPARATE_KINDS = _class_attr("_FloatingPdfWindow", "_SEPARATE_KINDS")
+
     def __init__(self, url="https://example.test/a.pdf", pane=None):
         self._url = url
         self._pane = pane if pane is not None else _FakePane()
@@ -630,6 +673,470 @@ class ViewerTests(unittest.TestCase):
         viewer = _Viewer()
         viewer._save()
         self.assertEqual(viewer.saved, 1)
+
+
+class SectionRailGateTests(unittest.TestCase):
+    """Which documents get a rail at all — the "only then" of the request."""
+
+    def _apply(self, sections):
+        viewer = _Viewer()
+        viewer.apply_analysis({
+            "url": viewer._url, "pages": [["c"]], "links": {},
+            "sections": sections,
+        })
+        return viewer._pane.marks
+
+    @staticmethod
+    def _sec(kind, page=0, label=None, start_at=None):
+        return mock.Mock(kind=kind, start_page=page, start_at=start_at,
+                         label=label or kind.title())
+
+    def test_an_opinion_with_a_dissent_gets_the_rail(self):
+        sections = [self._sec("majority"), self._sec("dissent", 6)]
+        self.assertEqual(self._apply(sections), sections)
+
+    def test_a_concurrence_counts_too(self):
+        sections = [self._sec("majority"), self._sec("concurrence", 4)]
+        self.assertEqual(self._apply(sections), sections)
+
+    def test_an_unlabelled_separate_writing_counts_too(self):
+        sections = [self._sec("majority"), self._sec("separate", 3)]
+        self.assertEqual(self._apply(sections), sections)
+
+    def test_a_syllabus_and_one_majority_get_no_rail(self):
+        # Nothing to hunt for: the request was explicit that the marks show up
+        # only when there are separate opinions.
+        self.assertIsNone(
+            self._apply([self._sec("syllabus"), self._sec("majority", 2)])
+        )
+
+    def test_a_pdf_with_no_parts_detected_gets_no_rail(self):
+        self.assertIsNone(self._apply([]))
+
+    def test_a_scan_with_no_text_layer_gets_no_rail(self):
+        viewer = _Viewer()
+        viewer.apply_analysis({
+            "url": viewer._url, "pages": [[], []],
+            "sections": [self._sec("majority"), self._sec("dissent", 2)],
+        })
+        self.assertIsNone(viewer._pane.marks)
+
+
+# ---------------------------------------------------------------------------
+# The rail itself, on the pane
+# ---------------------------------------------------------------------------
+
+WASH_NS = _load_functions(["_wash_hex"])
+
+_PART_COLORS = {
+    "syllabus": "#555555", "majority": "#1a3e72", "concurrence": "#1a7a3c",
+    "dissent": "#a31515", "separate": "#59636f",
+}
+
+
+class _FakeCanvas:
+    """The canvas surface the rail draws on (and the pane's page canvas)."""
+
+    def __init__(self, master=None, **kw):
+        self.kw = kw
+        self.items = []
+        self.packed = None
+        self.bindings = {}
+        self.destroyed = False
+        self.height = 800
+        self.width = 620
+        self.pointer = (6, 0)
+        self.view = 0.0
+
+    # --- canvas drawing ---
+    def delete(self, _what):
+        self.items = []
+
+    def create_line(self, *coords, **kw):
+        self.items.append(("line", coords, kw))
+        return len(self.items)
+
+    def create_rectangle(self, *coords, **kw):
+        self.items.append(("rect", coords, kw))
+        return len(self.items)
+
+    def find_all(self):
+        return list(range(len(self.items)))
+
+    def rects(self):
+        return [(c, kw) for kind, c, kw in self.items if kind == "rect"]
+
+    # --- widget surface ---
+    def pack(self, **kw):
+        self.packed = kw
+
+    def bind(self, seq, fn, add=None):
+        self.bindings[seq] = fn
+
+    def destroy(self):
+        self.destroyed = True
+
+    def winfo_height(self):
+        return self.height
+
+    def winfo_width(self):
+        return self.width
+
+    def winfo_rootx(self):
+        return 700
+
+    def winfo_rooty(self):
+        return 100
+
+    def winfo_pointerx(self):
+        return 700 + self.pointer[0]
+
+    def winfo_pointery(self):
+        return 100 + self.pointer[1]
+
+    def yview(self):
+        return (self.view, self.view + 0.1)
+
+    def yview_moveto(self, frac):
+        self.view = frac
+
+
+_Tk.Canvas = _FakeCanvas   # the rail builds its own canvas
+
+
+PANE_NS = _load(
+    "_PdfPane",
+    ["set_section_marks", "has_section_marks", "_section_doc_y",
+     "_draw_section_rail", "_section_at_rail_y", "_rail_tip_text",
+     "_on_rail_click", "fit_to_view", "_refit_by"],
+    {"_PDF_PART_COLORS": _PART_COLORS,
+     "_wash_hex": WASH_NS["_wash_hex"],
+     "_HoverTip": lambda *a, **kw: None},
+)
+
+
+class _Pane:
+    """A stand-in pane: the layout numbers the rail reads, and stubs for the
+    scrolling and re-layout it drives."""
+
+    _PAD = 12
+    _RAIL_W = 13
+    _RAIL_TICK_H = 3
+    _RAIL_BG = "#f0f1f3"
+    _RAIL_EDGE = "#cdd0d5"
+    _RAIL_BAND_WASH = 0.80
+    _ZOOM_MIN_W = 240
+    _ZOOM_MAX_W = 3200
+    _AUTOFIT_SLOP = 3
+
+    def __init__(self, pages=10, page_h=100):
+        # A ten-page document: page i occupies [i*100, i*100 + 88].
+        self._slots = [(i * page_h, page_h - _Pane._PAD, (0, 0, 1, 1), 1.0)
+                       for i in range(pages)]
+        self._content_h = pages * page_h
+        self._rail = None
+        self._sections = []
+        self._rail_spans = []
+        self._base_w = 600
+        self._target_w = 600
+        self._canvas = _FakeCanvas()
+        self._vsb = object()
+        self._body = object()
+        self.scrolled = []
+        self.layouts = 0
+        self.renders = 0
+        self.idle = []
+        for name in ("set_section_marks", "has_section_marks",
+                     "_section_doc_y", "_draw_section_rail",
+                     "_section_at_rail_y", "_rail_tip_text", "_on_rail_click",
+                     "fit_to_view", "_refit_by"):
+            setattr(self, name, PANE_NS[name].__get__(self))
+
+    # --- what the extracted methods call back into ---
+    def scroll_to_page(self, i, y_pt=None):
+        self.scrolled.append((i, y_pt))
+
+    def _page_point_y(self, i, y_pt):
+        # A page is 88px of content for 792pt of paper.
+        return self._slots[i][0] + (y_pt / 792.0) * 88
+
+    def _layout(self):
+        self.layouts += 1
+
+    def _render_visible(self):
+        self.renders += 1
+
+    def after_idle(self, fn, *a):
+        self.idle.append((fn, a))
+
+
+def _sec(kind, page, label=None, start_at=None):
+    return mock.Mock(kind=kind, start_page=page, start_at=start_at,
+                     label=label or f"{kind} part")
+
+
+SECTIONS = [
+    _sec("majority", 0, "Opinion of the Court"),
+    _sec("concurrence", 4, "Stewart, J., concurring"),
+    _sec("dissent", 6, "Rehnquist, J., dissenting"),
+]
+
+
+class RailBuildTests(unittest.TestCase):
+    def setUp(self):
+        self.pane = _Pane()
+
+    def test_two_or_more_parts_raise_the_rail(self):
+        self.pane.set_section_marks(SECTIONS)
+        self.assertTrue(self.pane.has_section_marks())
+        self.assertEqual(self.pane._rail.kw["width"], _Pane._RAIL_W)
+
+    def test_it_is_packed_alongside_the_scrollbar(self):
+        self.pane.set_section_marks(SECTIONS)
+        packed = self.pane._rail.packed
+        self.assertEqual(packed["side"], "right")
+        self.assertEqual(packed["fill"], "y")
+        # Just inside the scrollbar, so it shares the thumb's travel.
+        self.assertIs(packed["after"], self.pane._vsb)
+
+    def test_it_invites_a_click(self):
+        self.pane.set_section_marks(SECTIONS)
+        self.assertEqual(self.pane._rail.kw["cursor"], "hand2")
+        self.assertIn("<Button-1>", self.pane._rail.bindings)
+
+    def test_one_part_is_nothing_to_navigate_between(self):
+        self.pane.set_section_marks(SECTIONS[:1])
+        self.assertFalse(self.pane.has_section_marks())
+
+    def test_no_parts_leaves_no_rail(self):
+        self.pane.set_section_marks([])
+        self.assertFalse(self.pane.has_section_marks())
+
+    def test_parts_without_a_page_are_ignored(self):
+        self.pane.set_section_marks(
+            [_sec("majority", 0), mock.Mock(kind="dissent", start_page=None)]
+        )
+        self.assertFalse(self.pane.has_section_marks())
+
+    def test_dropping_to_one_part_takes_an_existing_rail_away(self):
+        self.pane.set_section_marks(SECTIONS)
+        rail = self.pane._rail
+        self.pane.set_section_marks(SECTIONS[:1])
+        self.assertTrue(rail.destroyed)
+        self.assertIsNone(self.pane._rail)
+        self.assertEqual(self.pane._rail_spans, [])
+
+    def test_the_rail_is_built_once_and_then_redrawn(self):
+        self.pane.set_section_marks(SECTIONS)
+        rail = self.pane._rail
+        self.pane.set_section_marks(SECTIONS)
+        self.assertIs(self.pane._rail, rail)
+        self.assertFalse(rail.destroyed)
+
+    def test_the_pages_make_room_for_the_rail(self):
+        # A page still sized to the whole canvas would be clipped by it.
+        self.pane.set_section_marks(SECTIONS)
+        self.assertEqual(self.pane._base_w, 600 - _Pane._RAIL_W)
+        self.assertEqual(self.pane._target_w, 600 - _Pane._RAIL_W)
+
+    def test_the_pages_get_the_room_back_when_it_goes(self):
+        self.pane.set_section_marks(SECTIONS)
+        self.pane.set_section_marks([])
+        self.assertEqual(self.pane._base_w, 600)
+
+    def test_a_zoomed_pane_keeps_its_zoom_when_the_rail_appears(self):
+        self.pane._target_w = 900          # zoomed to 150%
+        self.pane.set_section_marks(SECTIONS)
+        self.assertEqual(self.pane._base_w, 587)
+        self.assertEqual(round(self.pane._target_w / self.pane._base_w, 2), 1.5)
+
+
+class RailBandTests(unittest.TestCase):
+    def setUp(self):
+        self.pane = _Pane()
+        self.pane.set_section_marks(SECTIONS)
+        self.rail = self.pane._rail
+
+    def test_each_part_covers_the_stretch_of_the_document_it_occupies(self):
+        # Pages 1-4 majority, 5-6 concurrence, 7-10 dissent, of 10 pages, on
+        # an 800px rail.
+        spans = [(round(y0), round(y1), s.kind)
+                 for y0, y1, s in self.pane._rail_spans]
+        # A mark sits where scrolling to that part lands — the page top less
+        # the inter-page gap (_PAD), just as scroll_to_page computes it.
+        self.assertEqual(spans, [(0, 310, "majority"),
+                                 (310, 470, "concurrence"),
+                                 (470, 800, "dissent")])
+
+    def test_the_bands_tile_the_whole_rail(self):
+        spans = self.pane._rail_spans
+        self.assertEqual(spans[0][0], 0)
+        self.assertEqual(spans[-1][1], self.rail.height)
+        for a, b in zip(spans, spans[1:]):
+            self.assertAlmostEqual(a[1], b[0])
+
+    def test_a_part_is_drawn_as_a_washed_band_under_a_solid_marker(self):
+        rects = self.rail.rects()
+        self.assertEqual(len(rects), 2 * len(SECTIONS))
+        band, tick = rects[0], rects[1]
+        self.assertEqual(tick[1]["fill"], _PART_COLORS["majority"])
+        self.assertNotEqual(band[1]["fill"], tick[1]["fill"])
+        # The marker sits on the part's first line, a few pixels tall.
+        self.assertEqual(tick[0][1], 0)
+        self.assertEqual(tick[0][3], _Pane._RAIL_TICK_H)
+
+    def test_each_kind_keeps_its_own_color(self):
+        ticks = [kw["fill"] for _c, kw in self.rail.rects()[1::2]]
+        self.assertEqual(ticks, [_PART_COLORS["majority"],
+                                 _PART_COLORS["concurrence"],
+                                 _PART_COLORS["dissent"]])
+
+    def test_a_part_opening_partway_down_a_page_is_marked_there(self):
+        mid = _sec("dissent", 6, start_at=(6, 396.0))  # halfway down page 7
+        self.pane.set_section_marks([SECTIONS[0], mid])
+        start = self.pane._rail_spans[1][0]
+        top_of_page = 600 / self.pane._content_h * self.rail.height
+        self.assertGreater(start, top_of_page)
+
+    def test_a_relayout_redraws_the_bands(self):
+        # A zoom rebuilds the layout and moves every part.
+        self.rail.height = 400
+        self.pane._draw_section_rail()
+        self.assertEqual(self.pane._rail_spans[-1][1], 400)
+
+    def test_a_rail_with_no_layout_yet_draws_nothing(self):
+        self.pane._slots = []
+        self.pane._draw_section_rail()
+        self.assertEqual(self.pane._rail_spans, [])
+        self.assertEqual(self.rail.items, [])
+
+
+class RailNavigationTests(unittest.TestCase):
+    def setUp(self):
+        self.pane = _Pane()
+        self.pane.set_section_marks(SECTIONS)
+        self.rail = self.pane._rail
+
+    def test_a_height_names_the_part_whose_band_covers_it(self):
+        kinds = [self.pane._section_at_rail_y(y).kind
+                 for y in (10, 309, 311, 469, 471, 799)]
+        self.assertEqual(kinds, ["majority", "majority", "concurrence",
+                                 "concurrence", "dissent", "dissent"])
+
+    def test_a_height_off_either_end_clamps(self):
+        self.assertEqual(self.pane._section_at_rail_y(-40).kind, "majority")
+        self.assertEqual(self.pane._section_at_rail_y(9000).kind, "dissent")
+
+    def test_an_empty_rail_names_nothing(self):
+        self.pane._rail_spans = []
+        self.assertIsNone(self.pane._section_at_rail_y(100))
+
+    def test_clicking_a_band_scrolls_to_that_part(self):
+        self.pane._on_rail_click(mock.Mock(y=500))
+        self.assertEqual(self.pane.scrolled, [(6, None)])
+
+    def test_clicking_the_top_band_goes_back_to_the_opinion(self):
+        self.pane._on_rail_click(mock.Mock(y=2))
+        self.assertEqual(self.pane.scrolled, [(0, None)])
+
+    def test_a_part_opening_mid_page_is_jumped_to_by_its_first_line(self):
+        mid = _sec("dissent", 6, start_at=(6, 396.0))
+        self.pane.set_section_marks([SECTIONS[0], mid])
+        self.pane._on_rail_click(mock.Mock(y=799))
+        self.assertEqual(self.pane.scrolled, [(6, 396.0)])
+
+    def test_the_hover_tip_names_the_part_under_the_pointer(self):
+        self.rail.pointer = (6, 500)
+        self.assertEqual(self.pane._rail_tip_text(),
+                         "Rehnquist, J., dissenting — p. 7")
+
+    def test_the_tip_counts_pages_from_one(self):
+        self.rail.pointer = (6, 10)
+        self.assertTrue(self.pane._rail_tip_text().endswith("p. 1"))
+
+    def test_a_pointer_off_the_rail_gets_no_tip(self):
+        self.rail.pointer = (6, -30)      # left without a <Leave>
+        self.assertEqual(self.pane._rail_tip_text(), "")
+
+    def test_no_rail_means_no_tip(self):
+        self.pane._rail = None
+        self.assertEqual(self.pane._rail_tip_text(), "")
+
+
+class FitToViewTests(unittest.TestCase):
+    """The pages stay fitted to the room they actually have."""
+
+    def setUp(self):
+        self.pane = _Pane()
+
+    def test_it_measures_the_canvas_the_pages_live_in(self):
+        self.pane._canvas.width = 500
+        self.pane.fit_to_view()
+        self.assertEqual(self.pane._base_w, 500 - 2 * _Pane._PAD)
+        self.assertEqual(self.pane.layouts, 1)
+
+    def test_a_fit_that_is_already_right_re_lays_out_nothing(self):
+        self.pane._canvas.width = 600 + 2 * _Pane._PAD
+        self.pane.fit_to_view()
+        self.assertEqual(self.pane.layouts, 0)
+
+    def test_a_hairline_change_is_not_worth_a_re_render(self):
+        self.pane._canvas.width = 600 + 2 * _Pane._PAD + _Pane._AUTOFIT_SLOP
+        self.pane.fit_to_view()
+        self.assertEqual(self.pane.layouts, 0)
+
+    def test_nothing_is_measured_before_the_pane_is_laid_out(self):
+        self.pane._canvas.width = 1
+        self.pane.fit_to_view()
+        self.assertEqual(self.pane._base_w, 600)
+        self.assertEqual(self.pane.layouts, 0)
+
+    def test_the_zoom_ratio_survives_a_refit(self):
+        self.pane._target_w = 750         # zoomed to 125%
+        self.pane._canvas.width = 424     # → fit width 400
+        self.pane.fit_to_view()
+        self.assertEqual(self.pane._base_w, 400)
+        self.assertEqual(self.pane._target_w, 500)
+
+    def test_the_reading_position_survives_a_refit(self):
+        self.pane._canvas.view = 0.42
+        self.pane._canvas.width = 500
+        self.pane.fit_to_view()
+        self.assertAlmostEqual(self.pane._canvas.view, 0.42)
+
+    def test_a_refit_never_goes_below_the_minimum_page_width(self):
+        self.pane._canvas.width = 40
+        self.pane.fit_to_view()
+        self.assertEqual(self.pane._base_w, _Pane._ZOOM_MIN_W)
+
+    def test_a_dead_pane_measures_nothing(self):
+        self.pane._canvas.winfo_width = mock.Mock(side_effect=Exception("gone"))
+        self.pane.fit_to_view()   # must not raise
+        self.assertEqual(self.pane.layouts, 0)
+
+
+class WashTests(unittest.TestCase):
+    def test_a_color_washes_toward_white(self):
+        wash = WASH_NS["_wash_hex"]
+        self.assertEqual(wash("#000000", 0.0), "#000000")
+        self.assertEqual(wash("#000000", 1.0), "#ffffff")
+        self.assertEqual(wash("#a31515", 0.80), "#edd0d0")
+
+    def test_a_wash_is_lighter_than_what_it_came_from(self):
+        wash = WASH_NS["_wash_hex"]
+        for color in ("#1a3e72", "#1a7a3c", "#a31515", "#59636f"):
+            washed = wash(color, 0.80)
+            self.assertGreater(int(washed[1:3], 16), int(color[1:3], 16))
+
+    def test_an_unreadable_color_falls_back_to_grey(self):
+        wash = WASH_NS["_wash_hex"]
+        self.assertEqual(wash("", 0.8), "#eeeeee")
+        self.assertEqual(wash("transparent", 0.8), "#eeeeee")
+
+    def test_the_wash_is_clamped(self):
+        wash = WASH_NS["_wash_hex"]
+        self.assertEqual(wash("#808080", -5), "#808080")
+        self.assertEqual(wash("#808080", 9), "#ffffff")
 
 
 if __name__ == "__main__":

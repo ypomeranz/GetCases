@@ -1085,10 +1085,14 @@ class _HoverTip:
     ``widget`` it pops up ``text_getter()`` in a small yellow window near the
     cursor, and hides it on leave.  ``text_getter`` is read at show time, so a
     live status message (whose text changes) always shows its current value.
-    Nothing pops up when the text is empty."""
+    Nothing pops up when the text is empty.
+
+    ``follow_motion=True`` re-arms the tip whenever the pointer moves inside
+    the widget, for a widget whose tip names whatever is *under* the pointer
+    rather than the widget as a whole (the PDF pane's opinion-parts rail)."""
 
     def __init__(self, widget, text_getter, *, delay: int = 450,
-                 wraplength: int = 520) -> None:
+                 wraplength: int = 520, follow_motion: bool = False) -> None:
         self._widget = widget
         self._get = text_getter
         self._delay = delay
@@ -1098,6 +1102,14 @@ class _HoverTip:
         widget.bind("<Enter>", self._schedule, add="+")
         widget.bind("<Leave>", self._leave, add="+")
         widget.bind("<Destroy>", self._leave, add="+")
+        if follow_motion:
+            widget.bind("<Motion>", self._moved, add="+")
+
+    def _moved(self, _e=None) -> None:
+        """Take any showing tip down and start the delay again, so the text
+        describes wherever the pointer has come to rest."""
+        self._hide()
+        self._schedule()
 
     def _schedule(self, _e=None) -> None:
         self._cancel()
@@ -15132,6 +15144,20 @@ def _dispose_photo(photo) -> None:
             pass
 
 
+def _wash_hex(color: str, toward_white: float) -> str:
+    """*color* blended ``toward_white`` (0..1) — a pale version of a part's own
+    color, for a band that has to stay behind the marker drawn on top of it."""
+    text = (color or "").lstrip("#")
+    try:
+        rgb = [int(text[i:i + 2], 16) for i in (0, 2, 4)]
+    except (ValueError, IndexError):
+        return "#eeeeee"
+    f = max(0.0, min(1.0, toward_white))
+    return "#" + "".join(
+        f"{int(round(v + (255 - v) * f)):02x}" for v in rgb
+    )
+
+
 def _region_mostly_black(img, box, frac: float = 0.90) -> bool:
     """True when at least `frac` of the pixels inside `box` are near-black —
     the full-resolution confirmation that a small candidate really is a solid
@@ -15260,10 +15286,23 @@ class _PdfPane(ttk.Frame):
     #: a light, readable blue standing in for the black ink.
     _RECOLOR_RGB = (47, 111, 214)
 
+    # The opinion-parts rail beside the scrollbar (see set_section_marks).
+    _RAIL_W = 13        # rail width (px)
+    _RAIL_TICK_H = 3    # solid marker drawn at a part's first line (px)
+    _RAIL_BG = "#f0f1f3"
+    _RAIL_EDGE = "#cdd0d5"
+    _RAIL_BAND_WASH = 0.80   # how far a part's band is blended toward white
+
+    # A resize this small is a hairline shift, not a reader asking for a
+    # different page size; autofit ignores it (and its re-render).
+    _AUTOFIT_SLOP = 3
+    _AUTOFIT_DELAY = 120   # ms of quiet before an autofit re-layout (px drag)
+
     def __init__(self, parent: tk.Misc, pdf_bytes: bytes, width: int = 800,
                  margin: Optional[int] = None,
                  link_style: str = "tint",
-                 uniform_crop: bool = False) -> None:
+                 uniform_crop: bool = False,
+                 autofit: bool = False) -> None:
         super().__init__(parent)
         self._disposed = False
         import pypdfium2 as pdfium
@@ -15308,6 +15347,18 @@ class _PdfPane(ttk.Frame):
         self._sel_anchor: Optional[tuple[int, int]] = None
         self._sel_range: Optional[tuple] = None
         self._sel_ids: dict[int, list] = {}
+        # Optional opinion-parts rail beside the scrollbar (set_section_marks):
+        # the detected parts and, once drawn, their (y0, y1, part) rail bands.
+        self._rail = None
+        self._sections: list = []
+        self._rail_spans: list = []
+        # ``autofit``: keep fit-to-window fitted to the room the pages actually
+        # have, re-measuring whenever the canvas is resized (a window resize, or
+        # the parts rail claiming its column).  Off by default — a pane inside a
+        # reader keeps the width it was given, so the reader's own zoom sticks
+        # across window resizes.
+        self._autofit = bool(autofit)
+        self._autofit_after: Optional[str] = None
 
         # The canvas lives in a body frame so a find bar can sit above it.
         body = ttk.Frame(self)
@@ -15402,6 +15453,48 @@ class _PdfPane(ttk.Frame):
             pass
         self._render_visible()
 
+    def fit_to_view(self) -> None:
+        """Re-measure fit-to-window from the room the pages actually have.
+
+        The fit width is set once at construction, from the caller's estimate
+        of how wide its window would be.  Call this whenever that estimate can
+        have gone stale — the window opened or was resized to another width, or
+        a strip appeared beside the pages and took a column of it — so a page
+        is never left clipped by the canvas edge.  A no-op when the fit is
+        already right, so it is cheap to call speculatively."""
+        try:
+            view_w = self._canvas.winfo_width()
+        except tk.TclError:
+            return
+        if view_w <= 1:
+            return          # not laid out yet — nothing to measure against
+        want = max(self._ZOOM_MIN_W, view_w - 2 * self._PAD)
+        if abs(want - self._base_w) <= self._AUTOFIT_SLOP:
+            return
+        self._refit_by(want - self._base_w)
+
+    def _refit_by(self, delta: int) -> None:
+        """Move the fit-to-window width by *delta* px, keeping the current zoom
+        ratio, and re-lay the pages out at the same place in the document."""
+        if not delta or self._base_w <= 0:
+            return
+        ratio = self._target_w / self._base_w
+        self._base_w = max(self._ZOOM_MIN_W, self._base_w + delta)
+        self._target_w = max(
+            self._ZOOM_MIN_W,
+            min(self._ZOOM_MAX_W, int(round(self._base_w * ratio))),
+        )
+        try:
+            top_frac = self._canvas.yview()[0]
+        except tk.TclError:
+            top_frac = 0.0
+        self._layout()
+        try:
+            self._canvas.yview_moveto(top_frac)
+        except tk.TclError:
+            pass
+        self._render_visible()
+
     def _page_left(self) -> int:
         """Left x for each page so it's centred when the canvas is wider than
         the page, and flush at the gutter otherwise."""
@@ -15454,6 +15547,9 @@ class _PdfPane(ttk.Frame):
             y += slot_h + self._PAD
         self._content_h = y
         self._update_scrollregion()
+        # Every part moved with the pages (a zoom rebuilds the layout).
+        if getattr(self, "_rail", None) is not None:
+            self._draw_section_rail()
 
     def _on_configure(self) -> None:
         """Recentre on resize without a full re-render when the zoom is steady."""
@@ -15476,6 +15572,26 @@ class _PdfPane(ttk.Frame):
                     self._canvas.move(oid, dx, 0)
         self._update_scrollregion()
         self._render_visible()
+        if self._autofit:
+            self._schedule_autofit()
+
+    def _schedule_autofit(self) -> None:
+        """Coalesce the resizes of a window drag into one re-fit."""
+        if self._autofit_after is not None:
+            try:
+                self.after_cancel(self._autofit_after)
+            except tk.TclError:
+                pass
+            self._autofit_after = None
+        try:
+            self._autofit_after = self.after(self._AUTOFIT_DELAY,
+                                             self._run_autofit)
+        except tk.TclError:
+            pass
+
+    def _run_autofit(self) -> None:
+        self._autofit_after = None
+        self.fit_to_view()
 
     def _content_frac(self, img) -> tuple:
         """Fractional content box (l, t, r, b in 0..1) of `img` — the area
@@ -15772,6 +15888,138 @@ class _PdfPane(ttk.Frame):
         except tk.TclError:
             pass
         self._render_visible()
+
+    # ------------------------------------------------------------------
+    # Opinion-parts rail (beside the scrollbar)
+    # ------------------------------------------------------------------
+
+    def set_section_marks(self, sections: list) -> None:
+        """Map the opinion's parts onto a slim rail beside the scrollbar, so a
+        reader dragging the thumb can see how far down a concurrence or dissent
+        begins — and click straight to it.
+
+        ``sections`` is what :func:`slip_opinion.detect_sections` returned: each
+        part contributes a washed band covering the stretch of the document it
+        occupies, with its kind's color, and a solid marker on its first line.
+        Fewer than two parts is nothing to navigate between, and takes an
+        existing rail away again.  Deciding *which* documents deserve a rail is
+        the caller's: a PDF with no separate writing does not need one.
+        """
+        sections = [s for s in (sections or [])
+                    if getattr(s, "start_page", None) is not None]
+        if len(sections) < 2:
+            self._sections = []
+            self._rail_spans = []
+            if self._rail is not None:
+                self._rail.destroy()
+                self._rail = None
+                self._refit_by(self._RAIL_W)   # the pages get the room back
+            return
+        self._sections = sections
+        if self._rail is None:
+            rail = tk.Canvas(self._body, width=self._RAIL_W, bg=self._RAIL_BG,
+                             highlightthickness=0, cursor="hand2",
+                             takefocus=0)
+            # Packed after the scrollbar so it sits just inside it, sharing the
+            # full height its thumb travels over.
+            rail.pack(side="right", fill="y", after=self._vsb)
+            rail.bind("<Configure>", lambda _e: self._draw_section_rail())
+            rail.bind("<Button-1>", self._on_rail_click)
+            self._rail = rail
+            _HoverTip(rail, self._rail_tip_text, delay=320, follow_motion=True)
+            # The rail takes its width out of the page area, so narrow the
+            # pages by it now rather than leaving one clipped by the strip that
+            # just appeared.  (An autofit pane re-measures for itself when the
+            # canvas actually shrinks; this keeps the rest correct too.)
+            self._refit_by(-self._RAIL_W)
+        self._draw_section_rail()
+
+    def has_section_marks(self) -> bool:
+        return self._rail is not None
+
+    def _section_doc_y(self, sec) -> float:
+        """Where *sec* begins, in canvas y — its opening line when the part
+        starts partway down a page, else the top of that page."""
+        page = max(0, min(int(getattr(sec, "start_page", 0) or 0),
+                          len(self._slots) - 1))
+        start_at = getattr(sec, "start_at", None)
+        if start_at:
+            page = max(0, min(int(start_at[0]), len(self._slots) - 1))
+            try:
+                return float(self._page_point_y(page, float(start_at[1])))
+            except (IndexError, TypeError, ValueError):
+                pass
+        return float(self._slots[page][0] - self._PAD)
+
+    def _draw_section_rail(self) -> None:
+        """(Re)draw the bands and markers for the current layout — the rail is
+        rebuilt from scratch after a zoom, which moves every part."""
+        rail = self._rail
+        if rail is None:
+            return
+        rail.delete("all")
+        self._rail_spans = []
+        if not (self._sections and self._slots and self._content_h > 0):
+            return
+        h = max(1, rail.winfo_height())
+        w = self._RAIL_W
+        rail.create_line(0, 0, 0, h, fill=self._RAIL_EDGE)
+        starts = [self._section_doc_y(sec) for sec in self._sections]
+        for i, sec in enumerate(self._sections):
+            top = starts[i] / self._content_h
+            bottom = (starts[i + 1] / self._content_h
+                      if i + 1 < len(starts) else 1.0)
+            y0 = max(0.0, min(1.0, top)) * h
+            y1 = max(y0 + 2, max(0.0, min(1.0, bottom)) * h)
+            color = _PDF_PART_COLORS.get(getattr(sec, "kind", ""), "#666666")
+            rail.create_rectangle(
+                2, y0, w, y1, width=0,
+                fill=_wash_hex(color, self._RAIL_BAND_WASH))
+            rail.create_rectangle(
+                1, y0, w, min(y0 + self._RAIL_TICK_H, y1), width=0, fill=color)
+            self._rail_spans.append((y0, y1, sec))
+
+    def _section_at_rail_y(self, y: float):
+        """The part whose band covers rail height *y*, or the nearest one."""
+        spans = self._rail_spans
+        if not spans:
+            return None
+        if y < spans[0][0]:
+            return spans[0][2]
+        for y0, y1, sec in spans:
+            if y0 <= y < y1:
+                return sec
+        return spans[-1][2]
+
+    def _rail_tip_text(self) -> str:
+        """The part under the pointer, named for the hover tip."""
+        rail = self._rail
+        if rail is None:
+            return ""
+        try:
+            x = rail.winfo_pointerx() - rail.winfo_rootx()
+            y = rail.winfo_pointery() - rail.winfo_rooty()
+        except tk.TclError:
+            return ""
+        if not (0 <= x <= rail.winfo_width() and 0 <= y <= rail.winfo_height()):
+            return ""   # the pointer left without a <Leave> reaching us
+        sec = self._section_at_rail_y(y)
+        if sec is None:
+            return ""
+        start_at = getattr(sec, "start_at", None)
+        page = int(start_at[0] if start_at
+                   else (getattr(sec, "start_page", 0) or 0))
+        return f"{getattr(sec, 'label', 'Part')} — p. {page + 1}"
+
+    def _on_rail_click(self, event) -> None:
+        sec = self._section_at_rail_y(event.y)
+        if sec is None:
+            return
+        start_at = getattr(sec, "start_at", None)
+        if start_at:
+            self.scroll_to_page(int(start_at[0]), float(start_at[1]))
+        else:
+            self.scroll_to_page(int(getattr(sec, "start_page", 0) or 0))
 
     def viewport_anchor(self) -> "Optional[tuple[int, float]]":
         """Return the PDF page and point-height nearest the reading position.
@@ -16579,11 +16827,14 @@ class _FloatingPdfWindow:
             avail = self._win.winfo_width()
         except tk.TclError:
             avail = 0
-        # The pane's fit-to-window width is fixed at construction; leave room
-        # for its scrollbar so the page is not clipped at 100%.
-        width = max((avail or 720) - 30, self._MIN_W - 40)
+        # A first estimate of the fit-to-window width, so the pages are close to
+        # right on the very first render; ``autofit`` then keeps them fitted to
+        # the room they really have — the window this one actually got, and
+        # every resize of it afterwards.  Being one page, sized to its window,
+        # is what this viewer is for.
+        width = max((avail or self._W) - 30, self._MIN_W - 40)
         pane = _PdfPane(self._body, data, width=width, margin=margin,
-                        link_style="recolor", uniform_crop=True)
+                        link_style="recolor", uniform_crop=True, autofit=True)
         pane.pack(fill="both", expand=True)
         self._pane = pane
         self._zoom_var.set(f"{pane.zoom_percent()}%")
@@ -16592,10 +16843,17 @@ class _FloatingPdfWindow:
         """True when *url* is already the document on screen here."""
         return bool(self._pane is not None and url and self._url == url)
 
+    #: Part kinds that make a document worth mapping on the scrollbar rail —
+    #: a writing other than the Court's own.  A PDF holding only a syllabus and
+    #: one majority has nothing a reader needs to hunt for.
+    _SEPARATE_KINDS = frozenset({"concurrence", "dissent", "separate"})
+
     def apply_analysis(self, result: dict) -> None:
         """Wire the owner's cached analysis of this PDF into the pane: blue
-        clickable citations, and Ctrl/Cmd-F search plus drag-select over the
-        text layer.  Ignored once the window has moved on to another scan."""
+        clickable citations, Ctrl/Cmd-F search plus drag-select over the text
+        layer, and — for an opinion that carries separate writings — the rail
+        beside the scrollbar marking where each part begins.  Ignored once the
+        window has moved on to another scan."""
         pane = self._pane
         if pane is None or not self.alive():
             return
@@ -16615,6 +16873,10 @@ class _FloatingPdfWindow:
                 quiet_pages=result.get("quiet", set()),
             )
         pane.enable_find(pages, bind_keys=True)
+        sections = result.get("sections", []) or []
+        if any(getattr(sec, "kind", "") in self._SEPARATE_KINDS
+               for sec in sections):
+            pane.set_section_marks(sections)
 
     def scroll_to_page(self, page: int, y_pt: Optional[float] = None) -> None:
         """Open on the page the reader was on in the text, once laid out."""

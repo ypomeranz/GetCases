@@ -67,6 +67,8 @@ Click **Scholar** to fetch the full opinion from Google Scholar (often richer th
 
 **PDF** shows the official scan in place of the text, and **Text** brings the text back at the passage the PDF was left on. Tick **Window → View PDF in Separate Window** and the scan instead opens in a small window of its own – the page under one thin strip carrying the zoom controls (**−**, **+**, **Fit**, and Ctrl/Cmd +, −, 0), and nothing else: the opinion text stays on screen beside it. Citations in the page are still clickable, Ctrl/Cmd+F still searches it, and Save (Ctrl/Cmd+S), Print (Ctrl/Cmd+P) and Close (Ctrl/Cmd+W) are on the strip’s right‑click menu. The setting is remembered between sessions, and the viewer closes with the opinion window that opened it.
 
+When the opinion in that window carries **separate writings**, a slim rail appears just inside the scrollbar mapping them: each part covers the stretch of the document it occupies, in its own color (blue for the Court’s opinion, green for a concurrence, red for a dissent, grey for a syllabus), with a solid marker on its first line. Dragging the scrollbar you can see how far down the dissent starts; hovering names the part and its page, and clicking jumps straight to it. The parts come from the same detector the **Side panel** parts list uses, and the rail appears only for an opinion that actually has a concurrence, dissent or other separate writing – a lone majority gets no rail.
+
 Quick Lookup (Ctrl+S)
 Instant citation lookup: paste a case citation (410 U.S. 113), a statute (42 USC 1983), a regulation (29 CFR 1614.105), or a Federal Rule (FRE 404), and open the source directly.
 
