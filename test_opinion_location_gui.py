@@ -345,7 +345,6 @@ class ReverseSwitchTests(unittest.TestCase):
         )
         reader._pdf_holder = None
         reader._current_part = 0
-        reader._part_combo = types.SimpleNamespace(current=lambda _value: None)
         reader._pdf_parts_nav = object()
         reader._text_frame = types.SimpleNamespace(pack=lambda **_kwargs: None)
         reader._btn_frame = object()
