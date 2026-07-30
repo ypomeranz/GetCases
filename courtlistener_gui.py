@@ -17267,6 +17267,8 @@ class _ScholarTextWindow:
         self._details_related: Optional[tuple] = None  # cached (title, lines)
         self._recent_loaded = False
         self._details_recent: Optional[tuple] = None  # cached (title, lines)
+        self._docket_loaded = False
+        self._details_docket: Optional[tuple] = None  # cached (title, lines)
 
         txt.tag_configure("center", justify="center")
         txt.tag_configure("blockquote", lmargin1=36, lmargin2=36, rmargin=36)
@@ -21301,7 +21303,8 @@ class _ScholarTextWindow:
 
             # What the panel shows: the case details (Oyez line-up/summary,
             # falling back to CourtListener's cluster record, then to whatever
-            # the open text reveals), the Court's most recent decisions, the
+            # the open text reveals), the selected Supreme Court case's
+            # filtered docket briefs, the Court's most recent decisions, the
             # case's appellate family (appeals, decision below, remand
             # proceedings), or the opinion's detected outline.  Case details
             # and the recent-decisions list are separate views now, not one
@@ -21311,10 +21314,13 @@ class _ScholarTextWindow:
             ttk.Label(mode_row, text="Show",
                       style="ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel",
                       ).pack(side="left")
+            mode_values = ["Case details"]
+            if self._is_scotus:
+                mode_values.append("Docket")
+            mode_values.extend(("Recent SCOTUS", "Related cases", "Outline"))
             self._details_mode_combo = ttk.Combobox(
                 mode_row, state="readonly", width=16,
-                values=("Case details", "Recent SCOTUS", "Related cases",
-                        "Outline"),
+                values=tuple(mode_values),
                 style="Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox",
             )
             self._details_mode_combo.current(0)
@@ -21355,6 +21361,19 @@ class _ScholarTextWindow:
                                foreground=self._CONCUR_COLOR, spacing1=8)
             body.tag_configure("oldiss", font=self._details_fonts["h"],
                                foreground=self._DISSENT_COLOR, spacing1=8)
+            # Supreme Court booklet-cover colors, matching SCOTUSblog's docket
+            # legend.  The colored background applies to the linked brief name
+            # itself, while the date beneath it stays muted and uncolored.
+            try:
+                import scotus_docket
+                docket_colors = scotus_docket.COVER_COLORS
+            except Exception:
+                docket_colors = {}
+            for cover, color in docket_colors.items():
+                body.tag_configure(
+                    f"docket_{cover}", background=color,
+                    foreground="#25232e", spacing1=3, spacing3=1,
+                )
             self._details_text = body
             self._details_frame = f
             self._apply_details_fonts()   # honor the persisted zoom choice
@@ -21475,8 +21494,7 @@ class _ScholarTextWindow:
             self._pdf_parts_nav = None
 
     def _details_mode(self) -> str:
-        """The side panel's selected view: "case", "recent", "related" or
-        "outline"."""
+        """The selected side-panel view."""
         combo = getattr(self, "_details_mode_combo", None)
         try:
             if combo is not None:
@@ -21487,6 +21505,8 @@ class _ScholarTextWindow:
                     return "related"
                 if sel == "Recent SCOTUS":
                     return "recent"
+                if sel == "Docket":
+                    return "docket"
         except tk.TclError:
             pass
         return "case"
@@ -21502,6 +21522,8 @@ class _ScholarTextWindow:
             self._show_related_cases()
         elif mode == "recent":
             self._show_recent_scotus()
+        elif mode == "docket":
+            self._show_scotus_docket()
         else:
             self._show_case_details()
 
@@ -21759,6 +21781,136 @@ class _ScholarTextWindow:
                 print(f"[details] recent decisions: {exc}")
                 lines = [("lbl", f"Could not load recent decisions: {exc}")]
             self._post(self._apply_recent_scotus, title, lines)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Side panel: the selected Supreme Court case's filtered docket
+    # ------------------------------------------------------------------
+
+    def _show_scotus_docket(self) -> None:
+        """Show cached docket lines or begin the two-source lookup."""
+        cached = getattr(self, "_details_docket", None)
+        if cached is not None:
+            self._apply_details(*cached)
+        elif not self._docket_loaded:
+            self._load_scotus_docket()
+        else:
+            self._set_details([("lbl", "Loading docket briefs\u2026")])
+
+    def _apply_scotus_docket(
+        self, title: str, lines: list[tuple],
+    ) -> None:
+        """Cache a completed docket lookup and show it if still selected."""
+        self._details_docket = (title, lines)
+        if self._details_mode() == "docket":
+            self._apply_details(title, lines)
+
+    @staticmethod
+    def _details_lines_docket(result) -> list[tuple]:
+        """Render a ``scotus_docket.CaseDocket`` in brief-stage order."""
+        lines: list[tuple] = [
+            (
+                "lbl",
+                "Briefs only. Colors match Supreme Court booklet covers.",
+            ),
+        ]
+        documents = list(result.documents or [])
+        for stage, heading in (
+            ("cert", "Cert stage"),
+            ("merits", "Merits stage"),
+        ):
+            stage_documents = [
+                document for document in documents
+                if document.stage == stage
+            ]
+            if not stage_documents:
+                continue
+            lines.append(("h", heading))
+            for document in stage_documents:
+                lines.append((
+                    f"docket_{document.cover}",
+                    document.label,
+                    document.url,
+                ))
+                sub = " \u00b7 ".join(
+                    value for value in (
+                        document.date,
+                        (
+                            f"No. {document.docket}"
+                            if len(result.dockets) > 1 and document.docket
+                            else ""
+                        ),
+                    )
+                    if value
+                )
+                if sub:
+                    lines.append(("lbl", sub))
+
+        if not documents:
+            lines.append((
+                "lbl",
+                "No cert-stage or merits-stage brief files were found "
+                "in the online dockets.",
+            ))
+
+        source_links: list[tuple[str, str]] = []
+        for docket, url in zip(result.dockets, result.official_urls):
+            if url:
+                source_links.append((
+                    f"Full Supreme Court docket \u00b7 No. {docket}", url,
+                ))
+        if result.scotusblog_url:
+            source_links.append(("SCOTUSblog case file", result.scotusblog_url))
+        if source_links:
+            lines.append(("h", "Sources"))
+            for label, url in source_links:
+                lines.append(("", label, url))
+
+        try:
+            import scotus_docket
+            lines.append((
+                "",
+                "Official cover-color chart",
+                scotus_docket.BOOKLET_COLOR_CHART_URL,
+            ))
+        except Exception:
+            pass
+        return lines
+
+    def _load_scotus_docket(self) -> None:
+        """Fetch Court and SCOTUSblog docket files without blocking the UI."""
+        self._docket_loaded = True
+        if getattr(self, "_details_title_var", None) is not None:
+            self._details_title_var.set("Supreme Court Docket")
+        self._set_details([("lbl", "Loading docket briefs\u2026")])
+
+        item = self._pdf_item()
+        docket_text = _item_docket_text(item)
+        dockets = tuple(sorted(_scotus_docket_tokens(docket_text)))
+        name = self._bb.get("name", "")
+
+        def run() -> None:
+            title = "Supreme Court Docket"
+            if dockets:
+                title += " \u00b7 " + ", ".join(f"No. {d}" for d in dockets)
+            try:
+                import scotus_docket
+                if dockets:
+                    result = scotus_docket.fetch_case_docket(
+                        dockets, name=name, session=_anon_session,
+                    )
+                    lines = self._details_lines_docket(result)
+                else:
+                    lines = [(
+                        "lbl",
+                        "No Supreme Court docket number was found in this "
+                        "opinion.",
+                    )]
+            except Exception as exc:
+                print(f"[details] Supreme Court docket: {exc}")
+                lines = [("lbl", f"Could not load the docket: {exc}")]
+            self._post(self._apply_scotus_docket, title, lines)
 
         threading.Thread(target=run, daemon=True).start()
 
