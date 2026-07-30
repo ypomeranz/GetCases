@@ -504,7 +504,7 @@ BROWSER: list = []
 
 VIEWER_NS = _load(
     "_FloatingPdfWindow",
-    ["_open_text", "_style_name_as_link"],
+    ["_open_text"],
     {"_CTK_AVAILABLE": False, "_UI": {"accent": "#2f6bd8"},
      "time": __import__("time")},
 )
@@ -524,12 +524,11 @@ class _Viewer:
 
     def __init__(self, on_open_text=None):
         self._on_open_text = on_open_text
-        self._name_label = mock.Mock()
-        for name in ("_open_text", "_style_name_as_link"):
+        for name in ("_open_text",):
             setattr(self, name, VIEWER_NS[name].__get__(self))
 
 
-class NameOnTheStripTests(unittest.TestCase):
+class OpenTheTextTests(unittest.TestCase):
     def test_clicking_the_name_opens_the_text(self):
         opened = []
         _Viewer(on_open_text=lambda: opened.append(True))._open_text()
@@ -559,15 +558,6 @@ class NameOnTheStripTests(unittest.TestCase):
         viewer._opened_text_at -= DEBOUNCE + 0.1     # a click a moment later
         viewer._open_text()
         self.assertEqual(opened, [True, True])
-
-    def test_the_name_is_coloured_like_a_link(self):
-        viewer = _Viewer(on_open_text=lambda: None)
-        viewer._style_name_as_link("#2f6bd8")
-        viewer._name_label.configure.assert_called_with(fg="#2f6bd8")
-
-    def test_the_viewer_offers_the_name_only_when_there_is_text_behind_it(self):
-        body = _source_of("_FloatingPdfWindow", "_build_bar")
-        self.assertIn("if self._on_open_text is not None:", body)
 
     def test_a_pdf_opened_from_the_reader_goes_back_to_that_reader(self):
         body = _source_of("_ScholarTextWindow", "_show_pdf_floating")

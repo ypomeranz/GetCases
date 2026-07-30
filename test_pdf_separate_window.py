@@ -178,6 +178,7 @@ class _FakeFloatingWindow:
         self.scrolled = []
         self.surfaced = 0
         self.analyses = []
+        self.titles = []
         self._alive = True
         _FakeFloatingWindow.opened.append(self)
 
@@ -199,6 +200,9 @@ class _FakeFloatingWindow:
 
     def apply_analysis(self, result):
         self.analyses.append(result)
+
+    def set_title(self, title):
+        self.titles.append(title)
 
     def close(self):
         self._alive = False
@@ -301,12 +305,15 @@ READER_NS = _load(
     "_ScholarTextWindow",
     ["_pdf_opens_in_separate_window", "_show_pdf_floating", "_show_pdf",
      "_floating_pdf_closed", "_surface_text_view", "_text_view_alive",
-     "_float_pdf_master", "_float_pdf_anchor"],
+     "_float_pdf_master", "_float_pdf_anchor", "_scan_window_title"],
     {"_PdfPane": _FakePane,
      "_FloatingPdfWindow": _FakeFloatingWindow,
      "_is_us_reports_pdf": lambda url: "usrep" in (url or "").lower(),
      "_clamp_toplevel_to_work_area": lambda *a, **kw: (_ for _ in ()).throw(
          _InWindow()),
+     "_scan_citation_item": lambda item, url, printed="": dict(
+         item, **({"_us_reports_cite": printed} if printed else {})),
+     "_bluebook_display_name": lambda item: item.get("bluebook", ""),
      },
 )
 
@@ -358,7 +365,8 @@ class _Reader:
         for name in ("_pdf_opens_in_separate_window", "_show_pdf_floating",
                      "_show_pdf", "_floating_pdf_closed",
                      "_surface_text_view", "_text_view_alive",
-                     "_float_pdf_master", "_float_pdf_anchor"):
+                     "_float_pdf_master", "_float_pdf_anchor",
+                     "_scan_window_title"):
             setattr(self, name, READER_NS[name].__get__(self))
 
     # --- collaborators the extracted methods call ---
@@ -368,6 +376,12 @@ class _Reader:
 
     def _title_citation(self):
         return "Roe v. Wade, 410 U.S. 113 (1973)"
+
+    def _filename_item(self):
+        return {"bluebook": "Roe v. Wade, 410 U.S. 113 (1973)"}
+
+    def _shown_us_reports_cite(self):
+        return ""
 
     def _history_key(self):
         return "case-key"
@@ -440,10 +454,20 @@ class FloatingHandoffTests(unittest.TestCase):
         self.assertEqual(kw["on_open_text"], reader._surface_text_view)
 
     def test_the_window_is_named_for_the_case(self):
+        # In the reporter these pages print, not in every parallel reporter
+        # the case happens to carry.
         reader = _Reader()
         reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
         self.assertEqual(_FakeFloatingWindow.opened[0].title,
                          "Roe v. Wade, 410 U.S. 113 (1973)")
+
+    def test_it_is_renamed_when_the_pages_name_their_own_reporter(self):
+        reader = _Reader()
+        reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
+        window = _FakeFloatingWindow.opened[0]
+        _url, callback = reader.analysis_requests[0]
+        callback({"url": _url, "pages": [["c"]]})
+        self.assertEqual(window.titles, ["Roe v. Wade, 410 U.S. 113 (1973)"])
 
     def test_a_us_reports_scan_gets_the_roomier_margin(self):
         reader = _Reader()
@@ -608,8 +632,8 @@ class FloatingHandoffTests(unittest.TestCase):
 
 VIEWER_NS = _load(
     "_FloatingPdfWindow",
-    ["_short_name", "showing", "apply_analysis", "zoom", "alive", "close",
-     "_on_destroy", "_save", "_print", "_show_zoom"],
+    ["showing", "apply_analysis", "zoom", "alive", "close",
+     "_on_destroy", "_save", "_print", "_show_zoom", "set_title"],
 )
 
 
@@ -633,29 +657,41 @@ class _Viewer:
         self._on_save = lambda: setattr(self, "saved", self.saved + 1)
         self._on_print = self.printed.append
         self._on_close = self.closed_with.append
-        for name in ("_short_name", "showing", "apply_analysis", "zoom",
+        for name in ("showing", "apply_analysis", "zoom",
                      "alive", "close", "_on_destroy", "_save", "_print",
-                     "_show_zoom"):
+                     "_show_zoom", "set_title"):
             setattr(self, name, VIEWER_NS[name].__get__(self))
         # set_pdf wires the pane's zoom reports to the strip's percentage.
         self._pane.on_zoom = self._show_zoom
 
 
-class ShortNameTests(unittest.TestCase):
-    def test_a_short_caption_is_shown_whole(self):
-        self.assertEqual(VIEWER_NS["_short_name"]("Roe v. Wade"), "Roe v. Wade")
+class WindowTitleTests(unittest.TestCase):
+    """The window is named for the case, and renamed when the text says how."""
 
-    def test_a_long_caption_is_elided_so_the_zoom_controls_keep_their_room(self):
-        name = VIEWER_NS["_short_name"]("Roe v. Wade, " + "410 U.S. 113, " * 9)
-        self.assertLessEqual(len(name), 58)
-        self.assertTrue(name.endswith("…"))
+    def test_the_title_can_be_restated(self):
+        viewer = _Viewer()
+        viewer.set_title("Roe v. Wade, 410 U.S. 113 (1973)")
+        viewer._win.title.assert_called_with("Roe v. Wade, 410 U.S. 113 (1973)")
 
     def test_whitespace_is_collapsed(self):
-        self.assertEqual(VIEWER_NS["_short_name"]("Roe   v.\n Wade"),
-                         "Roe v. Wade")
+        viewer = _Viewer()
+        viewer.set_title("Roe v. Wade,\n  410 U.S. 113 (1973)")
+        viewer._win.title.assert_called_with("Roe v. Wade, 410 U.S. 113 (1973)")
 
-    def test_no_title_is_no_name(self):
-        self.assertEqual(VIEWER_NS["_short_name"](""), "")
+    def test_nothing_to_say_leaves_the_title_alone(self):
+        viewer = _Viewer()
+        viewer.set_title("   ")
+        viewer._win.title.assert_not_called()
+
+    def test_the_strip_no_longer_repeats_the_case_name(self):
+        body = next(
+            ast.get_source_segment(SRC, node)
+            for cls in TREE.body
+            if isinstance(cls, ast.ClassDef) and cls.name == "_FloatingPdfWindow"
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_build_bar"
+        )
+        self.assertNotIn("_name_var", body)
 
 
 class ViewerTests(unittest.TestCase):
