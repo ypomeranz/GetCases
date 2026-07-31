@@ -27904,23 +27904,110 @@ def _two_sided_supported() -> bool:
     return not sys.platform.startswith("win") and bool(shutil.which("lp"))
 
 
+#: PDF readers that will print to a named printer from the command line, and
+#: how each wants to be asked.  Windows has no general way to do this — the
+#: shell's "printto" verb only works if the program that owns PDFs registers
+#: it, and the one that owns them by default (Edge) does not — so a reader
+#: that does is worth looking for.
+_WINDOWS_PDF_PRINTERS: tuple = (
+    ("SumatraPDF.exe",
+     lambda exe, path, printer: [exe, "-print-to", printer, "-silent", path]),
+    ("AcroRd32.exe",
+     lambda exe, path, printer: [exe, "/n", "/t", path, printer]),
+    ("Acrobat.exe",
+     lambda exe, path, printer: [exe, "/n", "/t", path, printer]),
+    ("FoxitPDFReader.exe",
+     lambda exe, path, printer: [exe, "/t", path, printer]),
+    ("FoxitReader.exe",
+     lambda exe, path, printer: [exe, "/t", path, printer]),
+    ("PDFXEdit.exe",
+     lambda exe, path, printer: [exe, "/print", f"/printername:{printer}",
+                                 path]),
+)
+
+
+def _windows_program_path(exe: str) -> str:
+    """Where *exe* is installed, from PATH or the registry's App Paths — the
+    key a program registers so it can be launched by bare name."""
+    found = shutil.which(exe)
+    if found:
+        return found
+    try:
+        import winreg
+    except ImportError:
+        return ""
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(
+                root,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\\" + exe,
+            ) as key:
+                value = winreg.QueryValueEx(key, "")[0]
+        except OSError:
+            continue
+        if value and os.path.exists(value):
+            return str(value)
+    return ""
+
+
+def _windows_print_via_reader(path: str, printer: str) -> bool:
+    """Print through a PDF reader that takes a printer on its command line."""
+    for exe, build in _WINDOWS_PDF_PRINTERS:
+        program = _windows_program_path(exe)
+        if not program:
+            continue
+        try:
+            subprocess.Popen(build(program, path, printer))
+            print(f"[print] printed through {exe}")
+            return True
+        except Exception as exc:
+            print(f"[print] {exe} would not print: {exc}")
+    return False
+
+
 def _send_pdf_to_printer(path: str, printer: str,
                          two_sided: bool = False) -> bool:
-    """Hand *path* to *printer*.  False when it could not be done."""
+    """Hand *path* to *printer*.  False when it could not be done.
+
+    Unix hands it to CUPS, which takes both the queue and the options.
+    Windows has no equivalent, so three things are tried in turn: the shell's
+    "printto" verb, which works when the program owning PDFs registers it; a
+    PDF reader that prints to a named printer from the command line; and
+    finally the plain "print" verb, which prints to the *default* printer and
+    so is only used when that is the printer asked for."""
+    if not sys.platform.startswith("win"):
+        try:
+            cmd = ["lp", "-d", printer]
+            if two_sided:
+                cmd += ["-o", "sides=two-sided-long-edge"]
+            done = subprocess.run(cmd + [path], capture_output=True, text=True,
+                                  timeout=_PRINT_TIMEOUT, check=False)
+            return done.returncode == 0
+        except Exception as exc:
+            print(f"[print] sending to {printer!r} failed: {exc}")
+            return False
     try:
-        if sys.platform.startswith("win"):
-            # The shell's "printto" verb: the PDF handler prints to the named
-            # queue.  Not every handler registers it, hence the return value.
-            os.startfile(path, "printto", f'"{printer}"')  # type: ignore[attr-defined]
-            return True
-        cmd = ["lp", "-d", printer]
-        if two_sided:
-            cmd += ["-o", "sides=two-sided-long-edge"]
-        done = subprocess.run(cmd + [path], capture_output=True, text=True,
-                              timeout=_PRINT_TIMEOUT, check=False)
-        return done.returncode == 0
-    except Exception as exc:
-        print(f"[print] sending to {printer!r} failed: {exc}")
+        os.startfile(path, "printto", f'"{printer}"')  # type: ignore[attr-defined]
+        return True
+    except OSError as exc:
+        # 1155 is "no application is associated with this file for this
+        # operation" — the PDF handler has no printto verb, not a missing file.
+        print(f"[print] the PDF app does not print to a named printer "
+              f"({exc}); looking for one that does")
+    if _windows_print_via_reader(path, printer):
+        return True
+    # Last resort: the ordinary Print verb, which goes to whatever printer is
+    # the default.  Only honest when that is the one that was asked for.
+    _names, default = _system_printers()
+    if default and default.strip().lower() != printer.strip().lower():
+        print(f"[print] cannot target {printer!r} from here; "
+              f"{default!r} is the default")
+        return False
+    try:
+        os.startfile(path, "print")  # type: ignore[attr-defined]
+        return True
+    except OSError as exc:
+        print(f"[print] the PDF app will not print at all ({exc})")
         return False
 
 
@@ -28044,10 +28131,16 @@ class _PrintDialog:
             self._status(f"Sent to {printer}.")
             self._close()
             return
-        # The queue would not take it — offer the viewer rather than a dead end.
-        self._status_var.set(
-            f"{printer} would not take the document. "
-            "Try Open in Viewer and print from there.")
+        # It could not be sent — say what stands in the way and leave the
+        # reader somewhere they can act, rather than at a dead end.
+        if sys.platform.startswith("win"):
+            self._status_var.set(
+                "Windows' PDF app can't print to a chosen printer from here. "
+                "Use Open in Viewer, or make this one the default printer.")
+        else:
+            self._status_var.set(
+                f"{printer} would not take the document. "
+                "Try Open in Viewer and print from there.")
 
     def _close(self) -> None:
         try:

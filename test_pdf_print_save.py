@@ -51,6 +51,19 @@ def _load_functions(names, extra=None) -> dict:
     return ns
 
 
+def _module_value(name: str):
+    """A module-level constant, evaluated from the source."""
+    for node in TREE.body:
+        targets = (
+            node.targets if isinstance(node, ast.Assign)
+            else [node.target] if isinstance(node, ast.AnnAssign) else []
+        )
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            return eval(ast.get_source_segment(SRC, node.value),  # noqa: S307
+                        {"frozenset": frozenset})
+    raise AssertionError(f"module-level constant not found: {name}")
+
+
 def _source_of(cls: str, name: str) -> str:
     body = next(n.body for n in TREE.body
                 if isinstance(n, ast.ClassDef) and n.name == cls)
@@ -147,8 +160,10 @@ class _FakeBrowser:
 NS = _load_functions([
     "_run_text", "_first_line", "_system_printers", "_open_printer_settings",
     "_two_sided_supported", "_send_pdf_to_printer", "_macos_print_dialog",
-    "_open_pdf_externally", "_write_output_pdf",
-], {"_PRINT_TIMEOUT": 8})
+    "_open_pdf_externally", "_write_output_pdf", "_windows_program_path",
+    "_windows_print_via_reader",
+], {"_PRINT_TIMEOUT": 8,
+    "_WINDOWS_PDF_PRINTERS": _module_value("_WINDOWS_PDF_PRINTERS")})
 
 
 def _reset(platform="linux"):
@@ -262,6 +277,111 @@ class SendToPrinterTests(unittest.TestCase):
         ns = _reset("win32")
         _FakeOS.fail_startfile = True
         self.assertFalse(ns["_send_pdf_to_printer"]("C:/a.pdf", "Office"))
+
+
+class WindowsPrintFallbackTests(unittest.TestCase):
+    """Windows has no general way to print a PDF to a chosen printer.
+
+    The shell's "printto" verb works only if the program that owns PDFs
+    registers it — and the one that owns them by default, Edge, does not,
+    which is WinError 1155 ("no application is associated with the specified
+    file for this operation").  So two more things are tried.
+    """
+
+    def _no_printto(self):
+        """os.startfile refuses "printto" the way Edge makes it refuse."""
+        ns = _reset("win32")
+        refused = {"n": 0}
+
+        def startfile(path, operation=None, arguments=None):
+            if operation == "printto":
+                refused["n"] += 1
+                raise OSError(
+                    1155, "No application is associated with the specified "
+                          "file for this operation")
+            _FakeOS.startfiles.append((path, operation, arguments))
+
+        _FakeOS.startfile = startfile
+        self.addCleanup(setattr, _FakeOS, "startfile",
+                        _FakeOS.__dict__["startfile"])
+        return ns, refused
+
+    def test_a_reader_that_can_target_a_printer_is_used(self):
+        ns, refused = self._no_printto()
+        _FakeShutil.present = {"SumatraPDF.exe"}
+        self.assertTrue(ns["_send_pdf_to_printer"]("C:/a.pdf", "Brother"))
+        self.assertEqual(refused["n"], 1)
+        self.assertEqual(_FakeSubprocess.popens[-1],
+                         ["/usr/bin/SumatraPDF.exe", "-print-to", "Brother",
+                          "-silent", "C:/a.pdf"])
+
+    def test_adobe_is_asked_the_way_adobe_wants(self):
+        ns, _refused = self._no_printto()
+        _FakeShutil.present = {"AcroRd32.exe"}
+        self.assertTrue(ns["_send_pdf_to_printer"]("C:/a.pdf", "Brother"))
+        self.assertEqual(_FakeSubprocess.popens[-1],
+                         ["/usr/bin/AcroRd32.exe", "/n", "/t", "C:/a.pdf",
+                          "Brother"])
+
+    def test_with_no_such_reader_the_default_printer_is_printed_to(self):
+        # The plain Print verb goes to the default printer — honest only when
+        # that is the printer that was asked for.
+        ns, _refused = self._no_printto()
+        _FakeSubprocess.answering({"powershell": _Done("Brother\n")})
+        self.assertTrue(ns["_send_pdf_to_printer"]("C:/a.pdf", "Brother"))
+        self.assertEqual(_FakeOS.startfiles[-1], ("C:/a.pdf", "print", None))
+
+    def test_but_never_to_a_different_printer_than_the_one_chosen(self):
+        ns, _refused = self._no_printto()
+        _FakeSubprocess.answering({"powershell": _Done("Office\n")})
+        self.assertFalse(ns["_send_pdf_to_printer"]("C:/a.pdf", "Brother"))
+        self.assertEqual(_FakeOS.startfiles, [])
+
+    def test_the_default_is_matched_without_fussing_over_case(self):
+        ns, _refused = self._no_printto()
+        _FakeSubprocess.answering({"powershell": _Done("  BROTHER \n")})
+        self.assertTrue(ns["_send_pdf_to_printer"]("C:/a.pdf", "brother"))
+
+    def test_a_machine_that_names_no_default_still_tries(self):
+        ns, _refused = self._no_printto()
+        self.assertTrue(ns["_send_pdf_to_printer"]("C:/a.pdf", "Brother"))
+        self.assertEqual(_FakeOS.startfiles[-1], ("C:/a.pdf", "print", None))
+
+    def test_a_reader_on_the_path_is_found(self):
+        _reset("win32")
+        _FakeShutil.present = {"FoxitReader.exe"}
+        self.assertEqual(NS["_windows_program_path"]("FoxitReader.exe"),
+                         "/usr/bin/FoxitReader.exe")
+
+    def test_one_that_is_not_installed_is_not(self):
+        _reset("win32")
+        self.assertEqual(NS["_windows_program_path"]("SumatraPDF.exe"), "")
+
+    def test_a_reader_that_will_not_start_is_passed_over(self):
+        ns, _refused = self._no_printto()
+        _FakeShutil.present = {"SumatraPDF.exe", "AcroRd32.exe"}
+        _FakeSubprocess.fail = {"/usr/bin/SumatraPDF.exe"}
+        self.assertTrue(ns["_send_pdf_to_printer"]("C:/a.pdf", "Brother"))
+        self.assertEqual(_FakeSubprocess.popens[-1][0],
+                         "/usr/bin/AcroRd32.exe")
+
+    def test_every_reader_offered_is_asked_for_a_named_printer(self):
+        # A switch that only says "print" would silently use the default.
+        for exe, build in _module_value("_WINDOWS_PDF_PRINTERS"):
+            argv = build(f"C:/{exe}", "C:/doc.pdf", "Brother")
+            self.assertTrue(any("Brother" in arg for arg in argv), exe)
+            self.assertIn("C:/doc.pdf", argv, exe)
+
+    def test_unix_is_untouched_by_any_of_it(self):
+        ns = _reset("linux")
+        ns["_send_pdf_to_printer"]("/tmp/a.pdf", "HP")
+        self.assertEqual(_FakeSubprocess.runs[-1][0], "lp")
+        self.assertEqual(_FakeOS.startfiles, [])
+
+    def test_the_dialog_says_what_stands_in_the_way(self):
+        src = _source_of("_PrintDialog", "_print")
+        self.assertIn('sys.platform.startswith("win")', src)
+        self.assertIn("make this one the default printer", src)
 
     def test_double_sided_is_offered_only_where_it_can_be_honoured(self):
         # Windows prints by handing the file to whatever owns PDFs, which
