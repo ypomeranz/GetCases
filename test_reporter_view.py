@@ -731,6 +731,69 @@ class ReporterChainTests(unittest.TestCase):
             getattr(_HandoffViewer.made[0]._win, "_reporter_window", False))
 
 
+class WindowIndependenceTests(unittest.TestCase):
+    """No window in Reporter View closes another.  Tk destroys a top-level
+    with its master, so every one of them hangs on the application root."""
+
+    def setUp(self):
+        self.ns = _load(
+            "CourtListenerGUI", ["window_master", "new_secondary_view_host"],
+            {"_ui_toplevel": lambda master: ("window on", master)},
+        )
+
+    def _app(self, mode="reporter"):
+        app = _App(mode=mode)
+        app._case_tabs_enabled = mode == "tabs"
+        for name in ("window_master", "new_secondary_view_host"):
+            setattr(app, name, self.ns[name].__get__(app))
+        return app
+
+    def test_a_window_opened_in_reporter_view_hangs_on_the_app(self):
+        app = self._app()
+        self.assertIs(app.window_master(_Widget()), app.root)
+
+    def test_and_so_does_one_opened_from_a_popped_out_scan(self):
+        app = self._app(mode="tabs")
+        origin = _Widget()
+        origin._reporter_window = True
+        self.assertIs(app.window_master(origin), app.root)
+
+    def test_individual_windows_keeps_its_own_arrangement(self):
+        app = self._app(mode="windows")
+        origin = _Widget()
+        self.assertIs(app.window_master(origin), origin)
+
+    def test_the_root_going_away_is_not_fatal(self):
+        app = self._app()
+        app.root.destroy()
+        origin = _Widget()
+        self.assertIs(app.window_master(origin), origin)
+
+    def test_a_new_document_window_is_opened_on_that_master(self):
+        app = self._app()
+        self.assertEqual(app.new_secondary_view_host(_Widget()),
+                         ("window on", app.root))
+
+    def test_a_cited_scan_is_owned_by_the_app_not_by_the_case_it_came_from(self):
+        src = _source_of("CourtListenerGUI", "_show_cited_case_pdf")
+        self.assertIn("self.root, data, url, title, margin=margin, app=self",
+                      src)
+        self.assertIn("anchor = host if host is not self.root else None", src)
+        self.assertIn("anchor=anchor", src)
+
+    def test_and_a_citation_followed_out_of_it_starts_from_it(self):
+        src = _source_of("CourtListenerGUI", "_show_cited_case_pdf")
+        self.assertIn("on_cite=lambda act, snip: self.open_cited_case_pdf(\n"
+                      "                    onward()", src)
+        self.assertIn("on_open_text=lambda: _follow_brief_action(\n"
+                      "                    self, onward()", src)
+
+    def test_the_hidden_courier_is_owned_by_the_app_too(self):
+        src = _source_of("_PdfWindow", "__init__")
+        self.assertIn('_ui_toplevel(getattr(app, "root", parent)) '
+                      'if self._reporter', src)
+
+
 class ScanWindowSourceTests(unittest.TestCase):
     """The pieces that are easier to read off the source than to drive."""
 

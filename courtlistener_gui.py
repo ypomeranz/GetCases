@@ -6849,10 +6849,30 @@ class CourtListenerGUI:
         self._cited_pdf_windows.add(viewer)   # nothing else holds it
         return viewer.text_host()
 
+    def window_master(self, parent: tk.Misc) -> tk.Misc:
+        """What a new window's lifetime hangs on.
+
+        Tk destroys a top-level along with its master, so a window opened out
+        of another is closed with it.  In the reporter interface that is
+        wrong: every window there stands on its own — close the scan you came
+        from and the case, the statute and the second scan you opened out of
+        it all stay exactly where they are.  So the application's own root
+        owns them instead, and only quitting the app closes them.
+        """
+        try:
+            if not self.pdf_opens_in_separate_window(parent):
+                return parent
+            root = self.root
+            if root is not None and root.winfo_exists():
+                return root
+        except (AttributeError, tk.TclError):
+            pass
+        return parent
+
     def new_secondary_view_host(self, parent: tk.Misc):
         """Host a new non-modal view according to the current Window mode."""
         if not self._case_tabs_enabled:
-            return _ui_toplevel(parent)
+            return _ui_toplevel(self.window_master(parent))
         manager = self._tab_manager_for_parent(parent)
         if manager is not None:
             return _CaseTabPage(manager)
@@ -9118,6 +9138,10 @@ class CourtListenerGUI:
             host = host.winfo_toplevel()
         except (AttributeError, tk.TclError):
             host = self.root
+        # The window this one was opened from is where to *put* it, not what
+        # owns it: closing the case you followed the citation out of must
+        # leave the case you followed it to on screen.
+        anchor = host if host is not self.root else None
         # What this case is called, for saving and printing.  The clicked
         # citation and the link's own caption to begin with; the opinion text
         # fetched below replaces them with the real caption, the parallel
@@ -9135,6 +9159,18 @@ class CourtListenerGUI:
             in place of the scan, with nothing left to fetch."""
             named["page"] = (page_url, html)
 
+        def onward() -> tk.Misc:
+            """Where a citation followed *out of this window* starts from —
+            this window itself, so the chain does not depend on the one it was
+            opened from still being on screen."""
+            window = named.get("window")
+            try:
+                if window is not None and window.alive():
+                    return window._win
+            except (AttributeError, tk.TclError):
+                pass
+            return self.root
+
         # The text is fetched now rather than when the reader asks for it, so
         # the case name opens a page already in hand — and so the window can be
         # titled with the case's real citation rather than the clicked one.
@@ -9142,17 +9178,18 @@ class CourtListenerGUI:
                              on_page=page_ready)
         try:
             window = _FloatingPdfWindow(
-                host, data, url, title, margin=margin, app=self,
+                self.root, data, url, title, margin=margin, app=self,
+                anchor=anchor,
                 on_save=lambda pane: self._save_cited_pdf(named, pane, status),
                 on_print=lambda pane: self._print_cited_pdf(named, pane, status),
                 on_cite=lambda act, snip: self.open_cited_case_pdf(
-                    host, act, snip, status,
+                    onward(), act, snip, status,
                     fallback=lambda a=act, s=snip: _follow_brief_action(
-                        self, host, a, status, snippet=s),
+                        self, onward(), a, status, snippet=s),
                 ),
                 on_cite_browser=_open_citation_in_browser,
                 on_open_text=lambda: _follow_brief_action(
-                    self, host, action, status, snippet=snippet),
+                    self, onward(), action, status, snippet=snippet),
                 on_build_text=lambda body: self._embed_cited_case_text(
                     body, named),
                 on_close=self._cited_pdf_window_closed,
@@ -27819,7 +27856,10 @@ class _PdfWindow:
         self._float = None
 
         self._win = (
-            _ui_toplevel(parent) if self._reporter
+            # Owned by the application, like the viewer it hands the pages to:
+            # closing the window this scan was opened from must not take the
+            # scan with it.
+            _ui_toplevel(getattr(app, "root", parent)) if self._reporter
             else _case_view_host(parent, app) if self._is_case
             else _secondary_view_host(parent, app)
         )
