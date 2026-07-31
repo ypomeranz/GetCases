@@ -574,9 +574,28 @@ class CopyMenuTests(unittest.TestCase):
         menu = ns["_build_copy_menu"](None, reader)
         self.assertEqual(
             menu.labels(),
-            ["Copy citation to clipboard", None, "Plain", "With citation",
-             None, "Copy now \tCtrl+C"],
+            ["Edit citation…", None, "Copy citation to clipboard", None,
+             "Plain", "With citation", None, "Copy now \tCtrl+C"],
         )
+
+    def test_editing_the_citation_leads(self):
+        # Everything below it copies *this* citation, so correcting it is the
+        # thing to do before, not after — and in the PDF viewer, where the
+        # reader has no button bar, this menu is the only way to it.
+        src = next(ast.get_source_segment(SRC, n) for n in TREE.body
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name == "_build_copy_menu")
+        self.assertLess(src.index("Edit citation…"),
+                        src.index("Copy citation to clipboard"))
+        self.assertIn("reader._edit_base_citation", src)
+
+    def test_the_editor_hangs_on_a_window_even_when_the_reader_is_a_frame(self):
+        # Embedded in the viewer, self._win is a frame; wm transient needs the
+        # window around it.
+        src = _source_of("_ScholarTextWindow", "_edit_base_citation")
+        self.assertIn("host = self._win.winfo_toplevel()", src)
+        self.assertIn("dlg.transient(host)", src)
+        self.assertNotIn("dlg.transient(self._win)", src)
 
 
 # ---------------------------------------------------------------------------

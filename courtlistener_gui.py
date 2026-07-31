@@ -460,6 +460,13 @@ def _build_copy_menu(master: tk.Misc, reader) -> "Optional[tk.Menu]":
     if reader is None or not hasattr(reader, "on_copy_mode_chosen"):
         return None
     copy_menu = tk.Menu(master, tearoff=0)
+    # First, because everything below it copies *this* citation: correcting it
+    # is the thing to do before, not after.  In the PDF viewer, where the
+    # reader has no button bar of its own, this menu is the only way to it.
+    copy_menu.add_command(
+        label="Edit citation…", command=reader._edit_base_citation,
+    )
+    copy_menu.add_separator()
     copy_menu.add_command(
         label="Copy citation to clipboard",
         command=reader._copy_citation_to_clipboard,
@@ -19465,18 +19472,24 @@ class _ScholarTextWindow:
 
     def _edit_base_citation(self) -> None:
         """Edit the no-pincite citation used by copy and export operations."""
+        # A reader embedded in the PDF viewer is a frame, not a window; the
+        # dialog hangs on the window around it.
+        try:
+            host = self._win.winfo_toplevel()
+        except (AttributeError, tk.TclError):
+            host = self._win
         if not self._citation_override_keys:
             messagebox.showwarning(
                 "Edit Citation",
                 "This opinion has no stable reporter or database identifier, so a "
                 "citation override cannot yet be saved for future use.",
-                parent=self._win,
+                parent=host,
             )
             return
 
-        dlg = _ui_toplevel(self._win)
+        dlg = _ui_toplevel(host)
         dlg.title("Edit Base Citation")
-        dlg.transient(self._win)
+        dlg.transient(host)
         dlg.resizable(True, False)
         frame = _ui_frame(dlg)
         frame.pack(fill="both", expand=True, padx=16, pady=14)
