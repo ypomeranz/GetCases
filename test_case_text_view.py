@@ -107,6 +107,7 @@ DETAILS_NS = _load(
      "_when_resized", "_show_details_panel", "_open_details_panel",
      "_on_text_configure"],
     {"_CaseTabPage": type("_CaseTabPage", (), {}),
+     "_EmbeddedCaseHost": type("_EmbeddedCaseHost", (), {}),
      "_work_area": lambda _w: (0, 0, 1600, 900)},
 )
 

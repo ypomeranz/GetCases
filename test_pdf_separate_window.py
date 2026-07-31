@@ -301,13 +301,29 @@ class WindowMenuTests(unittest.TestCase):
 # The reader hands the PDF to the floating window
 # ---------------------------------------------------------------------------
 
+class _FakeEmbeddedReader:
+    """What _embed_text_reader builds: a chromeless copy of the opinion."""
+
+    made = []
+
+    def __init__(self, host, app, url, html, **kw):
+        self.host, self.app, self.url, self.html, self.kw = (
+            host, app, url, html, kw)
+        _FakeEmbeddedReader.made.append(self)
+
+
+READER_NAMES = [
+    "_pdf_opens_in_separate_window", "_show_pdf_floating", "_show_pdf",
+    "_floating_pdf_closed", "_surface_text_view", "_text_view_alive",
+    "_float_pdf_master", "_float_pdf_anchor", "_scan_window_title",
+    "_embed_text_reader",
+]
+
 READER_NS = _load(
-    "_ScholarTextWindow",
-    ["_pdf_opens_in_separate_window", "_show_pdf_floating", "_show_pdf",
-     "_floating_pdf_closed", "_surface_text_view", "_text_view_alive",
-     "_float_pdf_master", "_float_pdf_anchor", "_scan_window_title"],
+    "_ScholarTextWindow", READER_NAMES,
     {"_PdfPane": _FakePane,
      "_FloatingPdfWindow": _FakeFloatingWindow,
+     "_ScholarTextWindow": _FakeEmbeddedReader,
      "_is_us_reports_pdf": lambda url: "usrep" in (url or "").lower(),
      "_clamp_toplevel_to_work_area": lambda *a, **kw: (_ for _ in ()).throw(
          _InWindow()),
@@ -362,11 +378,20 @@ class _Reader:
         self.analysis_requests = []
         self.reopened = 0
         self._history_reopen = self._count_reopen
-        for name in ("_pdf_opens_in_separate_window", "_show_pdf_floating",
-                     "_show_pdf", "_floating_pdf_closed",
-                     "_surface_text_view", "_text_view_alive",
-                     "_float_pdf_master", "_float_pdf_anchor",
-                     "_scan_window_title"):
+        # What _embed_text_reader renders from — the ingredients this window
+        # was opened with, so the embedded copy refetches nothing.
+        self._item = {"caseName": "Roe v. Wade"}
+        self._cl_primary = False
+        self._cl_text = None
+        self._cl_parts = None
+        self._cl_blocks = None
+        self._primary_source_kind = "courtlistener"
+        self._primary_source_label = "CourtListener"
+        self._primary_source_url = ""
+        self._history_pdf_url = ""
+        self._scholar_url = "https://scholar.test/roe"
+        self._history_html = "<p>opinion</p>"
+        for name in READER_NAMES:
             setattr(self, name, READER_NS[name].__get__(self))
 
     # --- collaborators the extracted methods call ---
@@ -452,6 +477,8 @@ class FloatingHandoffTests(unittest.TestCase):
         self.assertEqual(kw["on_close"], reader._floating_pdf_closed)
         # The case name on the strip goes back to the text this PDF came from.
         self.assertEqual(kw["on_open_text"], reader._surface_text_view)
+        # …and the viewer's own "T" renders that same text inside itself.
+        self.assertEqual(kw["on_build_text"], reader._embed_text_reader)
 
     def test_the_window_is_named_for_the_case(self):
         # In the reporter these pages print, not in every parallel reporter
@@ -630,11 +657,15 @@ class FloatingHandoffTests(unittest.TestCase):
 # The floating viewer itself
 # ---------------------------------------------------------------------------
 
-VIEWER_NS = _load(
-    "_FloatingPdfWindow",
-    ["showing", "apply_analysis", "zoom", "alive", "close",
-     "_on_destroy", "_save", "_print", "_show_zoom", "set_title"],
-)
+# The scan/text switch these buttons drive is exercised in
+# test_pdf_text_mode.py; here the viewer only has to know it is on the scan.
+VIEWER_NAMES = [
+    "showing", "apply_analysis", "zoom", "alive", "close",
+    "_on_destroy", "_save", "_print", "_show_zoom", "set_title",
+    "showing_text",
+]
+
+VIEWER_NS = _load("_FloatingPdfWindow", VIEWER_NAMES)
 
 
 class _Viewer:
@@ -648,6 +679,10 @@ class _Viewer:
         self._zoom_var = _Var("100%")
         self._win = mock.Mock()
         self._app = None
+        self._mode = "pdf"
+        self._reader = None
+        self._text_host = None
+        self._flash_after = None
         self.cites = []
         self.printed = []
         self.saved = 0
@@ -657,9 +692,7 @@ class _Viewer:
         self._on_save = lambda: setattr(self, "saved", self.saved + 1)
         self._on_print = self.printed.append
         self._on_close = self.closed_with.append
-        for name in ("showing", "apply_analysis", "zoom",
-                     "alive", "close", "_on_destroy", "_save", "_print",
-                     "_show_zoom", "set_title"):
+        for name in VIEWER_NAMES:
             setattr(self, name, VIEWER_NS[name].__get__(self))
         # set_pdf wires the pane's zoom reports to the strip's percentage.
         self._pane.on_zoom = self._show_zoom
@@ -733,8 +766,9 @@ class ViewerTests(unittest.TestCase):
         self.assertIs(on_left, viewer._on_cite)
         self.assertEqual(quiet, {3})
         self.assertEqual(viewer._pane.find_pages, [[("c", (0, 0, 1, 1))]])
-        # The viewer owns its window, so it takes the find accelerators itself.
-        self.assertTrue(viewer._pane.find_bind)
+        # The window routes Ctrl-F itself — it has the opinion text to search
+        # as well — so the pane does not claim the accelerators.
+        self.assertFalse(viewer._pane.find_bind)
 
     def test_a_scan_with_no_text_layer_gets_no_links_or_search(self):
         viewer = _Viewer()
@@ -872,7 +906,7 @@ class StripIconTests(unittest.TestCase):
 
     def test_save_and_print_stay_on_the_context_menu_too(self):
         # Where the accelerators are written down.
-        self.assertIn("Save PDF As…", self.body)
+        self.assertIn("Save As…", self.body)
         self.assertIn("Print…", self.body)
 
 
