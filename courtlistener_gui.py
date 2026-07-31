@@ -2560,8 +2560,12 @@ def _bluebook_display_name(item: dict) -> str:
     # under — Google Scholar frequently gives a SCOTUS case only its S. Ct.
     # cite, which _pick_citation would otherwise have to settle for even
     # though the pages on screen are U.S. Reports pages.
+    # ``_scan_cite`` says the same thing for a scan of any other reporter:
+    # a Supreme Court Reporter file prints S. Ct. pages, and calling it by the
+    # U.S. Reports pages it does not print misdescribes what is on screen.
     citation_str = (
         item.get("_us_reports_cite")
+        or item.get("_scan_cite")
         or _pick_citation(item.get("citation", []))
     )
 
@@ -2612,8 +2616,10 @@ def _scan_citation_item(item: dict, url: str, printed_us_cite: str = "") -> dict
     window — or a saved file — after all of them describes pages the reader is
     not looking at.  A U.S. Reports scan is filed under its U.S. cite: the one
     the pagination in it belongs to, printed on the page when the analysis
-    could read it, else the U.S. cite among those known.  Any other scan keeps
-    the ordinary preference order.
+    could read it, else the U.S. cite among those known.  Any other reporter's
+    scan is filed under the reporter its own file names — a Supreme Court
+    Reporter scan by the S. Ct. pages it prints — and a scan whose file names
+    no reporter at all keeps the ordinary preference order.
     """
     narrowed = dict(item)
     us_cite = _normalized_us_cite(printed_us_cite or "")
@@ -2625,6 +2631,10 @@ def _scan_citation_item(item: dict, url: str, printed_us_cite: str = "") -> dict
         )
     if us_cite:
         narrowed["_us_reports_cite"] = us_cite
+        return narrowed
+    scan_cite = _case_law_reporter_cite(url)
+    if scan_cite:
+        narrowed["_scan_cite"] = scan_cite
     return narrowed
 
 
@@ -9147,7 +9157,7 @@ class CourtListenerGUI:
         # fetched below replaces them with the real caption, the parallel
         # citations and the decision date a Bluebook filename is built from.
         named = {"data": data, "url": url, "cite": cite, "name": name,
-                 "record": None, "page": None}
+                 "pin": pin, "record": None, "page": None, "pin_page": None}
 
         def described(record: dict) -> None:
             """The text has loaded: name the window properly."""
@@ -9202,9 +9212,51 @@ class CourtListenerGUI:
         if named.get("record"):        # the text beat the scan on screen
             self._retitle_cited_pdf(named)
         window.surface()
+        self._jump_to_pin(named)
         status(f"Showing the PDF of {cite}"
                + (f" at {_pin_display(pin)}" if pin else "") + ".")
         self._request_cited_pdf_analysis(window, data, url, named)
+
+    def _scan_cite_for(self, named: dict) -> str:
+        """The citation the scan in *named* is itself filed under — the pages
+        a pin cite would have to be counted against."""
+        url = named.get("url") or ""
+        printed = ""
+        analysis = named.get("analysis") or {}
+        if _is_us_reports_pdf(url):
+            printed = _normalized_us_cite(
+                str(analysis.get("pdf_cite") or "")) or ""
+            if not printed:
+                printed = next(
+                    (_normalized_us_cite(c) for c in
+                     _cluster_citations_to_strings(
+                         (named.get("record") or {}).get("cites") or [])
+                     if _normalized_us_cite(c)), "")
+            if not printed:
+                printed = _normalized_us_cite(named.get("cite") or "")
+        return printed or _case_law_reporter_cite(url)
+
+    def _jump_to_pin(self, named: dict, pdf_pages=None) -> None:
+        """Open a cited scan at the page the pin cite names.
+
+        Called twice: once as the window opens, on the arithmetic alone, and
+        again once the pages' own numbers have been read — which corrects for a
+        cover leaf.  The second is skipped if the reader has scrolled away in
+        the meantime; where they have gone is a better answer than ours."""
+        window = named.get("window")
+        pin = str(named.get("pin") or "")
+        if window is None or not pin or not window.alive():
+            return
+        target = _scan_page_for_pin(
+            self._scan_cite_for(named), pin, named.get("cite") or "",
+            pdf_pages)
+        if target is None or target == named.get("pin_page"):
+            return
+        was = named.get("pin_page")
+        if was is not None and window.viewport_page() not in (None, was):
+            return          # the reader has moved on; leave them there
+        named["pin_page"] = target
+        window.scroll_to_page(target)
 
     def _retitle_cited_pdf(self, named: dict) -> None:
         """Restate a cited case's window title as its Bluebook citation, once
@@ -9325,14 +9377,10 @@ class CourtListenerGUI:
             "court_id": court,
             "court": court,
         }
-        # A U.S. Reports scan is filed under the pages it actually prints.
-        if _is_us_reports_pdf(named.get("url") or ""):
-            us_cite = next(
-                (_normalized_us_cite(c) for c in cites
-                 if _normalized_us_cite(c)), "")
-            if us_cite:
-                item["_us_reports_cite"] = us_cite
-        return item
+        # Filed under the pages it actually prints, whichever reporter that
+        # is: the U.S. cite among those known for a U.S. Reports scan, and for
+        # any other the reporter its own file names.
+        return _scan_citation_item(item, named.get("url") or "")
 
     def _save_cited_pdf(self, named: dict, pane=None,
                         status=lambda _s: None) -> None:
@@ -9426,11 +9474,33 @@ class CourtListenerGUI:
                     sections = slip_opinion.detect_sections(pages)
                 except Exception as exc:
                     print(f"[cite-pdf] section detection failed: {exc}")
+            # What the pages call themselves, where they say: a preliminary
+            # print carries its U.S. Reports citation in the running heads
+            # precisely so it can be cited before the bound volume exists, and
+            # that is the citation to name the window and count pins against.
+            printed_cite = ""
+            if any(pages or []) and _is_us_reports_pdf(url):
+                try:
+                    printed_cite = opinion_location.us_reports_cite_from_pdf(
+                        pages)
+                except Exception as exc:
+                    print(f"[cite-pdf] reading the printed citation "
+                          f"failed: {exc}")
             result = {"url": url, "pages": pages, "links": links,
-                      "quiet": quiet, "sections": sections}
+                      "quiet": quiet, "sections": sections,
+                      "pdf_cite": printed_cite}
             if named is not None:
                 named["analysis"] = result
-            self._post_root(lambda: window.apply_analysis(result))
+
+            def ready() -> None:
+                window.apply_analysis(result)
+                if named is not None:
+                    # Now that the pages have been read, the page a pin cite
+                    # names can be confirmed against the numbers printed on
+                    # them rather than counted out from the first page.
+                    self._jump_to_pin(named, pages)
+
+            self._post_root(ready)
 
         threading.Thread(target=run, daemon=True).start()
         return True
@@ -14949,10 +15019,21 @@ class _TextFinder:
         self._entry.bind("<KeyRelease>", self._on_key)
         self._entry.bind("<Escape>", lambda _e: self.close())
         if bind_keys:
-            _bind_find_keys(win, self.open,
+            _bind_find_keys(win, self.toggle,
                             lambda: self.step(+1), lambda: self.step(-1))
         win.bind("<Escape>", lambda _e: self.close() if self._visible
                  else None)
+
+    def is_open(self) -> bool:
+        return self._visible
+
+    def toggle(self) -> None:
+        """What the find key does: open the bar, or put away the one already
+        showing.  The same key that asked for it takes it back."""
+        if self._visible:
+            self.close()
+        else:
+            self.open()
 
     def open(self) -> None:
         if not self._visible:
@@ -16515,6 +16596,7 @@ class _PdfPane(ttk.Frame):
         self._search_cur: int = -1
         self._search_ids: dict[int, list] = {}
         self._find_bar = None
+        self._find_showing = False
         # Mouse text selection (enabled with the text layer, see enable_find):
         # the anchor and range are (page_index, char_index) pairs.
         self._sel_bound = False
@@ -17427,12 +17509,23 @@ class _PdfPane(ttk.Frame):
         self._enable_selection()
         if not bind_keys:
             return
-        _bind_find_keys(self.winfo_toplevel(), self._open_find,
+        _bind_find_keys(self.winfo_toplevel(), self._toggle_find,
                         lambda: self._find_step(1),
                         lambda: self._find_step(-1))
 
     def has_find(self) -> bool:
         return bool(self._search_pages)
+
+    def find_is_open(self) -> bool:
+        """Whether the find bar is showing — recorded rather than read off the
+        widget, since a pane that is built but not packed (the scan behind an
+        opinion the reader has not left yet) reports nothing as mapped."""
+        return bool(self._find_showing)
+
+    def _toggle_find(self) -> str:
+        """What the find key does: open the bar, or put away the one already
+        showing."""
+        return self._close_find() if self.find_is_open() else self._open_find()
 
     def _open_find(self) -> str:
         if not self._search_pages:
@@ -17460,6 +17553,7 @@ class _PdfPane(ttk.Frame):
                        command=self._close_find).pack(side="right")
             self._find_bar = bar
         self._find_bar.pack(side="top", fill="x", before=self._body)
+        self._find_showing = True
         self._find_entry.focus_set()
         self._find_entry.selection_range(0, "end")
         return "break"
@@ -17468,6 +17562,7 @@ class _PdfPane(ttk.Frame):
         self._search_matches = []
         self._search_cur = -1
         self._redraw_search()
+        self._find_showing = False
         if self._find_bar is not None:
             self._find_bar.pack_forget()
         try:
@@ -18092,6 +18187,12 @@ class _FloatingPdfWindow:
         self._text_host: "Optional[_EmbeddedCaseHost]" = None
         self._reader = None
         self._flash_after = None
+        # A window that opened with no scan has one looked for behind it, by
+        # every route the PDF button uses (see _offer_scan_to_host): None
+        # while that is running, False once it has come back empty, True as
+        # soon as pages are in hand.  P is on the strip throughout, greyed
+        # until there is something for it to show.
+        self._scan_search: "Optional[bool]" = True if data is not None else None
 
         # ``parent`` owns this window's lifetime — Tk destroys a toplevel with
         # its master, so a viewer meant to outlive the reader that opened it is
@@ -18470,6 +18571,18 @@ class _FloatingPdfWindow:
                for sec in sections):
             pane.set_section_marks(sections)
 
+    def viewport_page(self) -> "Optional[int]":
+        """Which page of the scan is at the top of the view, or None when
+        there are no pages to be on."""
+        pane = self._pane
+        if pane is None:
+            return None
+        try:
+            anchor = pane.viewport_anchor()
+        except tk.TclError:
+            return None
+        return anchor[0] if anchor else None
+
     def scroll_to_page(self, page: int, y_pt: Optional[float] = None) -> None:
         """Open on the page the reader was on in the text, once laid out."""
         def go(pane=self._pane) -> None:
@@ -18530,8 +18643,55 @@ class _FloatingPdfWindow:
             self._sync_bar()
 
     def _mode_button_tip(self) -> str:
+        if not self.has_scan():
+            return ("No scan of this case could be found"
+                    if self._scan_search is False
+                    else "Looking for the scanned pages…")
         return ("Show the scanned pages" if self.showing_text()
                 else "Show the opinion text")
+
+    def attach_scan(self, data: bytes, url: str, title: str = "",
+                    *, margin: Optional[int] = None) -> bool:
+        """Take pages that arrived after this window opened.
+
+        A case the reporter interface could find no scan of from its citation
+        alone opens on the text and keeps looking; this is what a scan turning
+        up does.  The opinion on screen is left exactly as it is — all this
+        does is give the window a P to press.  Returns whether the pages were
+        taken (a window already showing some keeps those)."""
+        if self._pane is not None or self._bytes or not data:
+            return False
+        self._bytes = data
+        self._url = url
+        self._analysed_url = ""
+        self._scan_search = True
+        if title:
+            self.set_title(title)
+        try:
+            avail = self._win.winfo_width()
+        except tk.TclError:
+            avail = 0
+        width = max((avail or self._W) - 30, self._MIN_W - 40)
+        try:
+            # Built, but not packed: the opinion is what is on screen, and
+            # stays there until the reader presses P.
+            self._pane = _PdfPane(self._body, data, width=width, margin=margin,
+                                  link_style="recolor", uniform_crop=True,
+                                  autofit=True, on_zoom=self._show_zoom)
+        except Exception as exc:
+            print(f"[pdf-window] the scan that arrived could not be shown: {exc}")
+            self._bytes = None
+            self._scan_search = False
+            self._sync_bar()
+            return False
+        self._sync_bar()
+        return True
+
+    def no_scan_to_find(self) -> None:
+        """The background search came back empty: P stays, and stays grey."""
+        if self._scan_search is None:
+            self._scan_search = False
+            self._sync_bar()
 
     def _toggle_mode(self) -> None:
         """T / P: swap the scan for the opinion text and back."""
@@ -18629,9 +18789,11 @@ class _FloatingPdfWindow:
         gives its place to the Copy styles, and the scale reads out in the
         units the surface uses — a zoom percentage, or a type size.
 
-        A window showing only the one surface — a case with no scan, a scan
-        with no text — loses the switch itself: there is nothing for it to
-        switch to."""
+        A scan with no text behind it loses the switch itself: there is
+        nothing for it to switch to.  A case whose scan is still being looked
+        for keeps it, greyed, so the reader can see that the pages are coming
+        (or that there are none) rather than wondering where the button
+        went."""
         text = self.showing_text() or not self.has_scan()
         going, coming = ((self._fit_btn, self._copy_btn) if text
                          else (self._copy_btn, self._fit_btn))
@@ -18639,8 +18801,10 @@ class _FloatingPdfWindow:
             going.pack_forget()
             coming.pack(side="left", padx=(6, 0), pady=4,
                         before=self._zoom_label)
-            if self.has_scan() and self.has_text_side():
-                self._mode_btn.configure(text="P" if text else "T")
+            if self.has_text_side():
+                self._mode_btn.configure(
+                    text="P" if text else "T",
+                    state="normal" if self.has_scan() else "disabled")
                 self._mode_btn.pack(side="left", padx=(6, 0), pady=4,
                                     before=coming)
             else:
@@ -18736,6 +18900,8 @@ class _FloatingPdfWindow:
             return False
 
     def _find_open(self):
+        """The find key, on whichever surface is showing — and pressed again
+        on an open find bar, it puts it away."""
         if self.showing_text():
             try:
                 return self._reader._find_open()
@@ -18744,7 +18910,7 @@ class _FloatingPdfWindow:
         pane = self._pane
         if pane is None or not pane.has_find():
             return None
-        return pane._open_find()
+        return pane._toggle_find()
 
     def _find_step(self, direction: int):
         surface = self._reader if self.showing_text() else self._pane
@@ -18918,6 +19084,89 @@ def _case_law_reporter_cite(url: str) -> str:
         f"{int(match.group(2))} {reporter} "
         f"{int(match.group(3))}"
     )
+
+
+#: How far into a page to look for the reporter page number printed on it: a
+#: reporter puts it in the running head or in the footer, so the outermost two
+#: lines at each end are all that is read.
+_FOLIO_LINES = 2
+#: A bare number at one end of such a line.  Anything else on it is the case
+#: name or the reporter's own title, and says nothing about the page.
+_FOLIO_RE = re.compile(r"^\s*(\d{1,4})\b|\b(\d{1,4})\s*$")
+#: Figures a line reader has split apart.  Glyph boxes are the *ink*, and a
+#: "1" leaves far more room after it than the type's own advance, so a page
+#: number can arrive as "1 13" — digits parted by nothing but that gap belong
+#: to one number.
+_SPACED_DIGITS_RE = re.compile(r"(?<=\d)[ \t]+(?=\d)")
+
+
+def _printed_page_numbers(pdf_pages) -> "dict[int, int]":
+    """The reporter page number printed on each page of a scan, by page index.
+
+    Pages that print nothing readable — a plate, a cover, an OCR failure — are
+    simply absent, so the result is a check on the arithmetic rather than a
+    replacement for it."""
+    found: "dict[int, int]" = {}
+    for index, chars in enumerate(pdf_pages or ()):
+        try:
+            lines = slip_opinion.group_lines(list(chars or ()))
+        except Exception:
+            continue
+        if not lines:
+            continue
+        for line in list(lines[:_FOLIO_LINES]) + list(lines[-_FOLIO_LINES:]):
+            text = _SPACED_DIGITS_RE.sub(
+                "", getattr(line, "text", "") or "")
+            match = _FOLIO_RE.search(text)
+            if match:
+                found[index] = int(match.group(1) or match.group(2))
+                break
+    return found
+
+
+def _pin_page_number(pin: str) -> "Optional[int]":
+    """The reporter page a pin cite names — the first of a range, with any
+    footnote marker set aside.  None when it names no page at all."""
+    page, _notes = _split_note_pin(str(pin or ""))
+    match = re.search(r"\d{1,5}", page or "")
+    return int(match.group(0)) if match else None
+
+
+def _scan_page_for_pin(scan_cite: str, pin: str, cite: str = "",
+                       pdf_pages=None) -> "Optional[int]":
+    """Which page of a scan prints the page a pin cite names — 0-based.
+
+    Answered only when the pin belongs to the reporter the scan itself prints.
+    A pin is a page number in one reporter's volume: "410 U.S. at 153" locates
+    nothing in a Supreme Court Reporter scan, whose pages break elsewhere, so a
+    link whose citation names a different reporter from the file that was found
+    for it gets no jump rather than a wrong one.
+
+    Where the reporters agree, the scans run one printed page to a page of the
+    file, so the offset from the case's own first page is the answer.  When the
+    pages print their numbers, that arithmetic is checked against them — and a
+    printed number wins, since a volume slice can carry a cover leaf.
+    """
+    scan = opinion_location.parse_reporter_cite(scan_cite)
+    target = _pin_page_number(pin)
+    if scan is None or target is None or target < scan.page:
+        return None
+    if cite:
+        linked = opinion_location.parse_reporter_cite(cite)
+        if linked is not None and linked.reporter_key != scan.reporter_key:
+            return None
+    guess = target - scan.page
+    printed = _printed_page_numbers(pdf_pages) if pdf_pages else {}
+    if printed:
+        if printed.get(guess) == target:
+            return guess
+        exact = [index for index, number in printed.items()
+                 if number == target]
+        if len(exact) == 1:
+            return exact[0]
+    if pdf_pages is not None and guess >= len(pdf_pages):
+        return None
+    return guess
 
 
 _ANY_CITE_RE = re.compile(
@@ -20279,13 +20528,14 @@ class _ScholarTextWindow:
         return p
 
     def _find_open(self) -> None:
-        """Ctrl-F / Cmd-F: search whichever view the reader is looking at."""
+        """Ctrl-F / Cmd-F: search whichever view the reader is looking at —
+        and, pressed again on an open find bar, put it away."""
         pane = self._find_pane()
         if pane is not None:
             self._finder.close()
-            pane._open_find()
+            pane._toggle_find()
         else:
-            self._finder.open()
+            self._finder.toggle()
 
     def _find_step(self, delta: int) -> None:
         pane = self._find_pane()
@@ -26943,10 +27193,15 @@ class _ScholarTextWindow:
         exists so the View PDF button is enabled or left greyed out.  Warms the
         bytes for an instant view when that's allowed and the libs are present.
         """
-        if self._chromeless:
+        if self._chromeless and not self._standalone_embed:
             # Rendered inside the floating viewer, which is *showing* the scan:
             # there is no PDF button here to enable, and nothing to look up.
             return
+        # A standalone embed is the other case: a reporter window that opened
+        # on the text because the citation alone turned up no scan.  The
+        # search runs anyway — against the opinion now loaded, which knows the
+        # case's parallel citations, its court and its date — and its answer
+        # is what the window's P button waits on.
         if (self._pdf_locate_started or self._pdf_prefetch is not None
                 or (self._pdf_located is True and self._pdf_url)):
             if self._pdf_prefetch is not None or self._pdf_url:
@@ -26970,8 +27225,10 @@ class _ScholarTextWindow:
                 return
             self._pdf_url = url
             # Warm the bytes for an instant view (skipped when a big PDF is
-            # already live — prefetch_pdf=False — or the render libs are absent).
-            if self._prefetch_ok:
+            # already live — prefetch_pdf=False — or the render libs are
+            # absent).  A reporter window always warms them: the pages *are*
+            # what its P button shows, so there is nothing to defer them for.
+            if self._prefetch_ok or self._standalone_embed:
                 try:
                     import pypdfium2  # noqa: F401
                     from PIL import ImageTk  # noqa: F401
@@ -26995,6 +27252,48 @@ class _ScholarTextWindow:
             key = self._request_pdf_analysis(data, url)
             self._active_pdf_analysis_key = key
         self._refresh_pdf_button()
+        self._offer_scan_to_host(found)
+
+    def _offer_scan_to_host(self, found: bool) -> None:
+        """Give a reporter window the scan that has just been found for it.
+
+        The window opened on the text because the citation alone turned up no
+        PDF; the fuller search behind it has now answered.  Pages go straight
+        into the window — its title becomes the case as *these* pages cite it,
+        its P button comes alive, and the links and text layer follow when the
+        analysis finishes.  An empty answer leaves P where it is, greyed."""
+        if not self._standalone_embed:
+            return
+        window = getattr(self._win, "_window", None)
+        if window is None or not hasattr(window, "attach_scan"):
+            return
+        if not found or self._pdf_prefetch is None:
+            try:
+                window.no_scan_to_find()
+            except tk.TclError:
+                pass
+            return
+        data, url = self._pdf_prefetch
+        margin = _PdfPane._MARGIN * 3 if _is_us_reports_pdf(url) else None
+        try:
+            taken = window.attach_scan(data, url, self._scan_window_title(url),
+                                       margin=margin)
+        except Exception as exc:
+            print(f"[reporter] handing the scan to the window failed: {exc}")
+            return
+        if not taken:
+            return
+        # The pages' own citations, search and parts rail, once read.
+        self._request_pdf_analysis(
+            data, url,
+            callback=lambda result, w=window: self._apply_host_analysis(
+                w, result))
+
+    def _apply_host_analysis(self, window, result: dict) -> None:
+        try:
+            window.apply_analysis(result)
+        except Exception as exc:
+            print(f"[reporter] attaching the text layer failed: {exc}")
 
     def _render_courtlistener_view(self) -> None:
         """Re-show whichever CourtListener text rendering this window uses."""
@@ -28108,6 +28407,7 @@ class _PdfWindow:
         self._text_source = source
         self._text_lookup_empty = source is None
         self._maybe_start_location_map()
+        self._retitle_from_text(source)
         if source is None and self._float is not None:
             # Nothing to flip to after all: take T off the viewer's strip.
             try:
@@ -28127,6 +28427,27 @@ class _PdfWindow:
                 )
         except tk.TclError:
             pass
+
+    def _retitle_from_text(self, source) -> None:
+        """Name the viewer for the case now that the opinion has said what it
+        is called.
+
+        A scan reached by citation is opened under whatever the link said; the
+        text found for it behind the scenes — CAP's own metadata, or
+        CourtListener's — carries the caption, the parallel citations, the
+        court and the date a Bluebook citation is made of.  Cited to the
+        reporter *these* pages print, so the title describes what is on
+        screen."""
+        if source is None or self._float is None:
+            return
+        try:
+            title = _bluebook_display_name(
+                _scan_citation_item(dict(source.item or {}), self._url))
+        except Exception as exc:
+            print(f"[reporter] naming the case from its text failed: {exc}")
+            return
+        if title:
+            self._float.set_title(title)
 
     def _maybe_start_location_map(self) -> None:
         """Align a PDF-first case once both its text and text layer exist."""

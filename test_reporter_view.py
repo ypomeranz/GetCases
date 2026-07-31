@@ -379,8 +379,24 @@ def _raise(*_a, **_kw):
 # ---------------------------------------------------------------------------
 
 VIEWER_NAMES = ["has_scan", "has_text_side", "set_text_side", "_toggle_mode",
-                "showing_text", "_sync_bar", "_refresh_scale"]
-VIEWER_NS = _load("_FloatingPdfWindow", VIEWER_NAMES)
+                "showing_text", "_sync_bar", "_refresh_scale",
+                "attach_scan", "no_scan_to_find", "_mode_button_tip"]
+
+
+class _StubPane:
+    made: list = []
+
+    def __init__(self, body, data, **kw):
+        self.body, self.data, self.kw = body, data, kw
+        self.packed = False
+        _StubPane.made.append(self)
+
+    def pack(self, **kw):
+        self.packed = True
+
+
+VIEWER_NS = _load("_FloatingPdfWindow", VIEWER_NAMES,
+                  {"_PdfPane": _StubPane})
 
 
 class _Button:
@@ -388,9 +404,11 @@ class _Button:
         self.text = text
         self.packed = False
         self.before = None
+        self.state = "normal"
 
     def configure(self, **kw):
         self.text = kw.get("text", self.text)
+        self.state = kw.get("state", self.state)
 
     def pack(self, **kw):
         self.packed = True
@@ -401,9 +419,18 @@ class _Button:
 
 
 class _Viewer:
+    _W = 720
+    _MIN_W = 380
+
     def __init__(self, scan=True, build_text=None, reader=None):
         self._pane = object() if scan else None
         self._bytes = b"%PDF" if scan else None
+        self._scan_search = True if scan else None
+        self._url = ""
+        self._analysed_url = "x"
+        self._body = object()
+        self._win = _Widget()
+        self.titles: list = []
         self._mode = "pdf"
         self._reader = reader
         self._on_build_text = build_text
@@ -419,6 +446,12 @@ class _Viewer:
         self.switched = []
         for name in VIEWER_NAMES:
             setattr(self, name, VIEWER_NS[name].__get__(self))
+
+    def set_title(self, title):
+        self.titles.append(title)
+
+    def _show_zoom(self, *a, **kw):
+        pass
 
     # what _toggle_mode calls once it has decided to switch
     def _show_text(self):
@@ -469,10 +502,114 @@ class NoTextSideTests(unittest.TestCase):
         self.assertIsNotNone(viewer._on_build_text)
 
     def test_a_window_that_is_only_text_is_not_touched_by_that(self):
-        # No scan at all: the switch is already gone for the other reason.
+        # No scan at all: the switch is greyed, for the other reason.
         viewer = _Viewer(scan=False, reader=object())
         viewer.set_text_side(False)
         self.assertTrue(viewer.has_text_side())
+
+
+class ScanStillComingTests(unittest.TestCase):
+    """A case that opened on the text keeps P on the strip, greyed, while the
+    scan is looked for behind it — and comes alive if one turns up."""
+
+    def setUp(self):
+        _StubPane.made.clear()
+
+    def _text_only(self):
+        # As adopt_reader leaves it: the opinion is the surface on screen.
+        viewer = _Viewer(scan=False, reader=object())
+        viewer._mode = "text"
+        return viewer
+
+    def test_p_is_on_the_strip_from_the_start(self):
+        viewer = self._text_only()
+        viewer._sync_bar()
+        self.assertTrue(viewer._mode_btn.packed)
+        self.assertEqual(viewer._mode_btn.text, "P")
+
+    def test_but_greyed_out_while_there_is_nothing_to_show(self):
+        viewer = self._text_only()
+        viewer._sync_bar()
+        self.assertEqual(viewer._mode_btn.state, "disabled")
+
+    def test_and_it_says_which_it_is(self):
+        viewer = self._text_only()
+        self.assertIn("Looking", viewer._mode_button_tip())
+        viewer.no_scan_to_find()
+        self.assertIn("could be found", viewer._mode_button_tip())
+
+    def test_a_scan_that_turns_up_is_taken(self):
+        viewer = self._text_only()
+        self.assertTrue(viewer.attach_scan(b"%PDF", "https://x/1.pdf"))
+        self.assertTrue(viewer.has_scan())
+        self.assertEqual(_StubPane.made[0].data, b"%PDF")
+
+    def test_and_wakes_the_button_up(self):
+        viewer = self._text_only()
+        viewer.attach_scan(b"%PDF", "https://x/1.pdf")
+        self.assertEqual(viewer._mode_btn.state, "normal")
+        self.assertEqual(viewer._mode_btn.text, "P")
+
+    def test_the_opinion_on_screen_is_left_where_it_is(self):
+        viewer = self._text_only()
+        viewer.attach_scan(b"%PDF", "https://x/1.pdf")
+        self.assertTrue(viewer.showing_text())
+        self.assertFalse(_StubPane.made[0].packed)   # built, not shown
+
+    def test_and_the_window_takes_the_name_the_pages_carry(self):
+        viewer = self._text_only()
+        viewer.attach_scan(b"%PDF", "https://x/1.pdf", "Roe v. Wade, 410 U.S. 113")
+        self.assertEqual(viewer.titles, ["Roe v. Wade, 410 U.S. 113"])
+
+    def test_a_window_already_showing_pages_keeps_them(self):
+        viewer = _Viewer(scan=True, build_text=lambda h: object())
+        self.assertFalse(viewer.attach_scan(b"%PDF2", "https://x/2.pdf"))
+        self.assertEqual(_StubPane.made, [])
+
+    def test_an_empty_search_leaves_the_button_greyed(self):
+        viewer = self._text_only()
+        viewer.no_scan_to_find()
+        viewer._sync_bar()
+        self.assertTrue(viewer._mode_btn.packed)
+        self.assertEqual(viewer._mode_btn.state, "disabled")
+
+    def test_the_reader_behind_it_is_the_one_that_looks(self):
+        src = _source_of("_ScholarTextWindow", "_offer_scan_to_host")
+        self.assertIn("if not self._standalone_embed:", src)
+        self.assertIn("window.no_scan_to_find()", src)
+        self.assertIn("window.attach_scan(data, url, "
+                      "self._scan_window_title(url)", src)
+
+    def test_and_the_pages_own_links_follow_when_they_are_read(self):
+        src = _source_of("_ScholarTextWindow", "_offer_scan_to_host")
+        self.assertIn("self._request_pdf_analysis(", src)
+        self.assertIn("self._apply_host_analysis(", src)
+
+
+class ScanTitleTests(unittest.TestCase):
+    """The window takes the case's Bluebook citation once the text says what
+    it is — cited to the reporter the pages on screen actually print."""
+
+    def test_a_cited_scan_is_renamed_from_the_text_found_for_it(self):
+        src = _source_of("CourtListenerGUI", "_cited_filename_item")
+        self.assertIn("_scan_citation_item(item, named.get(\"url\") or \"\")",
+                      src)
+
+    def test_and_so_is_one_the_courier_went_looking_for(self):
+        src = _source_of("_PdfWindow", "_retitle_from_text")
+        self.assertIn("_scan_citation_item(dict(source.item or {}), self._url)",
+                      src)
+        self.assertIn("self._float.set_title(title)", src)
+        discovered = _source_of("_PdfWindow", "_on_text_discovered")
+        self.assertIn("self._retitle_from_text(source)", discovered)
+
+    def test_the_reporter_the_scan_names_beats_the_usual_order(self):
+        src = _source_of("CourtListenerGUI", "_show_cited_case_pdf")
+        self.assertIn("self._jump_to_pin(named)", src)
+        name = next(ast.get_source_segment(SRC, n) for n in TREE.body
+                    if isinstance(n, ast.FunctionDef)
+                    and n.name == "_bluebook_display_name")
+        self.assertIn('item.get("_scan_cite")', name)
 
 
 # ---------------------------------------------------------------------------

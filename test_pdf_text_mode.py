@@ -221,7 +221,19 @@ class _FakePane:
 
     def _open_find(self):
         self.stepped.append("open")
+        self.find_open = True
         return "break"
+
+    def find_is_open(self):
+        return getattr(self, "find_open", False)
+
+    def _toggle_find(self):
+        """The find key: opens the bar, or puts away the one showing."""
+        if self.find_is_open():
+            self.stepped.append("close")
+            self.find_open = False
+            return "break"
+        return self._open_find()
 
     def _find_step(self, direction):
         self.stepped.append(direction)
@@ -827,9 +839,17 @@ class ChromelessReaderTests(unittest.TestCase):
         # button here to enable or grey out — the lookup would be a network
         # round trip for nothing.
         src = _source_of("_ScholarTextWindow", "_locate_pdf")
-        self.assertIn("if self._chromeless:", src)
-        self.assertLess(src.index("if self._chromeless:"),
+        self.assertIn("if self._chromeless and not self._standalone_embed:",
+                      src)
+        self.assertLess(src.index("if self._chromeless"),
                         src.index("_pdf_locate_started"))
+
+    def test_but_a_reporter_window_with_no_scan_yet_does(self):
+        # There the lookup is the point: the window opened on the text and its
+        # P button is waiting on the answer.
+        src = _source_of("_ScholarTextWindow", "_locate_pdf")
+        self.assertIn("not self._standalone_embed", src)
+        self.assertIn("self._prefetch_ok or self._standalone_embed", src)
 
 
 PAGECOL_DIGITS = _class_attr("_ScholarTextWindow", "_PAGECOL_DIGITS")
