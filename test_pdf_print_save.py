@@ -528,25 +528,37 @@ class WriteOutputTests(unittest.TestCase):
     def tearDown(self):
         pathlib.Path(self.path).unlink(missing_ok=True)
 
-    def test_the_pane_renders_what_is_written(self):
+    def test_the_lossless_crop_is_what_is_written(self):
+        # It keeps the pages' own resolution and, above all, their text: a PDF
+        # with no text in it invites a reader to run its own OCR over it.
         pane = mock.Mock()
         self.assertTrue(self.write(self.path, b"%PDF-orig", pane))
-        pane.export_pdf.assert_called_once_with(
+        pane.export_cropped_pdf.assert_called_once_with(
             self.path, whiten_redactions=False, header_cite="")
+        pane.export_pdf.assert_not_called()
 
     def test_the_redaction_treatment_goes_through(self):
         pane = mock.Mock()
         self.write(self.path, b"%PDF", pane, whiten=True, header="410 U.S. 113")
         self.assertEqual(
-            pane.export_pdf.call_args.kwargs,
+            pane.export_cropped_pdf.call_args.kwargs,
             {"whiten_redactions": True, "header_cite": "410 U.S. 113"})
 
     def test_with_no_pane_the_original_is_written(self):
         self.assertFalse(self.write(self.path, b"%PDF-orig", None))
         self.assertEqual(pathlib.Path(self.path).read_bytes(), b"%PDF-orig")
 
-    def test_a_rendering_that_fails_falls_back_to_the_original(self):
+    def test_a_crop_that_fails_falls_back_to_rendering(self):
         pane = mock.Mock()
+        pane.export_cropped_pdf.side_effect = RuntimeError("no boxes")
+        self.assertTrue(self.write(self.path, b"%PDF-orig", pane,
+                                   whiten=True, header="410 U.S. 113"))
+        pane.export_pdf.assert_called_once_with(
+            self.path, whiten_redactions=True, header_cite="410 U.S. 113")
+
+    def test_and_both_failing_falls_back_to_the_original(self):
+        pane = mock.Mock()
+        pane.export_cropped_pdf.side_effect = RuntimeError("no boxes")
         pane.export_pdf.side_effect = RuntimeError("no pdfium")
         self.assertFalse(self.write(self.path, b"%PDF-orig", pane))
         self.assertEqual(pathlib.Path(self.path).read_bytes(), b"%PDF-orig")

@@ -15169,6 +15169,24 @@ def _clean_reporter_pdf(data: bytes) -> bytes:
     return _strip_preliminary_print_cover(_strip_page_proof_watermark(data))
 
 
+def _pdf_object_bounds(obj) -> Optional[tuple]:
+    """A page object's ``(left, bottom, right, top)`` in page points.
+
+    pypdfium2 has called this ``get_bounds`` and, in older releases,
+    ``get_pos``; asking for the wrong one raises AttributeError, which is easy
+    to swallow and leaves whatever depends on it quietly never firing."""
+    for name in ("get_bounds", "get_pos"):
+        getter = getattr(obj, name, None)
+        if getter is None:
+            continue
+        try:
+            left, bottom, right, top = getter()
+        except Exception:
+            return None
+        return (left, bottom, right, top)
+    return None
+
+
 def _page_has_scan_background(page) -> bool:
     """True when a page appears to be an OCR layer over a full-page scan."""
     import pypdfium2.raw as C
@@ -15198,10 +15216,10 @@ def _page_has_scan_background(page) -> bool:
                 image_objs += 1
             elif obj_type is not None:
                 continue
-            try:
-                ol, ob, orr, ot = obj.get_pos()
-            except Exception:
+            bounds = _pdf_object_bounds(obj)
+            if bounds is None:
                 continue
+            ol, ob, orr, ot = bounds
             ow, oh = orr - ol, ot - ob
             if ow <= 0 or oh <= 0:
                 continue
@@ -15326,6 +15344,132 @@ def _frac_box_to_points(frac: tuple, mb: tuple) -> Optional[tuple]:
     return (mb[0] + fl * w, mb[3] - fb * h, mb[0] + fr * w, mb[3] - ft * h)
 
 
+def _pdf_fill_rect(page, x0: float, y0: float, x1: float, y1: float,
+                   rgb: tuple = (255, 255, 255)) -> None:
+    """Paint a filled rectangle on to *page*, in the page's own points."""
+    import pypdfium2.raw as pdfium_c
+
+    obj = pdfium_c.FPDFPageObj_CreateNewRect(x0, y0, x1 - x0, y1 - y0)
+    pdfium_c.FPDFPageObj_SetFillColor(obj, rgb[0], rgb[1], rgb[2], 255)
+    pdfium_c.FPDFPath_SetDrawMode(obj, pdfium_c.FPDF_FILLMODE_WINDING, False)
+    pdfium_c.FPDFPage_InsertObject(page.raw, obj)
+
+
+def _pdf_new_text(doc, text: str, size: float = 10.0):
+    """A text object holding *text*, and its ``(width, height)`` at *size*."""
+    import ctypes
+
+    import pypdfium2.raw as pdfium_c
+
+    font = pdfium_c.FPDFText_LoadStandardFont(doc.raw, b"Times-Roman")
+    obj = pdfium_c.FPDFPageObj_CreateTextObj(doc.raw, font, size)
+    buf = ctypes.create_string_buffer(text.encode("utf-16-le") + b"\x00\x00")
+    if not pdfium_c.FPDFText_SetText(
+        obj, ctypes.cast(buf, ctypes.POINTER(ctypes.c_ushort))
+    ):
+        pdfium_c.FPDFPageObj_Destroy(obj)
+        return None, (0.0, 0.0)
+    pdfium_c.FPDFPageObj_SetFillColor(obj, 0, 0, 0, 255)
+    left, bottom, right, top = (ctypes.c_float() for _ in range(4))
+    pdfium_c.FPDFPageObj_GetBounds(obj, left, bottom, right, top)
+    return obj, (right.value - left.value, top.value - bottom.value)
+
+
+def _paint_out_pdf_redactions(pdf_bytes: bytes, plan: list,
+                              frac_boxes: Optional[list] = None,
+                              header_text: str = "") -> tuple:
+    """Erase a redacted scan's black bars by *drawing on the page* rather than
+    by repainting a picture of it, and letter the running head back on.
+
+    The bars are baked into the page bitmap, so where they are can only be
+    found by looking at a render — that is what *plan* carries, as fractions
+    of each page.  Painting them out here, though, leaves everything else
+    alone: the scan keeps its own resolution and, above all, its text, so the
+    file that is printed or saved is still searchable and no PDF reader is
+    tempted to run its own OCR over it.
+
+    Returns the new bytes and the surviving pages' content boxes (a page the
+    redaction left with nothing but boxes and its number is dropped)."""
+    import io
+
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as pdfium_c
+
+    with _PDFIUM_LOCK:
+        doc = pdfium.PdfDocument(pdf_bytes)
+        try:
+            # One size for the whole document: the text is the same on every
+            # page, so measure it once and shrink to the narrowest line.
+            probe, (text_w, text_h) = (
+                _pdf_new_text(doc, header_text) if header_text
+                else (None, (0.0, 0.0))
+            )
+            if probe is not None:
+                pdfium_c.FPDFPageObj_Destroy(probe)
+            scale = 0.0
+            if text_w > 0:
+                for i, entry in enumerate(plan):
+                    head = entry.get("head")
+                    if not head or entry.get("drop") or i >= len(doc):
+                        continue
+                    page = doc[i]
+                    try:
+                        _l, b, r, t = page.get_mediabox()
+                    finally:
+                        page.close()
+                    w_pt, h_pt = r - _l, t - b
+                    fit_w = 0.92 * (head[2] - head[0]) * w_pt / text_w
+                    fit_h = 0.80 * (head[3] - head[1]) * h_pt / max(text_h, 0.1)
+                    room = min(fit_w, fit_h)
+                    scale = room if scale == 0.0 else min(scale, room)
+            kept: list = []
+            for i in range(len(doc)):
+                entry = plan[i] if i < len(plan) else {}
+                if entry.get("drop"):
+                    continue
+                kept.append(frac_boxes[i]
+                            if frac_boxes and i < len(frac_boxes) else None)
+                page = doc[i]
+                try:
+                    ml, mb, mr, mt = page.get_mediabox()
+                    w_pt, h_pt = mr - ml, mt - mb
+                    # The detector measures a bar on a downsampled render, so
+                    # its box can stop a shade inside the ink.  Paint a little
+                    # wider than asked: a sliver of surviving bar is far more
+                    # noticeable than a hair of extra white.
+                    pad = max(1.5, 0.003 * w_pt)
+                    for fl, ft, fr, fb in entry.get("boxes", ()):
+                        # Fractions are measured from the top of the page; PDF
+                        # coordinates count up from the bottom.
+                        _pdf_fill_rect(
+                            page,
+                            ml + fl * w_pt - pad, mt - fb * h_pt - pad,
+                            ml + fr * w_pt + pad, mt - ft * h_pt + pad,
+                        )
+                    head = entry.get("head")
+                    if head and header_text and scale > 0:
+                        obj, _size = _pdf_new_text(doc, header_text)
+                        if obj is not None:
+                            cx = ml + (head[0] + head[2]) / 2 * w_pt
+                            cy = mt - (head[1] + head[3]) / 2 * h_pt
+                            pdfium_c.FPDFPageObj_Transform(
+                                obj, scale, 0, 0, scale,
+                                cx - text_w * scale / 2,
+                                cy - text_h * scale / 2)
+                            pdfium_c.FPDFPage_InsertObject(page.raw, obj)
+                    pdfium_c.FPDFPage_GenerateContent(page.raw)
+                finally:
+                    page.close()
+            for i in range(len(doc) - 1, -1, -1):
+                if i < len(plan) and plan[i].get("drop"):
+                    doc.del_page(i)
+            buf = io.BytesIO()
+            doc.save(buf)
+            return buf.getvalue(), kept
+        finally:
+            doc.close()
+
+
 def _crop_pdf_to_content(
     pdf_bytes: bytes,
     frac_boxes: Optional[list] = None,
@@ -15335,11 +15479,16 @@ def _crop_pdf_to_content(
     boxes — a lossless crop that removes the wide blank borders while leaving
     the original (selectable) text untouched.
 
-    Content is detected from the page objects (:func:`_page_content_box_pts`);
-    for a page where that fails — a bare scan — the matching entry in
-    *frac_boxes* (the viewer's ink-detected fraction) is used, so scanned pages
-    crop too.  A small *margin_pt* is left around the content and the result is
-    clamped to the original media box so a page is never enlarged."""
+    Content is detected from the page objects (:func:`_page_content_box_pts`),
+    which is exact for a born-digital file.  A *scan* is different: the page's
+    objects are a full-page picture — which that function ignores, as it tells
+    nothing about where the ink is — over an OCR layer whose invisible glyphs
+    sit wherever the recognizer put them, which is not the printed page's
+    margins.  So a scanned page is cropped to the viewer's own ink-detected
+    box from *frac_boxes* instead, which is what the reader sees on screen.
+
+    A small *margin_pt* is left around the content and the result is clamped to
+    the original media box so a page is never enlarged."""
     import io
 
     import pypdfium2 as pdfium
@@ -15351,9 +15500,14 @@ def _crop_pdf_to_content(
                 page = doc[i]
                 try:
                     mb = tuple(page.get_mediabox())
-                    box = _page_content_box_pts(page)
-                    if box is None and frac_boxes and i < len(frac_boxes):
-                        box = _frac_box_to_points(frac_boxes[i], mb)
+                    ink = (_frac_box_to_points(frac_boxes[i], mb)
+                           if frac_boxes and i < len(frac_boxes)
+                           and frac_boxes[i] else None)
+                    box = None
+                    if not _page_has_scan_background(page):
+                        box = _page_content_box_pts(page)
+                    if box is None:
+                        box = ink
                     if box is None:
                         continue  # leave this page at full size
                     l, b, r, t = box
@@ -17444,6 +17598,31 @@ class _PdfPane(ttk.Frame):
                 except Exception:
                     pass
 
+    def has_selectable_text(self) -> bool:
+        """Whether the document carries selectable text *anywhere* — a
+        born-digital file, or a scan with an OCR layer over it.
+
+        Wider than :meth:`has_text_layer`, which asks the narrower question of
+        whether the file is born-digital.  This one decides whether a copy of
+        the document can be handed on with its text intact, which is what
+        keeps a PDF reader from running its own OCR over it."""
+        try:
+            with _PDFIUM_LOCK:
+                for i in range(len(self._doc)):
+                    page = self._doc[i]
+                    try:
+                        tp = page.get_textpage()
+                        try:
+                            if tp.count_chars() > 0:
+                                return True
+                        finally:
+                            tp.close()
+                    finally:
+                        page.close()
+        except Exception:
+            return False
+        return False
+
     def has_text_layer(self) -> bool:
         """True when the PDF carries a real selectable text layer (born-digital,
         not a bare scan) — the case where a lossless, text-preserving crop is
@@ -17468,14 +17647,76 @@ class _PdfPane(ttk.Frame):
             return False
         return any_text
 
-    def export_cropped_pdf(self, path: str) -> None:
+    #: Resolution the redaction bars are looked for at.  The detector averages
+    #: the page down 4× anyway, so this only has to be enough to tell a solid
+    #: block from a line of type.
+    _REDACT_SCAN_DPI = 110
+
+    def _redaction_plan(self, header_cite: str = "") -> list:
+        """Where each page's redaction bars are, as fractions of the page.
+
+        The bars are part of the scan's own bitmap, so the only way to find
+        them is to look at a render — but recorded as fractions they can be
+        painted out on the page itself, which is what keeps the text layer
+        (see :func:`_paint_out_pdf_redactions`)."""
+        plan: list = []
+        scale = self._REDACT_SCAN_DPI / 72.0
+        for i in range(len(self._meta)):
+            entry: dict = {"boxes": (), "head": None, "drop": False}
+            try:
+                with _PDFIUM_LOCK:
+                    page = self._doc[i]
+                    try:
+                        img = page.render(scale=scale).to_pil().convert("RGB")
+                        try:
+                            tp = page.get_textpage()
+                            try:
+                                text = tp.get_text_range()
+                            finally:
+                                tp.close()
+                        except Exception:
+                            text = ""
+                    finally:
+                        page.close()
+                boxes = _whiten_pdf_redactions(img)
+                size = img.size
+                img.close()
+            except Exception as exc:
+                print(f"[pdf] reading page {i + 1} for redactions: {exc}")
+                plan.append(entry)
+                continue
+            W, H = size
+            if _page_fully_redacted(text, boxes, size):
+                entry["drop"] = True
+                plan.append(entry)
+                continue
+            head = _header_redaction_box(boxes, size) if header_cite else None
+            entry["boxes"] = tuple(
+                (l / W, t / H, r / W, b / H) for l, t, r, b in boxes)
+            if head:
+                entry["head"] = (head[0] / W, head[1] / H,
+                                 head[2] / W, head[3] / H)
+            plan.append(entry)
+        return plan
+
+    def export_cropped_pdf(self, path: str, *, whiten_redactions: bool = False,
+                           header_cite: str = "") -> None:
         """Write a PDF cropped to each page's content with the selectable text
         layer preserved (see :func:`_crop_pdf_to_content`).  The viewer's
         ink-detected boxes are passed as the per-page fallback so scanned pages
-        still crop."""
-        out = _crop_pdf_to_content(
-            self._pdf_bytes, frac_boxes=[m[2] for m in self._meta]
-        )
+        still crop.
+
+        ``whiten_redactions`` paints out a case.law scan's black bars and
+        letters ``header_cite`` back on to the running head they took the
+        citation from — drawn on to the page, so the crop stays lossless and
+        the text survives."""
+        data = self._pdf_bytes
+        frac_boxes = [m[2] for m in self._meta]
+        if whiten_redactions:
+            data, frac_boxes = _paint_out_pdf_redactions(
+                data, self._redaction_plan(header_cite), frac_boxes,
+                header_text=header_cite)
+        out = _crop_pdf_to_content(data, frac_boxes=frac_boxes)
         with open(path, "wb") as fh:
             fh.write(out)
 
@@ -27776,14 +28017,31 @@ class _PdfWindow:
 
 def _write_output_pdf(path: str, data: bytes, pane, *,
                       whiten: bool = False, header: str = "") -> bool:
-    """Write the document as the viewer *shows* it — each page cropped to its
-    content and re-centred on a clean page with the viewer's own margin, a
-    redacted case.law scan whitened and its running head re-lettered.
+    """Write the document cropped to its content the way the viewer shows it.
 
-    Both saving and printing go through here, so the file that comes off Save
-    is the file that would come off the printer.  Returns whether the rendering
-    was used; the original bytes are written when there is no pane to render
-    from, or when rendering fails."""
+    Two ways of doing that, and the first is much the better one.  Tightening
+    the page boxes crops *losslessly*: the pages keep their own resolution and,
+    crucially, their text — a scan's OCR layer included.  That matters beyond
+    being able to search the file afterwards: handed a PDF with no text in it
+    at all, a reader is entitled to conclude there is text to be recovered, and
+    older Acrobat duly runs its own OCR over the pages and then prints the
+    "suspect word" highlighting it produces, all over the opinion.
+
+    The second way re-renders the pages as images, which is needed only when
+    the pixels themselves must change: erasing a redacted case.law scan's black
+    bars and re-lettering the running head they took the citation from.
+
+    Both saving and printing come through here, so the file that comes off Save
+    is the file that would come off the printer.  Returns whether the document
+    was written from the pane at all; the original bytes are written when there
+    is no pane, or when both routes fail."""
+    if pane is not None:
+        try:
+            pane.export_cropped_pdf(path, whiten_redactions=whiten,
+                                    header_cite=header)
+            return True
+        except Exception as exc:
+            print(f"[pdf] the lossless crop failed ({exc}); rendering instead")
     try:
         if pane is not None:
             pane.export_pdf(path, whiten_redactions=whiten,

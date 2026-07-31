@@ -373,18 +373,19 @@ class CitedCaseFilenameTests(unittest.TestCase):
     def test_printing_uses_the_rendering_on_screen(self):
         pane = mock.Mock()
         self.app._print_cited_pdf(self.named, pane=pane)
-        pane.export_pdf.assert_called_once()
+        pane.export_cropped_pdf.assert_called_once()
 
     def test_a_redacted_scan_is_whitened_and_re_lettered_for_paper(self):
         self.named["url"] = "https://static.case.law/f2d/500/0123-01.pdf"
         pane = mock.Mock()
         self.app._print_cited_pdf(self.named, pane=pane)
-        kwargs = pane.export_pdf.call_args.kwargs
+        kwargs = pane.export_cropped_pdf.call_args.kwargs
         self.assertTrue(kwargs["whiten_redactions"])
         self.assertEqual(kwargs["header_cite"], "HEADER")
 
     def test_a_pane_that_will_not_export_still_prints_the_original(self):
         pane = mock.Mock()
+        pane.export_cropped_pdf.side_effect = RuntimeError("no")
         pane.export_pdf.side_effect = RuntimeError("no")
         self.app._print_cited_pdf(self.named, pane=pane)
         self.assertEqual(PRINTED, ["/tmp/NAME.pdf"])
