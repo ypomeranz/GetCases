@@ -786,7 +786,88 @@ class StoredUsCiteTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 4. A pin cite, and the page of the scan that prints it
+# 4. What names the case: its own caption, not the docket one
+# ---------------------------------------------------------------------------
+
+NAME_NS = _load("_ScholarTextWindow", ["_filename_item", "_scan_window_title",
+                                       "_pdf_filename_item"],
+                {"_scan_citation_item": SCAN_CITATION_ITEM,
+                 "_bluebook_display_name": lambda item: (
+                     f"{item.get('caseName')} | "
+                     f"{(item.get('_us_reports_cite') or item.get('_scan_cite') or (item.get('citation') or [''])[0])}")})
+
+
+class _NamedReader:
+    def __init__(self, item, caption):
+        self._item = item
+        self._bb = {"name": caption, "cite": "137 S. Ct. 911"}
+        for name in ("_filename_item", "_scan_window_title",
+                     "_pdf_filename_item"):
+            setattr(self, name, NAME_NS[name].__get__(self))
+
+    def _shown_us_reports_cite(self):
+        return ""
+
+    def _title_citation(self):
+        return ""
+
+
+#: What CourtListener's search result calls it, and what the reports print.
+DOCKET_ITEM = {"caseName": "Manuel v. City of Joliet, Illinois",
+               "citation": ["137 S. Ct. 911"],
+               "dateFiled": "2017-03-21", "court_id": "scotus"}
+CAPTION = "Manuel v. City of Joliet"
+SLIP_URL = "https://www.supremecourt.gov/opinions/16pdf/14-9496.pdf"
+
+
+class CaseNameTests(unittest.TestCase):
+    """A search result carries the caption the court docketed the case under;
+    the opinion carries the one the reports print."""
+
+    def test_the_opinion_s_own_caption_names_the_case(self):
+        reader = _NamedReader(DOCKET_ITEM, CAPTION)
+        self.assertEqual(reader._filename_item()["caseName"], CAPTION)
+
+    def test_and_names_the_window_the_scan_opens_in(self):
+        reader = _NamedReader(DOCKET_ITEM, CAPTION)
+        self.assertTrue(
+            reader._scan_window_title(SLIP_URL).startswith(CAPTION + " |"))
+
+    def test_and_the_file_a_scan_is_saved_as(self):
+        reader = _NamedReader(DOCKET_ITEM, CAPTION)
+        self.assertEqual(reader._pdf_filename_item()["caseName"], CAPTION)
+
+    def test_everything_else_about_the_case_still_comes_from_the_result(self):
+        item = _NamedReader(DOCKET_ITEM, CAPTION)._filename_item()
+        self.assertEqual(item["dateFiled"], "2017-03-21")
+        self.assertEqual(item["court_id"], "scotus")
+        self.assertEqual(item["citation"], ["137 S. Ct. 911"])
+
+    def test_the_result_itself_is_not_rewritten(self):
+        _NamedReader(DOCKET_ITEM, CAPTION)._filename_item()
+        self.assertEqual(DOCKET_ITEM["caseName"],
+                         "Manuel v. City of Joliet, Illinois")
+
+    def test_no_caption_to_read_leaves_the_result_s_name(self):
+        # A window opened straight onto a scan has no opinion text to ask.
+        reader = _NamedReader(DOCKET_ITEM, "")
+        self.assertEqual(reader._filename_item()["caseName"],
+                         "Manuel v. City of Joliet, Illinois")
+
+    def test_a_stale_case_name_key_does_not_outvote_it(self):
+        item = dict(DOCKET_ITEM, case_name="Manuel v. City of Joliet, Ill.")
+        self.assertNotIn("case_name",
+                         _NamedReader(item, CAPTION)._filename_item())
+
+    def test_a_reader_with_no_result_behind_it_is_unchanged(self):
+        reader = _NamedReader(None, CAPTION)
+        reader._bb = {"name": CAPTION, "cite": "137 S. Ct. 911",
+                      "year": "2017", "court": ""}
+        self.assertEqual(reader._filename_item()["caseName"], CAPTION)
+
+
+# ---------------------------------------------------------------------------
+# 5. A pin cite, and the page of the scan that prints it
 # ---------------------------------------------------------------------------
 
 

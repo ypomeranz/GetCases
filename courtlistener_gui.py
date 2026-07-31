@@ -23908,9 +23908,27 @@ class _ScholarTextWindow:
         return omit, len(fids)
 
     def _filename_item(self) -> dict:
-        if self._item:
-            return self._item
+        """What names this case — for the window title, and for a file saved
+        or printed from it.
+
+        The opinion's own caption, read off the page it was loaded from and
+        put through the Bluebook abbreviator, is the name to use: a search
+        result carries the docket caption the court filed under ("Manuel v.
+        City of Joliet, Illinois") where the reports print the case ("Manuel
+        v. City of Joliet").  Everything else about it — the court, the date,
+        the parallel citations — still comes from the result when there is
+        one; only the name is the opinion's to give, and only when it gave
+        one (a window opened on a scan has no caption to read).
+        """
         bb = self._bb
+        if self._item:
+            name = bb.get("name") or ""
+            if not name:
+                return self._item
+            item = dict(self._item)
+            item["caseName"] = name
+            item.pop("case_name", None)
+            return item
         return {
             "caseName": bb["name"],
             "citation": [bb["cite"]] if bb["cite"] else [],
@@ -28461,8 +28479,16 @@ class _PdfWindow:
         if source is None or self._float is None:
             return
         try:
+            item = dict(source.item or {})
+            # The opinion's own caption over the docket caption its metadata
+            # carries — the reports print "Manuel v. City of Joliet" where the
+            # court filed "Manuel v. City of Joliet, Illinois".
+            caption = _scholar_caption_name(list(source.blocks or ()))
+            if caption:
+                item["caseName"] = caption
+                item.pop("case_name", None)
             title = _bluebook_display_name(
-                _scan_citation_item(dict(source.item or {}), self._url))
+                _scan_citation_item(item, self._url))
         except Exception as exc:
             print(f"[reporter] naming the case from its text failed: {exc}")
             return

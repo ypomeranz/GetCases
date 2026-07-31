@@ -641,11 +641,20 @@ class ScanTitleTests(unittest.TestCase):
 
     def test_and_so_is_one_the_courier_went_looking_for(self):
         src = _source_of("_PdfWindow", "_retitle_from_text")
-        self.assertIn("_scan_citation_item(dict(source.item or {}), self._url)",
-                      src)
+        self.assertIn("_scan_citation_item(item, self._url)", src)
         self.assertIn("self._float.set_title(title)", src)
         discovered = _source_of("_PdfWindow", "_on_text_discovered")
         self.assertIn("self._retitle_from_text(source)", discovered)
+
+    def test_named_from_the_opinion_s_caption_not_its_docket_one(self):
+        for cls, name in (("_PdfWindow", "_retitle_from_text"),
+                          ("_ScholarTextWindow", "_filename_item")):
+            src = _source_of(cls, name)
+            self.assertIn('item.pop("case_name", None)', src)
+        self.assertIn("_scholar_caption_name(list(source.blocks or ()))",
+                      _source_of("_PdfWindow", "_retitle_from_text"))
+        self.assertIn('name = bb.get("name") or ""',
+                      _source_of("_ScholarTextWindow", "_filename_item"))
 
     def test_the_reporter_the_scan_names_beats_the_usual_order(self):
         src = _source_of("CourtListenerGUI", "_show_cited_case_pdf")
