@@ -17559,21 +17559,23 @@ class _FloatingPdfWindow:
 
     def _place_beside(self, anchor: "Optional[tk.Misc]") -> None:
         """Open next to the reader rather than over it — keeping the page from
-        covering the text is the point of the mode.  Falls back to the right
-        edge of the desktop when neither side of the reader has room."""
+        covering the text is the point of the mode.  The left of the desktop is
+        where it goes: to the reader's left when there is room there, to its
+        right when there is not, and against the left edge when neither side of
+        the reader can hold it."""
         left, top, work_w, work_h = _work_area(self._win)
         w = max(self._MIN_W, min(self._W, max(self._MIN_W, work_w - 32)))
         h = max(self._MIN_H, min(self._H, max(self._MIN_H, work_h - 72)))
-        x = left + max(16, work_w - w - 24)
+        x = left + 16
         y = top + 24
         try:
             if anchor is not None and anchor.winfo_exists():
                 anchor.update_idletasks()
                 ax, aw = anchor.winfo_rootx(), anchor.winfo_width()
-                if left + work_w - (ax + aw) >= w + 24:
-                    x = ax + aw + 12          # room to the reader's right
-                elif ax - left >= w + 24:
-                    x = ax - w - 12           # …or to its left
+                if ax - left >= w + 24:
+                    x = ax - w - 12           # room to the reader's left
+                elif left + work_w - (ax + aw) >= w + 24:
+                    x = ax + aw + 12          # …or to its right
                 y = max(top + 16,
                         min(anchor.winfo_rooty(), top + work_h - h - 24))
         except tk.TclError:
@@ -18613,10 +18615,14 @@ class _ScholarTextWindow:
         "separate": _SEPARATE_COLOR, "majority": _MAJORITY_COLOR,
     }
     _PAGECOL_W = 70     # left gutter: native and inferred reporter pages (px)
-    # The same gutter in a chromeless reader, where the page area is the whole
-    # window: narrow enough not to take room from the opinion, with the numbers
-    # shrunk to fit when a reporter runs to four digits (see _pagecol_size).
-    _PAGECOL_W_TIGHT = 38
+    #: Digits the gutter is cut to hold.  No reporter in ordinary use runs past
+    #: four figures, so four is the width worth reserving — and the size worth
+    #: setting them at, whatever the page number happens to be.
+    _PAGECOL_DIGITS = 4
+    _PAGECOL_PAD = 8            # breathing room either side of the number (px)
+    _PAGECOL_W_MIN = 18         # …however narrow the type gets
+    #: The chromeless gutter before its font exists to be measured.
+    _PAGECOL_W_TIGHT = 32
     _PARTMAP_W = 104    # right strip: map of the opinion's parts (px)
     # Approx. on-screen width of the right "Case details" panel (a 38-char Text
     # plus its scrollbar and padding).  Used to widen the window for SCOTUS
@@ -19130,6 +19136,9 @@ class _ScholarTextWindow:
         # already marked inline in purple).  Right strip: a colour-coded map of
         # where each concurrence/dissent begins (full-opinion view only).
         self._pagecol_font = tkfont.Font(
+            family="Georgia", size=max(self._base_size - 2, 7), weight="bold")
+        # Its twin, nothing is drawn with, for measuring — see _pagecol_ruler.
+        self._pagecol_ruler_font = tkfont.Font(
             family="Georgia", size=max(self._base_size - 2, 7), weight="bold")
         self._partmap_font = tkfont.Font(
             family="TkDefaultFont", size=max(self._base_size - 3, 7))
@@ -21181,19 +21190,60 @@ class _ScholarTextWindow:
         except tk.TclError:
             self._gutter_redraw_pending = False
 
+    def _pagecol_single_column(self) -> bool:
+        """Whether both page tracks share one column of the gutter.
+
+        Chromeless they do: the gutter is as narrow as it can be, and two
+        columns of numbers would cost the opinion more width than showing the
+        two tracks side by side is worth."""
+        return bool(getattr(self, "_chromeless", False))
+
+    def _pagecol_base_size(self) -> int:
+        return max(self._base_size - 2, 7)
+
+    def _pagecol_ruler(self, size: Optional[int] = None):
+        """The gutter font, at *size*, for measuring only.
+
+        A second Font object nothing is drawn with: resizing the one on screen
+        makes Tk re-lay-out every widget using it, which brings the gutter
+        round to be redrawn — and a redraw that resizes the font to measure it
+        would never settle."""
+        ruler = getattr(self, "_pagecol_ruler_font", None)
+        if ruler is None:
+            return None
+        wanted = self._pagecol_base_size() if size is None else size
+        try:
+            if ruler.cget("size") != wanted:
+                ruler.configure(size=wanted)
+        except tk.TclError:
+            return None
+        return ruler
+
     def _pagecol_width(self) -> int:
-        """How wide the page-number gutter may be.  A chromeless reader gives
-        the opinion the window, so its gutter is the tight one."""
-        return (self._PAGECOL_W_TIGHT if getattr(self, "_chromeless", False)
-                else self._PAGECOL_W)
+        """How wide the page-number gutter may be.
+
+        A chromeless reader gives the opinion the window, so its gutter is cut
+        to exactly what a four-digit page needs and no more — four figures is
+        as far as any reporter in ordinary use runs."""
+        if not self._pagecol_single_column():
+            return self._PAGECOL_W
+        ruler = self._pagecol_ruler()
+        if ruler is None:
+            return self._PAGECOL_W_TIGHT
+        try:
+            cut = ruler.measure("0" * self._PAGECOL_DIGITS) + self._PAGECOL_PAD
+        except tk.TclError:
+            return self._PAGECOL_W_TIGHT
+        return max(self._PAGECOL_W_MIN, int(cut))
 
     def _fit_pagecol_font(self, page_pos: dict, us_page_pos: dict,
                           width: int) -> None:
         """Size the gutter numbers to the room they have.
 
-        Reporters reach four digits ("1132"), and in a tight gutter the number
-        is what gives — it shrinks until it fits rather than being clipped or
-        pushing the opinion aside."""
+        The gutter is cut for a four-digit page, so four digits and fewer are
+        set at the ordinary size.  Only a longer number — a reporter running
+        past 9999 — shrinks, and only until it fits, rather than being clipped
+        or pushing the opinion aside."""
         font = getattr(self, "_pagecol_font", None)
         if font is None:
             return
@@ -21204,18 +21254,68 @@ class _ScholarTextWindow:
         )
         if not widest:
             return
-        base = max(self._base_size - 2, 7)
+        base = self._pagecol_base_size()
         size = base
-        # Two columns share the gutter when inferred U.S. pages are shown
-        # beside the source's own, so each gets about half of it.
-        room = (width - 6) // (2 if page_pos and us_page_pos else 1)
-        while size > 6:
-            font.configure(size=size)
-            if font.measure("0" * widest) <= room:
-                break
-            size -= 1
-        if font.cget("size") != size:
-            font.configure(size=size)
+        if widest > self._PAGECOL_DIGITS:
+            # Two columns share the gutter when inferred U.S. pages are shown
+            # beside the source's own, so each gets about half of it.
+            columns = 1 if self._pagecol_single_column() else (
+                2 if page_pos and us_page_pos else 1)
+            room = (width - self._PAGECOL_PAD) // columns
+            while size > 6:
+                ruler = self._pagecol_ruler(size)
+                if ruler is None or ruler.measure("0" * widest) <= room:
+                    break
+                size -= 1
+        try:
+            if font.cget("size") != size:
+                font.configure(size=size)
+        except tk.TclError:
+            pass
+
+    def _pagecol_rows(self, series: dict, prefer_later_page: bool = False):
+        """{screen y: (page, line height)} for the pages currently on screen."""
+        txt = self._text
+        rows: dict[int, tuple[int, int]] = {}
+        for page, index in sorted(
+            (series or {}).items(), key=lambda item: item[0],
+            reverse=prefer_later_page,
+        ):
+            try:
+                info = txt.dlineinfo(index)
+            except tk.TclError:
+                info = None
+            if not info:            # that page is not on screen right now
+                continue
+            y = info[1] + info[3] // 2
+            if y not in rows:
+                rows[y] = (page, info[3] or 1)
+        return rows
+
+    def _pagecol_one_column(self, page_pos: dict, us_page_pos: dict) -> dict:
+        """Lay both page tracks out in a single column: {y: (page, colour)}.
+
+        Where a U.S. Reports page recovered from the scan lands on the same
+        line as the source's own star page, the U.S. page keeps the line — it
+        is the pagination a reader is here for — and the other moves to the
+        line above, or to the line below when the line above is taken too."""
+        placed: dict[int, tuple[int, str]] = {}
+        for y, (page, _h) in self._pagecol_rows(
+            us_page_pos, prefer_later_page=True
+        ).items():
+            placed[y] = (page, self._MAPPED_US_PAGE_COLOR)
+        for y, (page, height) in self._pagecol_rows(page_pos).items():
+            slot = y
+            if slot in placed:
+                above, below = y - height, y + height
+                if above not in placed and above > 0:
+                    slot = above
+                elif below not in placed:
+                    slot = below
+                else:
+                    continue    # no line free either side; leave it out
+            placed[slot] = (page, "black")
+        return placed
 
     def _draw_page_column(self) -> None:
         """Draw the reporter page numbers (bold black) in the left gutter, each
@@ -21236,6 +21336,17 @@ class _ScholarTextWindow:
         self._fit_pagecol_font(page_pos, us_page_pos, width)
         txt = self._text
         w = width
+        if self._pagecol_single_column():
+            # One narrow column, right-aligned, both tracks in it.
+            for y, (page, color) in self._pagecol_one_column(
+                page_pos, us_page_pos
+            ).items():
+                canvas.create_text(
+                    w - 4, y, anchor="e", text=str(page),
+                    fill=color, font=self._pagecol_font,
+                )
+            return
+
         def draw(
             series: dict, x: int, anchor: str, color: str,
             prefer_later_page: bool = False,

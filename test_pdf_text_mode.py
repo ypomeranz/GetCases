@@ -806,14 +806,22 @@ class ChromelessReaderTests(unittest.TestCase):
                         src.index("_pdf_locate_started"))
 
 
+PAGECOL_DIGITS = _class_attr("_ScholarTextWindow", "_PAGECOL_DIGITS")
+PAGECOL_PAD = _class_attr("_ScholarTextWindow", "_PAGECOL_PAD")
+PAGECOL_W_MIN = _class_attr("_ScholarTextWindow", "_PAGECOL_W_MIN")
+US_PAGE_COLOR = "#0f7b7b"
+
 PAGECOL_NS = _load(
-    "_ScholarTextWindow", ["_pagecol_width", "_fit_pagecol_font"])
+    "_ScholarTextWindow",
+    ["_pagecol_width", "_fit_pagecol_font", "_pagecol_single_column",
+     "_pagecol_base_size", "_pagecol_ruler", "_pagecol_rows",
+     "_pagecol_one_column"])
 
 
 class _FakeFont:
-    """A monospace-ish font: every digit is `per_digit` pixels wide."""
+    """A monospace-ish font: every digit is `per_digit` pixels wide at 9pt."""
 
-    def __init__(self, size=9, per_digit=3):
+    def __init__(self, size=9, per_digit=6):
         self._size = size
         self._per_digit = per_digit
 
@@ -828,15 +836,38 @@ class _FakeFont:
         return len(text) * self._per_digit * self._size // 9
 
 
+class _GutterText:
+    """A Text whose display lines are all `height` px, at known offsets."""
+
+    def __init__(self, at=None, height=20):
+        self.at = at or {}      # index -> screen y of the line's top
+        self.height = height
+
+    def dlineinfo(self, index):
+        if index not in self.at:
+            return None         # that mark is off screen
+        return (0, self.at[index], 100, self.height, 15)
+
+
 class _GutterReader:
     _PAGECOL_W = PAGECOL_W
     _PAGECOL_W_TIGHT = PAGECOL_W_TIGHT
+    _PAGECOL_DIGITS = PAGECOL_DIGITS
+    _PAGECOL_PAD = PAGECOL_PAD
+    _PAGECOL_W_MIN = PAGECOL_W_MIN
+    _MAPPED_US_PAGE_COLOR = US_PAGE_COLOR
 
-    def __init__(self, chromeless=False, per_digit=3, base_size=11):
+    def __init__(self, chromeless=False, per_digit=6, base_size=11, text=None):
         self._chromeless = chromeless
         self._base_size = base_size
         self._pagecol_font = _FakeFont(max(base_size - 2, 7), per_digit)
-        for name in ("_pagecol_width", "_fit_pagecol_font"):
+        # Its measuring twin: nothing is drawn with it, so resizing it to take
+        # a measurement cannot bring the gutter round to be redrawn.
+        self._pagecol_ruler_font = _FakeFont(max(base_size - 2, 7), per_digit)
+        self._text = text if text is not None else _GutterText()
+        for name in ("_pagecol_width", "_fit_pagecol_font",
+                     "_pagecol_single_column", "_pagecol_base_size",
+                     "_pagecol_ruler", "_pagecol_rows", "_pagecol_one_column"):
             setattr(self, name, PAGECOL_NS[name].__get__(self))
 
 
@@ -844,49 +875,243 @@ class PageGutterTests(unittest.TestCase):
     def test_a_window_reader_keeps_the_roomy_gutter(self):
         self.assertEqual(_GutterReader()._pagecol_width(), PAGECOL_W)
 
-    def test_the_embedded_one_narrows_it(self):
-        self.assertEqual(_GutterReader(chromeless=True)._pagecol_width(),
-                         PAGECOL_W_TIGHT)
-        self.assertLess(PAGECOL_W_TIGHT, PAGECOL_W)
+    def test_the_embedded_one_is_cut_to_four_figures(self):
+        reader = _GutterReader(chromeless=True, per_digit=6)
+        self.assertEqual(reader._pagecol_width(),
+                         reader._pagecol_font.measure("0000") + PAGECOL_PAD)
+        self.assertLess(reader._pagecol_width(), PAGECOL_W)
 
-    def test_three_digit_pages_need_no_shrinking(self):
-        reader = _GutterReader(chromeless=True, per_digit=3)
-        reader._fit_pagecol_font({113: "i", 114: "i"}, {}, PAGECOL_W_TIGHT)
+    def test_the_cut_is_taken_at_the_ordinary_size(self):
+        # A number that shrank to fit must not shrink the gutter with it.
+        reader = _GutterReader(chromeless=True, per_digit=6)
+        wide = reader._pagecol_width()
+        reader._pagecol_font.configure(size=6)
+        reader._pagecol_ruler_font.configure(size=6)
+        self.assertEqual(reader._pagecol_width(), wide)
+
+    def test_measuring_never_touches_the_font_on_screen(self):
+        # Resizing the drawn font re-lays-out every widget using it, which
+        # brings the gutter round to be redrawn — and a redraw that resizes
+        # the font to measure it would never settle.
+        reader = _GutterReader(chromeless=True)
+        reader._pagecol_font.configure(size=6)
+        reader._pagecol_width()
+        reader._pagecol_ruler(7)
+        self.assertEqual(reader._pagecol_font.cget("size"), 6)
+
+    def test_the_ruler_is_a_font_of_its_own(self):
+        reader = _GutterReader(chromeless=True)
+        self.assertIsNot(reader._pagecol_ruler(), reader._pagecol_font)
+        src = _source_of("_ScholarTextWindow", "_build_ui")
+        self.assertIn("self._pagecol_ruler_font = tkfont.Font", src)
+
+    def test_a_larger_body_size_takes_the_gutter_with_it(self):
+        small = _GutterReader(chromeless=True, base_size=11)._pagecol_width()
+        large = _GutterReader(chromeless=True, base_size=16)._pagecol_width()
+        self.assertGreater(large, small)
+
+    def test_four_digit_pages_are_set_at_the_ordinary_size(self):
+        # The gutter is cut for them, so they do not shrink.
+        reader = _GutterReader(chromeless=True)
+        width = reader._pagecol_width()
+        reader._fit_pagecol_font({1132: "a", 1133: "b"}, {}, width)
         self.assertEqual(reader._pagecol_font.cget("size"), 9)
 
-    def test_four_digit_pages_shrink_until_they_fit(self):
-        reader = _GutterReader(chromeless=True, per_digit=9)
-        reader._fit_pagecol_font({1132: "i", 1133: "i"}, {}, PAGECOL_W_TIGHT)
-        size = reader._pagecol_font.cget("size")
-        self.assertLess(size, 9)
-        self.assertLessEqual(reader._pagecol_font.measure("0000"),
-                             PAGECOL_W_TIGHT - 6)
+    def test_nor_do_shorter_ones(self):
+        reader = _GutterReader(chromeless=True)
+        reader._fit_pagecol_font({113: "a"}, {}, reader._pagecol_width())
+        self.assertEqual(reader._pagecol_font.cget("size"), 9)
 
-    def test_two_series_share_the_gutter(self):
-        # Inferred U.S. pages sit beside the source's own, so each column has
-        # about half the room and the numbers shrink sooner.
-        alone = _GutterReader(chromeless=True, per_digit=6)
-        alone._fit_pagecol_font({113: "i"}, {}, PAGECOL_W_TIGHT)
-        shared = _GutterReader(chromeless=True, per_digit=6)
-        shared._fit_pagecol_font({113: "i"}, {450: "i"}, PAGECOL_W_TIGHT)
-        self.assertLess(shared._pagecol_font.cget("size"),
-                        alone._pagecol_font.cget("size"))
+    def test_only_a_fifth_digit_shrinks_them(self):
+        reader = _GutterReader(chromeless=True)
+        width = reader._pagecol_width()
+        reader._fit_pagecol_font({11321: "a"}, {}, width)
+        self.assertLess(reader._pagecol_font.cget("size"), 9)
+        self.assertLessEqual(reader._pagecol_font.measure("00000"),
+                             width - PAGECOL_PAD)
+
+    def test_a_font_shrunk_for_one_opinion_is_restored_for_the_next(self):
+        reader = _GutterReader(chromeless=True)
+        reader._pagecol_font.configure(size=6)
+        reader._fit_pagecol_font({113: "a"}, {}, reader._pagecol_width())
+        self.assertEqual(reader._pagecol_font.cget("size"), 9)
 
     def test_it_never_shrinks_past_legibility(self):
         reader = _GutterReader(chromeless=True, per_digit=40)
-        reader._fit_pagecol_font({1132: "i"}, {}, PAGECOL_W_TIGHT)
+        reader._fit_pagecol_font({112345: "a"}, {}, 20)
         self.assertGreaterEqual(reader._pagecol_font.cget("size"), 6)
 
     def test_no_pages_leaves_the_font_alone(self):
         reader = _GutterReader(chromeless=True)
-        reader._fit_pagecol_font({}, {}, PAGECOL_W_TIGHT)
+        reader._fit_pagecol_font({}, {}, reader._pagecol_width())
         self.assertEqual(reader._pagecol_font.cget("size"), 9)
+
+    def test_the_roomy_gutter_still_splits_itself_between_two_tracks(self):
+        reader = _GutterReader(chromeless=False, per_digit=12)
+        reader._fit_pagecol_font({11321: "a"}, {45012: "b"}, PAGECOL_W)
+        shared = reader._pagecol_font.cget("size")
+        alone = _GutterReader(chromeless=False, per_digit=12)
+        alone._fit_pagecol_font({11321: "a"}, {}, PAGECOL_W)
+        self.assertLess(shared, alone._pagecol_font.cget("size"))
 
     def test_the_gutter_is_drawn_at_the_width_the_reader_allows(self):
         src = _source_of("_ScholarTextWindow", "_draw_page_column")
         self.assertIn("width = self._pagecol_width()", src)
         self.assertIn("self._fit_pagecol_font(page_pos, us_page_pos, width)",
                       src)
+
+
+class OneColumnGutterTests(unittest.TestCase):
+    """Both page tracks share the narrow gutter, U.S. Reports first."""
+
+    LINES = {"a": 0, "b": 20, "c": 40, "d": 60}   # index -> line top
+
+    def _reader(self, **kw):
+        return _GutterReader(chromeless=True,
+                             text=_GutterText(self.LINES, height=20), **kw)
+
+    def test_the_embedded_reader_uses_one_column(self):
+        self.assertTrue(_GutterReader(chromeless=True)._pagecol_single_column())
+
+    def test_the_case_window_keeps_its_two(self):
+        self.assertFalse(_GutterReader()._pagecol_single_column())
+
+    def test_both_tracks_land_in_it(self):
+        reader = self._reader()
+        placed = reader._pagecol_one_column({450: "a"}, {113: "c"})
+        self.assertEqual(placed[10], (450, "black"))
+        self.assertEqual(placed[50], (113, US_PAGE_COLOR))
+
+    def test_a_conflict_leaves_the_us_page_where_it_is(self):
+        reader = self._reader()
+        placed = reader._pagecol_one_column({450: "b"}, {113: "b"})
+        self.assertEqual(placed[30], (113, US_PAGE_COLOR))
+
+    def test_and_moves_the_other_up_a_line(self):
+        reader = self._reader()
+        placed = reader._pagecol_one_column({450: "b"}, {113: "b"})
+        self.assertEqual(placed[10], (450, "black"))
+
+    def test_it_goes_down_a_line_when_the_one_above_is_taken(self):
+        # A U.S. page on the line above as well, so up is not available.
+        reader = self._reader()
+        placed = reader._pagecol_one_column(
+            {450: "b"}, {112: "a", 113: "b"})
+        self.assertEqual(placed[50], (450, "black"))
+        self.assertEqual(placed[10], (112, US_PAGE_COLOR))
+        self.assertEqual(placed[30], (113, US_PAGE_COLOR))
+
+    def test_nor_above_the_top_of_the_view(self):
+        reader = self._reader()
+        placed = reader._pagecol_one_column({450: "a"}, {113: "a"})
+        self.assertEqual(placed[10], (113, US_PAGE_COLOR))
+        self.assertEqual(placed[30], (450, "black"))
+
+    def test_a_page_with_no_line_either_side_is_left_out(self):
+        reader = self._reader()
+        placed = reader._pagecol_one_column(
+            {450: "b"}, {112: "a", 113: "b", 114: "c"})
+        self.assertNotIn((450, "black"), placed.values())
+        self.assertEqual(len(placed), 3)
+
+    def test_a_page_that_is_off_screen_is_not_drawn(self):
+        reader = self._reader()
+        placed = reader._pagecol_one_column({450: "elsewhere"}, {113: "a"})
+        self.assertEqual(list(placed.values()), [(113, US_PAGE_COLOR)])
+
+    def test_two_pages_on_one_line_keep_the_first(self):
+        reader = self._reader()
+        rows = reader._pagecol_rows({113: "a", 114: "a"})
+        self.assertEqual(rows, {10: (113, 20)})
+
+    def test_the_later_us_page_wins_a_shared_line(self):
+        # A boundary the source and the scan both mark: show the page the
+        # reader is entering, not the one being left.
+        reader = self._reader()
+        rows = reader._pagecol_rows({113: "a", 114: "a"}, prefer_later_page=True)
+        self.assertEqual(rows, {10: (114, 20)})
+
+    def test_the_column_is_right_aligned_against_the_text(self):
+        src = _source_of("_ScholarTextWindow", "_draw_page_column")
+        self.assertIn('w - 4, y, anchor="e"', src)
+
+
+# ---------------------------------------------------------------------------
+# Where the window opens
+# ---------------------------------------------------------------------------
+
+
+PLACE_NS = _load(
+    "_FloatingPdfWindow", ["_place_beside"],
+    {"_work_area": lambda _w: (0, 0, 1600, 900)},
+)
+
+
+class _Anchor:
+    def __init__(self, x, width, y=60, alive=True):
+        self.x, self.width, self.y, self._alive = x, width, y, alive
+
+    def winfo_exists(self):
+        return self._alive
+
+    def update_idletasks(self):
+        pass
+
+    def winfo_rootx(self):
+        return self.x
+
+    def winfo_width(self):
+        return self.width
+
+    def winfo_rooty(self):
+        return self.y
+
+
+class _Placed:
+    _W = _class_attr("_FloatingPdfWindow", "_W")
+    _H = _class_attr("_FloatingPdfWindow", "_H")
+    _MIN_W = _class_attr("_FloatingPdfWindow", "_MIN_W")
+    _MIN_H = _class_attr("_FloatingPdfWindow", "_MIN_H")
+
+    def __init__(self):
+        self.spec = None
+        self._win = self
+        self._place_beside = PLACE_NS["_place_beside"].__get__(self)
+
+    def geometry(self, spec):
+        self.spec = spec
+
+    def x(self):
+        return int(re.search(r"\+(-?\d+)\+", self.spec).group(1))
+
+
+class WindowPlacementTests(unittest.TestCase):
+    """The viewer belongs on the left of the desktop, clear of the reader."""
+
+    def test_with_nothing_to_open_beside_it_takes_the_left_edge(self):
+        win = _Placed()
+        win._place_beside(None)
+        self.assertEqual(win.x(), 16)
+
+    def test_it_opens_to_the_left_of_a_reader_with_room_there(self):
+        win = _Placed()
+        win._place_beside(_Anchor(x=800, width=760))
+        self.assertEqual(win.x(), 800 - win._W - 12)
+
+    def test_and_to_its_right_when_the_left_is_too_tight(self):
+        win = _Placed()
+        win._place_beside(_Anchor(x=20, width=700))
+        self.assertEqual(win.x(), 720 + 12)
+
+    def test_a_reader_filling_the_desktop_sends_it_to_the_left_edge(self):
+        win = _Placed()
+        win._place_beside(_Anchor(x=10, width=1580))
+        self.assertEqual(win.x(), 16)
+
+    def test_a_reader_that_has_gone_away_is_no_obstacle(self):
+        win = _Placed()
+        win._place_beside(_Anchor(x=800, width=760, alive=False))
+        self.assertEqual(win.x(), 16)
 
 
 # ---------------------------------------------------------------------------
