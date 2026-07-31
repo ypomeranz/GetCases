@@ -18234,15 +18234,20 @@ class _FloatingPdfWindow:
         else:
             rule = tk.Frame(self._win, bg=_UI["border"], height=1)
         rule.pack(side="top", fill="x")
-        # The strip's own actions, also on a right-click.
+        # The strip's own actions, also on a right-click.  This window carries
+        # no menu bar, so what a document window keeps up there — History,
+        # Bookmarks, and the Interface the app is worn in — is here instead.
         menu = tk.Menu(self._win, tearoff=0)
         menu.add_command(label=f"Save As…\t{_ACCEL}+S", command=self._save)
         menu.add_command(label=f"Print…\t{_ACCEL}+P", command=self._print)
-        menu.add_separator()
-        menu.add_command(label=f"Close\t{_ACCEL}+W", command=self.close)
         self._bar_menu = menu
-        # Everything past here is rebuilt each time the menu is posted.
+        # Everything past here is rebuilt each time the menu is posted; the two
+        # submenus are made once and re-attached, since deleting a cascade
+        # entry leaves the menu it points at alone.
         self._bar_menu_fixed = menu.index("end")
+        self._recent_menu = self._bar_submenu("populate_history_menu")
+        self._interface_menu = self._bar_submenu("populate_window_menu",
+                                                 self._win)
         for seq in ("<Button-3>", "<Button-2>"):  # Button-2 is the Mac right-click
             _bind_recursive(bar, seq, self._post_bar_menu)
 
@@ -18266,21 +18271,66 @@ class _FloatingPdfWindow:
         except Exception as exc:
             print(f"[pdf-window] opening the case text failed: {exc}")
 
-    def _sync_bar_menu_bookmark(self) -> None:
-        """Put this document's Bookmark entry at the foot of the strip's menu.
+    def _bar_submenu(self, filler: str, *args):
+        """A submenu of the strip's menu that the app fills when it opens, or
+        None when this app cannot fill it."""
+        app = self._app
+        if app is None or not hasattr(app, filler):
+            return None
+        sub = tk.Menu(self._bar_menu, tearoff=0)
+        fill = getattr(app, filler)
+        try:
+            sub.configure(postcommand=lambda m=sub: fill(m, *args))
+        except tk.TclError:
+            pass
+        try:
+            fill(sub, *args)
+        except Exception as exc:
+            print(f"[pdf-window] filling the {filler} menu failed: {exc}")
+            return None
+        return sub
 
-        A scan opened in the reporter interface has no menu bar to carry the
-        Bookmarks cascade, so bookmarking it lives here — named for what the
-        document is, and reading *Remove* once it is already on the list.
-        Rebuilt on every posting, since that answer changes."""
+    def _bookmark_owner(self):
+        """Whatever can bookmark what this window is showing: the opinion when
+        the text is up, the document behind the pages when it is not."""
+        if self.showing_text() and hasattr(
+                self._reader, "_bookmark_descriptor"):
+            return self._reader
+        return self._bookmarks
+
+    def _sync_bar_menu(self) -> None:
+        """Rebuild the strip menu below Save and Print.
+
+        This window has no menu bar, so bookmarking, History and the Interface
+        the app is worn in live here.  All three are rebuilt on every posting:
+        which document is showing, whether it is already bookmarked, and what
+        the interface is are all answers that change."""
         menu = self._bar_menu
         try:
             last = menu.index("end")
             if last is not None and last > self._bar_menu_fixed:
                 menu.delete(self._bar_menu_fixed + 1, last)
+            menu.add_separator()
         except tk.TclError:
             return
-        owner, app = self._bookmarks, self._app
+        self._add_bar_menu_bookmark()
+        for label, sub in (("Recent", self._recent_menu),
+                           ("Interface", self._interface_menu)):
+            if sub is not None:
+                try:
+                    menu.add_cascade(label=label, menu=sub)
+                except tk.TclError:
+                    pass
+        try:
+            menu.add_separator()
+            menu.add_command(label=f"Close\t{_ACCEL}+W", command=self.close)
+        except tk.TclError:
+            pass
+
+    def _add_bar_menu_bookmark(self) -> None:
+        """The Bookmark entry, named for what the document is and reading
+        *Remove* once it is already on the list."""
+        owner, app = self._bookmark_owner(), self._app
         if owner is None or app is None or not hasattr(app, "is_bookmarked"):
             return
         try:
@@ -18295,8 +18345,8 @@ class _FloatingPdfWindow:
                  if app.is_bookmarked(desc.get("key"))
                  else f"Bookmark This {noun}")
         try:
-            menu.add_separator()
-            menu.add_command(label=label, command=owner._toggle_bookmark)
+            self._bar_menu.add_command(label=label,
+                                       command=owner._toggle_bookmark)
         except tk.TclError:
             pass
 
@@ -18308,7 +18358,7 @@ class _FloatingPdfWindow:
             menu.entryconfigure(1, label=self._print_label().replace("   ", "\t"))
         except tk.TclError:
             pass
-        self._sync_bar_menu_bookmark()
+        self._sync_bar_menu()
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
