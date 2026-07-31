@@ -1,0 +1,717 @@
+"""Reporter View: the interface that answers with the report itself.
+
+Interface ▸ *Reporter View* changes what opening a document means.  A case
+opens as its scan, in the small floating viewer, with T turning it into the
+opinion text; a case with no scan anywhere opens in that same window at that
+same size, on the text side, rather than as a different kind of window.  A
+source printed only as pages — Statutes at Large, the English Reports — opens
+there too, without the switch, because there is nothing to switch to.  And a
+citation followed out of a search result, a brief or the text side is looked
+up as a scan first, exactly as one clicked on a page already was.
+
+As elsewhere in this suite the methods are lifted out of
+``courtlistener_gui`` with ``ast`` (importing it needs tkinter, absent on a
+headless run) and driven against stubs.
+"""
+
+import ast
+import pathlib
+import re
+import sys
+import typing
+import unittest
+
+
+SRC = pathlib.Path(__file__).with_name("courtlistener_gui.py").read_text()
+TREE = ast.parse(SRC)
+
+
+class _Tk:
+    TclError = Exception
+    Menu = Misc = Frame = Toplevel = object
+
+
+def _base_ns(extra=None) -> dict:
+    ns = {"tk": _Tk, "sys": sys, "re": re, "Optional": typing.Optional,
+          "threading": _Threading, "print": lambda *a, **k: None,
+          "_INTERFACE_MODES": _module_value("_INTERFACE_MODES"),
+          "_DEFAULT_INTERFACE_MODE": _module_value(
+              "_DEFAULT_INTERFACE_MODE")}
+    ns.update(extra or {})
+    return ns
+
+
+class _Threading:
+    """Runs a worker inline, so a test sees the whole path in one call."""
+
+    started: list = []
+
+    class Thread:
+        def __init__(self, target=None, daemon=False, **kw):
+            self._target = target
+
+        def start(self):
+            _Threading.started.append(self._target)
+            if self._target is not None:
+                self._target()
+
+
+def _load(cls: str, names, extra=None) -> dict:
+    body = next(n.body for n in TREE.body
+                if isinstance(n, ast.ClassDef) and n.name == cls)
+    found = {n.name: ast.get_source_segment(SRC, n) for n in body
+             if isinstance(n, ast.FunctionDef) and n.name in names}
+    missing = [n for n in names if n not in found]
+    if missing:
+        raise AssertionError(f"not found on {cls}: {missing}")
+    ns = _base_ns(extra)
+    for name in names:
+        exec(found[name], ns)
+    return ns
+
+
+def _load_functions(names, extra=None) -> dict:
+    found = {n.name: ast.get_source_segment(SRC, n) for n in TREE.body
+             if isinstance(n, ast.FunctionDef) and n.name in names}
+    missing = [n for n in names if n not in found]
+    if missing:
+        raise AssertionError(f"module-level functions not found: {missing}")
+    ns = _base_ns(extra)
+    for name in names:
+        exec(found[name], ns)
+    return ns
+
+
+def _source_of(cls: str, name: str) -> str:
+    body = next(n.body for n in TREE.body
+                if isinstance(n, ast.ClassDef) and n.name == cls)
+    for node in body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(SRC, node)
+    raise AssertionError(f"{cls} has no {name}")
+
+
+def _module_value(name: str):
+    """A module-level constant, evaluated from the source."""
+    for node in TREE.body:
+        targets = (
+            node.targets if isinstance(node, ast.Assign)
+            else [node.target] if isinstance(node, ast.AnnAssign) else []
+        )
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            return eval(ast.get_source_segment(SRC, node.value),  # noqa: S307
+                        {"frozenset": frozenset})
+    raise AssertionError(f"module-level constant not found: {name}")
+
+
+# ---------------------------------------------------------------------------
+# Stubs
+# ---------------------------------------------------------------------------
+
+
+class _Widget:
+    def __init__(self, top=None):
+        self._top = top
+        self.destroyed = False
+        self.shown = False
+
+    def winfo_exists(self):
+        return not self.destroyed
+
+    def winfo_toplevel(self):
+        return self._top if self._top is not None else self
+
+    def destroy(self):
+        self.destroyed = True
+
+    def deiconify(self):
+        self.shown = True
+
+    def after(self, _ms, fn=None, *args):
+        if fn is not None:
+            fn(*args)
+
+
+class _Var:
+    def __init__(self, value=""):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+# ---------------------------------------------------------------------------
+# PDF-first: a citation is looked up as a scan before it is looked up as text
+# ---------------------------------------------------------------------------
+
+APP_NAMES = ["open_case_pdf_first", "reporter_open_case",
+             "pdf_opens_in_separate_window", "interface_mode",
+             "_safe_root_status"]
+
+APP_NS = _load(
+    "CourtListenerGUI", APP_NAMES,
+    {"_pick_citation": lambda cites: (cites[0] if cites else "")},
+)
+
+
+class _App:
+    def __init__(self, mode="reporter", opens=True):
+        self._interface_mode = mode
+        self.root = _Widget()
+        self.asked: list = []
+        self.opens = opens
+        self._status_var = _Var()
+        for name in APP_NAMES:
+            setattr(self, name, APP_NS[name].__get__(self))
+
+    def open_cited_case_pdf(self, parent, action, snippet="",
+                            status=lambda _s: None, fallback=None):
+        self.asked.append((parent, action, snippet, fallback))
+        return self.opens
+
+
+class PdfFirstTests(unittest.TestCase):
+    def test_the_reporter_interface_looks_for_the_scan(self):
+        app = _App()
+        self.assertTrue(
+            app.open_case_pdf_first(app.root, ("cite", "410 U.S. 113")))
+        self.assertEqual(app.asked[0][1], ("cite", "410 U.S. 113"))
+
+    def test_the_other_two_do_not(self):
+        for mode in ("windows", "tabs"):
+            app = _App(mode=mode)
+            self.assertFalse(
+                app.open_case_pdf_first(app.root, ("cite", "410 U.S. 113")))
+            self.assertEqual(app.asked, [])
+
+    def test_a_window_popped_out_of_a_scan_does_though(self):
+        app = _App(mode="tabs")
+        popped = _Widget()
+        popped._reporter_window = True
+        self.assertTrue(
+            app.open_case_pdf_first(popped, ("cite", "410 U.S. 113")))
+
+    def test_the_caller_s_own_way_of_opening_it_is_the_fallback(self):
+        app = _App()
+        marker = []
+        app.open_case_pdf_first(app.root, ("cite", "1 U.S. 1"),
+                                fallback=lambda: marker.append(1))
+        app.asked[0][3]()
+        self.assertEqual(marker, [1])
+
+    def test_a_lookup_that_cannot_start_leaves_the_caller_to_it(self):
+        app = _App(opens=False)
+        self.assertFalse(
+            app.open_case_pdf_first(app.root, ("cite", "1 U.S. 1")))
+
+
+class ReporterOpenCaseTests(unittest.TestCase):
+    """What a search result means by "open this case"."""
+
+    def test_a_result_is_opened_by_its_citation(self):
+        app = _App()
+        item = {"citation": ["410 U.S. 113"], "caseName": "Roe v. Wade"}
+        self.assertTrue(app.reporter_open_case(app.root, item))
+        _parent, action, snippet, _fb = app.asked[0]
+        self.assertEqual(action, ("cite", "410 U.S. 113"))
+        self.assertEqual(snippet, "Roe v. Wade")
+
+    def test_an_explicit_citation_wins_over_the_item_s(self):
+        app = _App()
+        app.reporter_open_case(app.root, {"citation": ["1 U.S. 1"]},
+                               cite="410 U.S. 113", name="Roe")
+        self.assertEqual(app.asked[0][1], ("cite", "410 U.S. 113"))
+
+    def test_a_result_with_no_citation_is_left_to_the_text_path(self):
+        app = _App()
+        self.assertFalse(app.reporter_open_case(app.root, {"caseName": "X"}))
+        self.assertEqual(app.asked, [])
+
+    def test_no_parent_means_the_main_window(self):
+        app = _App()
+        app.reporter_open_case(None, cite="410 U.S. 113")
+        self.assertIs(app.asked[0][0], app.root)
+
+    def test_the_other_interfaces_open_a_result_as_they_always_did(self):
+        app = _App(mode="windows")
+        self.assertFalse(app.reporter_open_case(app.root, cite="410 U.S. 113"))
+
+
+class WhereItIsAskedTests(unittest.TestCase):
+    """Every way of opening a case asks the same question first."""
+
+    def test_the_main_window_s_search_results_do(self):
+        src = _source_of("CourtListenerGUI", "_fetch_scholar_text")
+        self.assertIn("self.reporter_open_case(self.root, item", src)
+        self.assertIn("fallback=ordinary", src)
+
+    def test_and_so_does_a_brief_s_citation(self):
+        src = next(ast.get_source_segment(SRC, n) for n in TREE.body
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name == "_follow_brief_action")
+        self.assertIn("open_case_pdf_first", src)
+        self.assertIn("_following_as_text", src)
+
+    def test_and_a_link_clicked_in_the_opinion_text(self):
+        src = _source_of("_ScholarTextWindow", "_follow_link")
+        self.assertIn("self._app.open_case_pdf_first(", src)
+        self.assertIn("fallback=as_text", src)
+
+    def test_but_federal_appendix_keeps_its_own_scan_route(self):
+        src = _source_of("_ScholarTextWindow", "_follow_link")
+        self.assertIn("not _FED_APPX_RE.search(cite)", src)
+
+    def test_and_a_citation_re_followed_as_text_is_not_asked_twice(self):
+        src = _source_of("_ScholarTextWindow", "_follow_link")
+        self.assertIn("not self._following_as_text", src)
+        self.assertIn("self._following_as_text = True", src)
+
+
+# ---------------------------------------------------------------------------
+# A case with no scan: the same window, on the text side
+# ---------------------------------------------------------------------------
+
+HOST_NS = _load(
+    "CourtListenerGUI", ["new_case_view_host", "_reporter_text_host"],
+    {"_FloatingPdfWindow": lambda *a, **kw: _StubViewer(*a, **kw)},
+)
+
+
+class _StubViewer:
+    made: list = []
+
+    def __init__(self, parent, data, url, title, **kw):
+        self.parent, self.data, self.kw = parent, data, kw
+        self.host = object()
+        _StubViewer.made.append(self)
+
+    def text_host(self, standalone=True):
+        self.standalone = standalone
+        return self.host
+
+
+class _HostApp:
+    def __init__(self, mode="reporter"):
+        self._interface_mode = mode
+        self.root = _Widget()
+        self._cited_pdf_windows: set = set()
+        self.secondary: list = []
+        for name in ("new_case_view_host", "_reporter_text_host"):
+            setattr(self, name, HOST_NS[name].__get__(self))
+        self.pdf_opens_in_separate_window = APP_NS[
+            "pdf_opens_in_separate_window"].__get__(self)
+        self.interface_mode = APP_NS["interface_mode"].__get__(self)
+
+    def new_secondary_view_host(self, parent):
+        self.secondary.append(parent)
+        return "ordinary host"
+
+
+class TextOnlyCaseTests(unittest.TestCase):
+    def setUp(self):
+        _StubViewer.made.clear()
+
+    def test_it_opens_in_a_viewer_of_its_own(self):
+        app = _HostApp()
+        host = app.new_case_view_host(app.root)
+        self.assertEqual(len(_StubViewer.made), 1)
+        self.assertIs(host, _StubViewer.made[0].host)
+
+    def test_with_no_scan_in_it(self):
+        app = _HostApp()
+        app.new_case_view_host(app.root)
+        self.assertIsNone(_StubViewer.made[0].data)
+
+    def test_and_the_window_belongs_to_the_app_not_the_caller(self):
+        # A viewer opened from a reader has to outlive it.
+        app = _HostApp()
+        app.new_case_view_host(_Widget())
+        self.assertIs(_StubViewer.made[0].parent, app.root)
+
+    def test_it_sits_beside_the_window_it_was_opened_from(self):
+        app = _HostApp()
+        caller = _Widget()
+        app.new_case_view_host(caller)
+        self.assertIs(_StubViewer.made[0].kw["anchor"], caller)
+
+    def test_but_not_beside_the_main_window(self):
+        app = _HostApp()
+        app.new_case_view_host(app.root)
+        self.assertIsNone(_StubViewer.made[0].kw["anchor"])
+
+    def test_something_has_to_hold_the_window(self):
+        app = _HostApp()
+        app.new_case_view_host(app.root)
+        self.assertIn(_StubViewer.made[0], app._cited_pdf_windows)
+
+    def test_it_is_a_window_in_its_own_right_not_an_inset(self):
+        # standalone: it records itself in History and answers to Window ▸ …
+        app = _HostApp()
+        app.new_case_view_host(app.root)
+        self.assertTrue(_StubViewer.made[0].standalone)
+
+    def test_the_other_interfaces_open_the_text_as_they_always_did(self):
+        for mode in ("windows", "tabs"):
+            app = _HostApp(mode=mode)
+            self.assertEqual(app.new_case_view_host(app.root), "ordinary host")
+            self.assertEqual(_StubViewer.made, [])
+
+    def test_a_viewer_that_will_not_open_is_not_fatal(self):
+        ns = _load(
+            "CourtListenerGUI", ["new_case_view_host", "_reporter_text_host"],
+            {"_FloatingPdfWindow": _raise},
+        )
+        app = _HostApp()
+        for name in ("new_case_view_host", "_reporter_text_host"):
+            setattr(app, name, ns[name].__get__(app))
+        self.assertEqual(app.new_case_view_host(app.root), "ordinary host")
+
+
+def _raise(*_a, **_kw):
+    raise RuntimeError("no window")
+
+
+# ---------------------------------------------------------------------------
+# A source printed only as pages: no switch on the strip
+# ---------------------------------------------------------------------------
+
+VIEWER_NAMES = ["has_scan", "has_text_side", "set_text_side", "_toggle_mode",
+                "showing_text", "_sync_bar", "_refresh_scale"]
+VIEWER_NS = _load("_FloatingPdfWindow", VIEWER_NAMES)
+
+
+class _Button:
+    def __init__(self, text=""):
+        self.text = text
+        self.packed = False
+        self.before = None
+
+    def configure(self, **kw):
+        self.text = kw.get("text", self.text)
+
+    def pack(self, **kw):
+        self.packed = True
+        self.before = kw.get("before")
+
+    def pack_forget(self):
+        self.packed = False
+
+
+class _Viewer:
+    def __init__(self, scan=True, build_text=None, reader=None):
+        self._pane = object() if scan else None
+        self._bytes = b"%PDF" if scan else None
+        self._mode = "pdf"
+        self._reader = reader
+        self._on_build_text = build_text
+        self._text_host = None
+        self._flash_after = None
+        self._zoom_var = _Var()
+        self._mode_btn = _Button("T")
+        self._mode_btn.packed = True
+        self._fit_btn = _Button("Fit")
+        self._fit_btn.packed = True
+        self._copy_btn = _Button("Copy ▾")
+        self._zoom_label = object()
+        self.switched = []
+        for name in VIEWER_NAMES:
+            setattr(self, name, VIEWER_NS[name].__get__(self))
+
+    # what _toggle_mode calls once it has decided to switch
+    def _show_text(self):
+        self.switched.append("text")
+
+    def _show_scan(self):
+        self.switched.append("scan")
+
+
+class NoTextSideTests(unittest.TestCase):
+    def test_a_scan_with_an_opinion_behind_it_offers_the_switch(self):
+        viewer = _Viewer(build_text=lambda host: object())
+        self.assertTrue(viewer.has_text_side())
+        viewer._sync_bar()
+        self.assertTrue(viewer._mode_btn.packed)
+
+    def test_so_does_one_already_showing_the_opinion(self):
+        self.assertTrue(_Viewer(reader=object()).has_text_side())
+
+    def test_but_statutes_at_large_has_none(self):
+        viewer = _Viewer()
+        self.assertFalse(viewer.has_text_side())
+        viewer._sync_bar()
+        self.assertFalse(viewer._mode_btn.packed)
+
+    def test_and_pressing_it_anyway_does_nothing(self):
+        viewer = _Viewer()
+        viewer._toggle_mode()
+        self.assertEqual(viewer.switched, [])
+
+    def test_fit_still_belongs_to_the_pages(self):
+        viewer = _Viewer()
+        viewer._sync_bar()
+        self.assertTrue(viewer._fit_btn.packed)
+        self.assertFalse(viewer._copy_btn.packed)
+
+    def test_a_lookup_that_came_back_empty_takes_the_switch_off(self):
+        viewer = _Viewer(build_text=lambda host: object())
+        viewer._sync_bar()
+        self.assertTrue(viewer._mode_btn.packed)
+        viewer.set_text_side(False)
+        self.assertFalse(viewer._mode_btn.packed)
+        self.assertIsNone(viewer._on_build_text)
+
+    def test_a_lookup_that_found_something_leaves_it_alone(self):
+        viewer = _Viewer(build_text=lambda host: object())
+        viewer.set_text_side(True)
+        self.assertIsNotNone(viewer._on_build_text)
+
+    def test_a_window_that_is_only_text_is_not_touched_by_that(self):
+        # No scan at all: the switch is already gone for the other reason.
+        viewer = _Viewer(scan=False, reader=object())
+        viewer.set_text_side(False)
+        self.assertTrue(viewer.has_text_side())
+
+
+# ---------------------------------------------------------------------------
+# The scan window hands its pages to the viewer and steps aside
+# ---------------------------------------------------------------------------
+
+PDFWIN_NAMES = ["_hand_to_viewer", "_viewer_closed", "_dialog_parent",
+                "_reveal", "_say", "_show", "_reporter_analysis"]
+
+
+class _HandoffViewer:
+    made: list = []
+
+    def __init__(self, parent, data, url, title, **kw):
+        self.parent, self.data, self.url, self.title, self.kw = (
+            parent, data, url, title, kw)
+        self._win = _Widget()
+        self._pane = object()
+        self.analyses: list = []
+        self.surfaced = False
+        _HandoffViewer.made.append(self)
+
+    def surface(self):
+        self.surfaced = True
+
+    def apply_analysis(self, result):
+        self.analyses.append(result)
+
+
+def _pdfwin_ns(pages=(("some text",),)):
+    return _load(
+        "_PdfWindow", PDFWIN_NAMES,
+        {"_FloatingPdfWindow": _HandoffViewer,
+         "_PdfPane": _raise,
+         "_extract_pdf_text_and_style": lambda data: (list(pages), []),
+         "_citation_links_from_visible_pdf_text":
+             lambda data, pages, italics: ({1: ["link"]}, set()),
+         "slip_opinion": type("slip", (), {
+             "detect_sections": staticmethod(lambda pages: ["section"])}),
+         },
+    )
+
+
+PDFWIN_NS = _pdfwin_ns()
+
+
+class _ScanWindow:
+    def __init__(self, is_case=False, can_discover=False, reporter=True,
+                 ns=None):
+        ns = ns or PDFWIN_NS
+        self._app = _HostApp()
+        self._win = _Widget()
+        self._body = _Widget()
+        self._url = "https://example.test/scan.pdf"
+        self._title = "5 Stat. 797"
+        self._is_case = is_case
+        self._can_discover_text = can_discover
+        self._text_lookup_empty = False
+        self._reporter = reporter
+        self._reporter_anchor = None
+        self._float = None
+        self._pane = None
+        self._bytes = None
+        self._status_var = _Var()
+        self._pdf_text_pages = None
+        self._pdf_text_italics: list = []
+        self._pdf_text_links: dict = {}
+        self._pdf_quiet_pages: set = set()
+        self._pdf_sections: list = []
+        self.mapped = 0
+        for name in PDFWIN_NAMES:
+            setattr(self, name, ns[name].__get__(self))
+
+    def _post(self, fn, *args):
+        fn(*args)
+
+    def _maybe_start_location_map(self):
+        self.mapped += 1
+
+    def _download(self, pane=None):
+        pass
+
+    def _print(self, pane=None):
+        pass
+
+    def _open_cite(self, action, snippet):
+        pass
+
+    def _open_cite_browser(self, action, snippet):
+        pass
+
+    def _embed_discovered_text(self, host):
+        return None
+
+
+class ScanHandoffTests(unittest.TestCase):
+    def setUp(self):
+        _HandoffViewer.made.clear()
+
+    def test_the_pages_go_to_the_floating_viewer(self):
+        win = _ScanWindow()
+        win._show(b"%PDF-1.4")
+        self.assertEqual(len(_HandoffViewer.made), 1)
+        self.assertEqual(_HandoffViewer.made[0].data, b"%PDF-1.4")
+
+    def test_and_the_window_that_fetched_them_stays_out_of_sight(self):
+        win = _ScanWindow()
+        win._show(b"%PDF-1.4")
+        self.assertFalse(win._win.shown)
+
+    def test_statutes_at_large_gets_no_switch_to_offer(self):
+        win = _ScanWindow()
+        win._show(b"%PDF-1.4")
+        self.assertIsNone(_HandoffViewer.made[0].kw["on_build_text"])
+
+    def test_a_case_scan_whose_text_is_being_looked_for_does(self):
+        win = _ScanWindow(is_case=True, can_discover=True)
+        win._show(b"%PDF-1.4")
+        self.assertIsNotNone(_HandoffViewer.made[0].kw["on_build_text"])
+
+    def test_but_not_once_that_lookup_has_come_back_empty(self):
+        win = _ScanWindow(is_case=True, can_discover=True)
+        win._text_lookup_empty = True
+        win._show(b"%PDF-1.4")
+        self.assertIsNone(_HandoffViewer.made[0].kw["on_build_text"])
+
+    def test_the_viewer_is_raised_when_it_opens(self):
+        win = _ScanWindow()
+        win._show(b"%PDF-1.4")
+        self.assertTrue(_HandoffViewer.made[0].surfaced)
+
+    def test_something_holds_the_viewer_open(self):
+        win = _ScanWindow()
+        win._show(b"%PDF-1.4")
+        self.assertIn(_HandoffViewer.made[0], win._app._cited_pdf_windows)
+
+    def test_closing_the_viewer_closes_the_courier_behind_it(self):
+        win = _ScanWindow()
+        win._show(b"%PDF-1.4")
+        _HandoffViewer.made[0].kw["on_close"](_HandoffViewer.made[0])
+        self.assertTrue(win._win.destroyed)
+
+    def test_a_viewer_that_will_not_open_leaves_the_window_to_show_it(self):
+        ns = _pdfwin_ns()
+        ns["_FloatingPdfWindow"] = _raise
+        win = _ScanWindow(ns=ns)
+        # _show falls through to its own pane, which this stub refuses to build
+        with self.assertRaises(Exception):
+            win._show(b"%PDF-1.4")
+
+    def test_the_other_interfaces_show_the_scan_in_the_window(self):
+        win = _ScanWindow(reporter=False)
+        with self.assertRaises(Exception):
+            win._show(b"%PDF-1.4")
+        self.assertEqual(_HandoffViewer.made, [])
+
+
+class ScanTextLayerTests(unittest.TestCase):
+    def setUp(self):
+        _HandoffViewer.made.clear()
+
+    def test_the_viewer_gets_the_text_layer(self):
+        win = _ScanWindow(is_case=True)
+        win._show(b"%PDF-1.4")
+        result = _HandoffViewer.made[0].analyses[0]
+        self.assertEqual(result["pages"], [("some text",)])
+        self.assertEqual(result["links"], {1: ["link"]})
+        self.assertEqual(result["sections"], ["section"])
+
+    def test_and_the_window_keeps_it_for_the_opinion_to_align_against(self):
+        win = _ScanWindow(is_case=True)
+        win._show(b"%PDF-1.4")
+        self.assertEqual(win._pdf_text_pages, [("some text",)])
+        self.assertEqual(win.mapped, 1)
+
+    def test_a_statute_scan_is_not_scanned_for_citations(self):
+        win = _ScanWindow(is_case=False)
+        win._show(b"%PDF-1.4")
+        self.assertEqual(_HandoffViewer.made[0].analyses[0]["links"], {})
+
+    def test_it_is_read_once_for_both(self):
+        win = _ScanWindow(is_case=True)
+        win._show(b"%PDF-1.4")
+        self.assertEqual(len(_HandoffViewer.made[0].analyses), 1)
+
+
+class ScanWindowChromeTests(unittest.TestCase):
+    def setUp(self):
+        _HandoffViewer.made.clear()
+
+    def test_a_dialog_belongs_to_the_viewer_once_there_is_one(self):
+        win = _ScanWindow()
+        self.assertIs(win._dialog_parent(), win._win)
+        win._show(b"%PDF-1.4")
+        self.assertIs(win._dialog_parent(), _HandoffViewer.made[0]._win)
+
+    def test_a_hand_off_panel_brings_the_hidden_window_out(self):
+        win = _ScanWindow()
+        win._reveal()
+        self.assertTrue(win._win.shown)
+
+    def test_but_not_once_the_pages_are_showing_elsewhere(self):
+        win = _ScanWindow()
+        win._show(b"%PDF-1.4")
+        win._reveal()
+        self.assertFalse(win._win.shown)
+
+    def test_nothing_to_reveal_in_the_other_interfaces(self):
+        win = _ScanWindow(reporter=False)
+        win._reveal()
+        self.assertFalse(win._win.shown)
+
+
+class ScanWindowSourceTests(unittest.TestCase):
+    """The pieces that are easier to read off the source than to drive."""
+
+    def test_the_hidden_courier_is_not_in_the_window_registry(self):
+        src = _source_of("_PdfWindow", "__init__")
+        self.assertIn("not self._reporter", src)
+        self.assertIn("self._win.withdraw()", src)
+
+    def test_saving_and_printing_use_the_rendering_on_screen(self):
+        src = _source_of("_PdfWindow", "_hand_to_viewer")
+        self.assertIn("on_save=lambda pane: self._download(pane)", src)
+        self.assertIn("on_print=lambda pane: self._print(pane)", src)
+
+    def test_the_place_the_reader_is_comes_from_the_viewer_s_pages(self):
+        src = _source_of("_PdfWindow", "_discovered_text_target")
+        self.assertIn('getattr(self._float, "_pane", None)', src)
+
+    def test_an_empty_lookup_takes_the_switch_off_the_strip(self):
+        src = _source_of("_PdfWindow", "_on_text_discovered")
+        self.assertIn("self._float.set_text_side(False)", src)
+
+    def test_the_switch_builds_the_discovered_text_in_place(self):
+        src = _source_of("_PdfWindow", "_embed_discovered_text")
+        self.assertIn("chromeless=True", src)
+        self.assertIn("initial_pdf_analysis=self._initial_pdf_analysis()", src)
+
+
+if __name__ == "__main__":
+    unittest.main()

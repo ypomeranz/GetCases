@@ -483,6 +483,7 @@ READER_NS = _load(
     {"_PdfPane": _FakePane,
      "_FloatingPdfWindow": _FakeFloatingWindow,
      "_ScholarTextWindow": _FakeEmbeddedReader,
+     "_EmbeddedCaseHost": type("_EmbeddedCaseHost", (), {}),
      "_is_us_reports_pdf": lambda url: "usrep" in (url or "").lower(),
      "_clamp_toplevel_to_work_area": lambda *a, **kw: (_ for _ in ()).throw(
          _InWindow()),

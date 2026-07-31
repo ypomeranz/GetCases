@@ -280,8 +280,9 @@ class _FakeHostFrame:
 
     made = []
 
-    def __init__(self, master, window):
+    def __init__(self, master, window, retitles=False, standalone=False):
         self.master, self.window = master, window
+        self.retitles, self.standalone = retitles, standalone
         self.packed = False
         self.destroyed = False
         _FakeHostFrame.made.append(self)
@@ -297,8 +298,9 @@ class _FakeHostFrame:
 
 
 VIEWER_NAMES = [
-    "showing_text", "_mode_button_tip", "_toggle_mode", "_build_reader",
-    "zoom",
+    "showing_text", "has_scan", "has_text_side", "set_text_side",
+    "_mode_button_tip", "_toggle_mode",
+    "_build_reader", "zoom",
     "_show_text", "_show_scan", "_sync_bar", "_refresh_scale", "_flash",
     "_post_copy_menu", "_bigger", "_smaller", "_reset_scale", "_rescale",
     "_scroll_key", "_find_open", "_find_step", "_drop_reader", "_show_zoom",
@@ -316,6 +318,7 @@ VIEWER_NS = _load(
 class _Viewer:
     def __init__(self, build_text="reader", pane=None):
         self._pane = _FakePane() if pane is None else pane
+        self._bytes = b"%PDF-1"
         self._url = "https://example.test/a.pdf"
         self._closing = False
         self._mode = "pdf"
@@ -800,8 +803,9 @@ class ChromelessReaderTests(unittest.TestCase):
 
     def test_it_is_not_a_case_window_of_its_own(self):
         # History and "bring the open text forward" must find the real reader,
-        # not this second rendering of the same case.
-        self.assertIn("if self._chromeless:",
+        # not this second rendering of the same case — unless the window holds
+        # nothing else, in which case it *is* the case's own view.
+        self.assertIn("if self._chromeless and not self._standalone_embed:",
                       _source_of("_ScholarTextWindow", "_record_history"))
 
     def test_it_never_widens_the_window_for_the_side_panel(self):
@@ -1799,11 +1803,14 @@ class EmbeddedHostTests(unittest.TestCase):
         src = _source_of("_EmbeddedCaseHost", "bind")
         self.assertIn("self.winfo_toplevel().bind(sequence, func", src)
 
-    def test_it_does_not_rename_the_viewer(self):
-        # The viewer names itself after the case as the reporter on screen
-        # cites it — more particular than the reader's own title.
+    def test_it_renames_the_viewer_only_when_asked_to(self):
+        # Beside a scan it must not: the viewer names itself after the case as
+        # the reporter on screen cites it, which is more particular.  In a
+        # window holding only the text there is no such name to keep.
         src = _source_of("_EmbeddedCaseHost", "title")
-        self.assertNotIn("set_title", src)
+        self.assertIn("if self._retitles:", src)
+        self.assertLess(src.index("if self._retitles:"),
+                        src.index("set_title"))
 
 
 if __name__ == "__main__":
