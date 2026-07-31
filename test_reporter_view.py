@@ -794,6 +794,129 @@ class WindowIndependenceTests(unittest.TestCase):
                       'if self._reporter', src)
 
 
+class _StripMenu:
+    def __init__(self):
+        self.items: list = []
+
+    def add_command(self, label="", command=None, **kw):
+        self.items.append(("command", label, command))
+
+    def add_separator(self, **kw):
+        self.items.append(("separator", "", None))
+
+    def index(self, _what):
+        return len(self.items) - 1 if self.items else None
+
+    def delete(self, first, last):
+        del self.items[first:last + 1]
+
+    def labels(self):
+        return [label for kind, label, _c in self.items if kind == "command"]
+
+
+class _BookmarkOwner:
+    def __init__(self, desc=None):
+        self.desc = desc
+        self.toggled = 0
+
+    def _bookmark_descriptor(self):
+        return self.desc
+
+    def _toggle_bookmark(self):
+        self.toggled += 1
+
+
+class _BookmarkApp:
+    def __init__(self, marked=()):
+        self.marked = set(marked)
+
+    def is_bookmarked(self, key):
+        return key in self.marked
+
+
+class StripBookmarkTests(unittest.TestCase):
+    """A window with no menu bar keeps bookmarking on the strip's own menu."""
+
+    def setUp(self):
+        self.ns = _load("_FloatingPdfWindow", ["_sync_bar_menu_bookmark"])
+
+    def _viewer(self, owner=None, app=None):
+        viewer = _Viewer()
+        viewer._bookmarks = owner
+        viewer._app = app
+        viewer._bar_menu = _StripMenu()
+        for label in ("Save As…", "Print…"):
+            viewer._bar_menu.add_command(label=label)
+        viewer._bar_menu.add_separator()
+        viewer._bar_menu.add_command(label="Close")
+        viewer._bar_menu_fixed = viewer._bar_menu.index("end")
+        viewer._sync_bar_menu_bookmark = self.ns[
+            "_sync_bar_menu_bookmark"].__get__(viewer)
+        return viewer
+
+    def test_a_statute_scan_can_be_bookmarked_from_the_strip(self):
+        owner = _BookmarkOwner({"key": "pdf:x", "noun": "statute"})
+        viewer = self._viewer(owner, _BookmarkApp())
+        viewer._sync_bar_menu_bookmark()
+        self.assertEqual(viewer._bar_menu.labels()[-1],
+                         "Bookmark This Statute")
+
+    def test_and_taken_off_again(self):
+        owner = _BookmarkOwner({"key": "pdf:x", "noun": "case"})
+        viewer = self._viewer(owner, _BookmarkApp(marked={"pdf:x"}))
+        viewer._sync_bar_menu_bookmark()
+        self.assertEqual(viewer._bar_menu.labels()[-1],
+                         "Remove Bookmark for This Case")
+
+    def test_the_entry_does_the_bookmarking(self):
+        owner = _BookmarkOwner({"key": "pdf:x", "noun": "case"})
+        viewer = self._viewer(owner, _BookmarkApp())
+        viewer._sync_bar_menu_bookmark()
+        viewer._bar_menu.items[-1][2]()
+        self.assertEqual(owner.toggled, 1)
+
+    def test_posting_it_twice_does_not_stack_two_of_them(self):
+        owner = _BookmarkOwner({"key": "pdf:x", "noun": "case"})
+        viewer = self._viewer(owner, _BookmarkApp())
+        viewer._sync_bar_menu_bookmark()
+        viewer._sync_bar_menu_bookmark()
+        self.assertEqual(
+            [label for label in viewer._bar_menu.labels()
+             if "Bookmark" in label], ["Bookmark This Case"])
+
+    def test_and_the_state_is_re_read_each_time(self):
+        owner = _BookmarkOwner({"key": "pdf:x", "noun": "case"})
+        app = _BookmarkApp()
+        viewer = self._viewer(owner, app)
+        viewer._sync_bar_menu_bookmark()
+        app.marked.add("pdf:x")
+        viewer._sync_bar_menu_bookmark()
+        self.assertEqual(viewer._bar_menu.labels()[-1],
+                         "Remove Bookmark for This Case")
+
+    def test_a_document_that_cannot_be_bookmarked_gets_no_entry(self):
+        viewer = self._viewer(_BookmarkOwner(None), _BookmarkApp())
+        viewer._sync_bar_menu_bookmark()
+        self.assertEqual(viewer._bar_menu.labels(),
+                         ["Save As…", "Print…", "Close"])
+
+    def test_nor_does_a_viewer_with_no_owner_to_ask(self):
+        viewer = self._viewer(None, _BookmarkApp())
+        viewer._sync_bar_menu_bookmark()
+        self.assertEqual(viewer._bar_menu.labels(),
+                         ["Save As…", "Print…", "Close"])
+
+    def test_the_menu_is_refreshed_whenever_it_is_posted(self):
+        src = _source_of("_FloatingPdfWindow", "_post_bar_menu")
+        self.assertIn("self._sync_bar_menu_bookmark()", src)
+
+    def test_the_courier_hands_the_viewer_its_bookmark(self):
+        _HandoffViewer.made.clear()
+        win = _ScanWindow()
+        win._show(b"%PDF-1.4")
+        self.assertIs(_HandoffViewer.made[0].kw["bookmarks"], win)
+
+
 class ScanWindowSourceTests(unittest.TestCase):
     """The pieces that are easier to read off the source than to drive."""
 
