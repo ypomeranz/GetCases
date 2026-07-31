@@ -483,6 +483,22 @@ def _build_copy_menu(master: tk.Misc, reader) -> "Optional[tk.Menu]":
     return copy_menu
 
 
+def _add_interface_cascade(menubar: tk.Menu, app, win: tk.Misc) -> None:
+    """Append the Interface menu — the three ways the app can be worn."""
+    if app is None or not hasattr(app, "populate_window_menu"):
+        return
+    interface_menu = tk.Menu(menubar, tearoff=0)
+    try:
+        interface_menu.configure(
+            postcommand=lambda m=interface_menu, w=win:
+                app.populate_window_menu(m, w)
+        )
+    except tk.TclError:
+        pass
+    app.populate_window_menu(interface_menu, win)
+    menubar.add_cascade(label="Interface", menu=interface_menu)
+
+
 def _add_copy_cascade(menubar: tk.Menu, reader) -> None:
     """Append the citation-only command and selectable Ctrl-C styles."""
     copy_menu = _build_copy_menu(menubar, reader)
@@ -505,20 +521,12 @@ def _install_history_menubar(app, win: tk.Misc, reader=None):
         pass
     app.populate_history_menu(history_menu)
     menubar.add_cascade(label="History", menu=history_menu)
-    if hasattr(app, "populate_window_menu"):
-        window_menu = tk.Menu(menubar, tearoff=0)
-        try:
-            window_menu.configure(
-                postcommand=lambda m=window_menu, w=win:
-                    app.populate_window_menu(m, w)
-            )
-        except tk.TclError:
-            pass
-        app.populate_window_menu(window_menu, win)
-        menubar.add_cascade(label="Window", menu=window_menu)
     _add_bookmarks_cascade(menubar, app, win)
-    # Keep copy settings at the far right of the existing menu bar.
     _add_copy_cascade(menubar, reader)
+    # Interface last, at the far right: it is the one menu that is about the
+    # app rather than about the document, and it sits in the same place on
+    # every window so it can be found without looking.
+    _add_interface_cascade(menubar, app, win)
     try:
         win.config(menu=menubar)
     except tk.TclError:
@@ -1143,6 +1151,41 @@ class _CaseTabsWindow:
             self.app, "_case_tabs_window_destroyed"
         ):
             self.app._case_tabs_window_destroyed(self)
+
+
+#: The three interfaces, in the order the Interface menu offers them.
+#:
+#:   windows   every document in a window of its own — the original app.
+#:   tabs      one OS window, each document a page in its notebook.
+#:   reporter  the reports themselves: a document opens as the scan, in the
+#:             small floating viewer, and T turns it into the text.  Anything
+#:             with no scan to show still opens *there*, in the same window at
+#:             the same size, on the text side; anything with no text at all —
+#:             a statute, a regulation — opens in a window of its own, because
+#:             there is nothing about it a reporter view would improve.
+_INTERFACE_MODES = ("windows", "tabs", "reporter")
+_INTERFACE_LABELS = (
+    ("windows", "Individual Windows"),
+    ("tabs", "Tabbed View"),
+    ("reporter", "Reporter View"),
+)
+_DEFAULT_INTERFACE_MODE = "windows"
+
+
+def _read_interface_mode(config: dict) -> str:
+    """The saved interface, honouring the older two-checkbox settings.
+
+    The mode used to be two independent booleans — tabs on or off, PDFs
+    floating or not.  A reader who had turned both on was already asking for
+    the reporter interface; tabs alone still means tabs."""
+    mode = str(config.get("interface_mode") or "").strip().lower()
+    if mode in _INTERFACE_MODES:
+        return mode
+    if config.get("pdf_separate_window"):
+        return "reporter"
+    if config.get("case_tabs_enabled"):
+        return "tabs"
+    return _DEFAULT_INTERFACE_MODE
 
 
 def _case_view_host(parent: tk.Misc, app):
@@ -6182,26 +6225,18 @@ class CourtListenerGUI:
         self._spotlight_hotkey = _load_saved_spotlight_hotkey()
         self._root_hidden = False
 
-        # Opinion windows can remain separate (the default) or share one
-        # notebook Toplevel.  Viewers register no-refetch reopen callbacks so
-        # changing modes can migrate every case already on screen.
+        # Which of the three interfaces the app is wearing — see the Interface
+        # menu (:data:`_INTERFACE_MODES`).  Viewers register no-refetch reopen
+        # callbacks so switching between windows and tabs can migrate every
+        # case already on screen.
         config = _load_config()
-        self._case_tabs_enabled = bool(config.get("case_tabs_enabled", False))
-        self._case_tabs_var = tk.BooleanVar(
-            master=self.root, value=self._case_tabs_enabled
+        self._interface_mode = _read_interface_mode(config)
+        self._interface_var = tk.StringVar(
+            master=self.root, value=self._interface_mode
         )
         self._case_tabs_window: Optional[_CaseTabsWindow] = None
         self._detached_tab_windows: set[_CaseTabsWindow] = set()
         self._open_case_views: dict[int, dict] = {}
-
-        # "View PDF" either swaps the scan into the opinion window (the
-        # default) or floats it in its own minimal viewer, off the reader.
-        self._pdf_separate_window = bool(
-            config.get("pdf_separate_window", False)
-        )
-        self._pdf_separate_var = tk.BooleanVar(
-            master=self.root, value=self._pdf_separate_window
-        )
         # Viewers opened by following a citation inside a PDF; they belong to
         # no reader, so the app holds them until they are closed.
         self._cited_pdf_windows: set = set()
@@ -6664,29 +6699,21 @@ class CourtListenerGUI:
             menu.add_command(label=label, command=opener)
 
     # ------------------------------------------------------------------
-    # Opinion-window mode (separate OS windows or one tabbed window)
+    # The interface: windows, tabs, or the reports themselves
     # ------------------------------------------------------------------
 
     def populate_window_menu(self, menu: tk.Menu, view=None) -> None:
-        """Fill the Window menu shown beside History on every opinion."""
+        """Fill the Interface menu every window carries at its right-hand end."""
         try:
             menu.delete(0, "end")
         except tk.TclError:
             return
-        menu.add_checkbutton(
-            label="Show All Windows in Tabbed View",
-            variable=self._case_tabs_var,
-            command=lambda: self.set_case_tabs_enabled(
-                bool(self._case_tabs_var.get())
-            ),
-        )
-        menu.add_checkbutton(
-            label="View PDF in Separate Window",
-            variable=self._pdf_separate_var,
-            command=lambda: self.set_pdf_separate_window(
-                bool(self._pdf_separate_var.get())
-            ),
-        )
+        for mode, label in _INTERFACE_LABELS:
+            menu.add_radiobutton(
+                label=label, value=mode, variable=self._interface_var,
+                command=lambda m=mode: self.set_interface_mode(m),
+            )
+        menu.add_separator()
         # Opinion viewers expose their (default-hidden) source bar here.
         source_owner = getattr(view, "_source_bar_control", None)
         if source_owner is not None and hasattr(source_owner, "_source_bar_var"):
@@ -6695,29 +6722,66 @@ class CourtListenerGUI:
                 variable=source_owner._source_bar_var,
                 command=source_owner._toggle_source_bar_from_menu,
             )
-        menu.add_separator()
-        menu.add_command(
-            label="Close Current Tab" if isinstance(view, _CaseTabPage)
-            else "Close Window",
-            command=(view.destroy if view is not None else lambda: None),
-        )
+        if view is not None and view is not getattr(self, "root", None):
+            menu.add_command(
+                label="Close Current Tab" if isinstance(view, _CaseTabPage)
+                else "Close Window",
+                command=view.destroy,
+            )
 
-    def pdf_opens_in_separate_window(self) -> bool:
-        """Whether "View PDF" floats the scan in its own minimal viewer rather
-        than showing it inside the opinion window."""
-        return bool(getattr(self, "_pdf_separate_window", False))
+    def interface_mode(self) -> str:
+        """Which of :data:`_INTERFACE_MODES` the app is wearing."""
+        mode = getattr(self, "_interface_mode", _DEFAULT_INTERFACE_MODE)
+        return mode if mode in _INTERFACE_MODES else _DEFAULT_INTERFACE_MODE
 
-    def set_pdf_separate_window(self, enabled: bool) -> None:
-        """Remember the reader's choice of where a PDF opens.  Views already on
-        screen are left alone — the setting applies from the next PDF opened."""
-        enabled = bool(enabled)
-        self._pdf_separate_var.set(enabled)
-        if enabled == self._pdf_separate_window:
+    @property
+    def _case_tabs_enabled(self) -> bool:
+        """Whether documents share one tabbed window."""
+        return self.interface_mode() == "tabs"
+
+    def pdf_opens_in_separate_window(self, view=None) -> bool:
+        """Whether a scan floats in its own viewer rather than taking the
+        reader's place.
+
+        Only the reporter interface does that: in the other two, "View PDF"
+        turns the window it is in over to the scan, which is what those two are
+        for.  A PDF popped out of the tabbed window is the exception — it *is*
+        a reporter window, so what it opens behaves like one."""
+        if self.interface_mode() == "reporter":
+            return True
+        if getattr(view, "_reporter_window", False):
+            return True
+        try:                    # a tab page carries the flag on its window
+            return bool(getattr(view.winfo_toplevel(), "_reporter_window",
+                                False))
+        except (AttributeError, tk.TclError):
+            return False
+
+    def set_interface_mode(self, mode: str) -> None:
+        """Switch interfaces, and remember it.
+
+        Windows and tabs are two ways of holding the same views, so switching
+        between them migrates everything on screen (each view knows how to
+        reopen itself with no refetch).  The reporter interface is not: putting
+        a case into it means finding a scan of it, which is a fetch that can
+        fail, so it applies to what is opened next rather than rearranging what
+        is already there."""
+        mode = str(mode or "").lower()
+        if mode not in _INTERFACE_MODES:
             return
-        self._pdf_separate_window = enabled
+        self._interface_var.set(mode)
+        previous = self.interface_mode()
+        if mode == previous:
+            return
+        self._interface_mode = mode
         config = _load_config()
-        config["pdf_separate_window"] = enabled
+        config["interface_mode"] = mode
+        config.pop("case_tabs_enabled", None)
+        config.pop("pdf_separate_window", None)
         _save_config(config)
+        if "reporter" in (mode, previous):
+            return          # applies from the next document opened
+        self._migrate_open_views(tabs=(mode == "tabs"))
 
     def new_case_view_host(self, parent: tk.Misc):
         """Compatibility name for opinion viewers."""
@@ -6816,16 +6880,29 @@ class CourtListenerGUI:
             and self._secondary_entry_for_view(view) is not None
         )
 
+    @staticmethod
+    def _view_is_showing_pdf(view) -> bool:
+        owner = getattr(view, "_secondary_owner", None)
+        return bool(getattr(owner, "_mode", "") == "pdf")
+
     def pop_out_view(self, view) -> None:
-        """Move one tab into a new independent tabbed OS window."""
+        """Move one tab into a new independent tabbed OS window.
+
+        A tab showing a *scan* pops out as a reporter window: the reader asked
+        for the report on its own, which is the reporter interface in
+        miniature, so what that window opens from then on behaves that way
+        whatever the app as a whole is set to."""
         entry = self._secondary_entry_for_view(view)
         if entry is None or not isinstance(view, _CaseTabPage):
             return
+        reporter = self._view_is_showing_pdf(view)
         try:
             view.destroy()
         except tk.TclError:
             pass
         manager = _CaseTabsWindow(self, self.root)
+        if reporter:
+            manager.win._reporter_window = True
         self._detached_tab_windows.add(manager)
         try:
             entry["reopen"](manager.win)
@@ -6841,30 +6918,24 @@ class CourtListenerGUI:
             return False
 
     def set_case_tabs_enabled(self, enabled: bool) -> None:
-        """Switch modes and migrate every currently open opinion."""
-        enabled = bool(enabled)
-        self._case_tabs_var.set(enabled)
-        if enabled == self._case_tabs_enabled:
-            return
+        """Compatibility name: the tabbed interface on or off."""
+        self.set_interface_mode("tabs" if enabled else "windows")
 
+    def _migrate_open_views(self, tabs: bool) -> None:
+        """Reopen every view on screen in the interface just chosen."""
         snapshots = [
             entry for entry in self._open_case_views.values()
             if self._case_view_is_live(entry.get("view"))
         ]
-        self._case_tabs_enabled = enabled
-        config = _load_config()
-        config["case_tabs_enabled"] = enabled
-        _save_config(config)
-
-        # Set the new mode before closing anything; each snapshot's reopen
-        # callback will therefore choose the destination host automatically.
+        # The mode is already set, so each snapshot's reopen callback chooses
+        # the destination host by itself.
         for entry in snapshots:
             try:
                 entry["view"].destroy()
             except tk.TclError:
                 pass
         self._open_case_views.clear()
-        if not enabled:
+        if not tabs:
             managers = list(self._detached_tab_windows)
             if self._case_tabs_window is not None:
                 managers.append(self._case_tabs_window)
@@ -6970,6 +7041,9 @@ class CourtListenerGUI:
         # document view, so this one lists the saved bookmarks without the
         # "Bookmark This …" toggle the readers show first.
         _add_bookmarks_cascade(menubar, self, self.root)
+        # …and the Interface menu at the far right, in the same place it sits
+        # on every document window.
+        _add_interface_cascade(menubar, self, self.root)
         # The Mac modifier is Cmd, and Tk keeps the two apart — the same
         # reason Ctrl-F alone never opened the find bar there (_bind_find_keys).
         for key, command in (("l", self._show_statute_lookup),
@@ -26659,12 +26733,21 @@ class _ScholarTextWindow:
         threading.Thread(target=run, daemon=True).start()
 
     def _pdf_opens_in_separate_window(self) -> bool:
-        """Whether the app is set to float PDFs in their own minimal viewer."""
+        """Whether this reader's scan floats in its own minimal viewer.
+
+        The reporter interface says yes for everything; the other two say yes
+        only for a window that was popped out of the tabbed one holding a
+        PDF — that window is a reporter window, whatever the app is set to."""
         getter = getattr(self._app, "pdf_opens_in_separate_window", None)
         if getter is None:
             return False
         try:
-            return bool(getter())
+            return bool(getter(self._win))
+        except TypeError:       # an older app object, before the argument
+            try:
+                return bool(getter())
+            except Exception:
+                return False
         except Exception:
             return False
 
