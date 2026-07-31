@@ -332,7 +332,10 @@ class _Viewer:
         self.printed = []
         self.saved = 0
         self.closed_with = []
-        self._on_save = lambda: setattr(self, "saved", self.saved + 1)
+        self.saved_pane = None
+        self._on_save = lambda pane: (
+            setattr(self, "saved", self.saved + 1),
+            setattr(self, "saved_pane", pane))
         self._on_print = self.printed.append
         self._on_close = self.closed_with.append
         if build_text == "reader":

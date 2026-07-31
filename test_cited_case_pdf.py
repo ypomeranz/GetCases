@@ -73,6 +73,23 @@ def _source_of(cls: str, name: str) -> str:
     raise AssertionError(f"{cls} has no {name}")
 
 
+def _load_function(name: str, extra=None):
+    """Exec one module-level function into a stub namespace."""
+    src = next((ast.get_source_segment(SRC, n) for n in TREE.body
+                if isinstance(n, ast.FunctionDef) and n.name == name), None)
+    if src is None:
+        raise AssertionError(f"module-level function not found: {name}")
+    ns = {"tk": _Tk, "re": re, "Optional": typing.Optional}
+    ns.update(extra or {})
+    exec(src, ns)
+    return ns[name]
+
+
+#: The real thing: what saving and printing both write, so a test that watches
+#: the pane sees exactly the calls the app makes.
+WRITE_OUTPUT_PDF = _load_function("_write_output_pdf")
+
+
 # ---------------------------------------------------------------------------
 # 2. A citation clicked inside a PDF opens the cited case's PDF
 # ---------------------------------------------------------------------------
@@ -118,6 +135,7 @@ APP_NS = _load(
      "_is_redacted_case_pdf": lambda url: "case.law" in (url or ""),
      "_build_default_filename": lambda item: FILENAMES.append(item) or "NAME",
      "_named_temp_pdf_path": lambda stem: f"/tmp/{stem}.pdf",
+     "_write_output_pdf": WRITE_OUTPUT_PDF,
      "_print_pdf_file": lambda parent, path, status: PRINTED.append(path),
      "_case_law_print_citation": lambda *a, **kw: "HEADER",
      "filedialog": mock.Mock(),

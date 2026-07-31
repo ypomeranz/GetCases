@@ -8932,7 +8932,7 @@ class CourtListenerGUI:
         try:
             window = _FloatingPdfWindow(
                 host, data, url, title, margin=margin, app=self,
-                on_save=lambda: self._save_cited_pdf(named, status),
+                on_save=lambda pane: self._save_cited_pdf(named, pane, status),
                 on_print=lambda pane: self._print_cited_pdf(named, pane, status),
                 on_cite=lambda act, snip: self.open_cited_case_pdf(
                     host, act, snip, status,
@@ -9086,12 +9086,16 @@ class CourtListenerGUI:
                 item["_us_reports_cite"] = us_cite
         return item
 
-    def _save_cited_pdf(self, named: dict, status=lambda _s: None) -> None:
-        """Save a cited case's scan, named the way the reader's own PDFs are."""
+    def _save_cited_pdf(self, named: dict, pane=None,
+                        status=lambda _s: None) -> None:
+        """Save a cited case's scan the way the reader's own PDFs are saved:
+        named for the case, and holding the pages as the viewer shows them —
+        the same file printing would produce."""
         data = named.get("data")
         if not data:
             return
-        default = _build_default_filename(self._cited_filename_item(named))
+        item = self._cited_filename_item(named)
+        default = _build_default_filename(item)
         path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
@@ -9101,9 +9105,19 @@ class CourtListenerGUI:
         )
         if not path:
             return
+        url = named.get("url") or ""
+        whiten = _is_redacted_case_pdf(url)
+        header = ""
+        if whiten:
+            try:
+                header = _case_law_print_citation(
+                    data, url, item=item, cite_hint=named.get("cite", ""),
+                    client=(self._get_client()
+                            if self._token_var.get().strip() else None))
+            except Exception as exc:
+                print(f"[cite-pdf] header citation failed: {exc}")
         try:
-            with open(path, "wb") as fh:
-                fh.write(data)
+            _write_output_pdf(path, data, pane, whiten=whiten, header=header)
         except Exception as exc:
             messagebox.showerror("Download PDF", str(exc), parent=self.root)
             return
@@ -9133,16 +9147,7 @@ class CourtListenerGUI:
             except Exception as exc:
                 print(f"[cite-pdf] header citation failed: {exc}")
         path = _named_temp_pdf_path(_build_default_filename(item))
-        try:
-            if pane is not None:
-                pane.export_pdf(path, whiten_redactions=whiten,
-                                header_cite=header)
-            else:
-                with open(path, "wb") as fh:
-                    fh.write(data)
-        except Exception:
-            with open(path, "wb") as fh:
-                fh.write(data)
+        _write_output_pdf(path, data, pane, whiten=whiten, header=header)
         _print_pdf_file(self.root, path, status)
 
     def _request_cited_pdf_analysis(self, window, data: bytes, url: str,
@@ -18188,7 +18193,9 @@ class _FloatingPdfWindow:
                 print(f"[pdf-window] exporting the text failed: {exc}")
             return
         if self._on_save is not None:
-            self._on_save()
+            # Its own pane, as with printing: what is saved is the rendering
+            # this window is showing, not the scan as it arrived.
+            self._on_save(self._pane)
 
     def _print(self) -> None:
         if self.showing_text():
@@ -26682,8 +26689,31 @@ class _ScholarTextWindow:
         except tk.TclError:
             pass
 
-    def _download_pdf(self) -> None:
-        """Save the original PDF currently being viewed."""
+    def _pdf_print_header(self, data: bytes) -> tuple[bool, str]:
+        """(whiten the redaction boxes?, the running head to re-letter).
+
+        A redacted case.law scan has its black bars erased for paper — they
+        waste ink — and the reporter citation the redaction took off the
+        running head put back.  Saving and printing want the same answer."""
+        whiten = _is_redacted_case_pdf(self._pdf_url)
+        if not whiten:
+            return False, ""
+        cite_hint = next(
+            (c.cite for c in getattr(self, "_case_law_pdf_choices", []) or []
+             if getattr(c, "url", None) == self._pdf_url), "")
+        try:
+            return True, _case_law_print_citation(
+                data, self._pdf_url, item=getattr(self, "_item", None),
+                cite_hint=cite_hint, client=_client_for_window(self._app))
+        except Exception as exc:
+            print(f"[pdf] header citation failed: {exc}")
+        return True, ""
+
+    def _download_pdf(self, pane: "Optional[_PdfPane]" = None) -> None:
+        """Save the PDF being viewed — the pages as the viewer shows them,
+        cropped and re-centred, redactions whitened, which is the same file
+        Print produces.  ``pane`` names the rendering when it is not this
+        window's own (the floating viewer saves the page it is showing)."""
         data = getattr(self, "_pdf_bytes", None)
         if not data:
             return
@@ -26698,9 +26728,11 @@ class _ScholarTextWindow:
         )
         if not path:
             return
+        whiten, header = self._pdf_print_header(data)
         try:
-            with open(path, "wb") as fh:
-                fh.write(data)
+            _write_output_pdf(
+                path, data, pane if pane is not None else self._pdf_pane,
+                whiten=whiten, header=header)
         except Exception as exc:
             messagebox.showerror("Download PDF", str(exc), parent=parent)
             return
@@ -26719,32 +26751,12 @@ class _ScholarTextWindow:
         if not data:
             return
         pane = pane if pane is not None else self._pdf_pane
-        whiten = _is_redacted_case_pdf(self._pdf_url)
-        header = ""
-        if whiten:
-            cite_hint = next(
-                (c.cite for c in getattr(self, "_case_law_pdf_choices", [])
-                 or [] if getattr(c, "url", None) == self._pdf_url), "")
-            try:
-                header = _case_law_print_citation(
-                    data, self._pdf_url, item=getattr(self, "_item", None),
-                    cite_hint=cite_hint, client=_client_for_window(self._app))
-            except Exception as exc:
-                print(f"[pdf] header citation failed: {exc}")
+        whiten, header = self._pdf_print_header(data)
         # Name the print file the same as "Download PDF" would, so a Save-As
         # from the viewer already carries the Bluebook citation.
         path = _named_temp_pdf_path(
             _build_default_filename(self._pdf_filename_item()))
-        try:
-            if pane is not None:
-                pane.export_pdf(
-                    path, whiten_redactions=whiten, header_cite=header)
-            else:
-                with open(path, "wb") as fh:
-                    fh.write(data)
-        except Exception:
-            with open(path, "wb") as fh:
-                fh.write(data)
+        _write_output_pdf(path, data, pane, whiten=whiten, header=header)
         _print_pdf_file(self._live_parent(), path, self._safe_status)
 
     def _open_pdf_cite(self, action: tuple, snippet: str) -> None:
@@ -27689,19 +27701,12 @@ class _PdfWindow:
         # viewer already carries the proper name.
         stem = re.sub(r"[^\w.-]+", "_", self._title).strip("_") or "statute"
         path = _named_temp_pdf_path(stem)
-        try:
-            if self._pane is not None:
-                self._pane.export_pdf(
-                    path, whiten_redactions=whiten, header_cite=header)
-            else:
-                with open(path, "wb") as fh:
-                    fh.write(data)
-        except Exception:
-            with open(path, "wb") as fh:
-                fh.write(data)
+        _write_output_pdf(path, data, self._pane, whiten=whiten, header=header)
         _print_pdf_file(self._win, path, self._status_var.set)
 
     def _download(self) -> None:
+        """Save the pages as this window shows them — the same file Print
+        produces, rather than the document as it was fetched."""
         data = self._bytes
         if not data:
             return
@@ -27715,9 +27720,18 @@ class _PdfWindow:
         )
         if not path:
             return
+        whiten = _is_redacted_case_pdf(self._url)
+        header = ""
+        if whiten:
+            try:
+                header = _case_law_print_citation(
+                    data, self._url, title=self._title,
+                    client=_client_for_window(self._app))
+            except Exception as exc:
+                print(f"[pdf] header citation failed: {exc}")
         try:
-            with open(path, "wb") as fh:
-                fh.write(data)
+            _write_output_pdf(path, data, self._pane,
+                              whiten=whiten, header=header)
         except Exception as exc:
             messagebox.showerror("Download PDF", str(exc), parent=self._win)
             return
@@ -27734,11 +27748,191 @@ class _PdfWindow:
         _open_citation_in_browser(action, snippet)
 
 
-def _print_pdf_file(parent: tk.Misc, path: str,
-                    status=lambda _s: None) -> None:
-    """Open the PDF in the system's default viewer so the user can print it —
-    choosing a printer in the viewer's own Print dialog — rather than sending it
-    straight to the default printer."""
+# ---------------------------------------------------------------------------
+# Printing a PDF: choosing a printer
+# ---------------------------------------------------------------------------
+# There is no one way to raise the operating system's own print dialog for a
+# file.  macOS has one and will show it on request; Windows' shell "print" verb
+# goes straight to the default printer with no chooser; Linux has no external
+# hook into a print dialog at all.  So the printer is chosen where the OS lets
+# us — Preview's real dialog on a Mac — and in a small dialog of our own where
+# it does not, which offers the printer's *own* settings (where duplex, paper
+# and quality live) alongside the choice.  If none of that works the document
+# opens in the system viewer, which is what this used to do and always leaves
+# the reader a way to print.
+
+def _write_output_pdf(path: str, data: bytes, pane, *,
+                      whiten: bool = False, header: str = "") -> bool:
+    """Write the document as the viewer *shows* it — each page cropped to its
+    content and re-centred on a clean page with the viewer's own margin, a
+    redacted case.law scan whitened and its running head re-lettered.
+
+    Both saving and printing go through here, so the file that comes off Save
+    is the file that would come off the printer.  Returns whether the rendering
+    was used; the original bytes are written when there is no pane to render
+    from, or when rendering fails."""
+    try:
+        if pane is not None:
+            pane.export_pdf(path, whiten_redactions=whiten,
+                            header_cite=header)
+            return True
+    except Exception as exc:
+        print(f"[pdf] rendering the page for output failed: {exc}")
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Printing a PDF: choosing a printer
+# ---------------------------------------------------------------------------
+
+_PRINT_TIMEOUT = 8      # seconds to wait on a printer-listing command
+
+
+def _run_text(cmd: list[str], timeout: int = _PRINT_TIMEOUT) -> str:
+    """*cmd*'s standard output, or "" if it cannot be run."""
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except Exception:
+        return ""
+    return done.stdout or ""
+
+
+def _first_line(text: str) -> str:
+    """The first non-blank line of *text* — a printer name is one line, and a
+    command that answers with more than that has told us something else."""
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _system_printers() -> tuple[list[str], str]:
+    """(printer names this machine knows about, the default one).
+
+    Best effort: an empty list means we could not find out, and the caller
+    falls back to opening the document in the system viewer."""
+    names: list[str] = []
+    default = ""
+    if sys.platform.startswith("win"):
+        out = _run_text([
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "Get-Printer | Select-Object -ExpandProperty Name",
+        ])
+        names = [line.strip() for line in out.splitlines() if line.strip()]
+        if not names:       # older Windows without the Get-Printer cmdlet
+            out = _run_text(["wmic", "printer", "get", "name"])
+            names = [line.strip() for line in out.splitlines()[1:]
+                     if line.strip()]
+        default = _first_line(_run_text([
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "(Get-CimInstance Win32_Printer -Filter 'Default=True')"
+            ".Name",
+        ]))
+    else:
+        # CUPS: "printer NAME is idle.  enabled since …"
+        for line in _run_text(["lpstat", "-a"]).splitlines():
+            first = line.split()
+            if first:
+                names.append(first[0])
+        if not names:
+            for line in _run_text(["lpstat", "-p"]).splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "printer":
+                    names.append(parts[1])
+        shown = _first_line(_run_text(["lpstat", "-d"]))
+        match = re.search(r":\s*(\S+)$", shown)
+        if match:
+            default = match.group(1)
+    seen: set[str] = set()
+    ordered = [n for n in names if not (n in seen or seen.add(n))]
+    if default and default not in ordered:
+        ordered.insert(0, default)
+    return ordered, (default or (ordered[0] if ordered else ""))
+
+
+def _open_printer_settings(printer: str) -> bool:
+    """Open *printer*'s own settings — the dialog carrying duplex, paper size
+    and quality, which is the OS's to draw, not ours."""
+    if not printer:
+        return False
+    try:
+        if sys.platform.startswith("win"):
+            # Printing Preferences for this queue.
+            subprocess.Popen(["rundll32", "printui.dll,PrintUIEntry",
+                              "/e", "/n", printer])
+            return True
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "/System/Library/PreferencePanes/"
+                                      "PrintAndScan.prefPane"])
+            return True
+        # Linux: the desktop's printer tool if it is installed, else the CUPS
+        # page for this queue, which is the same settings by another door.
+        if shutil.which("system-config-printer"):
+            subprocess.Popen(["system-config-printer",
+                              "--show-printer", printer])
+            return True
+        from urllib.parse import quote
+        return bool(webbrowser.open(
+            f"http://localhost:631/printers/{quote(printer)}"))
+    except Exception as exc:
+        print(f"[print] opening printer settings failed: {exc}")
+        return False
+
+
+def _two_sided_supported() -> bool:
+    """Whether we can ask for double-sided ourselves.
+
+    Through CUPS we can (``-o sides=…``).  Windows prints by handing the file
+    to whatever program owns PDFs, which takes no such instruction — duplex
+    there is set in the printer's own settings, which the dialog links to."""
+    return not sys.platform.startswith("win") and bool(shutil.which("lp"))
+
+
+def _send_pdf_to_printer(path: str, printer: str,
+                         two_sided: bool = False) -> bool:
+    """Hand *path* to *printer*.  False when it could not be done."""
+    try:
+        if sys.platform.startswith("win"):
+            # The shell's "printto" verb: the PDF handler prints to the named
+            # queue.  Not every handler registers it, hence the return value.
+            os.startfile(path, "printto", f'"{printer}"')  # type: ignore[attr-defined]
+            return True
+        cmd = ["lp", "-d", printer]
+        if two_sided:
+            cmd += ["-o", "sides=two-sided-long-edge"]
+        done = subprocess.run(cmd + [path], capture_output=True, text=True,
+                              timeout=_PRINT_TIMEOUT, check=False)
+        return done.returncode == 0
+    except Exception as exc:
+        print(f"[print] sending to {printer!r} failed: {exc}")
+        return False
+
+
+def _macos_print_dialog(path: str) -> bool:
+    """Show the system print dialog for *path* — the real one, which macOS
+    will raise on request through Preview."""
+    script = (
+        'tell application "Preview"\n'
+        ' activate\n'
+        f' open POSIX file {json.dumps(path)}\n'
+        ' print document 1 with print dialog\n'
+        'end tell'
+    )
+    try:
+        done = subprocess.run(["osascript", "-e", script],
+                              capture_output=True, text=True,
+                              timeout=30, check=False)
+        return done.returncode == 0
+    except Exception as exc:
+        print(f"[print] the system print dialog failed: {exc}")
+        return False
+
+
+def _open_pdf_externally(path: str) -> bool:
+    """Open *path* in whatever the system uses for PDFs."""
     try:
         if sys.platform.startswith("win"):
             os.startfile(path)  # type: ignore[attr-defined]
@@ -27746,13 +27940,133 @@ def _print_pdf_file(parent: tk.Misc, path: str,
             subprocess.Popen(["open", path])
         else:
             subprocess.Popen(["xdg-open", path])
-        status("Opened the PDF — print it (Ctrl/Cmd-P) and choose your printer.")
+        return True
     except Exception:
         try:
-            webbrowser.open("file://" + path)
-            status("Opened the PDF — print it and choose your printer.")
-        except Exception as exc:
-            messagebox.showerror("Print", str(exc), parent=parent)
+            return bool(webbrowser.open("file://" + path))
+        except Exception:
+            return False
+
+
+class _PrintDialog:
+    """Choose a printer for a document, where the OS will not choose one for us.
+
+    Deliberately small: the printers this machine knows about, a way into the
+    selected printer's *own* settings — duplex, paper, quality, all of which
+    belong to the printer and not to us — and, where we can honour it
+    ourselves, double-sided as a checkbox so the common case needs no detour.
+    """
+
+    def __init__(self, parent: tk.Misc, path: str, printers: list[str],
+                 default: str, status=lambda _s: None) -> None:
+        self._path = path
+        self._status = status
+        win = _ui_toplevel(parent)
+        self._win = win
+        win.title("Print")
+        win.minsize(360, 200)
+        _ensure_modern_ttk_styles(win)
+        try:
+            win.transient(parent.winfo_toplevel())
+        except (AttributeError, tk.TclError):
+            pass
+        frame = _ui_frame(win)
+        frame.pack(fill="both", expand=True, padx=16, pady=14)
+        _ui_label(frame, "Print", size=14, weight="bold",
+                  anchor="w").pack(anchor="w", fill="x")
+        _ui_label(frame, os.path.basename(path), muted=True, anchor="w").pack(
+            anchor="w", fill="x", pady=(0, 10))
+        _ui_label(frame, "Printer", anchor="w").pack(anchor="w", fill="x")
+        self._printer_var = tk.StringVar(
+            master=win, value=default or (printers[0] if printers else ""))
+        combo = ttk.Combobox(
+            frame, textvariable=self._printer_var, values=printers,
+            state="readonly",
+            style="Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox",
+        )
+        combo.pack(fill="x", pady=(2, 10))
+        self._two_sided = tk.BooleanVar(master=win, value=False)
+        if _two_sided_supported():
+            _ui_checkbox(frame, "Print on both sides",
+                         self._two_sided).pack(anchor="w", pady=(0, 6))
+        self._status_var = tk.StringVar(master=win, value="")
+        _ui_label(frame, muted=True, anchor="w",
+                  textvariable=self._status_var).pack(fill="x", pady=(0, 8))
+        btns = _ui_frame(frame)
+        btns.pack(fill="x")
+        _ui_button(btns, "Print", command=self._print, primary=True,
+                   width=92).pack(side="right")
+        _ui_button(btns, "Cancel", command=win.destroy, width=88).pack(
+            side="right", padx=(0, 8))
+        _ui_button(btns, "Printer Settings…",
+                   command=self._settings, width=148).pack(side="left")
+        _ui_button(btns, "Open in Viewer", command=self._open_viewer,
+                   width=124).pack(side="left", padx=(8, 0))
+        combo.focus_set()
+        win.bind("<Return>", lambda _e: self._print())
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+    def _settings(self) -> None:
+        if not _open_printer_settings(self._printer_var.get()):
+            self._status_var.set("Could not open the printer's settings.")
+
+    def _open_viewer(self) -> None:
+        if _open_pdf_externally(self._path):
+            self._status("Opened the PDF — print it with Ctrl/Cmd-P.")
+            self._close()
+        else:
+            self._status_var.set("Could not open the PDF.")
+
+    def _print(self) -> None:
+        printer = self._printer_var.get().strip()
+        if not printer:
+            self._status_var.set("Choose a printer first.")
+            return
+        self._status_var.set(f"Sending to {printer}…")
+        try:
+            self._win.update_idletasks()
+        except tk.TclError:
+            pass
+        if _send_pdf_to_printer(self._path, printer, self._two_sided.get()):
+            self._status(f"Sent to {printer}.")
+            self._close()
+            return
+        # The queue would not take it — offer the viewer rather than a dead end.
+        self._status_var.set(
+            f"{printer} would not take the document. "
+            "Try Open in Viewer and print from there.")
+
+    def _close(self) -> None:
+        try:
+            self._win.destroy()
+        except tk.TclError:
+            pass
+
+
+def _print_pdf_file(parent: tk.Misc, path: str,
+                    status=lambda _s: None) -> None:
+    """Print *path*, letting the reader choose a printer.
+
+    macOS is asked for its own print dialog.  Everywhere else the printers are
+    listed and offered in :class:`_PrintDialog`, which also opens the chosen
+    printer's settings.  When neither can be done the document opens in the
+    system's PDF viewer — the reader can print from there, which is what this
+    always used to do."""
+    if sys.platform == "darwin" and _macos_print_dialog(path):
+        status("Choose your printer in the print dialog.")
+        return
+    printers, default = _system_printers()
+    if printers:
+        try:
+            _PrintDialog(parent, path, printers, default, status)
+            return
+        except tk.TclError as exc:
+            print(f"[print] the print dialog could not open: {exc}")
+    if _open_pdf_externally(path):
+        status("Opened the PDF — print it (Ctrl/Cmd-P) and choose your printer.")
+        return
+    messagebox.showerror("Print", "Could not open the PDF for printing.",
+                         parent=parent)
 
 
 def _open_statute_pdf(parent: tk.Misc, url: str,
@@ -28261,8 +28575,8 @@ class _SlipOpinionWindow:
         if not path:
             return
         try:
-            with open(path, "wb") as fh:
-                fh.write(self._bytes)  # the official file, unmodified
+            # The pages as this window shows them — the same file Print makes.
+            _write_output_pdf(path, self._bytes, self._pane)
             self._status_var.set(f"Saved PDF to {path}")
         except Exception as exc:
             messagebox.showerror("Download PDF", str(exc), parent=self._win)
@@ -28273,15 +28587,7 @@ class _SlipOpinionWindow:
         # Same file name "Download PDF" would offer for this slip opinion.
         stem = re.sub(r"[^\w.-]+", "_", self._title).strip("_") or "slip_opinion"
         path = _named_temp_pdf_path(stem)
-        try:
-            if self._pane is not None:
-                self._pane.export_pdf(path)
-            else:
-                with open(path, "wb") as fh:
-                    fh.write(self._bytes)
-        except Exception:
-            with open(path, "wb") as fh:
-                fh.write(self._bytes)
+        _write_output_pdf(path, self._bytes, self._pane)
         _print_pdf_file(self._win, path, self._status_var.set)
 
     # -- load / analyze ------------------------------------------------------
