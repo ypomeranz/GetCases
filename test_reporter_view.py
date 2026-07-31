@@ -283,7 +283,7 @@ HOST_NS = _load(
 class _StubViewer:
     made: list = []
 
-    def __init__(self, parent, data, url, title, **kw):
+    def __init__(self, parent, data, url, title, **kw):  # noqa: D107
         self.parent, self.data, self.kw = parent, data, kw
         self.host = object()
         _StubViewer.made.append(self)
@@ -308,6 +308,9 @@ class _HostApp:
     def new_secondary_view_host(self, parent):
         self.secondary.append(parent)
         return "ordinary host"
+
+    def _cited_pdf_window_closed(self, window):
+        self._cited_pdf_windows.discard(window)
 
 
 class TextOnlyCaseTests(unittest.TestCase):
@@ -426,6 +429,8 @@ class _Viewer:
         self._pane = object() if scan else None
         self._bytes = b"%PDF" if scan else None
         self._scan_search = True if scan else None
+        self._on_save = self._on_print = None
+        self._on_cite = self._on_cite_browser = None
         self._url = ""
         self._analysed_url = "x"
         self._body = object()
@@ -577,13 +582,52 @@ class ScanStillComingTests(unittest.TestCase):
         src = _source_of("_ScholarTextWindow", "_offer_scan_to_host")
         self.assertIn("if not self._standalone_embed:", src)
         self.assertIn("window.no_scan_to_find()", src)
-        self.assertIn("window.attach_scan(data, url, "
-                      "self._scan_window_title(url)", src)
+        self.assertIn("data, url, self._scan_window_title(url), "
+                      "margin=margin,", src)
 
     def test_and_the_pages_own_links_follow_when_they_are_read(self):
         src = _source_of("_ScholarTextWindow", "_offer_scan_to_host")
         self.assertIn("self._request_pdf_analysis(", src)
         self.assertIn("self._apply_host_analysis(", src)
+
+    def test_the_handlers_come_across_with_the_pages(self):
+        # Without them a citation on the page clicks into nothing: the window
+        # was built around a case with no scan, so it has no scan handlers.
+        viewer = self._text_only()
+        self.assertIsNone(viewer._on_cite)
+        marks: list = []
+        viewer.attach_scan(
+            b"%PDF", "https://x/1.pdf",
+            on_cite=lambda a, s: marks.append(("cite", a)),
+            on_cite_browser=lambda a, s: marks.append(("browser", a)),
+            on_save=lambda pane: marks.append("save"),
+            on_print=lambda pane: marks.append("print"))
+        viewer._on_cite(("cite", "1 U.S. 1"), "")
+        viewer._on_cite_browser(("cite", "1 U.S. 1"), "")
+        viewer._on_save(None)
+        viewer._on_print(None)
+        self.assertEqual(marks, [("cite", ("cite", "1 U.S. 1")),
+                                 ("browser", ("cite", "1 U.S. 1")),
+                                 "save", "print"])
+
+    def test_a_window_that_already_had_them_keeps_its_own(self):
+        viewer = self._text_only()
+        viewer._on_cite = "original"
+        viewer.attach_scan(b"%PDF", "https://x/1.pdf")
+        self.assertEqual(viewer._on_cite, "original")
+
+    def test_the_reader_hands_over_the_ones_it_uses_for_its_own_scans(self):
+        src = _source_of("_ScholarTextWindow", "_offer_scan_to_host")
+        for handler in ("on_save=self._download_pdf",
+                        "on_print=self._print_pdf",
+                        "on_cite=self._open_pdf_cite",
+                        "on_cite_browser=self._open_pdf_cite_browser"):
+            self.assertIn(handler, src)
+
+    def test_and_keeps_the_scan_those_handlers_act_on(self):
+        # _download_pdf and _print_pdf read the bytes off the reader.
+        src = _source_of("_ScholarTextWindow", "_offer_scan_to_host")
+        self.assertIn("self._pdf_bytes = data", src)
 
 
 class ScanTitleTests(unittest.TestCase):

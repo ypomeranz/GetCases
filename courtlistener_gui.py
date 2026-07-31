@@ -6852,6 +6852,7 @@ class CourtListenerGUI:
         try:
             viewer = _FloatingPdfWindow(
                 self.root, None, "", "", app=self,
+                on_close=self._cited_pdf_window_closed,
                 anchor=parent if parent is not self.root else None)
         except Exception as exc:
             print(f"[reporter] could not open a text window: {exc}")
@@ -18651,16 +18652,28 @@ class _FloatingPdfWindow:
                 else "Show the opinion text")
 
     def attach_scan(self, data: bytes, url: str, title: str = "",
-                    *, margin: Optional[int] = None) -> bool:
+                    *, margin: Optional[int] = None,
+                    on_save=None, on_print=None,
+                    on_cite=None, on_cite_browser=None) -> bool:
         """Take pages that arrived after this window opened.
 
         A case the reporter interface could find no scan of from its citation
         alone opens on the text and keeps looking; this is what a scan turning
         up does.  The opinion on screen is left exactly as it is — all this
         does is give the window a P to press.  Returns whether the pages were
-        taken (a window already showing some keeps those)."""
+        taken (a window already showing some keeps those).
+
+        The handlers come with them.  A window built around no scan was built
+        with none of them — there was nothing for them to act on — so without
+        this a citation on the page would click into nothing, and save and
+        print would have no document to work from."""
         if self._pane is not None or self._bytes or not data:
             return False
+        self._on_save = on_save if on_save is not None else self._on_save
+        self._on_print = on_print if on_print is not None else self._on_print
+        self._on_cite = on_cite if on_cite is not None else self._on_cite
+        if on_cite_browser is not None:
+            self._on_cite_browser = on_cite_browser
         self._bytes = data
         self._url = url
         self._analysed_url = ""
@@ -27276,13 +27289,20 @@ class _ScholarTextWindow:
         data, url = self._pdf_prefetch
         margin = _PdfPane._MARGIN * 3 if _is_us_reports_pdf(url) else None
         try:
-            taken = window.attach_scan(data, url, self._scan_window_title(url),
-                                       margin=margin)
+            # The handlers go across with the pages: this window was built
+            # around a case with no scan, so it has none of its own.
+            taken = window.attach_scan(
+                data, url, self._scan_window_title(url), margin=margin,
+                on_save=self._download_pdf, on_print=self._print_pdf,
+                on_cite=self._open_pdf_cite,
+                on_cite_browser=self._open_pdf_cite_browser)
         except Exception as exc:
             print(f"[reporter] handing the scan to the window failed: {exc}")
             return
         if not taken:
             return
+        # …and this reader now holds the scan those handlers act on.
+        self._pdf_bytes = data
         # The pages' own citations, search and parts rail, once read.
         self._request_pdf_analysis(
             data, url,
