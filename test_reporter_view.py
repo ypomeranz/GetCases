@@ -686,6 +686,51 @@ class ScanWindowChromeTests(unittest.TestCase):
         self.assertFalse(win._win.shown)
 
 
+class ReporterChainTests(unittest.TestCase):
+    """A scan popped out of the tabbed window carries its interface with it —
+    and so does everything opened from it, text side included."""
+
+    def setUp(self):
+        _HandoffViewer.made.clear()
+        self.mark = _load_functions(["_mark_reporter_window"])[
+            "_mark_reporter_window"]
+
+    def test_a_viewer_opened_from_a_reporter_window_is_one(self):
+        app, win = _App(mode="tabs"), _Widget()
+        origin = _Widget()
+        origin._reporter_window = True
+        self.mark(win, app, origin)
+        self.assertTrue(getattr(win, "_reporter_window", False))
+
+    def test_and_so_is_every_viewer_in_reporter_view(self):
+        app, win = _App(mode="reporter"), _Widget()
+        self.mark(win, app, _Widget())
+        self.assertTrue(getattr(win, "_reporter_window", False))
+
+    def test_but_not_one_opened_from_an_ordinary_window(self):
+        app, win = _App(mode="windows"), _Widget()
+        self.mark(win, app, _Widget())
+        self.assertFalse(getattr(win, "_reporter_window", False))
+
+    def test_an_app_that_cannot_answer_is_not_fatal(self):
+        win = _Widget()
+        self.mark(win, None, _Widget())
+        self.assertFalse(getattr(win, "_reporter_window", False))
+
+    def test_the_viewer_marks_itself_where_it_was_opened_from(self):
+        src = _source_of("_FloatingPdfWindow", "__init__")
+        self.assertIn(
+            "_mark_reporter_window(self._win, app,\n"
+            "                              anchor if anchor is not None "
+            "else parent)", src)
+
+    def test_a_scan_handed_over_by_its_courier_is_one_too(self):
+        win = _ScanWindow()
+        win._show(b"%PDF-1.4")
+        self.assertTrue(
+            getattr(_HandoffViewer.made[0]._win, "_reporter_window", False))
+
+
 class ScanWindowSourceTests(unittest.TestCase):
     """The pieces that are easier to read off the source than to drive."""
 

@@ -1223,6 +1223,19 @@ def _case_view_host(parent: tk.Misc, app):
     return _ui_toplevel(parent)
 
 
+def _mark_reporter_window(win, app, origin) -> None:
+    """Flag a floating viewer as a reporter window when whatever opened it was
+    one.  Everything reached from it — a citation clicked on a page, a link on
+    its text side — then opens the way Reporter View opens things, whatever
+    the app as a whole is set to.  This is what carries a scan popped out of
+    the tabbed window, and the chain of windows opened from it, along."""
+    try:
+        if app is not None and app.pdf_opens_in_separate_window(origin):
+            win._reporter_window = True
+    except Exception:
+        pass
+
+
 def _secondary_view_host(parent: tk.Misc, app):
     """Host any non-modal document/tool view in the shared notebook mode."""
     if app is not None and hasattr(app, "new_secondary_view_host"):
@@ -18044,6 +18057,8 @@ class _FloatingPdfWindow:
         # given the application's own root instead.  ``anchor`` is only where to
         # put it on screen.
         self._win = _ui_toplevel(parent)
+        _mark_reporter_window(self._win, app,
+                              anchor if anchor is not None else parent)
         _ensure_modern_ttk_styles(self._win)
         self._win.title(title or "PDF")
         self._place_beside(anchor if anchor is not None else parent)
@@ -28277,6 +28292,13 @@ class _PdfWindow:
             return False
         self._bytes = data
         self._float = viewer
+        # This window was already reporter-bound (that is why it is hiding), so
+        # the viewer taking its place is too, even when the app as a whole is
+        # not — a scan popped out of the tabbed window carries the chain.
+        try:
+            viewer._win._reporter_window = True
+        except (AttributeError, tk.TclError):
+            pass
         if app is not None and hasattr(app, "_cited_pdf_windows"):
             app._cited_pdf_windows.add(viewer)
         viewer.surface()
