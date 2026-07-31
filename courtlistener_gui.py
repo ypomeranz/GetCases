@@ -8917,9 +8917,7 @@ class CourtListenerGUI:
         window.surface()
         status(f"Showing the PDF of {cite}"
                + (f" at {_pin_display(pin)}" if pin else "") + ".")
-        key = self._request_cited_pdf_analysis(window, data, url)
-        if key is None:
-            return
+        self._request_cited_pdf_analysis(window, data, url, named)
 
     def _retitle_cited_pdf(self, named: dict) -> None:
         """Restate a cited case's window title as its Bluebook citation, once
@@ -8935,15 +8933,22 @@ class CourtListenerGUI:
         """Render a cited case's opinion inside its PDF viewer — what the T
         button shows there.  Returns None while the background fetch of the
         text is still running (or if it found nothing), which is the viewer's
-        cue to stay on the scan and say so."""
+        cue to stay on the scan and say so.
+
+        The scan and what has been read off it go across as well, so the reader
+        can align the two and the switch keeps the reader's place."""
         page = named.get("page")
         if not page:
             return None
         page_url, html = page
         item = self._cited_filename_item(named)
         item.pop("_us_reports_cite", None)   # a filename hint, not case data
-        return _ScholarTextWindow(host, self, page_url, html, item=item,
-                                  prefetch_pdf=False, chromeless=True)
+        return _ScholarTextWindow(
+            host, self, page_url, html, item=item, prefetch_pdf=False,
+            chromeless=True,
+            initial_pdf=(named.get("data"), named.get("url") or ""),
+            initial_pdf_analysis=named.get("analysis"),
+        )
 
     def _cited_pdf_window_closed(self, window) -> None:
         self._cited_pdf_windows.discard(window)
@@ -9101,9 +9106,14 @@ class CourtListenerGUI:
                 fh.write(data)
         _print_pdf_file(self.root, path, status)
 
-    def _request_cited_pdf_analysis(self, window, data: bytes, url: str):
+    def _request_cited_pdf_analysis(self, window, data: bytes, url: str,
+                                    named: Optional[dict] = None):
         """Give a cited case's viewer the same clickable citations and text
-        search the opinion reader's PDFs get."""
+        search the opinion reader's PDFs get.
+
+        ``named`` also keeps the result, so the opinion text the viewer's T
+        button shows can be handed the pages already read off the scan and
+        align itself to them rather than extracting them a second time."""
         def run() -> None:
             pages: list = []
             italics: list = []
@@ -9126,6 +9136,8 @@ class CourtListenerGUI:
                     print(f"[cite-pdf] section detection failed: {exc}")
             result = {"url": url, "pages": pages, "links": links,
                       "quiet": quiet, "sections": sections}
+            if named is not None:
+                named["analysis"] = result
             self._post_root(lambda: window.apply_analysis(result))
 
         threading.Thread(target=run, daemon=True).start()
@@ -15760,6 +15772,67 @@ def _wash_hex(color: str, toward_white: float) -> str:
     )
 
 
+def _part_author(label: str, loose: bool = False) -> str:
+    """The writer named in a part's heading — "MR. JUSTICE REHNQUIST,
+    dissenting" → "Rehnquist" — or "per curiam" for an opinion issued in the
+    Court's name.  "" when the heading names nobody.
+
+    ``loose`` accepts any capitalised word as a last resort, for a heading
+    whose wording none of the usual forms match."""
+    text = re.sub(r"\s+", " ", label or "").strip()
+    # Per curiam opinions are not written by a named justice; the surname
+    # extraction below would otherwise produce the truncated "Per".
+    if re.search(r"per\s+curiam", text, re.IGNORECASE):
+        return "per curiam"
+    m = (re.search(r"\b(?:[Cc]hief\s+)?(?:JUSTICE|Justice)\s+"
+                   r"([A-Z][A-Za-z'’.]+)", text)
+         or re.search(r"\b([A-Z][A-Za-z'’]{2,}),\s*(?:C\.\s*)?J\.", text)
+         or re.search(r"\(([A-Z][A-Za-z'’.]+)", text)
+         or (re.search(r"\b([A-Z][A-Za-z'’]{2,})\b", text) if loose else None))
+    if not m:
+        return ""
+    name = m.group(1).rstrip(".")
+    if name.isupper():      # THOMAS → Thomas
+        name = name[:1] + name[1:].lower()
+    return name
+
+
+#: What each kind of writing is called in full, for a hover tip — a parts strip
+#: has room for a surname at most, and colour alone does not say whether a
+#: writing is a dissent or a concurrence.
+_PART_KIND_NAMES = {
+    "majority": "Opinion of the Court",
+    "concurrence": "Concurrence",
+    "dissent": "Dissent",
+    "separate": "Separate opinion",
+    "syllabus": "Syllabus",
+    "header": "Caption",
+}
+
+
+#: The kinds of part somebody signs.  A syllabus or a caption has no author,
+#: so a capitalised word in its heading is its own name, not a judge's.
+_AUTHORED_PART_KINDS = frozenset(
+    {"majority", "concurrence", "dissent", "separate"})
+
+
+def _part_tip_text(label: str, kind: str, page: object = None) -> str:
+    """What the pointer resting on a part says: the kind of writing and who
+    wrote it, plus the page it starts on when that is known — the answer the
+    rail beside a PDF's scrollbar gives, for the opinion text as well."""
+    name = _PART_KIND_NAMES.get(kind, "Part")
+    author = _part_author(label, loose=kind in _AUTHORED_PART_KINDS)
+    if author and author.lower() == name.lower():
+        author = ""     # a heading that is only the word "Dissent" names nobody
+    if author == "per curiam":
+        text = f"{name} (per curiam)"
+    elif author:
+        text = f"{name} — {author}"
+    else:
+        text = name
+    return f"{text} — p. {page}" if page else text
+
+
 def _region_mostly_black(img, box, frac: float = 0.90) -> bool:
     """True when at least `frac` of the pixels inside `box` are near-black —
     the full-resolution confirmation that a small candidate really is a solid
@@ -17764,12 +17837,21 @@ class _FloatingPdfWindow:
         return reader
 
     def _show_text(self) -> None:
+        pane = self._pane
+        # Where the pages are open, read before anything moves — the opinion is
+        # then scrolled to the same passage, so the switch keeps the reader's
+        # place rather than dropping them at the top of the case.
+        viewport = None
+        if pane is not None:
+            try:
+                viewport = pane.viewport_anchor()
+            except tk.TclError:
+                viewport = None
         if self._build_reader() is None:
             # The background fetch has not finished (or found nothing): stay on
             # the scan and say why, on the strip itself.
             self._flash("Text not ready")
             return
-        pane = self._pane
         if pane is not None:
             try:
                 pane.pack_forget()
@@ -17779,11 +17861,24 @@ class _FloatingPdfWindow:
         self._mode = "text"
         self._sync_bar()
         try:
+            self._reader._show_text_at_pdf_viewport(self._url, viewport)
+        except (AttributeError, tk.TclError) as exc:
+            print(f"[pdf-window] matching the text to the page failed: {exc}")
+        try:
             self._reader._text.focus_set()
         except (AttributeError, tk.TclError):
             pass
 
     def _show_scan(self) -> None:
+        # The mirror of the above: the passage being read decides which page
+        # the scan opens on.
+        target = None
+        if self._reader is not None:
+            try:
+                self._reader._forget_pdf_viewport_request()
+                target = self._reader._consume_pdf_switch_target(self._url)
+            except (AttributeError, tk.TclError):
+                target = None
         if self._text_host is not None:
             try:
                 self._text_host.pack_forget()
@@ -17798,6 +17893,9 @@ class _FloatingPdfWindow:
             except tk.TclError:
                 pass
         self._sync_bar()
+        if target is not None:
+            page, y_pt = target
+            self.scroll_to_page(page, y_pt)
 
     def _sync_bar(self) -> None:
         """Point the strip at whichever surface is showing: T becomes P, Fit
@@ -18691,6 +18789,9 @@ class _ScholarTextWindow:
         self._saved_pagination_json: Optional[dict] = None
         self._pending_pdf_switch = False
         self._pending_pdf_target: Optional[tuple[int, float]] = None
+        # A switch from a scan to this text that arrived before the two were
+        # aligned: (pdf url, viewport, where the reader was left).
+        self._pdf_viewport_request: Optional[tuple] = None
         # A standalone PDF-first case view can hand us the address matching
         # its viewport.  It is consumed after the first text render; when no
         # map was ready at the click, this remains None and preserves the
@@ -19049,6 +19150,11 @@ class _ScholarTextWindow:
         self._partmap.bind("<Button-1>", self._on_partmap_click)
         self._partmap.bind("<Enter>", lambda _e: self._partmap.config(cursor="hand2"))
         self._partmap.bind("<Leave>", lambda _e: self._partmap.config(cursor=""))
+        # The strip has room for a surname at most, and its colour alone does
+        # not distinguish a dissent from a concurrence — so resting on a part
+        # names it in full, exactly as the rail beside a PDF's scrollbar does.
+        _HoverTip(self._partmap, self._partmap_tip_text, delay=320,
+                  follow_motion=True)
         self._text_frame, self._vsb = text_frame, vsb
         self._details_frame: Optional[ttk.Frame] = None
         self._details_loaded = False
@@ -19852,6 +19958,9 @@ class _ScholarTextWindow:
         # A pin cite followed into this window may have been waiting for these
         # inferred reporter pages to exist.
         self._retry_pending_pin_jump()
+        # …and so may a switch from a scan to this text, which cannot know
+        # where in the opinion the pages were until the two are aligned.
+        self._retry_pdf_viewport_request()
 
     def _mapped_page_at_index(self, index: str) -> Optional[int]:
         txt = self._text
@@ -21225,7 +21334,8 @@ class _ScholarTextWindow:
                 if ys[i + 1] - ys[i] < gap:
                     ys[i] = ys[i + 1] - gap
             ys[0] = max(ys[0], top)
-        drawn: list[list] = []   # [y, y_bottom, start index, [canvas ids]]
+        # [y, y_bottom, start index, label, kind, [canvas ids]]
+        drawn: list[list] = []
         for (rs, kind, label), y in zip(marks, ys):
             color = self._PARTMAP_COLORS.get(kind, "black")
             ids = [
@@ -21240,7 +21350,7 @@ class _ScholarTextWindow:
             ids.append(tid)
             bbox = canvas.bbox(tid)
             y2 = bbox[3] if bbox else y + 14
-            drawn.append([y, y2, rs, ids])
+            drawn.append([y, y2, rs, label, kind, ids])
         # A label's real height is only known once it is drawn — a long name
         # wraps to a second line, taller than the single line reserved above.
         # Walk up from the bottom lifting any marker whose label runs past the
@@ -21249,14 +21359,14 @@ class _ScholarTextWindow:
         # opinion is exactly the one that would have.
         limit = h - 2
         for row in reversed(drawn):
-            y, y2, _rs, ids = row
+            y, y2, ids = row[0], row[1], row[5]
             shift = min(y2 - limit, y - top)
             if shift > 0:
                 for item in ids:
                     canvas.move(item, 0, -shift)
                 row[0], row[1] = y - shift, y2 - shift
             limit = min(limit, row[0] - 3)
-        self._partmap_rows = [(y, y2, rs) for y, y2, rs, _ids in drawn]
+        self._partmap_rows = [tuple(row[:5]) for row in drawn]
 
     def _draw_part_rail(self, canvas) -> None:
         """The parts as washed bands on a slim rail, each covering the stretch
@@ -21271,7 +21381,7 @@ class _ScholarTextWindow:
             canvas.config(width=0)
             return
         marks = [
-            (start, parts[p].kind)
+            (start, parts[p].kind, parts[p].label)
             for start, _end, p in regions
             if parts[p].kind in ("majority", "concurrence", "dissent",
                                  "separate", "syllabus")
@@ -21287,9 +21397,10 @@ class _ScholarTextWindow:
         except tk.TclError:
             height = self._text.winfo_height()
         canvas.create_line(0, 0, 0, height, fill=_PdfPane._RAIL_EDGE)
-        starts = [max(0.0, self._ypixels(start) / total) for start, _k in marks]
-        rows: list[tuple[float, float, str]] = []
-        for i, (start, kind) in enumerate(marks):
+        starts = [max(0.0, self._ypixels(start) / total)
+                  for start, _k, _l in marks]
+        rows: list[tuple] = []
+        for i, (start, kind, label) in enumerate(marks):
             top = starts[i] * height
             bottom = (starts[i + 1] * height if i + 1 < len(starts) else height)
             bottom = max(top + 2, bottom)
@@ -21300,7 +21411,7 @@ class _ScholarTextWindow:
             canvas.create_rectangle(
                 1, top, width, min(top + _PdfPane._RAIL_TICK_H, bottom),
                 width=0, fill=color)
-            rows.append((top, bottom, start))
+            rows.append((top, bottom, start, label, kind))
         self._partmap_rows = rows
 
     @staticmethod
@@ -21309,45 +21420,68 @@ class _ScholarTextWindow:
         opinions just the author's surname (the colour conveys its known or
         neutral role); for the main opinion 'Opinion
         (Author)'."""
-        text = re.sub(r"\s+", " ", label or "").strip()
-        # Per curiam opinions: the parenthetical should read "(per curiam)", not
-        # the truncated "(Per)" the surname extraction below would produce.
-        if re.search(r"per\s+curiam", text, re.IGNORECASE):
+        name = _part_author(label)
+        if name == "per curiam":
             return "Opinion (per curiam)" if kind == "majority" else "per curiam"
-        m = (re.search(r"\b(?:[Cc]hief\s+)?(?:JUSTICE|Justice)\s+"
-                       r"([A-Z][A-Za-z'’.]+)", text)
-             or re.search(r"\b([A-Z][A-Za-z'’]{2,}),\s*(?:C\.\s*)?J\.", text)
-             or re.search(r"\(([A-Z][A-Za-z'’.]+)", text))
-        name = None
-        if m:
-            name = m.group(1).rstrip(".")
-            if name.isupper():  # THOMAS → Thomas
-                name = name[:1] + name[1:].lower()
         if kind == "majority":
             return f"Opinion ({name})" if name else "Opinion"
         # Dissent / concurrence: surname alone (colour distinguishes the two).
-        if name is None:  # last resort: any capitalised token
-            m2 = re.search(r"\b([A-Z][A-Za-z'’]{2,})\b", text)
-            if m2:
-                name = m2.group(1)
-                if name.isupper():
-                    name = name[:1] + name[1:].lower()
+        name = name or _part_author(label, loose=True)
         fallback = {
             "dissent": "Dissent", "concurrence": "Concurrence",
             "separate": "Separate opinion",
         }
         return name or fallback.get(kind, "Opinion")
 
+    def _partmap_start_page(self, index: str) -> object:
+        """The reporter page in force where a part begins, if the opinion
+        carries star pagination at all."""
+        best = None
+        for page, mark in (getattr(self, "_page_pos", None) or {}).items():
+            try:
+                if self._text.compare(mark, "<=", index):
+                    if best is None or page > best:
+                        best = page
+            except tk.TclError:
+                continue
+        return best
+
+    def _partmap_row_at(self, y: float):
+        """The part whose band or marker covers strip height *y*."""
+        for row in getattr(self, "_partmap_rows", []):
+            if row[0] - 4 <= y <= row[1] + 4:
+                return row
+        return None
+
+    def _partmap_tip_text(self) -> str:
+        """The part under the pointer, named for the hover tip."""
+        canvas = getattr(self, "_partmap", None)
+        if canvas is None:
+            return ""
+        try:
+            x = canvas.winfo_pointerx() - canvas.winfo_rootx()
+            y = canvas.winfo_pointery() - canvas.winfo_rooty()
+        except tk.TclError:
+            return ""
+        if not (0 <= x <= canvas.winfo_width()
+                and 0 <= y <= canvas.winfo_height()):
+            return ""   # the pointer left without a <Leave> reaching us
+        row = self._partmap_row_at(y)
+        if row is None or len(row) < 5:
+            return ""
+        return _part_tip_text(row[3], row[4],
+                              self._partmap_start_page(row[2]))
+
     def _on_partmap_click(self, event) -> None:
-        for y1, y2, rs in getattr(self, "_partmap_rows", []):
-            if y1 - 4 <= event.y <= y2 + 4:
-                try:
-                    self._text.see(rs)
-                    self._text.yview(rs)
-                except tk.TclError:
-                    pass
-                self._draw_page_column()
-                return
+        row = self._partmap_row_at(event.y)
+        if row is None:
+            return
+        try:
+            self._text.see(row[2])
+            self._text.yview(row[2])
+        except tk.TclError:
+            pass
+        self._draw_page_column()
 
     def _render_cl_blocks(self) -> None:
         """Render CourtListener opinion parts with full block formatting."""
@@ -25530,6 +25664,90 @@ class _ScholarTextWindow:
         self._pending_pdf_target = None
         return target
 
+    def _text_target_for_viewport(
+        self, viewport, mode: Optional[str] = None, url: str = "",
+    ):
+        """The place in the opinion matching where a PDF of it is scrolled.
+
+        The other half of :meth:`_begin_pdf_switch`: that one turns a reading
+        position in the text into a page and a height on it, this one turns a
+        page and a height back into a place in the text.  ``None`` when no
+        alignment good enough to navigate by is ready — the caller then leaves
+        the reader where it was, which is what it has always done."""
+        if viewport is None:
+            return None
+        location_map = self._location_map_for(mode or self._mode, url)
+        if not self._location_map_navigation_ready(location_map):
+            return None
+        try:
+            matched = location_map.text_location(*viewport)
+        except Exception:
+            return None
+        return self._location_address(matched) if matched else None
+
+    def _show_text_at_pdf_viewport(self, url: str, viewport) -> bool:
+        """Scroll this already-rendered opinion to where *viewport* is in the
+        scan — what the floating viewer's T button asks for, so flipping to the
+        text lands on the passage the pages were open at.
+
+        Aligning an opinion to a scan takes a moment on a worker thread, and
+        the first press of T can easily come first.  The request is then kept
+        and honoured as soon as the alignment lands — but only if the reader
+        has not scrolled in the meantime, since moving the page under someone
+        who has started reading is worse than not moving it at all."""
+        self._pdf_viewport_request = None
+        if viewport is None:
+            return False
+        if self._apply_pdf_viewport(url, viewport):
+            return True
+        try:
+            resting = self._text.yview()[0]
+        except tk.TclError:
+            return False
+        self._pdf_viewport_request = (url, viewport, resting)
+        return False
+
+    def _apply_pdf_viewport(self, url: str, viewport) -> bool:
+        address = self._text_target_for_viewport(viewport, url=url)
+        if address is None:
+            return False
+        self._pending_text_target = address
+        self._restore_pending_text_location()
+        return True
+
+    def _retry_pdf_viewport_request(self) -> None:
+        """An alignment has just been installed: honour a switch to the text
+        that arrived before it was ready."""
+        request = getattr(self, "_pdf_viewport_request", None)
+        if not request:
+            return
+        url, viewport, resting = request
+        try:
+            if abs(self._text.yview()[0] - resting) > 0.001:
+                self._pdf_viewport_request = None   # they have moved on
+                return
+        except tk.TclError:
+            return
+        if self._apply_pdf_viewport(url, viewport):
+            self._pdf_viewport_request = None
+
+    def _forget_pdf_viewport_request(self) -> None:
+        """Drop a pending switch — the text is no longer what is on screen."""
+        self._pdf_viewport_request = None
+
+    def _pdf_analysis_for(self, url: str) -> Optional[dict]:
+        """What this window has read off the scan at *url*, in the form another
+        reader of the same case can be handed.
+
+        The pages, the citation links and the detected parts travel: extracting
+        them is the slow part, and they say nothing about any one rendering.
+        The alignment maps do not — an address in one names its block by object
+        identity, and a second reader has parsed its own — so the copy leaves
+        them out and aligns the same pages against its own text instead."""
+        key = self._pdf_url_keys.get(url)
+        result = self._pdf_analysis_cache.get(key) if key is not None else None
+        return dict(result, maps={}) if result else None
+
     def _pdf_item(self) -> dict:
         """The search-result-shaped dict used to resolve a PDF URL.  Falls back
         to the Bluebook citation when this window wasn't opened from a result."""
@@ -26080,9 +26298,17 @@ class _ScholarTextWindow:
 
         Built from the ingredients this window already holds, so the text
         appears at once and nothing is fetched a second time; the copy is
-        chromeless, taking its controls from the viewer's own strip."""
+        chromeless, taking its controls from the viewer's own strip.
+
+        The scan on show and this window's analysis of it go across too — that
+        analysis carries the alignment between the opinion and the pages, which
+        is what lets the viewer's T and P keep the reader's place."""
         kwargs: dict = {"item": dict(self._item), "prefetch_pdf": False,
                         "chromeless": True}
+        if self._pdf_bytes is not None and self._pdf_url:
+            kwargs["initial_pdf"] = (self._pdf_bytes, self._pdf_url)
+            kwargs["initial_pdf_analysis"] = self._pdf_analysis_for(
+                self._pdf_url)
         if self._cl_primary:
             kwargs.update(cl_text=self._cl_text, cl_parts=self._cl_parts,
                           cl_blocks=self._cl_blocks)
@@ -26362,26 +26588,18 @@ class _ScholarTextWindow:
         Scholar text, or the CourtListener text for a CL-primary window."""
         self._pending_text_target = None
         pane = self._pdf_pane
-        location_map = self._location_map_for(self._pre_pdf_mode)
-        if (
-            pane is not None
-            and self._location_map_navigation_ready(location_map)
-        ):
-            viewport = pane.viewport_anchor()
-            if viewport is not None:
-                try:
-                    matched = location_map.text_location(*viewport)
-                except Exception:
-                    matched = None
-                address = self._location_address(matched) if matched else None
-                if address is not None:
-                    self._pending_text_target = address
-                    part_index = getattr(address, "part_index", None)
-                    if (self._current_part is not None
-                            and part_index != self._current_part):
-                        # The PDF can be scrolled into another writing. Show the
-                        # full opinion so that target exists in the rendering.
-                        self._current_part = None
+        address = self._text_target_for_viewport(
+            pane.viewport_anchor() if pane is not None else None,
+            mode=self._pre_pdf_mode,
+        )
+        if address is not None:
+            self._pending_text_target = address
+            part_index = getattr(address, "part_index", None)
+            if (self._current_part is not None
+                    and part_index != self._current_part):
+                # The PDF can be scrolled into another writing. Show the
+                # full opinion so that target exists in the rendering.
+                self._current_part = None
         holder = getattr(self, "_pdf_holder", None)
         if holder is not None:
             holder.destroy()  # takes the pane and its parts strip with it

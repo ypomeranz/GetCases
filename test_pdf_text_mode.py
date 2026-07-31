@@ -68,6 +68,27 @@ def _source_of(cls: str, name: str) -> str:
     raise AssertionError(f"{cls} has no {name}")
 
 
+def _load_function(name: str, extra=None):
+    """Exec one module-level function into a stub namespace."""
+    src = next(
+        (ast.get_source_segment(SRC, n) for n in TREE.body
+         if isinstance(n, ast.FunctionDef) and n.name == name), None)
+    if src is None:
+        raise AssertionError(f"module-level function not found: {name}")
+    ns = _base_ns(extra)
+    exec(src, ns)
+    return ns[name]
+
+
+def _module_dict(name: str):
+    for node in TREE.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            return eval(ast.get_source_segment(SRC, node.value), {})  # noqa: S307
+    raise AssertionError(f"module-level constant not found: {name}")
+
+
 def _class_attr(cls: str, name: str):
     body = next(n.body for n in TREE.body
                 if isinstance(n, ast.ClassDef) and n.name == cls)
@@ -171,6 +192,10 @@ class _FakePane:
         self.scrolled = []
         self.stepped = []
         self.find_pages = None
+        self.viewport = (2, 96.0)
+
+    def viewport_anchor(self):
+        return self.viewport
 
     def zoom(self, delta):
         self.zoomed.append(delta)
@@ -240,6 +265,15 @@ class _FakeReader:
     def _export_pdf_latex(self):
         self.exported.append("latex")
 
+    def _show_text_at_pdf_viewport(self, url, viewport):
+        return False
+
+    def _consume_pdf_switch_target(self, url):
+        return None
+
+    def _forget_pdf_viewport_request(self):
+        pass
+
 
 class _FakeHostFrame:
     """The _EmbeddedCaseHost the opinion is built into."""
@@ -294,6 +328,7 @@ class _Viewer:
         self._body = object()
         self._app = None
         self.built = []
+        self.scrolled = []
         self.printed = []
         self.saved = 0
         self.closed_with = []
@@ -315,6 +350,9 @@ class _Viewer:
         self._zoom_label = object()
         for name in VIEWER_NAMES:
             setattr(self, name, VIEWER_NS[name].__get__(self))
+
+    def scroll_to_page(self, page, y_pt=None):
+        self.scrolled.append((page, y_pt))
 
 
 def _in_text_mode(**kw):
@@ -863,9 +901,11 @@ class _RailCanvas:
         self.rects = []
         self.lines = []
         self.texts = []
+        self._text_at = {}
 
     def delete(self, _what):
         self.rects, self.lines, self.texts = [], [], []
+        self._text_at = {}
 
     def config(self, **kw):
         if "width" in kw:
@@ -880,21 +920,38 @@ class _RailCanvas:
     def create_line(self, *coords, **kw):
         self.lines.append((tuple(coords), kw.get("fill")))
 
-    def create_text(self, *coords, **kw):
+    def create_text(self, x, y, **kw):
         self.texts.append(kw.get("text"))
+        self._text_at[len(self.texts)] = [x, y]
         return len(self.texts)
 
     def bbox(self, tid):
-        return (0, 0, 80, 15)      # the labelled map measures what it drew
+        # A label is one line high, as tall as the map's own font: what the
+        # labelled map measures to keep the last marker on screen.
+        x, y = self._text_at[tid]
+        return (x, y, x + 80, y + 15)
 
-    def move(self, _item, _dx, _dy):
-        pass
+    def move(self, tid, dx, dy):
+        if tid in self._text_at:
+            self._text_at[tid][0] += dx
+            self._text_at[tid][1] += dy
 
+
+PART_AUTHOR = _load_function("_part_author")
+PART_TIP_TEXT = _load_function(
+    "_part_tip_text",
+    {"_part_author": PART_AUTHOR,
+     "_PART_KIND_NAMES": _module_dict("_PART_KIND_NAMES"),
+     "_AUTHORED_PART_KINDS": _module_dict("_AUTHORED_PART_KINDS")},
+)
 
 RAIL_NS = _load(
     "_ScholarTextWindow",
-    ["_draw_part_map", "_draw_part_rail", "_partmap_short_label"],
-    {"_PdfPane": type("_PdfPane", (), {
+    ["_draw_part_map", "_draw_part_rail", "_partmap_short_label",
+     "_partmap_row_at", "_partmap_tip_text", "_partmap_start_page",
+     "_on_partmap_click"],
+    {"_part_author": PART_AUTHOR, "_part_tip_text": PART_TIP_TEXT,
+     "_PdfPane": type("_PdfPane", (), {
         "_RAIL_W": RAIL_W, "_RAIL_TICK_H": RAIL_TICK_H,
         "_RAIL_EDGE": RAIL_EDGE, "_RAIL_BAND_WASH": RAIL_BAND_WASH}),
      "_wash_hex": lambda color, toward: f"wash({color})",
@@ -912,21 +969,38 @@ class _RailReader:
     _PARTMAP_COLORS = PART_COLORS
 
     def __init__(self, kinds, starts, total=10000, chromeless=True,
-                 height=600):
+                 height=600, labels=None, pages=None):
         self._chromeless = chromeless
         self._partmap = _RailCanvas(height)
         self._partmap_rows = []
         self._mode = "scholar"
         self._current_part = None
-        self._rendered_parts = [_Part(k) for k in kinds]
+        self._rendered_parts = [
+            _Part(k, (labels or {}).get(k, "")) for k in kinds]
+        # {page: start index} — the star pagination the tip quotes.
+        self._page_pos = pages or {}
         self._text = mock.Mock(winfo_height=lambda: height)
+        self._text.compare = lambda mark, op, index: mark <= index
         self._total = total
         self._starts = {f"s{i}": s for i, s in enumerate(starts)}
         self._regions = [(f"s{i}", f"e{i}", i) for i in range(len(kinds))]
         self._partmap_font = mock.Mock(metrics=lambda _w: 15)
-        for name in ("_draw_part_map", "_draw_part_rail"):
+        for name in ("_draw_part_map", "_draw_part_rail", "_partmap_row_at",
+                     "_partmap_tip_text", "_partmap_start_page",
+                     "_on_partmap_click"):
             setattr(self, name, RAIL_NS[name].__get__(self))
         self._partmap_short_label = RAIL_NS["_partmap_short_label"]
+        self._draw_page_column = lambda: None
+
+    def point_at(self, y):
+        """Put the pointer on the strip at height *y* and read the tip."""
+        canvas = self._partmap
+        canvas.winfo_pointerx = lambda: 5
+        canvas.winfo_rootx = lambda: 0
+        canvas.winfo_pointery = lambda: y
+        canvas.winfo_rooty = lambda: 0
+        canvas.winfo_width = lambda: RAIL_W
+        return self._partmap_tip_text()
 
     def _part_region_indices(self):
         return self._regions
@@ -993,6 +1067,9 @@ class PartRailTests(unittest.TestCase):
         reader = _rail()
         self.assertEqual([row[2] for row in reader._partmap_rows],
                          ["s0", "s1", "s2"])
+        # Bands: majority 0-300, concurrence 300-480, dissent 480-600.
+        reader._on_partmap_click(mock.Mock(y=520))
+        reader._text.yview.assert_called_once_with("s2")
 
     def test_an_opinion_with_nothing_to_map_takes_no_rail_at_all(self):
         reader = _RailReader(["majority"], [0])
@@ -1018,6 +1095,118 @@ class PartRailTests(unittest.TestCase):
         reader._mode = "pdf"
         reader._draw_part_map()
         self.assertEqual(reader._partmap.width_set, 0)
+
+
+# ---------------------------------------------------------------------------
+# Resting on a part names it
+# ---------------------------------------------------------------------------
+
+
+HEADINGS = {
+    "majority": "MR. JUSTICE BLACKMUN delivered the opinion of the Court.",
+    "concurrence": "MR. JUSTICE STEWART, concurring.",
+    "dissent": "MR. JUSTICE REHNQUIST, dissenting.",
+}
+
+
+class PartNameTests(unittest.TestCase):
+    """What the tip says — the kind of writing and who wrote it."""
+
+    def test_a_dissent_is_named_with_its_author(self):
+        self.assertEqual(
+            PART_TIP_TEXT("MR. JUSTICE REHNQUIST, dissenting.", "dissent"),
+            "Dissent — Rehnquist")
+
+    def test_a_concurrence_too(self):
+        self.assertEqual(
+            PART_TIP_TEXT("Justice Stewart, concurring", "concurrence"),
+            "Concurrence — Stewart")
+
+    def test_the_court_s_own_opinion_says_so_in_full(self):
+        self.assertEqual(
+            PART_TIP_TEXT("BLACKMUN, J., delivered the opinion", "majority"),
+            "Opinion of the Court — Blackmun")
+
+    def test_a_per_curiam_names_no_one(self):
+        self.assertEqual(PART_TIP_TEXT("PER CURIAM.", "majority"),
+                         "Opinion of the Court (per curiam)")
+
+    def test_an_unattributed_writing_is_still_named(self):
+        self.assertEqual(PART_TIP_TEXT("", "dissent"), "Dissent")
+
+    def test_a_syllabus_is_named_for_what_it_is(self):
+        self.assertEqual(PART_TIP_TEXT("Syllabus", "syllabus"), "Syllabus")
+
+    def test_the_page_it_starts_on_is_added_when_known(self):
+        self.assertEqual(
+            PART_TIP_TEXT("REHNQUIST, J., dissenting", "dissent", 171),
+            "Dissent — Rehnquist — p. 171")
+
+    def test_a_chief_justice_is_read_the_same_way(self):
+        self.assertEqual(
+            PART_TIP_TEXT("MR. CHIEF JUSTICE BURGER, concurring",
+                          "concurrence"),
+            "Concurrence — Burger")
+
+    def test_the_strip_s_own_short_label_uses_the_same_reading(self):
+        # One author extraction, so the tip and the label never disagree.
+        self.assertEqual(PART_AUTHOR("MR. JUSTICE REHNQUIST, dissenting."),
+                         "Rehnquist")
+        self.assertEqual(
+            RAIL_NS["_partmap_short_label"](
+                "MR. JUSTICE REHNQUIST, dissenting.", "dissent"),
+            "Rehnquist")
+
+
+class PartHoverTests(unittest.TestCase):
+    """The tip on the strip itself, in both the rail and the labelled map."""
+
+    def _reader(self, **kw):
+        reader = _RailReader(["majority", "concurrence", "dissent"],
+                             [0, 5000, 8000], labels=HEADINGS, **kw)
+        reader._draw_part_map()
+        return reader
+
+    def test_resting_on_a_band_names_that_writing(self):
+        # Bands: majority 0-300, concurrence 300-480, dissent 480-600.
+        reader = self._reader()
+        self.assertEqual(reader.point_at(520), "Dissent — Rehnquist")
+
+    def test_each_band_answers_for_itself(self):
+        reader = self._reader()
+        self.assertEqual(
+            [reader.point_at(y) for y in (100, 400, 550)],
+            ["Opinion of the Court — Blackmun", "Concurrence — Stewart",
+             "Dissent — Rehnquist"])
+
+    def test_the_labelled_map_answers_the_same_way(self):
+        # The strip in the ordinary case window shows a surname at most; the
+        # tip is what says whether it is a dissent or a concurrence.
+        reader = self._reader(chromeless=False)
+        y = reader._partmap_rows[2][0]
+        self.assertEqual(reader.point_at(y + 1), "Dissent — Rehnquist")
+
+    def test_it_quotes_the_reporter_page_the_part_starts_on(self):
+        reader = self._reader(pages={113: "s0", 171: "s2"})
+        self.assertEqual(reader.point_at(520), "Dissent — Rehnquist — p. 171")
+
+    def test_an_opinion_with_no_star_pagination_just_names_the_part(self):
+        reader = self._reader(pages={})
+        self.assertEqual(reader.point_at(520), "Dissent — Rehnquist")
+
+    def test_a_pointer_that_has_left_says_nothing(self):
+        reader = self._reader()
+        self.assertEqual(reader.point_at(-20), "")
+
+    def test_nor_does_a_strip_with_nothing_on_it(self):
+        reader = _RailReader(["majority"], [0], labels=HEADINGS)
+        reader._draw_part_map()
+        self.assertEqual(reader.point_at(100), "")
+
+    def test_the_strip_is_given_the_tip_the_pdf_rail_has(self):
+        src = _source_of("_ScholarTextWindow", "_build_ui")
+        self.assertIn("_HoverTip(self._partmap, self._partmap_tip_text", src)
+        self.assertIn("follow_motion=True", src)
 
 
 # ---------------------------------------------------------------------------
@@ -1052,8 +1241,14 @@ class _SourceReader:
         self._history_pdf_url = ""
         self._scholar_url = "https://scholar.test/roe"
         self._history_html = "<p>opinion</p>"
+        self._pdf_bytes = b"%PDF-1"
+        self._pdf_url = "https://example.test/a.pdf"
+        self._analysis = {"pages": [["c"]], "maps": {"scholar": object()}}
         self.__dict__.update(kw)
         self._embed_text_reader = EMBED_NS["_embed_text_reader"].__get__(self)
+
+    def _pdf_analysis_for(self, url):
+        return self._analysis if url == self._pdf_url else None
 
 
 class TextSourceTests(unittest.TestCase):
@@ -1092,6 +1287,19 @@ class TextSourceTests(unittest.TestCase):
         self.assertEqual(built.kw["history_pdf_url"],
                          "https://static.case.law/x.pdf")
 
+    def test_the_scan_and_its_alignment_go_across_too(self):
+        # The analysis carries the opinion-to-pages alignment, which is what
+        # lets T and P keep the reader's place.
+        built = _SourceReader()._embed_text_reader("host")
+        self.assertEqual(built.kw["initial_pdf"],
+                         (b"%PDF-1", "https://example.test/a.pdf"))
+        self.assertEqual(built.kw["initial_pdf_analysis"]["maps"].keys(),
+                         {"scholar"})
+
+    def test_a_window_with_no_scan_of_its_own_sends_none(self):
+        built = _SourceReader(_pdf_bytes=None)._embed_text_reader("host")
+        self.assertNotIn("initial_pdf", built.kw)
+
     def test_the_viewer_is_told_how_to_build_it(self):
         self.assertIn("on_build_text=self._embed_text_reader",
                       _source_of("_ScholarTextWindow", "_show_pdf_floating"))
@@ -1110,6 +1318,212 @@ class TextSourceTests(unittest.TestCase):
         src = _source_of("CourtListenerGUI", "_warm_case_text")
         self.assertIn("on_page", src)
         self.assertIn("on_page(*fetched)", src)
+
+    def test_a_cited_case_gets_the_scan_and_its_analysis_as_well(self):
+        src = _source_of("CourtListenerGUI", "_embed_cited_case_text")
+        self.assertIn("initial_pdf=", src)
+        self.assertIn('initial_pdf_analysis=named.get("analysis")', src)
+
+    def test_which_the_viewer_s_own_analysis_put_there(self):
+        # Read off the scan once, for the pages *and* for the alignment.
+        src = _source_of("CourtListenerGUI", "_request_cited_pdf_analysis")
+        self.assertIn('named["analysis"] = result', src)
+
+
+# ---------------------------------------------------------------------------
+# The switch keeps the reader's place
+# ---------------------------------------------------------------------------
+
+
+class KeepsThePlaceTests(unittest.TestCase):
+    """T lands on the passage the pages were open at, and P the other way —
+    the same alignment the case window's own PDF/Text switch uses."""
+
+    def setUp(self):
+        _FakeHostFrame.made = []
+
+    @staticmethod
+    def _placed(viewer):
+        reader = viewer._reader
+        reader.matched = []
+        reader.pdf_targets = []
+
+        def to_text(url, viewport):
+            reader.matched.append((url, viewport))
+            return viewport is not None
+
+        def to_pdf(url):
+            reader.pdf_targets.append(url)
+            return (4, 288.0)
+
+        reader._show_text_at_pdf_viewport = to_text
+        reader._consume_pdf_switch_target = to_pdf
+        return reader
+
+    def test_the_text_opens_where_the_pages_were(self):
+        viewer = _Viewer()
+        viewer._pane.viewport = (3, 120.0)
+        viewer._toggle_mode()          # builds the reader
+        reader = self._placed(viewer)
+        viewer._toggle_mode()          # back to the scan
+        viewer._toggle_mode()          # and to the text again
+        self.assertEqual(reader.matched,
+                         [("https://example.test/a.pdf", (3, 120.0))])
+
+    def test_the_viewport_is_read_before_the_pages_are_hidden(self):
+        # Unpacking first would leave nothing to measure.
+        src = _source_of("_FloatingPdfWindow", "_show_text")
+        self.assertLess(src.index("viewport_anchor()"),
+                        src.index("pack_forget()"))
+
+    def test_the_pages_open_where_the_text_was(self):
+        viewer = _in_text_mode()
+        reader = self._placed(viewer)
+        viewer._toggle_mode()
+        self.assertEqual(reader.pdf_targets, ["https://example.test/a.pdf"])
+        self.assertEqual(viewer.scrolled, [(4, 288.0)])
+
+    def test_the_reading_position_is_taken_before_the_text_is_hidden(self):
+        src = _source_of("_FloatingPdfWindow", "_show_scan")
+        self.assertLess(src.index("_consume_pdf_switch_target"),
+                        src.index("pack_forget()"))
+
+    def test_no_alignment_means_the_switch_just_happens(self):
+        # The historical behaviour: land at the top rather than guessing.
+        viewer = _in_text_mode()
+        viewer._reader._consume_pdf_switch_target = lambda _url: None
+        viewer._toggle_mode()
+        self.assertEqual(viewer.scrolled, [])
+        self.assertFalse(viewer.showing_text())
+
+    def test_a_scan_with_no_viewport_is_no_obstacle(self):
+        viewer = _Viewer()
+        viewer._pane.viewport = None
+        viewer._toggle_mode()
+        self.assertTrue(viewer.showing_text())
+
+    def test_a_failure_to_match_does_not_block_the_switch(self):
+        viewer = _in_text_mode()
+        viewer._toggle_mode()
+        viewer._reader._show_text_at_pdf_viewport = mock.Mock(
+            side_effect=AttributeError("no map"))
+        viewer._toggle_mode()
+        self.assertTrue(viewer.showing_text())
+
+    def test_the_two_directions_are_each_other_s_inverse(self):
+        # One alignment, read forwards and backwards: the reader's own
+        # PDF/Text switch is built from the same pair.
+        forward = _source_of("_ScholarTextWindow", "_begin_pdf_switch")
+        backward = _source_of("_ScholarTextWindow", "_text_target_for_viewport")
+        self.assertIn("pdf_location(", forward)
+        self.assertIn("text_location(", backward)
+
+    def test_the_case_window_s_own_return_uses_the_same_helper(self):
+        self.assertIn("self._text_target_for_viewport(",
+                      _source_of("_ScholarTextWindow", "_back_from_pdf"))
+
+
+VIEWPORT_NS = _load(
+    "_ScholarTextWindow",
+    ["_show_text_at_pdf_viewport", "_apply_pdf_viewport",
+     "_retry_pdf_viewport_request", "_forget_pdf_viewport_request"],
+)
+
+
+class _AligningReader:
+    """A reader whose alignment with the scan arrives when told to."""
+
+    def __init__(self, ready=False, at=0.0):
+        self.ready = ready
+        self.at = at
+        self.restored = []
+        self._pending_text_target = None
+        self._pdf_viewport_request = None
+        self._text = mock.Mock(yview=lambda: (self.at, 1.0))
+        for name in ("_show_text_at_pdf_viewport", "_apply_pdf_viewport",
+                     "_retry_pdf_viewport_request",
+                     "_forget_pdf_viewport_request"):
+            setattr(self, name, VIEWPORT_NS[name].__get__(self))
+
+    def _text_target_for_viewport(self, viewport, mode=None, url=""):
+        return ("address", viewport) if self.ready else None
+
+    def _restore_pending_text_location(self):
+        self.restored.append(self._pending_text_target)
+        self._pending_text_target = None
+
+
+class LateAlignmentTests(unittest.TestCase):
+    """Aligning an opinion to a scan runs on a worker thread, and the first
+    press of T beats it — the switch is honoured when the alignment lands."""
+
+    def test_a_ready_alignment_is_used_at_once(self):
+        reader = _AligningReader(ready=True)
+        self.assertTrue(
+            reader._show_text_at_pdf_viewport("u", (6, 200.0)))
+        self.assertEqual(reader.restored, [("address", (6, 200.0))])
+        self.assertIsNone(reader._pdf_viewport_request)
+
+    def test_one_that_is_not_ready_is_remembered(self):
+        reader = _AligningReader(ready=False, at=0.0)
+        self.assertFalse(
+            reader._show_text_at_pdf_viewport("u", (6, 200.0)))
+        self.assertEqual(reader.restored, [])
+        self.assertEqual(reader._pdf_viewport_request, ("u", (6, 200.0), 0.0))
+
+    def test_and_honoured_the_moment_it_arrives(self):
+        reader = _AligningReader(ready=False)
+        reader._show_text_at_pdf_viewport("u", (6, 200.0))
+        reader.ready = True
+        reader._retry_pdf_viewport_request()
+        self.assertEqual(reader.restored, [("address", (6, 200.0))])
+        self.assertIsNone(reader._pdf_viewport_request)
+
+    def test_but_not_once_the_reader_has_started_reading(self):
+        # Moving the page under someone mid-paragraph is worse than leaving it.
+        reader = _AligningReader(ready=False)
+        reader._show_text_at_pdf_viewport("u", (6, 200.0))
+        reader.at = 0.31                     # they scrolled
+        reader.ready = True
+        reader._retry_pdf_viewport_request()
+        self.assertEqual(reader.restored, [])
+        self.assertIsNone(reader._pdf_viewport_request)
+
+    def test_it_keeps_waiting_while_no_alignment_comes(self):
+        reader = _AligningReader(ready=False)
+        reader._show_text_at_pdf_viewport("u", (6, 200.0))
+        reader._retry_pdf_viewport_request()
+        self.assertEqual(reader.restored, [])
+        self.assertIsNotNone(reader._pdf_viewport_request)
+
+    def test_a_scan_with_no_viewport_asks_for_nothing(self):
+        reader = _AligningReader(ready=True)
+        self.assertFalse(reader._show_text_at_pdf_viewport("u", None))
+        self.assertEqual(reader.restored, [])
+        self.assertIsNone(reader._pdf_viewport_request)
+
+    def test_switching_back_to_the_scan_drops_the_request(self):
+        reader = _AligningReader(ready=False)
+        reader._show_text_at_pdf_viewport("u", (6, 200.0))
+        reader._forget_pdf_viewport_request()
+        reader.ready = True
+        reader._retry_pdf_viewport_request()
+        self.assertEqual(reader.restored, [])
+
+    def test_the_viewer_drops_it_when_the_scan_comes_back(self):
+        self.assertIn("_forget_pdf_viewport_request()",
+                      _source_of("_FloatingPdfWindow", "_show_scan"))
+
+    def test_the_alignment_landing_is_what_wakes_it(self):
+        self.assertIn("self._retry_pdf_viewport_request()",
+                      _source_of("_ScholarTextWindow",
+                                 "_install_current_location_map"))
+
+    def test_the_maps_themselves_are_never_handed_over(self):
+        # An address names its block by object identity, so a map built by one
+        # reader cannot be read by another that parsed its own blocks.
+        src = _source_of("_ScholarTextWindow", "_pdf_analysis_for")
+        self.assertIn("dict(result, maps={})", src)
 
 
 # ---------------------------------------------------------------------------

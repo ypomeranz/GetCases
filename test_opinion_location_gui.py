@@ -309,7 +309,7 @@ class ReverseSwitchTests(unittest.TestCase):
     def setUpClass(cls):
         names = (
             "_location_address", "_location_map_navigation_ready",
-            "_back_from_pdf",
+            "_text_target_for_viewport", "_back_from_pdf",
         )
         ns = _load_methods("_ScholarTextWindow", names)
         cls.Reader = type("Reader", (), {
