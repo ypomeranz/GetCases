@@ -4653,7 +4653,37 @@ _BUCKET_CAPS: dict[str, int] = {
     "juris": 3,       # a single jurisdiction named in the query
     "cl": 3,          # CourtListener citation-lookup results
     "engrep": 1,      # English Reports
+    # Google Scholar's first page read as a subject search, shown only when
+    # the name filters left the dropdown empty — so it may fill it.
+    "phrase": 10,
 }
+
+
+#: How few rows count as "the filters left nothing".  One survivor is as much
+#: a miss as none: a subject query that happens to share a word with one case
+#: name should not be answered by that case alone.
+_SPOTLIGHT_PHRASE_MAX_ROWS = 1
+
+
+def _spotlight_phrase_page(scholar_page: list, rows_shown: int,
+                           is_reporter_cite: bool) -> list:
+    """Google Scholar's first results page, to be shown as a subject search —
+    or nothing, when the dropdown should be left as it is.
+
+    Spotlight ranks Scholar and CourtListener hits on how close each case
+    *name* is to the query, and drops the rest.  That is right when the query
+    is a caption and wrong when it is a subject ("qualified immunity clearly
+    established"), where every hit is dropped and the dropdown comes back all
+    but empty.  So when the name pass leaves at most
+    :data:`_SPOTLIGHT_PHRASE_MAX_ROWS` rows, Scholar's own page is offered as
+    it stands — the query read as a phrase, which is what it turned out to be.
+
+    A query carrying a reporter citation is exempt: it pins one case, so
+    finding none of it is a genuine miss rather than a filtering accident.
+    """
+    if is_reporter_cite or rows_shown > _SPOTLIGHT_PHRASE_MAX_ROWS:
+        return []
+    return list(scholar_page or [])
 
 
 def _prefer_source(new_bucket: str, shown_bucket: str) -> bool:
@@ -8252,6 +8282,37 @@ class CourtListenerGUI:
         # three online sources proceed immediately without it.
         loaded_opinion_db = self._get_opinion_db(wait=False)
         total_searches = 3 + (1 if loaded_opinion_db is not None else 0)
+        # Google Scholar's first results page as Scholar itself ranked it,
+        # before the name filters run over it — what the phrase fallback below
+        # falls back *to*.
+        scholar_page: list = []
+        phrase_added = [0]
+        phrase_done = [False]
+
+        def _phrase_fallback() -> None:
+            """Show Scholar's page as a subject search when the name pass left
+            the dropdown empty — see :func:`_spotlight_phrase_page`."""
+            if phrase_done[0]:
+                return
+            page = _spotlight_phrase_page(
+                scholar_page, len(result_rows), is_reporter_cite)
+            if not page:
+                return
+            phrase_done[0] = True
+            before = len(result_rows)
+            for result in page:
+                cite = _scholar_result_cite(result)
+                _add_result(
+                    "phrase",
+                    _scholar_source_to_court_id(result.source),
+                    result.title, cite,
+                    _scholar_source_year(result.source),
+                    "Scholar (phrase match)",
+                    self._scholar_result_opener(result, cite),
+                    _scholar_result_identity(result.url),
+                    result.snippet,
+                )
+            phrase_added[0] = len(result_rows) - before
 
         def _update_status() -> None:
             if my_gen != self._spotlight_generation:
@@ -8259,13 +8320,20 @@ class CourtListenerGUI:
             try:
                 if not popup.winfo_exists():
                     return
-                n = len(result_rows)
                 if search_done[0] >= total_searches:
-                    status_lbl.configure(
-                        text=f"{n} results" if n else "No results found"
-                    )
+                    _phrase_fallback()
+                    n = len(result_rows)
+                    if phrase_added[0]:
+                        status_lbl.configure(
+                            text=f"No case of that name — {n} results "
+                                 "for this phrase")
+                    else:
+                        status_lbl.configure(
+                            text=f"{n} results" if n else "No results found"
+                        )
                 else:
-                    status_lbl.configure(text=f"{n} results so far…")
+                    status_lbl.configure(
+                        text=f"{len(result_rows)} results so far…")
             except tk.TclError:
                 pass
 
@@ -8322,6 +8390,10 @@ class CourtListenerGUI:
                 if candidate_results:
                     results = candidate_results
                     break
+            # Keep the page as Scholar ranked it, before any of our filtering:
+            # if the filters leave the dropdown empty, this is what the query
+            # gets read as a phrase against.
+            scholar_page[:] = results
             if is_reporter_cite:
                 # A reporter citation in the query pins the case, so keep
                 # Google Scholar's own relevance order (top few).
@@ -8351,42 +8423,9 @@ class CourtListenerGUI:
                 # The case's own reporter citation sits in the source byline.
                 cite = _scholar_result_cite(r)
 
-                def make_opener(sr=r, cite=cite):
-                    def open_it():
-                        f = self._get_scholar()
-                        if f is None:
-                            return
-
-                        def run():
-                            try:
-                                res = f.fetch_by_url(sr.url)
-                            except Exception as exc:
-                                print(f"[scholar] open {sr.url!r} failed: {exc}")
-                                res = None
-                            if res:
-                                url, html = res
-
-                                def show(u=url, h=html):
-                                    try:
-                                        _ScholarTextWindow(
-                                            self.root, self, u, h, item=None,
-                                        )
-                                    except tk.TclError:
-                                        pass
-                                self._post_root(show)
-                            else:
-                                # Opinion page didn't load — show CourtListener
-                                # and retry Scholar in the background.
-                                self._post_root(
-                                    self._scholar_case_fallback, sr.url, cite,
-                                    "", True, sr.title,
-                                )
-                        threading.Thread(target=run, daemon=True).start()
-                    return open_it
-
                 self.root.after(
                     0, _add_result, "scholar", court_id, r.title, cite, year,
-                    "Scholar", make_opener(),
+                    "Scholar", self._scholar_result_opener(r, cite),
                     _scholar_result_identity(r.url),
                     r.snippet,
                 )
@@ -11417,6 +11456,41 @@ class CourtListenerGUI:
                 )
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _scholar_result_opener(self, result, cite: str):
+        """What clicking a Google Scholar search hit does: fetch its opinion
+        page on a worker and show the text, or fall back to CourtListener when
+        Google will not serve the page."""
+        def open_it() -> None:
+            fetcher = self._get_scholar()
+            if fetcher is None:
+                return
+
+            def run() -> None:
+                try:
+                    fetched = fetcher.fetch_by_url(result.url)
+                except Exception as exc:
+                    print(f"[scholar] open {result.url!r} failed: {exc}")
+                    fetched = None
+                if fetched:
+                    url, html = fetched
+
+                    def show(u=url, h=html) -> None:
+                        try:
+                            _ScholarTextWindow(self.root, self, u, h, item=None)
+                        except tk.TclError:
+                            pass
+
+                    self._post_root(show)
+                else:
+                    # Opinion page didn't load — show CourtListener and retry
+                    # Scholar in the background.
+                    self._post_root(self._scholar_case_fallback, result.url,
+                                    cite, "", True, result.title)
+
+            threading.Thread(target=run, daemon=True).start()
+
+        return open_it
 
     def _scholar_case_fallback(
         self, url: str, cite: str, pin: str = "", prefetch_pdf: bool = True,

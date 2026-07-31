@@ -43,6 +43,8 @@ On first start, the main window will be hidden – it runs in the background.
 
 Press Ctrl+Space (or Cmd+Space on macOS) to open a quick‑search popup.
 
+The popup ranks its results by how close each case’s **name** is to what you typed, and drops the rest – which is right for a caption (“Roe v. Wade”) and wrong for a subject. So when that ranking leaves nothing (no rows, or a single stray one) the query is read as a **phrase** instead: Google Scholar’s own first results page is shown as it stands, in Scholar’s relevance order, and the status line says so. A query carrying a reporter citation is never re‑read this way – it names one case, so finding none of it is a real miss rather than something the ranking did.
+
 Type s + Enter in the terminal to show the main window, or q + Enter to quit.
 
 How to Search
