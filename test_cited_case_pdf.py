@@ -20,6 +20,8 @@ absent on a headless run) and driven against stubs.
 import ast
 import pathlib
 import re
+import sys
+import types
 import typing
 import unittest
 from unittest import mock
@@ -192,6 +194,9 @@ APP_NS = _load(
      "_normalized_us_cite": _NORMALIZED_US_CITE,
      "_scan_citation_item": SCAN_CITATION_ITEM,
      "_scan_page_for_pin": SCAN_PAGE_FOR_PIN,
+     # The reader's caption reader, which names a case the way the reports do.
+     "parse_opinion_blocks": lambda html: html,
+     "_scholar_caption_name": lambda blocks: CAPTIONS.get(blocks, ""),
      "_case_law_reporter_cite": _fake_case_law_reporter_cite,
      "_cluster_citations_to_strings": lambda cites: [str(c) for c in cites],
      "_is_redacted_case_pdf": lambda url: "case.law" in (url or ""),
@@ -208,6 +213,7 @@ APP_NS = _load(
 TEXT_OPENS: list = []
 FILENAMES: list = []
 PRINTED: list = []
+CAPTIONS: dict = {}          # opinion html -> what its caption reads as
 
 
 class _FakeViewer:
@@ -818,6 +824,50 @@ DOCKET_ITEM = {"caseName": "Manuel v. City of Joliet, Illinois",
                "dateFiled": "2017-03-21", "court_id": "scotus"}
 CAPTION = "Manuel v. City of Joliet"
 SLIP_URL = "https://www.supremecourt.gov/opinions/16pdf/14-9496.pdf"
+
+
+class WarmedCaseNameTests(unittest.TestCase):
+    """What the background fetch of the opinion tells the scan's window the
+    case is called."""
+
+    HTML = "<opinion of Manuel>"
+
+    def setUp(self):
+        CAPTIONS.clear()
+        CAPTIONS[self.HTML] = "Manuel v. City of Joliet"
+
+    def _describe(self, stored_name="Manuel v. City of Joliet, Illinois",
+                  fallback="Manuel v. City of Joliet, Ill.", html=None):
+        html = self.HTML if html is None else html
+        record = {"name": stored_name, "cites": ["137 S. Ct. 911"],
+                  "year": "2017", "court": "scotus"}
+        fake = types.ModuleType("opinion_db")
+        fake.extract_record = lambda url, h: dict(record)
+        got: list = []
+        with mock.patch.dict(sys.modules, {"opinion_db": fake}):
+            APP_NS["_describe_warmed_case"](
+                ("https://scholar.google.com/scholar_case?case=1", html),
+                fallback, got.append)
+        return got[0] if got else None
+
+    def test_the_caption_the_reports_print_names_the_case(self):
+        # The stored record keeps the docket caption whole; the window is
+        # named the way every other window in the app names a case.
+        self.assertEqual(self._describe()["name"], "Manuel v. City of Joliet")
+
+    def test_the_stored_record_itself_is_not_rewritten(self):
+        # A copy goes to the window; the database keeps what it keeps.
+        record = self._describe()
+        self.assertEqual(record["cites"], ["137 S. Ct. 911"])
+        self.assertEqual(record["court"], "scotus")
+
+    def test_an_unreadable_caption_leaves_the_stored_name(self):
+        self.assertEqual(self._describe(html="<no caption here>")["name"],
+                         "Manuel v. City of Joliet, Illinois")
+
+    def test_and_with_neither_the_clicked_name_stands_in(self):
+        record = self._describe(stored_name="", html="<no caption here>")
+        self.assertEqual(record["name"], "Manuel v. City of Joliet, Ill.")
 
 
 class CaseNameTests(unittest.TestCase):

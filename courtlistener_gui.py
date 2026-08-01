@@ -9347,6 +9347,21 @@ class CourtListenerGUI:
             return
         if not record:
             return
+        # The reader's own caption reader names the case the way the reports
+        # do, where the stored record keeps the docket caption whole: "Elijah
+        # MANUEL, Petitioner v. CITY OF JOLIET, ILLINOIS, et al." is "Manuel
+        # v. City of Joliet" to one and "Manuel v. City of Joliet, Illinois"
+        # to the other.  The record is what the database keeps; the window is
+        # named the way every other window in the app names a case.  A copy,
+        # so the stored record is untouched.
+        record = dict(record)
+        try:
+            caption = _scholar_caption_name(parse_opinion_blocks(html))
+        except Exception as exc:
+            print(f"[cite-pdf] reading the caption failed: {exc}")
+            caption = ""
+        if caption:
+            record["name"] = caption
         if name and not record.get("name"):
             record["name"] = name
         try:
