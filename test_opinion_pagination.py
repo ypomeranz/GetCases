@@ -341,6 +341,7 @@ class InstalledPageTrackTests(unittest.TestCase):
         reader._schedule_text_justify = lambda: None
         reader._schedule_gutter_redraw = lambda: None
         reader._retry_pending_pin_jump = lambda: None
+        reader._retry_pdf_viewport_request = lambda: None
         reader._fn_marker_pos = lambda _side, _fid: None
         reader._location_index_for_address = lambda address: "1.0"
         reader._new_location_mark = lambda stem, _index: stem

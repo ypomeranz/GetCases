@@ -49,6 +49,29 @@ def _load(cls: str, names, extra=None) -> dict:
     return ns
 
 
+def _module_dict(name: str):
+    """The value of a module-level dict constant, read from the source."""
+    for node in TREE.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            return eval(ast.get_source_segment(SRC, node.value), {})  # noqa: S307
+    raise AssertionError(f"module-level constant not found: {name}")
+
+
+def _load_function(name: str, extra=None):
+    """Exec one module-level function into a stub namespace."""
+    src = next(
+        (ast.get_source_segment(SRC, n) for n in TREE.body
+         if isinstance(n, ast.FunctionDef) and n.name == name), None)
+    if src is None:
+        raise AssertionError(f"module-level function not found: {name}")
+    ns = {"tk": _Tk, "re": re, "typing": typing, "Optional": typing.Optional}
+    ns.update(extra or {})
+    exec(src, ns)
+    return ns[name]
+
+
 def _source_of(cls: str, name: str) -> str:
     body = next(n.body for n in TREE.body
                 if isinstance(n, ast.ClassDef) and n.name == cls)
@@ -107,6 +130,7 @@ DETAILS_NS = _load(
      "_when_resized", "_show_details_panel", "_open_details_panel",
      "_on_text_configure"],
     {"_CaseTabPage": type("_CaseTabPage", (), {}),
+     "_EmbeddedCaseHost": type("_EmbeddedCaseHost", (), {}),
      "_work_area": lambda _w: (0, 0, 1600, 900)},
 )
 
@@ -492,10 +516,18 @@ class _MapCanvas:
                 if kind == "text"]
 
 
+PART_AUTHOR = _load_function("_part_author")
+PART_TIP_TEXT = _load_function(
+    "_part_tip_text",
+    {"_part_author": PART_AUTHOR,
+     "_PART_KIND_NAMES": _module_dict("_PART_KIND_NAMES"),
+     "_AUTHORED_PART_KINDS": _module_dict("_AUTHORED_PART_KINDS")},
+)
+
 MAP_NS = _load(
     "_ScholarTextWindow",
     ["_draw_part_map", "_partmap_short_label"],
-    {"_PARTMAP_COLORS": PART_COLORS},
+    {"_PARTMAP_COLORS": PART_COLORS, "_part_author": PART_AUTHOR},
 )
 
 
@@ -571,9 +603,19 @@ class PartMapTailTests(unittest.TestCase):
         reader._draw_part_map()
         rows = reader._partmap_rows
         self.assertEqual(len(rows), 3)
-        for y1, y2, _rs in rows:
+        for y1, y2, _rs, _label, _kind in rows:
             self.assertLess(y1, y2)
             self.assertLessEqual(y2, reader._partmap.height)
+
+    def test_a_row_carries_what_the_hover_tip_needs(self):
+        # The strip shows a surname at most; the tip names the writing in full,
+        # so each row has to remember which part it stands for.
+        reader = _reader_with_short_tail()
+        reader._draw_part_map()
+        self.assertEqual([(row[3], row[4]) for row in reader._partmap_rows],
+                         [("Opinion of the Court (Blackmun)", "majority"),
+                          ("MR. JUSTICE STEWART, concurring", "concurrence"),
+                          ("MR. JUSTICE REHNQUIST, dissenting", "dissent")])
 
     def test_only_the_marker_that_overflows_is_lifted(self):
         # Markers with room between them must keep their places: a wrapped

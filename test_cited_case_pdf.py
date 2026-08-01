@@ -20,9 +20,15 @@ absent on a headless run) and driven against stubs.
 import ast
 import pathlib
 import re
+import sys
+import types
 import typing
 import unittest
 from unittest import mock
+
+import citations
+import opinion_location
+import slip_opinion
 
 
 SRC = pathlib.Path(__file__).with_name("courtlistener_gui.py").read_text()
@@ -73,6 +79,78 @@ def _source_of(cls: str, name: str) -> str:
     raise AssertionError(f"{cls} has no {name}")
 
 
+def _load_function(name: str, extra=None):
+    """Exec one module-level function into a stub namespace."""
+    src = next((ast.get_source_segment(SRC, n) for n in TREE.body
+                if isinstance(n, ast.FunctionDef) and n.name == name), None)
+    if src is None:
+        raise AssertionError(f"module-level function not found: {name}")
+    ns = {"tk": _Tk, "re": re, "Optional": typing.Optional}
+    ns.update(extra or {})
+    exec(src, ns)
+    return ns[name]
+
+
+#: The real thing: what saving and printing both write, so a test that watches
+#: the pane sees exactly the calls the app makes.
+WRITE_OUTPUT_PDF = _load_function("_write_output_pdf")
+
+
+def _fake_case_law_reporter_cite(url: str) -> str:
+    """The reporter a static.case.law file names, as the real one reads it."""
+    m = re.search(r"static\.case\.law/([a-z0-9-]+)/(\d+)/(\d+)", url or "")
+    reporters = {"us": "U.S.", "sct": "S. Ct.", "f2d": "F.2d"}
+    if not m or m.group(1) not in reporters:
+        return ""
+    return f"{int(m.group(2))} {reporters[m.group(1)]} {int(m.group(3))}"
+
+
+_NORMALIZED_US_CITE = (
+    lambda c: (str(c).strip()
+               if re.search(r"\d+\s+U\.?\s?S\.?\s+\d+", str(c)) else "")
+)
+
+#: The real pin-cite arithmetic, so a test exercises the rule rather than a
+#: restatement of it.
+PIN_PAGE_NUMBER = _load_function(
+    "_pin_page_number", {"_split_note_pin": citations.split_note_pin})
+def _module_value(name: str):
+    """A module-level constant, evaluated from the source, so a test reads the
+    real thing rather than a restatement of it."""
+    for node in TREE.body:
+        targets = (
+            node.targets if isinstance(node, ast.Assign)
+            else [node.target] if isinstance(node, ast.AnnAssign) else []
+        )
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            return eval(ast.get_source_segment(SRC, node.value),  # noqa: S307
+                        {"re": re, "frozenset": frozenset})
+    raise AssertionError(f"module-level constant not found: {name}")
+
+
+PRINTED_PAGE_NUMBERS = _load_function(
+    "_printed_page_numbers",
+    {"slip_opinion": slip_opinion,
+     "_FOLIO_LINES": _module_value("_FOLIO_LINES"),
+     "_FOLIO_RE": _module_value("_FOLIO_RE"),
+     "_SPACED_DIGITS_RE": _module_value("_SPACED_DIGITS_RE")})
+SCAN_PAGE_FOR_PIN = _load_function(
+    "_scan_page_for_pin",
+    {"opinion_location": opinion_location,
+     "_pin_page_number": PIN_PAGE_NUMBER,
+     "_printed_page_numbers": PRINTED_PAGE_NUMBERS})
+
+
+#: The real narrowing: which of a case's parallel citations names the pages
+#: actually on screen.
+SCAN_CITATION_ITEM = _load_function(
+    "_scan_citation_item",
+    {"_normalized_us_cite": _NORMALIZED_US_CITE,
+     "_is_us_reports_pdf": lambda url: "usrep" in (url or "").lower(),
+     "_case_law_reporter_cite": _fake_case_law_reporter_cite},
+)
+
+
 # ---------------------------------------------------------------------------
 # 2. A citation clicked inside a PDF opens the cited case's PDF
 # ---------------------------------------------------------------------------
@@ -95,6 +173,7 @@ APP_NS = _load(
     ["open_cited_case_pdf", "_cited_case_pdf_item", "_show_cited_case_pdf",
      "_cited_pdf_window_closed", "_warm_case_text",
      "_request_cited_pdf_analysis", "_cited_filename_item",
+     "_jump_to_pin", "_scan_cite_for",
      "_describe_warmed_case", "_save_cited_pdf", "_print_cited_pdf"],
     {"_citation_link_name": lambda snippet, cite="": snippet.strip(),
      "_cl_item_for_citation": _cl_item_for_citation,
@@ -112,12 +191,18 @@ APP_NS = _load(
      "_extract_pdf_text_and_style": lambda data: ([[("c", (0, 0, 1, 1))]], []),
      "_citation_links_from_visible_pdf_text": lambda d, p, i: ({0: ["x"]}, set()),
      "slip_opinion": mock.Mock(detect_sections=lambda pages: []),
-     "_normalized_us_cite": lambda c: (
-         str(c).strip() if re.search(r"\d+\s+U\.?\s?S\.?\s+\d+", str(c))
-         else ""),
+     "_normalized_us_cite": _NORMALIZED_US_CITE,
+     "_scan_citation_item": SCAN_CITATION_ITEM,
+     "_scan_page_for_pin": SCAN_PAGE_FOR_PIN,
+     # The reader's caption reader, which names a case the way the reports do.
+     "parse_opinion_blocks": lambda html: html,
+     "_scholar_caption_name": lambda blocks: CAPTIONS.get(blocks, ""),
+     "_case_law_reporter_cite": _fake_case_law_reporter_cite,
+     "_cluster_citations_to_strings": lambda cites: [str(c) for c in cites],
      "_is_redacted_case_pdf": lambda url: "case.law" in (url or ""),
      "_build_default_filename": lambda item: FILENAMES.append(item) or "NAME",
      "_named_temp_pdf_path": lambda stem: f"/tmp/{stem}.pdf",
+     "_write_output_pdf": WRITE_OUTPUT_PDF,
      "_print_pdf_file": lambda parent, path, status: PRINTED.append(path),
      "_case_law_print_citation": lambda *a, **kw: "HEADER",
      "filedialog": mock.Mock(),
@@ -128,6 +213,7 @@ APP_NS = _load(
 TEXT_OPENS: list = []
 FILENAMES: list = []
 PRINTED: list = []
+CAPTIONS: dict = {}          # opinion html -> what its caption reads as
 
 
 class _FakeViewer:
@@ -138,6 +224,9 @@ class _FakeViewer:
         self.kw = kw
         self.surfaced = 0
         self.analyses = []
+        self.scrolled: list = []
+        self.at_page = None
+        self.living = True
         _FakeViewer.opened.append(self)
 
     def surface(self):
@@ -145,6 +234,16 @@ class _FakeViewer:
 
     def apply_analysis(self, result):
         self.analyses.append(result)
+
+    def alive(self):
+        return self.living
+
+    def viewport_page(self):
+        return self.at_page
+
+    def scroll_to_page(self, page, y_pt=None):
+        self.scrolled.append(page)
+        self.at_page = page
 
 
 class _FakeHost:
@@ -166,7 +265,7 @@ class _App:
                      "_show_cited_case_pdf", "_cited_pdf_window_closed",
                      "_warm_case_text", "_request_cited_pdf_analysis",
                      "_cited_filename_item", "_save_cited_pdf",
-                     "_print_cited_pdf"):
+                     "_print_cited_pdf", "_jump_to_pin", "_scan_cite_for"):
             setattr(self, name, APP_NS[name].__get__(self))
 
     # --- collaborators ---
@@ -235,6 +334,22 @@ class CitedCasePdfTests(unittest.TestCase):
         self._click(action=("cite", "410 U.S. 113@153"))
         self.assertEqual(len(_FakeViewer.opened), 1)
         self.assertTrue(any("153" in s for s in self.status))
+
+    def test_and_the_scan_opens_at_the_page_the_pin_names(self):
+        self._click(action=("cite", "410 U.S. 113@153"))
+        # 153 is the 41st page of a scan that starts at 113.
+        self.assertEqual(_FakeViewer.opened[0].scrolled[0], 40)
+
+    def test_a_citation_with_no_pin_opens_at_the_start(self):
+        self._click(action=("cite", "410 U.S. 113"))
+        self.assertEqual(_FakeViewer.opened[0].scrolled, [])
+
+    def test_a_pin_in_another_reporter_is_not_counted_against_this_one(self):
+        # The link cites the Supreme Court Reporter; the scan found for it is
+        # the U.S. Reports, whose pages break somewhere else entirely.
+        RESOLVED["93 S. Ct. 705"] = "https://loc.test/usrep410113.pdf"
+        self._click(action=("cite", "93 S. Ct. 705@710"))
+        self.assertEqual(_FakeViewer.opened[0].scrolled, [])
 
     def test_no_scan_anywhere_falls_back_to_the_text(self):
         self.app._resolves = False
@@ -338,6 +453,30 @@ class CitedCaseFilenameTests(unittest.TestCase):
         self.assertNotIn("_us_reports_cite",
                          self.app._cited_filename_item(self.named))
 
+    def test_it_is_filed_under_the_reporter_its_own_file_names(self):
+        # A Supreme Court Reporter scan prints S. Ct. pages: naming it by the
+        # U.S. Reports pages it does not print describes the wrong document.
+        self.named.update(
+            url="https://static.case.law/sct/93/0705-01.pdf",
+            record={"name": "Roe", "cites": ["410 U.S. 113", "93 S. Ct. 705"]})
+        item = self.app._cited_filename_item(self.named)
+        self.assertEqual(item["_scan_cite"], "93 S. Ct. 705")
+        self.assertNotIn("_us_reports_cite", item)
+
+    def test_the_us_reports_pages_still_win_where_they_are_what_is_shown(self):
+        self.named.update(
+            url="https://static.case.law/us/410/0113-01.pdf",
+            record={"name": "Roe", "cites": ["410 U.S. 113", "93 S. Ct. 705"]})
+        item = self.app._cited_filename_item(self.named)
+        self.assertEqual(item["_scan_cite"], "410 U.S. 113")
+
+    def test_a_scan_whose_file_names_no_reporter_keeps_the_usual_order(self):
+        self.named.update(url="https://www.supremecourt.gov/x/22-1234.pdf",
+                          record={"name": "Roe", "cites": ["410 U.S. 113"]})
+        item = self.app._cited_filename_item(self.named)
+        self.assertNotIn("_scan_cite", item)
+        self.assertNotIn("_us_reports_cite", item)
+
     def test_the_clicked_citation_is_kept_when_the_text_omits_it(self):
         self.named["record"] = {"name": "Roe", "cites": ["93 S. Ct. 705"]}
         self.assertIn("410 U.S. 113",
@@ -355,18 +494,19 @@ class CitedCaseFilenameTests(unittest.TestCase):
     def test_printing_uses_the_rendering_on_screen(self):
         pane = mock.Mock()
         self.app._print_cited_pdf(self.named, pane=pane)
-        pane.export_pdf.assert_called_once()
+        pane.export_cropped_pdf.assert_called_once()
 
     def test_a_redacted_scan_is_whitened_and_re_lettered_for_paper(self):
         self.named["url"] = "https://static.case.law/f2d/500/0123-01.pdf"
         pane = mock.Mock()
         self.app._print_cited_pdf(self.named, pane=pane)
-        kwargs = pane.export_pdf.call_args.kwargs
+        kwargs = pane.export_cropped_pdf.call_args.kwargs
         self.assertTrue(kwargs["whiten_redactions"])
         self.assertEqual(kwargs["header_cite"], "HEADER")
 
     def test_a_pane_that_will_not_export_still_prints_the_original(self):
         pane = mock.Mock()
+        pane.export_cropped_pdf.side_effect = RuntimeError("no")
         pane.export_pdf.side_effect = RuntimeError("no")
         self.app._print_cited_pdf(self.named, pane=pane)
         self.assertEqual(PRINTED, ["/tmp/NAME.pdf"])
@@ -504,7 +644,7 @@ BROWSER: list = []
 
 VIEWER_NS = _load(
     "_FloatingPdfWindow",
-    ["_open_text", "_style_name_as_link"],
+    ["_open_text"],
     {"_CTK_AVAILABLE": False, "_UI": {"accent": "#2f6bd8"},
      "time": __import__("time")},
 )
@@ -524,12 +664,11 @@ class _Viewer:
 
     def __init__(self, on_open_text=None):
         self._on_open_text = on_open_text
-        self._name_label = mock.Mock()
-        for name in ("_open_text", "_style_name_as_link"):
+        for name in ("_open_text",):
             setattr(self, name, VIEWER_NS[name].__get__(self))
 
 
-class NameOnTheStripTests(unittest.TestCase):
+class OpenTheTextTests(unittest.TestCase):
     def test_clicking_the_name_opens_the_text(self):
         opened = []
         _Viewer(on_open_text=lambda: opened.append(True))._open_text()
@@ -559,15 +698,6 @@ class NameOnTheStripTests(unittest.TestCase):
         viewer._opened_text_at -= DEBOUNCE + 0.1     # a click a moment later
         viewer._open_text()
         self.assertEqual(opened, [True, True])
-
-    def test_the_name_is_coloured_like_a_link(self):
-        viewer = _Viewer(on_open_text=lambda: None)
-        viewer._style_name_as_link("#2f6bd8")
-        viewer._name_label.configure.assert_called_with(fg="#2f6bd8")
-
-    def test_the_viewer_offers_the_name_only_when_there_is_text_behind_it(self):
-        body = _source_of("_FloatingPdfWindow", "_build_bar")
-        self.assertIn("if self._on_open_text is not None:", body)
 
     def test_a_pdf_opened_from_the_reader_goes_back_to_that_reader(self):
         body = _source_of("_ScholarTextWindow", "_show_pdf_floating")
@@ -659,6 +789,254 @@ class StoredUsCiteTests(unittest.TestCase):
         given = body.index("if given_us_cite:")
         gather = body.index("all_cites = _gather_all_citations")
         self.assertLess(given, gather)
+
+
+# ---------------------------------------------------------------------------
+# 4. What names the case: its own caption, not the docket one
+# ---------------------------------------------------------------------------
+
+NAME_NS = _load("_ScholarTextWindow", ["_filename_item", "_scan_window_title",
+                                       "_pdf_filename_item"],
+                {"_scan_citation_item": SCAN_CITATION_ITEM,
+                 "_bluebook_display_name": lambda item: (
+                     f"{item.get('caseName')} | "
+                     f"{(item.get('_us_reports_cite') or item.get('_scan_cite') or (item.get('citation') or [''])[0])}")})
+
+
+class _NamedReader:
+    def __init__(self, item, caption):
+        self._item = item
+        self._bb = {"name": caption, "cite": "137 S. Ct. 911"}
+        for name in ("_filename_item", "_scan_window_title",
+                     "_pdf_filename_item"):
+            setattr(self, name, NAME_NS[name].__get__(self))
+
+    def _shown_us_reports_cite(self):
+        return ""
+
+    def _title_citation(self):
+        return ""
+
+
+#: What CourtListener's search result calls it, and what the reports print.
+DOCKET_ITEM = {"caseName": "Manuel v. City of Joliet, Illinois",
+               "citation": ["137 S. Ct. 911"],
+               "dateFiled": "2017-03-21", "court_id": "scotus"}
+CAPTION = "Manuel v. City of Joliet"
+SLIP_URL = "https://www.supremecourt.gov/opinions/16pdf/14-9496.pdf"
+
+
+class WarmedCaseNameTests(unittest.TestCase):
+    """What the background fetch of the opinion tells the scan's window the
+    case is called."""
+
+    HTML = "<opinion of Manuel>"
+
+    def setUp(self):
+        CAPTIONS.clear()
+        CAPTIONS[self.HTML] = "Manuel v. City of Joliet"
+
+    def _describe(self, stored_name="Manuel v. City of Joliet, Illinois",
+                  fallback="Manuel v. City of Joliet, Ill.", html=None):
+        html = self.HTML if html is None else html
+        record = {"name": stored_name, "cites": ["137 S. Ct. 911"],
+                  "year": "2017", "court": "scotus"}
+        fake = types.ModuleType("opinion_db")
+        fake.extract_record = lambda url, h: dict(record)
+        got: list = []
+        with mock.patch.dict(sys.modules, {"opinion_db": fake}):
+            APP_NS["_describe_warmed_case"](
+                ("https://scholar.google.com/scholar_case?case=1", html),
+                fallback, got.append)
+        return got[0] if got else None
+
+    def test_the_caption_the_reports_print_names_the_case(self):
+        # The stored record keeps the docket caption whole; the window is
+        # named the way every other window in the app names a case.
+        self.assertEqual(self._describe()["name"], "Manuel v. City of Joliet")
+
+    def test_the_stored_record_itself_is_not_rewritten(self):
+        # A copy goes to the window; the database keeps what it keeps.
+        record = self._describe()
+        self.assertEqual(record["cites"], ["137 S. Ct. 911"])
+        self.assertEqual(record["court"], "scotus")
+
+    def test_an_unreadable_caption_leaves_the_stored_name(self):
+        self.assertEqual(self._describe(html="<no caption here>")["name"],
+                         "Manuel v. City of Joliet, Illinois")
+
+    def test_and_with_neither_the_clicked_name_stands_in(self):
+        record = self._describe(stored_name="", html="<no caption here>")
+        self.assertEqual(record["name"], "Manuel v. City of Joliet, Ill.")
+
+
+class CaseNameTests(unittest.TestCase):
+    """A search result carries the caption the court docketed the case under;
+    the opinion carries the one the reports print."""
+
+    def test_the_opinion_s_own_caption_names_the_case(self):
+        reader = _NamedReader(DOCKET_ITEM, CAPTION)
+        self.assertEqual(reader._filename_item()["caseName"], CAPTION)
+
+    def test_and_names_the_window_the_scan_opens_in(self):
+        reader = _NamedReader(DOCKET_ITEM, CAPTION)
+        self.assertTrue(
+            reader._scan_window_title(SLIP_URL).startswith(CAPTION + " |"))
+
+    def test_and_the_file_a_scan_is_saved_as(self):
+        reader = _NamedReader(DOCKET_ITEM, CAPTION)
+        self.assertEqual(reader._pdf_filename_item()["caseName"], CAPTION)
+
+    def test_everything_else_about_the_case_still_comes_from_the_result(self):
+        item = _NamedReader(DOCKET_ITEM, CAPTION)._filename_item()
+        self.assertEqual(item["dateFiled"], "2017-03-21")
+        self.assertEqual(item["court_id"], "scotus")
+        self.assertEqual(item["citation"], ["137 S. Ct. 911"])
+
+    def test_the_result_itself_is_not_rewritten(self):
+        _NamedReader(DOCKET_ITEM, CAPTION)._filename_item()
+        self.assertEqual(DOCKET_ITEM["caseName"],
+                         "Manuel v. City of Joliet, Illinois")
+
+    def test_no_caption_to_read_leaves_the_result_s_name(self):
+        # A window opened straight onto a scan has no opinion text to ask.
+        reader = _NamedReader(DOCKET_ITEM, "")
+        self.assertEqual(reader._filename_item()["caseName"],
+                         "Manuel v. City of Joliet, Illinois")
+
+    def test_a_stale_case_name_key_does_not_outvote_it(self):
+        item = dict(DOCKET_ITEM, case_name="Manuel v. City of Joliet, Ill.")
+        self.assertNotIn("case_name",
+                         _NamedReader(item, CAPTION)._filename_item())
+
+    def test_a_reader_with_no_result_behind_it_is_unchanged(self):
+        reader = _NamedReader(None, CAPTION)
+        reader._bb = {"name": CAPTION, "cite": "137 S. Ct. 911",
+                      "year": "2017", "court": ""}
+        self.assertEqual(reader._filename_item()["caseName"], CAPTION)
+
+
+# ---------------------------------------------------------------------------
+# 5. A pin cite, and the page of the scan that prints it
+# ---------------------------------------------------------------------------
+
+
+def _page_with(text: str) -> list:
+    """One page of a scan's text layer, as a run of positioned glyphs."""
+    return [(ch, (i * 6.0, 700.0, i * 6.0 + 5.0, 710.0))
+            for i, ch in enumerate(text)]
+
+
+class PinPageTests(unittest.TestCase):
+    """Counting a pin cite out to a page of the file it is printed in."""
+
+    def test_the_offset_from_the_case_s_first_page(self):
+        self.assertEqual(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "153", "410 U.S. 113"), 40)
+
+    def test_the_first_page_is_the_first_page(self):
+        self.assertEqual(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "113", "410 U.S. 113"), 0)
+
+    def test_a_pin_before_the_case_starts_is_not_in_this_file(self):
+        self.assertIsNone(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "94", "410 U.S. 113"))
+
+    def test_a_footnote_pin_still_names_its_page(self):
+        self.assertEqual(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "153n4", "410 U.S. 113"), 40)
+
+    def test_a_range_opens_at_the_first_of_it(self):
+        self.assertEqual(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "153-55", "410 U.S. 113"), 40)
+
+    def test_a_pin_naming_only_a_footnote_names_no_page(self):
+        self.assertIsNone(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "n4", "410 U.S. 113"))
+
+    def test_a_pin_in_another_reporter_is_refused(self):
+        # "93 S. Ct. at 710" says nothing about where 410 U.S. breaks.
+        self.assertIsNone(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "710", "93 S. Ct. 705"))
+
+    def test_the_same_reporter_in_another_volume_is_still_refused(self):
+        self.assertIsNone(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "710", "93 S.Ct. 705"))
+
+    def test_a_link_that_names_no_reporter_is_taken_at_its_word(self):
+        self.assertEqual(SCAN_PAGE_FOR_PIN("410 U.S. 113", "153"), 40)
+
+    def test_a_scan_that_names_no_reporter_answers_nothing(self):
+        self.assertIsNone(SCAN_PAGE_FOR_PIN("", "153", "410 U.S. 113"))
+
+    def test_a_pin_past_the_end_of_the_file_is_refused(self):
+        self.assertIsNone(SCAN_PAGE_FOR_PIN(
+            "410 U.S. 113", "900", "410 U.S. 113",
+            pdf_pages=[_page_with("113"), _page_with("114")]))
+
+    def test_the_printed_numbers_confirm_the_arithmetic(self):
+        pages = [_page_with("113  ROE v. WADE"),
+                 _page_with("114  OCTOBER TERM, 1972")]
+        self.assertEqual(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "114", "410 U.S. 113", pages), 1)
+
+    def test_and_correct_it_where_a_cover_leaf_shifts_the_pages(self):
+        pages = [_page_with("Supreme Court of the United States"),
+                 _page_with("113  ROE v. WADE"),
+                 _page_with("114  OCTOBER TERM, 1972")]
+        self.assertEqual(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "114", "410 U.S. 113", pages), 2)
+
+    def test_pages_that_print_nothing_leave_the_arithmetic_alone(self):
+        pages = [_page_with(""), _page_with(""), _page_with("")]
+        self.assertEqual(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "115", "410 U.S. 113", pages), 2)
+
+    def test_a_number_read_twice_is_not_trusted_over_the_count(self):
+        # Two pages both claiming 114: the arithmetic is the better answer.
+        pages = [_page_with("113"), _page_with("114"), _page_with("114")]
+        self.assertEqual(
+            SCAN_PAGE_FOR_PIN("410 U.S. 113", "114", "410 U.S. 113", pages), 1)
+
+
+class PrintedFolioTests(unittest.TestCase):
+    def test_a_number_at_the_left_of_the_running_head(self):
+        self.assertEqual(
+            PRINTED_PAGE_NUMBERS([_page_with("152  OCTOBER TERM, 1972")]),
+            {0: 152})
+
+    def test_and_one_at_the_right(self):
+        self.assertEqual(
+            PRINTED_PAGE_NUMBERS([_page_with("ROE v. WADE  153")]), {0: 153})
+
+    def test_figures_parted_by_the_line_reader_are_one_number(self):
+        # A "1" leaves more room after its ink than the type's own advance,
+        # so a page number comes off the scan as "1 13".
+        self.assertEqual(
+            PRINTED_PAGE_NUMBERS([_page_with("ROE v. WADE  1 13")]), {0: 113})
+        self.assertEqual(
+            PRINTED_PAGE_NUMBERS([_page_with("1 14  OCTOBER TERM, 1972")]),
+            {0: 114})
+
+    def test_a_page_printing_no_number_is_absent(self):
+        self.assertEqual(PRINTED_PAGE_NUMBERS([_page_with("Syllabus")]), {})
+
+    def test_an_empty_page_is_absent_too(self):
+        self.assertEqual(PRINTED_PAGE_NUMBERS([[]]), {})
+
+
+class PinNumberTests(unittest.TestCase):
+    def test_a_plain_page(self):
+        self.assertEqual(PIN_PAGE_NUMBER("153"), 153)
+
+    def test_a_page_and_a_note(self):
+        self.assertEqual(PIN_PAGE_NUMBER("153n4"), 153)
+
+    def test_a_note_alone(self):
+        self.assertIsNone(PIN_PAGE_NUMBER("n4"))
+
+    def test_nothing_at_all(self):
+        self.assertIsNone(PIN_PAGE_NUMBER(""))
 
 
 if __name__ == "__main__":

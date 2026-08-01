@@ -73,6 +73,28 @@ def _class_attr(cls: str, name: str):
     raise AssertionError(f"{cls} has no {name}")
 
 
+def _module_value(name: str):
+    """A module-level constant, evaluated from the source."""
+    for node in TREE.body:
+        targets = (
+            node.targets if isinstance(node, ast.Assign)
+            else [node.target] if isinstance(node, ast.AnnAssign) else []
+        )
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            return eval(ast.get_source_segment(SRC, node.value),  # noqa: S307
+                        {"frozenset": frozenset})
+    raise AssertionError(f"module-level constant not found: {name}")
+
+
+def _source_of(cls: str, name: str) -> str:
+    body = next(n.body for n in TREE.body
+                if isinstance(n, ast.ClassDef) and n.name == cls)
+    for node in body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(SRC, node)
+    raise AssertionError(f"{cls} has no {name}")
+
+
 def _load_functions(names, extra=None) -> dict:
     """Exec the named module-level functions into a stub namespace."""
     found = {n.name: ast.get_source_segment(SRC, n) for n in TREE.body
@@ -114,6 +136,9 @@ class _FakeMenu:
 
     def add_command(self, **kw):
         self.items.append(("command", kw))
+
+    def add_radiobutton(self, **kw):
+        self.items.append(("radiobutton", kw))
 
     def add_separator(self):
         self.items.append(("separator", {}))
@@ -178,6 +203,7 @@ class _FakeFloatingWindow:
         self.scrolled = []
         self.surfaced = 0
         self.analyses = []
+        self.titles = []
         self._alive = True
         _FakeFloatingWindow.opened.append(self)
 
@@ -200,6 +226,9 @@ class _FakeFloatingWindow:
     def apply_analysis(self, result):
         self.analyses.append(result)
 
+    def set_title(self, title):
+        self.titles.append(title)
+
     def close(self):
         self._alive = False
 
@@ -209,104 +238,258 @@ class _InWindow(Exception):
 
 
 # ---------------------------------------------------------------------------
-# The app-level setting
+# The Interface menu
 # ---------------------------------------------------------------------------
+
+INTERFACE_LABELS = _module_value("_INTERFACE_LABELS")
+INTERFACE_MODES = _module_value("_INTERFACE_MODES")
 
 APP_NS = _load(
     "CourtListenerGUI",
     ["populate_window_menu", "pdf_opens_in_separate_window",
-     "set_pdf_separate_window", "surface_case_view"],
+     "interface_mode", "set_interface_mode", "set_case_tabs_enabled",
+     "surface_case_view"],
     {"_load_config": lambda: dict(APP_CONFIG),
-     "_save_config": lambda data: APP_CONFIG.update(data)},
+     "_save_config": lambda data: (APP_CONFIG.clear(),
+                                  APP_CONFIG.update(data)),
+     "_INTERFACE_LABELS": INTERFACE_LABELS,
+     "_INTERFACE_MODES": INTERFACE_MODES,
+     "_DEFAULT_INTERFACE_MODE": _module_value("_DEFAULT_INTERFACE_MODE")},
 )
 APP_CONFIG: dict = {}
 
 
 class _App:
-    def __init__(self, separate=False):
-        self._case_tabs_var = _Var(False)
-        self._case_tabs_enabled = False
-        self._pdf_separate_window = separate
-        self._pdf_separate_var = _Var(separate)
+    def __init__(self, separate=False, mode=None):
+        self._interface_mode = mode or ("reporter" if separate else "windows")
+        self._interface_var = _Var(self._interface_mode)
         self.root = _FakeHost()
         self._cited_pdf_windows: set = set()
-        self.tabs_calls = []
+        self.migrated: list = []
         self._open_case_views: dict = {}
         for name in ("populate_window_menu", "pdf_opens_in_separate_window",
-                     "set_pdf_separate_window", "surface_case_view"):
+                     "interface_mode", "set_interface_mode",
+                     "set_case_tabs_enabled", "surface_case_view"):
             setattr(self, name, APP_NS[name].__get__(self))
 
-    def set_case_tabs_enabled(self, enabled):
-        self.tabs_calls.append(enabled)
+    def _migrate_open_views(self, tabs):
+        self.migrated.append(tabs)
 
 
-class WindowMenuTests(unittest.TestCase):
+class InterfaceMenuTests(unittest.TestCase):
     def setUp(self):
         APP_CONFIG.clear()
 
-    def test_the_setting_is_offered_in_the_window_menu(self):
+    def test_the_three_interfaces_are_what_it_offers(self):
         app, menu = _App(), _FakeMenu()
         app.populate_window_menu(menu, None)
-        self.assertIn("View PDF in Separate Window", menu.labels())
+        self.assertEqual(menu.labels()[:3],
+                         ["Individual Windows", "Tabbed View",
+                          "Reporter View"])
 
-    def test_it_sits_with_the_other_window_mode_choice(self):
-        # Both entries decide *where* a view opens, so they belong together
-        # above the separator.
+    def test_they_are_one_choice_not_three_switches(self):
         app, menu = _App(), _FakeMenu()
         app.populate_window_menu(menu, None)
-        labels = menu.labels()
-        self.assertEqual(
-            labels[:2],
-            ["Show All Windows in Tabbed View", "View PDF in Separate Window"],
-        )
-        self.assertLess(labels.index("View PDF in Separate Window"),
-                        labels.index(None))  # the separator
+        kinds = [kind for kind, _kw in menu.items][:3]
+        self.assertEqual(kinds, ["radiobutton"] * 3)
+        for _kind, kw in menu.items[:3]:
+            self.assertIs(kw["variable"], app._interface_var)
 
-    def test_the_checkbutton_tracks_the_saved_preference(self):
-        app, menu = _App(separate=True), _FakeMenu()
-        app.populate_window_menu(menu, None)
-        entry = menu.entry("View PDF in Separate Window")
-        self.assertIs(entry["variable"], app._pdf_separate_var)
-        self.assertTrue(entry["variable"].get())
-
-    def test_choosing_it_flips_the_mode_and_saves_it(self):
+    def test_they_lead_the_menu(self):
         app, menu = _App(), _FakeMenu()
         app.populate_window_menu(menu, None)
-        app._pdf_separate_var.set(True)   # Tk sets the variable, then calls us
-        menu.entry("View PDF in Separate Window")["command"]()
-        self.assertTrue(app.pdf_opens_in_separate_window())
-        self.assertIs(APP_CONFIG["pdf_separate_window"], True)
+        self.assertLess(menu.labels().index("Reporter View"),
+                        menu.labels().index(None))   # the separator
 
-    def test_unticking_it_saves_the_default_back(self):
-        app = _App(separate=True)
-        app._pdf_separate_var.set(False)
-        app.set_pdf_separate_window(False)
-        self.assertFalse(app.pdf_opens_in_separate_window())
-        self.assertIs(APP_CONFIG["pdf_separate_window"], False)
+    def test_the_radio_marks_the_interface_in_force(self):
+        app, menu = _App(mode="tabs"), _FakeMenu()
+        app.populate_window_menu(menu, None)
+        self.assertEqual(menu.entry("Tabbed View")["variable"].get(), "tabs")
 
-    def test_setting_the_mode_it_is_already_in_writes_nothing(self):
-        app = _App(separate=True)
-        app.set_pdf_separate_window(True)
+    def test_choosing_one_switches_and_saves_it(self):
+        app, menu = _App(), _FakeMenu()
+        app.populate_window_menu(menu, None)
+        menu.entry("Reporter View")["command"]()
+        self.assertEqual(app.interface_mode(), "reporter")
+        self.assertEqual(APP_CONFIG["interface_mode"], "reporter")
+
+    def test_choosing_the_one_already_in_force_writes_nothing(self):
+        app = _App(mode="tabs")
+        app.set_interface_mode("tabs")
         self.assertEqual(APP_CONFIG, {})
 
-    def test_the_default_is_the_pdf_inside_the_opinion_window(self):
-        self.assertFalse(_App().pdf_opens_in_separate_window())
+    def test_an_interface_nobody_offers_is_ignored(self):
+        app = _App()
+        app.set_interface_mode("kaleidoscope")
+        self.assertEqual(app.interface_mode(), "windows")
+        self.assertEqual(APP_CONFIG, {})
+
+    def test_the_old_two_settings_are_not_written_any_more(self):
+        app = _App()
+        APP_CONFIG.update({"case_tabs_enabled": True,
+                           "pdf_separate_window": True})
+        app.set_interface_mode("reporter")
+        self.assertNotIn("case_tabs_enabled", APP_CONFIG)
+        self.assertNotIn("pdf_separate_window", APP_CONFIG)
+
+    def test_windows_and_tabs_migrate_what_is_on_screen(self):
+        # Two ways of holding the same views, so everything moves across.
+        app = _App(mode="windows")
+        app.set_interface_mode("tabs")
+        self.assertEqual(app.migrated, [True])
+        app.set_interface_mode("windows")
+        self.assertEqual(app.migrated, [True, False])
+
+    def test_reporter_view_leaves_what_is_open_alone(self):
+        # Putting a case into it means finding a scan of it, which is a fetch
+        # that can fail; it applies to what is opened next.
+        app = _App(mode="tabs")
+        app.set_interface_mode("reporter")
+        self.assertEqual(app.migrated, [])
+        app.set_interface_mode("windows")
+        self.assertEqual(app.migrated, [])
+
+    def test_the_close_item_names_what_it_closes(self):
+        app, menu = _App(), _FakeMenu()
+        app.populate_window_menu(menu, _FakeHost())
+        self.assertIn("Close Window", menu.labels())
+
+    def test_the_main_window_is_not_offered_a_close_item(self):
+        app, menu = _App(), _FakeMenu()
+        app.populate_window_menu(menu, app.root)
+        self.assertNotIn("Close Window", menu.labels())
+
+
+class InterfaceMenuPlacementTests(unittest.TestCase):
+    """It sits at the far right of every menu bar, the same place each time."""
+
+    def test_the_document_windows_put_it_last(self):
+        src = next(ast.get_source_segment(SRC, n) for n in TREE.body
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name == "_install_history_menubar")
+        self.assertLess(src.index("_add_bookmarks_cascade"),
+                        src.index("_add_interface_cascade"))
+        self.assertLess(src.index("_add_copy_cascade"),
+                        src.index("_add_interface_cascade"))
+
+    def test_and_so_does_the_main_window(self):
+        src = _source_of("CourtListenerGUI", "_build_ui")
+        self.assertIn("_add_interface_cascade(menubar, self, self.root)", src)
+        self.assertLess(src.index("_add_bookmarks_cascade"),
+                        src.index("_add_interface_cascade"))
+
+    def test_it_is_called_Interface(self):
+        src = next(ast.get_source_segment(SRC, n) for n in TREE.body
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name == "_add_interface_cascade")
+        self.assertIn('label="Interface"', src)
+
+
+class WhereAPdfOpensTests(unittest.TestCase):
+    """Only the reporter interface floats a scan in its own viewer."""
+
+    def test_individual_windows_turn_the_window_over_to_the_scan(self):
+        self.assertFalse(_App(mode="windows").pdf_opens_in_separate_window())
+
+    def test_so_does_the_tabbed_one(self):
+        self.assertFalse(_App(mode="tabs").pdf_opens_in_separate_window())
+
+    def test_reporter_view_floats_it(self):
+        self.assertTrue(_App(mode="reporter").pdf_opens_in_separate_window())
+
+    def test_a_window_popped_out_holding_a_scan_is_a_reporter_window(self):
+        app = _App(mode="tabs")
+        popped = _FakeHost()
+        popped._reporter_window = True
+        self.assertTrue(app.pdf_opens_in_separate_window(popped))
+
+    def test_and_so_is_anything_it_opens(self):
+        # A tab in that window carries the flag on the window, not on itself.
+        app = _App(mode="tabs")
+        window = _FakeHost()
+        window._reporter_window = True
+        self.assertTrue(
+            app.pdf_opens_in_separate_window(_FakeHost(top=window)))
+
+    def test_an_ordinary_popped_out_window_is_not(self):
+        app = _App(mode="tabs")
+        self.assertFalse(app.pdf_opens_in_separate_window(_FakeHost()))
+
+    def test_only_a_tab_showing_a_scan_pops_out_as_one(self):
+        src = _source_of("CourtListenerGUI", "pop_out_view")
+        self.assertIn("reporter = self._view_is_showing_pdf(view)", src)
+        self.assertIn("manager.win._reporter_window = True", src)
+        showing = _source_of("CourtListenerGUI", "_view_is_showing_pdf")
+        self.assertIn('_mode', showing)
+        self.assertIn('"pdf"', showing)
+
+
+class SavedInterfaceTests(unittest.TestCase):
+    """What the app wears on startup, including for an older config file."""
+
+    def setUp(self):
+        self.read = _load_functions(
+            ["_read_interface_mode"],
+            {"_INTERFACE_MODES": INTERFACE_MODES,
+             "_DEFAULT_INTERFACE_MODE": _module_value(
+                 "_DEFAULT_INTERFACE_MODE")},
+        )["_read_interface_mode"]
+
+    def test_a_saved_interface_is_worn_again(self):
+        self.assertEqual(self.read({"interface_mode": "reporter"}), "reporter")
+
+    def test_an_empty_config_gets_individual_windows(self):
+        self.assertEqual(self.read({}), "windows")
+
+    def test_so_does_a_config_naming_an_interface_that_is_gone(self):
+        self.assertEqual(self.read({"interface_mode": "kaleidoscope"}),
+                         "windows")
+
+    def test_the_old_tabbed_checkbox_still_means_tabs(self):
+        self.assertEqual(self.read({"case_tabs_enabled": True}), "tabs")
+
+    def test_the_old_floating_pdf_checkbox_means_reporter_view(self):
+        # Someone who had turned that on was already asking for this.
+        self.assertEqual(self.read({"pdf_separate_window": True}), "reporter")
+        self.assertEqual(
+            self.read({"pdf_separate_window": True, "case_tabs_enabled": True}),
+            "reporter")
 
 
 # ---------------------------------------------------------------------------
 # The reader hands the PDF to the floating window
 # ---------------------------------------------------------------------------
 
+class _FakeEmbeddedReader:
+    """What _embed_text_reader builds: a chromeless copy of the opinion."""
+
+    made = []
+
+    def __init__(self, host, app, url, html, **kw):
+        self.host, self.app, self.url, self.html, self.kw = (
+            host, app, url, html, kw)
+        _FakeEmbeddedReader.made.append(self)
+
+
+READER_NAMES = [
+    "_pdf_opens_in_separate_window", "_show_pdf_floating", "_show_pdf",
+    "_floating_pdf_closed", "_surface_text_view", "_text_view_alive",
+    "_float_pdf_master", "_float_pdf_anchor", "_scan_window_title",
+    "_embed_text_reader",
+]
+
 READER_NS = _load(
-    "_ScholarTextWindow",
-    ["_pdf_opens_in_separate_window", "_show_pdf_floating", "_show_pdf",
-     "_floating_pdf_closed", "_surface_text_view", "_text_view_alive",
-     "_float_pdf_master", "_float_pdf_anchor"],
+    "_ScholarTextWindow", READER_NAMES,
     {"_PdfPane": _FakePane,
      "_FloatingPdfWindow": _FakeFloatingWindow,
+     "_ScholarTextWindow": _FakeEmbeddedReader,
+     "_EmbeddedCaseHost": type("_EmbeddedCaseHost", (), {}),
      "_is_us_reports_pdf": lambda url: "usrep" in (url or "").lower(),
      "_clamp_toplevel_to_work_area": lambda *a, **kw: (_ for _ in ()).throw(
          _InWindow()),
+     "_scan_citation_item": lambda item, url, printed="": dict(
+         item, **({"_us_reports_cite": printed} if printed else {})),
+     "_bluebook_display_name": lambda item: item.get("bluebook", ""),
      },
 )
 
@@ -337,6 +520,9 @@ class _FakeHost:
     def focus_force(self):
         pass
 
+    def destroy(self):
+        self._alive = False
+
 
 class _Reader:
     def __init__(self, separate=True, switch_target=None):
@@ -355,10 +541,20 @@ class _Reader:
         self.analysis_requests = []
         self.reopened = 0
         self._history_reopen = self._count_reopen
-        for name in ("_pdf_opens_in_separate_window", "_show_pdf_floating",
-                     "_show_pdf", "_floating_pdf_closed",
-                     "_surface_text_view", "_text_view_alive",
-                     "_float_pdf_master", "_float_pdf_anchor"):
+        # What _embed_text_reader renders from — the ingredients this window
+        # was opened with, so the embedded copy refetches nothing.
+        self._item = {"caseName": "Roe v. Wade"}
+        self._cl_primary = False
+        self._cl_text = None
+        self._cl_parts = None
+        self._cl_blocks = None
+        self._primary_source_kind = "courtlistener"
+        self._primary_source_label = "CourtListener"
+        self._primary_source_url = ""
+        self._history_pdf_url = ""
+        self._scholar_url = "https://scholar.test/roe"
+        self._history_html = "<p>opinion</p>"
+        for name in READER_NAMES:
             setattr(self, name, READER_NS[name].__get__(self))
 
     # --- collaborators the extracted methods call ---
@@ -368,6 +564,12 @@ class _Reader:
 
     def _title_citation(self):
         return "Roe v. Wade, 410 U.S. 113 (1973)"
+
+    def _filename_item(self):
+        return {"bluebook": "Roe v. Wade, 410 U.S. 113 (1973)"}
+
+    def _shown_us_reports_cite(self):
+        return ""
 
     def _history_key(self):
         return "case-key"
@@ -438,12 +640,24 @@ class FloatingHandoffTests(unittest.TestCase):
         self.assertEqual(kw["on_close"], reader._floating_pdf_closed)
         # The case name on the strip goes back to the text this PDF came from.
         self.assertEqual(kw["on_open_text"], reader._surface_text_view)
+        # …and the viewer's own "T" renders that same text inside itself.
+        self.assertEqual(kw["on_build_text"], reader._embed_text_reader)
 
     def test_the_window_is_named_for_the_case(self):
+        # In the reporter these pages print, not in every parallel reporter
+        # the case happens to carry.
         reader = _Reader()
         reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
         self.assertEqual(_FakeFloatingWindow.opened[0].title,
                          "Roe v. Wade, 410 U.S. 113 (1973)")
+
+    def test_it_is_renamed_when_the_pages_name_their_own_reporter(self):
+        reader = _Reader()
+        reader._show_pdf_floating(b"%PDF-1", "https://example.test/a.pdf")
+        window = _FakeFloatingWindow.opened[0]
+        _url, callback = reader.analysis_requests[0]
+        callback({"url": _url, "pages": [["c"]]})
+        self.assertEqual(window.titles, ["Roe v. Wade, 410 U.S. 113 (1973)"])
 
     def test_a_us_reports_scan_gets_the_roomier_margin(self):
         reader = _Reader()
@@ -606,11 +820,15 @@ class FloatingHandoffTests(unittest.TestCase):
 # The floating viewer itself
 # ---------------------------------------------------------------------------
 
-VIEWER_NS = _load(
-    "_FloatingPdfWindow",
-    ["_short_name", "showing", "apply_analysis", "zoom", "alive", "close",
-     "_on_destroy", "_save", "_print", "_show_zoom"],
-)
+# The scan/text switch these buttons drive is exercised in
+# test_pdf_text_mode.py; here the viewer only has to know it is on the scan.
+VIEWER_NAMES = [
+    "showing", "apply_analysis", "zoom", "alive", "close",
+    "_on_destroy", "_save", "_print", "_show_zoom", "set_title",
+    "showing_text",
+]
+
+VIEWER_NS = _load("_FloatingPdfWindow", VIEWER_NAMES)
 
 
 class _Viewer:
@@ -624,38 +842,55 @@ class _Viewer:
         self._zoom_var = _Var("100%")
         self._win = mock.Mock()
         self._app = None
+        self._mode = "pdf"
+        self._reader = None
+        self._text_host = None
+        self._flash_after = None
         self.cites = []
         self.printed = []
         self.saved = 0
         self.closed_with = []
         self._on_cite = lambda action, snippet: self.cites.append(action)
         self._on_cite_browser = lambda action, snippet: None
-        self._on_save = lambda: setattr(self, "saved", self.saved + 1)
+        self.saved_pane = None
+        self._on_save = lambda pane: (
+            setattr(self, "saved", self.saved + 1),
+            setattr(self, "saved_pane", pane))
         self._on_print = self.printed.append
         self._on_close = self.closed_with.append
-        for name in ("_short_name", "showing", "apply_analysis", "zoom",
-                     "alive", "close", "_on_destroy", "_save", "_print",
-                     "_show_zoom"):
+        for name in VIEWER_NAMES:
             setattr(self, name, VIEWER_NS[name].__get__(self))
         # set_pdf wires the pane's zoom reports to the strip's percentage.
         self._pane.on_zoom = self._show_zoom
 
 
-class ShortNameTests(unittest.TestCase):
-    def test_a_short_caption_is_shown_whole(self):
-        self.assertEqual(VIEWER_NS["_short_name"]("Roe v. Wade"), "Roe v. Wade")
+class WindowTitleTests(unittest.TestCase):
+    """The window is named for the case, and renamed when the text says how."""
 
-    def test_a_long_caption_is_elided_so_the_zoom_controls_keep_their_room(self):
-        name = VIEWER_NS["_short_name"]("Roe v. Wade, " + "410 U.S. 113, " * 9)
-        self.assertLessEqual(len(name), 58)
-        self.assertTrue(name.endswith("…"))
+    def test_the_title_can_be_restated(self):
+        viewer = _Viewer()
+        viewer.set_title("Roe v. Wade, 410 U.S. 113 (1973)")
+        viewer._win.title.assert_called_with("Roe v. Wade, 410 U.S. 113 (1973)")
 
     def test_whitespace_is_collapsed(self):
-        self.assertEqual(VIEWER_NS["_short_name"]("Roe   v.\n Wade"),
-                         "Roe v. Wade")
+        viewer = _Viewer()
+        viewer.set_title("Roe v. Wade,\n  410 U.S. 113 (1973)")
+        viewer._win.title.assert_called_with("Roe v. Wade, 410 U.S. 113 (1973)")
 
-    def test_no_title_is_no_name(self):
-        self.assertEqual(VIEWER_NS["_short_name"](""), "")
+    def test_nothing_to_say_leaves_the_title_alone(self):
+        viewer = _Viewer()
+        viewer.set_title("   ")
+        viewer._win.title.assert_not_called()
+
+    def test_the_strip_no_longer_repeats_the_case_name(self):
+        body = next(
+            ast.get_source_segment(SRC, node)
+            for cls in TREE.body
+            if isinstance(cls, ast.ClassDef) and cls.name == "_FloatingPdfWindow"
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_build_bar"
+        )
+        self.assertNotIn("_name_var", body)
 
 
 class ViewerTests(unittest.TestCase):
@@ -697,8 +932,9 @@ class ViewerTests(unittest.TestCase):
         self.assertIs(on_left, viewer._on_cite)
         self.assertEqual(quiet, {3})
         self.assertEqual(viewer._pane.find_pages, [[("c", (0, 0, 1, 1))]])
-        # The viewer owns its window, so it takes the find accelerators itself.
-        self.assertTrue(viewer._pane.find_bind)
+        # The window routes Ctrl-F itself — it has the opinion text to search
+        # as well — so the pane does not claim the accelerators.
+        self.assertFalse(viewer._pane.find_bind)
 
     def test_a_scan_with_no_text_layer_gets_no_links_or_search(self):
         viewer = _Viewer()
@@ -836,7 +1072,7 @@ class StripIconTests(unittest.TestCase):
 
     def test_save_and_print_stay_on_the_context_menu_too(self):
         # Where the accelerators are written down.
-        self.assertIn("Save PDF As…", self.body)
+        self.assertIn("Save As…", self.body)
         self.assertIn("Print…", self.body)
 
 

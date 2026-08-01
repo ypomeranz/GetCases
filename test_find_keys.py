@@ -230,9 +230,11 @@ class ReaderScrollKeyTests(unittest.TestCase):
 
 
 class _FakePane:
-    def __init__(self, exists=True, has_find=True):
+    def __init__(self, exists=True, has_find=True, showing=False):
         self._exists, self._has_find = exists, has_find
         self.opened = 0
+        self.closed = 0
+        self.showing = showing
         self.steps = []
 
     def winfo_exists(self):
@@ -241,24 +243,44 @@ class _FakePane:
     def has_find(self):
         return self._has_find
 
-    def _open_find(self):
-        self.opened += 1
+    def find_is_open(self):
+        return self.showing
+
+    def _toggle_find(self):
+        # The real one, in miniature: the key that opened the bar closes it.
+        if self.showing:
+            self.closed += 1
+        else:
+            self.opened += 1
+        self.showing = not self.showing
 
     def _find_step(self, delta):
         self.steps.append(delta)
 
 
 class _FakeFinder:
-    def __init__(self):
+    def __init__(self, showing=False):
         self.opened = 0
         self.closed = 0
+        self.showing = showing
         self.steps = []
+
+    def is_open(self):
+        return self.showing
+
+    def toggle(self):
+        if self.showing:
+            self.close()
+        else:
+            self.open()
 
     def open(self):
         self.opened += 1
+        self.showing = True
 
     def close(self):
         self.closed += 1
+        self.showing = False
 
     def step(self, delta):
         self.steps.append(delta)
@@ -316,6 +338,19 @@ class ReaderRoutingTests(unittest.TestCase):
         r._find_open()
         self.assertEqual(r._finder.closed, 1)
 
+    def test_the_find_key_pressed_again_puts_the_bar_away(self):
+        pane = _FakePane()
+        r = self._reader("pdf", pane)
+        r._find_open()
+        r._find_open()
+        self.assertEqual((pane.opened, pane.closed), (1, 1))
+
+    def test_and_the_same_on_the_text_view(self):
+        r = self._reader("scholar", _FakePane())
+        r._find_open()
+        r._find_open()
+        self.assertEqual((r._finder.opened, r._finder.closed), (1, 1))
+
     def test_find_again_follows_the_same_view(self):
         pane = _FakePane()
         r = self._reader("pdf", pane)
@@ -327,6 +362,64 @@ class ReaderRoutingTests(unittest.TestCase):
         r = self._reader("courtlistener", pane)
         r._find_step(+1)
         self.assertEqual((pane.steps, r._finder.steps), ([], [1]))
+
+
+class FindKeyTogglesTests(unittest.TestCase):
+    """The key that opens the find bar is the key that puts it away."""
+
+    def test_the_text_finder_binds_its_toggle_not_its_open(self):
+        src = _source_of("_TextFinder", "__init__")
+        self.assertIn("_bind_find_keys(win, self.toggle,", src)
+
+    def test_and_the_toggle_closes_a_bar_already_showing(self):
+        ns = _load("toggle", "is_open", cls="_TextFinder")
+        finder = type("F", (), dict(ns))()
+        finder._visible = True
+        finder.calls = []
+        finder.close = lambda: finder.calls.append("close")
+        finder.open = lambda: finder.calls.append("open")
+        finder.toggle()
+        self.assertEqual(finder.calls, ["close"])
+        finder._visible = False
+        finder.toggle()
+        self.assertEqual(finder.calls, ["close", "open"])
+
+    def test_the_pdf_pane_binds_its_toggle_too(self):
+        src = _source_of("_PdfPane", "enable_find")
+        self.assertIn("_bind_find_keys(self.winfo_toplevel(), "
+                      "self._toggle_find,", src)
+
+    def test_and_that_toggle_closes_an_open_bar(self):
+        ns = _load("_toggle_find", cls="_PdfPane")
+        pane = type("P", (), dict(ns))()
+        pane.calls = []
+        pane.find_is_open = lambda: True
+        pane._close_find = lambda: pane.calls.append("close")
+        pane._open_find = lambda: pane.calls.append("open")
+        pane._toggle_find()
+        pane.find_is_open = lambda: False
+        pane._toggle_find()
+        self.assertEqual(pane.calls, ["close", "open"])
+
+    def test_the_floating_viewer_routes_the_key_to_the_toggle(self):
+        src = _source_of("_FloatingPdfWindow", "_find_open")
+        self.assertIn("pane._toggle_find()", src)
+
+    def test_and_so_does_the_reader(self):
+        src = _source_of("_ScholarTextWindow", "_find_open")
+        self.assertIn("pane._toggle_find()", src)
+        self.assertIn("self._finder.toggle()", src)
+
+
+def _source_of(cls: str, name: str) -> str:
+    src = pathlib.Path(__file__).with_name("courtlistener_gui.py").read_text()
+    tree = ast.parse(src)
+    body = next(n.body for n in tree.body
+                if isinstance(n, ast.ClassDef) and n.name == cls)
+    for node in body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(src, node)
+    raise AssertionError(f"{cls} has no {name}")
 
 
 if __name__ == "__main__":
