@@ -714,5 +714,45 @@ class PartMapLabelTests(unittest.TestCase):
         self.assertEqual(self.short("", "concurrence"), "Concurrence")
 
 
+# ---------------------------------------------------------------------------
+# The same panel, built in a window of its own
+# ---------------------------------------------------------------------------
+
+
+class ReporterSidePanelTests(unittest.TestCase):
+    """The reporter interface stands the side panel beside the whole window
+    rather than inside it, and asks it for the case's details alone
+    (see _FloatingPdfWindow._open_details)."""
+
+    def test_the_panel_is_built_where_the_window_says(self):
+        src = _source_of("_ScholarTextWindow", "_details_panel")
+        self.assertIn("self._details_host if self._details_host is not None",
+                      src)
+        self.assertIn("else self._text_frame", src)
+
+    def test_the_show_selector_belongs_to_the_case_window(self):
+        src = _source_of("_ScholarTextWindow", "_details_panel")
+        self.assertIn("if self._details_views:", src)
+
+    def test_and_without_it_the_panel_shows_the_case_s_details(self):
+        # _details_mode is what reads the selector; with none it says "case".
+        ns = _load("_ScholarTextWindow", ["_details_mode"])
+        reader = type("Reader", (), {"_details_mode": ns["_details_mode"]})()
+        self.assertEqual(reader._details_mode(), "case")
+
+    def test_both_start_out_as_the_case_window_s_own(self):
+        src = _source_of("_ScholarTextWindow", "_build_ui")
+        self.assertIn("self._details_host: Optional[tk.Misc] = None", src)
+        self.assertIn("self._details_views = True", src)
+
+    def test_a_chromeless_reader_leaves_the_s_key_to_its_viewer(self):
+        # The viewer's own "s" serves the scan as well as the opinion, and one
+        # owner per key beats two handlers racing to answer the same press.
+        src = _source_of("_ScholarTextWindow", "_build_ui")
+        self.assertIn("if not self._chromeless:\n"
+                      '            win.bind("<KeyPress-s>", '
+                      "self._toggle_details_shortcut)", src)
+
+
 if __name__ == "__main__":
     unittest.main()

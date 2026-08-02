@@ -18296,6 +18296,13 @@ class _FloatingPdfWindow:
         # soon as pages are in hand.  P is on the strip throughout, greyed
         # until there is something for it to show.
         self._scan_search: "Optional[bool]" = True if data is not None else None
+        # The case-details panel, in a window of its own beside this one (the
+        # "s" key).  Kept once built and hidden rather than destroyed, so
+        # opening it again costs neither a rebuild nor a second lookup, and
+        # the geometry this window last had, so following it about does not
+        # re-place the panel on every unrelated <Configure>.
+        self._details_win: "Optional[tk.Toplevel]" = None
+        self._details_geom: tuple = ()
 
         # ``parent`` owns this window's lifetime — Tk destroys a toplevel with
         # its master, so a viewer meant to outlive the reader that opened it is
@@ -18339,6 +18346,11 @@ class _FloatingPdfWindow:
         _bind_find_keys(self._win, self._find_open,
                         lambda: self._find_step(+1),
                         lambda: self._find_step(-1))
+        # Bare "s" opens the case's details beside the window — over the pages
+        # as much as over the text, since it is the same case either way.
+        self._win.bind("<KeyPress-s>", self._details_shortcut)
+        # The panel stands against this window, so it goes where this one goes.
+        self._win.bind("<Configure>", self._on_geometry, add="+")
         self._win.bind("<Destroy>", self._on_destroy, add="+")
         if data is None:
             # A window with no scan to show — a case the reporter interface
@@ -18519,6 +18531,15 @@ class _FloatingPdfWindow:
         except tk.TclError:
             return
         self._add_bar_menu_bookmark()
+        if self.has_text_side():
+            try:
+                menu.add_command(
+                    label=("Hide Case Details\ts" if self.details_showing()
+                           else "Case Details\ts"),
+                    command=self.toggle_details,
+                )
+            except tk.TclError:
+                pass
         for label, sub in (("Recent", self._recent_menu),
                            ("Interface", self._interface_menu)):
             if sub is not None:
@@ -18724,9 +18745,16 @@ class _FloatingPdfWindow:
         return self._text_host
 
     def adopt_reader(self, reader) -> None:
-        """Take charge of an opinion built into :meth:`text_host`."""
+        """Take charge of an opinion built into :meth:`text_host`.
+
+        Where there are no pages the opinion *is* the surface, so the window
+        goes to the text side as it arrives.  Where there are, the opinion was
+        built behind them — for the T button, or for the details panel — and
+        building it must not change what is on screen; T says when to show
+        it."""
         self._reader = reader
-        self._mode = "text"
+        if not self.has_scan():
+            self._mode = "text"
         self._sync_bar()
 
     def has_text_side(self) -> bool:
@@ -18899,6 +18927,170 @@ class _FloatingPdfWindow:
         if target is not None:
             page, y_pt = target
             self.scroll_to_page(page, y_pt)
+
+    # ------------------------------------------------------------------
+    # The case's details, in a panel standing beside the window
+    # ------------------------------------------------------------------
+
+    _DETAILS_GAP = 10   # px between this window and the panel beside it
+
+    def _details_shortcut(self, event=None):
+        """The bare "s" key, over the pages as much as over the text: show
+        this case's details beside the window, or put them away again.  Left
+        to the keyboard while a field that takes typing has it."""
+        try:
+            focused = self._win.focus_get()
+        except (KeyError, tk.TclError):
+            focused = None
+        if _widget_accepts_typing(focused):
+            return None
+        self.toggle_details()
+        return "break"
+
+    def details_showing(self) -> bool:
+        """Whether the details panel is on screen beside this window."""
+        win = self._details_win
+        try:
+            return win is not None and bool(win.winfo_ismapped())
+        except tk.TclError:
+            return False
+
+    def toggle_details(self) -> None:
+        if self.details_showing():
+            self._hide_details()
+        else:
+            self._open_details()
+
+    def _open_details(self) -> None:
+        """Show the panel, building it the first time it is asked for.
+
+        The details are the opinion's to give, so the reader is built for them
+        — the same one the T button shows, and by then usually already
+        fetched.  A case whose text has not arrived says so on the strip and
+        leaves the key to be pressed again; a document with no text side at
+        all (the Statutes at Large, an English report) has no case details to
+        show and stays as it is."""
+        win = self._details_win
+        if win is None:
+            if not self.has_text_side():
+                return
+            reader = self._build_reader()
+            if reader is None:
+                self._flash("Case details not ready")
+                return
+            try:
+                win = self._details_window(reader)
+            except Exception as exc:
+                print(f"[pdf-window] the details panel could not open: {exc}")
+                return
+            self._details_win = win
+        try:
+            self._win.update_idletasks()
+        except tk.TclError:
+            pass
+        self._details_geom = ()
+        self._place_details()
+        try:
+            win.deiconify()
+            win.lift()
+        except tk.TclError:
+            self._details_win = None
+
+    def _hide_details(self) -> None:
+        """Put the panel away — withdrawn, not destroyed, so bringing it back
+        costs neither a rebuild nor a second lookup."""
+        win = self._details_win
+        if win is not None:
+            try:
+                win.withdraw()
+            except tk.TclError:
+                self._details_win = None
+        return None
+
+    def _details_window(self, reader) -> tk.Toplevel:
+        """A window holding this case's details panel, built by the opinion
+        that owns them.  Mastered on this window, so it is closed with the
+        case it belongs to; the panel offers the case's details alone (see
+        ``_ScholarTextWindow._details_panel``)."""
+        win = _ui_toplevel(self._win)
+        _ensure_modern_ttk_styles(win)
+        win.title("Case Details")
+        try:
+            if self._win.winfo_viewable():
+                win.transient(self._win)   # a panel of this window's, not a peer
+        except tk.TclError:
+            pass
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True)
+        # A chromeless reader builds no panel of its own — it has neither the
+        # checkbox nor the key for one — so this is the panel, and it is built
+        # here, in this window.
+        reader._details_host = body
+        reader._details_views = False
+        reader._details_panel().pack(fill="both", expand=True)
+        reader._details_on = True
+        try:
+            reader._details_var.set(True)
+        except (AttributeError, tk.TclError):
+            pass
+        reader._refresh_details_view()
+        for seq in ("<KeyPress-s>", "<Escape>", "<Control-w>", "<Command-w>"):
+            try:
+                win.bind(seq, lambda _e: self._hide_details() or "break")
+            except tk.TclError:
+                pass    # modifier not supported on this platform
+        win.protocol("WM_DELETE_WINDOW", self._hide_details)
+        return win
+
+    def _details_width(self) -> int:
+        """The panel's own width — the column it is given in a case window."""
+        width = getattr(self._reader, "_details_panel_w", 0)
+        return int(width) if width else _ScholarTextWindow._DETAILS_PANEL_W
+
+    def _place_details(self) -> None:
+        """Stand the panel against this window's right-hand edge and match its
+        height.  Beside the window, never inside it: nothing here is resized,
+        re-laid out or re-rendered by opening it.  A maximized window has
+        nothing to its right, so there the panel goes against the right of the
+        desktop, over the edge of the pages rather than moving them."""
+        win = self._details_win
+        if win is None:
+            return
+        try:
+            x0, y0 = self._win.winfo_rootx(), self._win.winfo_rooty()
+            w, h = self._win.winfo_width(), self._win.winfo_height()
+        except tk.TclError:
+            return
+        left, top, work_w, work_h = _work_area(self._win)
+        pw = self._details_width()
+        h = max(self._MIN_H, min(h, work_h))
+        x = x0 + w + self._DETAILS_GAP
+        if x + pw > left + work_w:      # maximized, or no room to the right
+            x = max(left, left + work_w - pw)
+        y = max(top, min(y0, top + work_h - h))
+        try:
+            win.geometry(f"{pw}x{int(h)}+{int(x)}+{int(y)}")
+        except tk.TclError:
+            pass
+
+    def _on_geometry(self, event) -> None:
+        """This window moved or was resized: bring the panel along with it.
+        Only this window's own <Configure> counts — the event fires for every
+        child — and only one that changed something, so nothing is re-placed
+        on an event that says the window is where it already was."""
+        if getattr(event, "widget", None) is not self._win:
+            return
+        if not self.details_showing():
+            return
+        try:
+            geom = (self._win.winfo_rootx(), self._win.winfo_rooty(),
+                    self._win.winfo_width(), self._win.winfo_height())
+        except tk.TclError:
+            return
+        if geom == self._details_geom:
+            return
+        self._details_geom = geom
+        self._place_details()
 
     def _sync_bar(self) -> None:
         """Point the strip at whichever surface is showing: T becomes P, Fit
@@ -19111,6 +19303,7 @@ class _FloatingPdfWindow:
         self._closing = True
         self._pane = None
         self._text_host = self._reader = None
+        self._details_win = None    # a child of this window; already gone
         self._flash_after = None
         if self._on_close is not None:
             try:
@@ -20299,6 +20492,14 @@ class _ScholarTextWindow:
                   follow_motion=True)
         self._text_frame, self._vsb = text_frame, vsb
         self._details_frame: Optional[ttk.Frame] = None
+        # Where the side panel is built, and how much of it is offered there.
+        # In a case window it is a column of the window itself, and its "Show"
+        # selector offers every view.  The reporter interface sets both — the
+        # panel is built into a window of its own standing beside the scan,
+        # and holds the case's details and nothing else (see
+        # _FloatingPdfWindow._open_details).
+        self._details_host: Optional[tk.Misc] = None
+        self._details_views = True
         self._details_loaded = False
         self._details_case: Optional[tuple] = None  # cached (title, lines)
         self._related_loaded = False
@@ -20444,8 +20645,11 @@ class _ScholarTextWindow:
                 win.bind(seq, lambda _e: self._zoom(-1))
             win.bind("<Control-0>", lambda _e: self._zoom(0))
         # Bare "s" toggles whichever side panel the current view has, except
-        # while a text field has focus.
-        win.bind("<KeyPress-s>", self._toggle_details_shortcut)
+        # while a text field has focus.  Chromeless, the key is the viewer's:
+        # it owns a side panel that stands beside the whole window, and serves
+        # the scan as well as the opinion (see _FloatingPdfWindow._open_details).
+        if not self._chromeless:
+            win.bind("<KeyPress-s>", self._toggle_details_shortcut)
         # Bare "x" cycles the persistent Ctrl-C style. Like the side-panel
         # shortcut, it stays out of fields where the user is typing.
         win.bind("<KeyPress-x>", self._cycle_copy_mode)
@@ -24510,7 +24714,9 @@ class _ScholarTextWindow:
             # particular, long docket filing names must wrap inside the panel
             # rather than letting a child's requested width enlarge it.
             f = ttk.Frame(
-                self._text_frame, width=self._details_panel_w,
+                self._details_host if self._details_host is not None
+                else self._text_frame,
+                width=self._details_panel_w,
             )
             f.pack_propagate(False)
             base_family = tkfont.nametofont("TkDefaultFont").actual("family")
@@ -24559,25 +24765,32 @@ class _ScholarTextWindow:
             # proceedings), or the opinion's detected outline.  Case details
             # and the recent-decisions list are separate views now, not one
             # falling through to the other.
-            mode_row = ttk.Frame(f)
-            mode_row.pack(fill="x", padx=6, pady=(0, 2))
-            ttk.Label(mode_row, text="Show",
-                      style="ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel",
-                      ).pack(side="left")
-            mode_values = ["Case details"]
-            if self._is_scotus:
-                mode_values.append("Docket")
-            mode_values.extend(("Recent SCOTUS", "Related cases", "Outline"))
-            self._details_mode_combo = ttk.Combobox(
-                mode_row, state="readonly", width=16,
-                values=tuple(mode_values),
-                style="Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox",
-            )
-            self._details_mode_combo.current(0)
-            self._details_mode_combo.pack(side="left", padx=(6, 0))
-            self._details_mode_combo.bind(
-                "<<ComboboxSelected>>",
-                lambda _e: self._refresh_details_view())
+            # The other views are the case window's: they answer questions
+            # about the docket, the Court's term and the shape of the opinion,
+            # which want the room a window has.  A panel standing beside a
+            # scan is opened for the case's own details, so it offers those
+            # and leaves the selector out (_details_mode then reads "case").
+            if self._details_views:
+                mode_row = ttk.Frame(f)
+                mode_row.pack(fill="x", padx=6, pady=(0, 2))
+                ttk.Label(
+                    mode_row, text="Show",
+                    style="ModernMuted.TLabel" if _CTK_AVAILABLE else "TLabel",
+                ).pack(side="left")
+                mode_values = ["Case details"]
+                if self._is_scotus:
+                    mode_values.append("Docket")
+                mode_values.extend(("Recent SCOTUS", "Related cases", "Outline"))
+                self._details_mode_combo = ttk.Combobox(
+                    mode_row, state="readonly", width=16,
+                    values=tuple(mode_values),
+                    style="Modern.TCombobox" if _CTK_AVAILABLE else "TCombobox",
+                )
+                self._details_mode_combo.current(0)
+                self._details_mode_combo.pack(side="left", padx=(6, 0))
+                self._details_mode_combo.bind(
+                    "<<ComboboxSelected>>",
+                    lambda _e: self._refresh_details_view())
 
             body = tk.Text(
                 f, width=1, wrap="word",
