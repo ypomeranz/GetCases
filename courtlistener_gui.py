@@ -14901,12 +14901,13 @@ def _find_scholar_for_item(
 
 
 def _reader_scroll_key_owns(widget) -> bool:
-    """Whether a reader may consume Up/Down from the focused *widget*.
+    """Whether a reader may consume an arrow key from the focused *widget*.
 
     Arrow keys belong to text fields, selectors, lists, trees, scales, and
     scrollbars when one of those has focus.  Buttons, labels, the document
-    surface, and the window itself have no useful vertical-arrow action, so the
-    visible reader may use them to scroll.
+    surface, and the window itself have no useful arrow-key action, so the
+    visible reader may use them to scroll — and, Left and Right, to turn the
+    pages of a PDF.
     """
     try:
         cls = str(widget.winfo_class() or "").lower()
@@ -14953,6 +14954,35 @@ def _bind_reader_scroll_keys(win: tk.Misc, scroll_cb) -> None:
         lambda event: handler(event, 1),
         add="+",
     )
+
+
+def _bind_reader_page_keys(win: tk.Misc, turn_cb) -> None:
+    """Route Left/Right to the pages of the PDF a window is showing.
+
+    ``turn_cb`` receives ``-1`` for Left and ``+1`` for Right, and returns
+    ``False`` when there is no PDF on screen to turn — a window on its text
+    side, or one whose scan has not arrived yet — in which case the key is
+    left alone.  It is left alone for a text widget with the keyboard as well:
+    there the arrows are the caret's, and a reader moving through a quotation
+    would not thank us for turning the page under them.
+    """
+    def handler(event, direction: int):
+        widget = getattr(event, "widget", None)
+        if not _reader_scroll_key_owns(widget):
+            return None
+        try:
+            if str(widget.winfo_class()).lower() == "text":
+                return None
+        except (AttributeError, tk.TclError):
+            pass
+        try:
+            handled = turn_cb(direction)
+        except tk.TclError:
+            return None
+        return None if handled is False else "break"
+
+    win.bind("<KeyPress-Left>", lambda event: handler(event, -1), add="+")
+    win.bind("<KeyPress-Right>", lambda event: handler(event, 1), add="+")
 
 
 def _bind_text_scroll_keys(win: tk.Misc, txt: tk.Text, scroll_cb=None,
@@ -16557,6 +16587,9 @@ class _PdfPane(ttk.Frame):
     # Kept above a line scrolled to mid-page, so the reader can see the tail of
     # what precedes it and knows they are not at the top of the page.
     _LINE_LEAD_IN = 28
+    # How far the view may sit off a page's top and still count as being at it
+    # (see turn_page) — the rounding a fractional scroll leaves behind.
+    _PAGE_TOP_SLOP = 3
     _BBOX_SCALE = 0.6   # low-res render scale used to detect the content box
     _INK_THRESH = 185   # grayscale < this counts as "ink" (ignores scan bg)
     _PROFILE_MIN = 2    # min avg ink (0-255) for a row/col to count as content
@@ -16720,8 +16753,15 @@ class _PdfPane(ttk.Frame):
                     lambda _e: self.scroll_key(-1) and "break")
         canvas.bind("<KeyPress-Down>",
                     lambda _e: self.scroll_key(1) and "break")
-        canvas.bind("<KeyPress-Left>", lambda _e: self._hwheel(-1))
-        canvas.bind("<KeyPress-Right>", lambda _e: self._hwheel(1))
+        # Left and Right turn the pages, as they do in every other PDF reader;
+        # panning a zoomed-in page sideways moves to Shift with them (where the
+        # wheel's own sideways pan already lives).
+        canvas.bind("<KeyPress-Left>",
+                    lambda _e: self.turn_page(-1) and "break")
+        canvas.bind("<KeyPress-Right>",
+                    lambda _e: self.turn_page(1) and "break")
+        canvas.bind("<Shift-KeyPress-Left>", lambda _e: self._hwheel(-1))
+        canvas.bind("<Shift-KeyPress-Right>", lambda _e: self._hwheel(1))
         # Take keyboard focus only when the reader intentionally clicks in the
         # PDF.  Focusing on hover can make some platforms raise this window just
         # because the pointer crossed it.
@@ -17071,9 +17111,9 @@ class _PdfPane(ttk.Frame):
 
     def take_focus(self) -> None:
         """Give the page canvas the keyboard.  For a window whose only content
-        is the PDF: the arrow keys — including Left/Right panning, which is
-        bound on the canvas alone so it cannot hijack arrows elsewhere — then
-        work without the reader having to click the page first."""
+        is the PDF: the arrow keys — Up/Down scrolling, Left/Right turning the
+        pages, Shift with them panning a zoomed page — then work without the
+        reader having to click the page first."""
         try:
             self._canvas.focus_set()
         except tk.TclError:
@@ -17293,6 +17333,37 @@ class _PdfPane(ttk.Frame):
         except tk.TclError:
             pass
         self._render_visible()
+
+    def turn_page(self, direction: int) -> bool:
+        """Turn to the next page (*direction* > 0) or back to the one before —
+        Right and Left, on every view that shows a PDF.
+
+        Forward lands on the first page beginning below the top of the view,
+        back on the last one beginning above it.  So a page read part-way down
+        goes back to its own top before it goes to the page before it, and
+        neither key can skip a page the reader has not seen.  At either end of
+        the document the key is still the pane's — it simply has nowhere left
+        to go.  False only when there are no pages at all, which leaves the
+        key to whatever else in the window wants it.
+        """
+        if self._disposed or not self._slots:
+            return False
+        try:
+            view_top = self._canvas.canvasy(0)
+        except tk.TclError:
+            return False
+        # Where each page begins, in canvas pixels: what scroll_to_page puts
+        # at the top of the view.
+        tops = [slot[0] - self._PAD for slot in self._slots]
+        if direction > 0:
+            target = next((i for i, y in enumerate(tops)
+                           if y > view_top + self._PAGE_TOP_SLOP),
+                          len(tops) - 1)
+        else:
+            target = next((i for i in reversed(range(len(tops)))
+                           if tops[i] < view_top - self._PAGE_TOP_SLOP), 0)
+        self.scroll_to_page(target)
+        return True
 
     # ------------------------------------------------------------------
     # Opinion-parts rail (beside the scrollbar)
@@ -18262,6 +18333,7 @@ class _FloatingPdfWindow:
         for seq in ("<Control-p>", "<Command-p>"):
             self._win.bind(seq, lambda _e: self._print())
         _bind_reader_scroll_keys(self._win, self._scroll_key)
+        _bind_reader_page_keys(self._win, self._page_key)
         # Find belongs to the window, not to either surface: whichever is
         # showing is what Ctrl/Cmd-F searches.
         _bind_find_keys(self._win, self._find_open,
@@ -18940,6 +19012,20 @@ class _FloatingPdfWindow:
             if self.showing_text():
                 return surface._scroll_reader(direction)
             return surface.scroll_key(direction)
+        except (AttributeError, tk.TclError):
+            return False
+
+    def _page_key(self, direction: int):
+        """Left and Right turn the pages of whichever scan is showing — this
+        window's own, or one the embedded opinion has itself switched to.  On
+        the opinion text they are nobody's but the reader's."""
+        surface = self._reader if self.showing_text() else self._pane
+        if surface is None:
+            return False
+        try:
+            if self.showing_text():
+                return surface._turn_pdf_page(direction)
+            return surface.turn_page(direction)
         except (AttributeError, tk.TclError):
             return False
 
@@ -20273,6 +20359,8 @@ class _ScholarTextWindow:
                             lambda: self._find_step(-1))
         _bind_text_scroll_keys(win, txt, self._scroll_reader,
                                window_keys=not self._chromeless)
+        if not self._chromeless:
+            _bind_reader_page_keys(win, self._turn_pdf_page)
 
         btn_frame = _ui_frame(win)
         if not self._chromeless:
@@ -20594,6 +20682,13 @@ class _ScholarTextWindow:
             return self._pdf_pane.scroll_key(direction)
         self._text.yview_scroll(direction, "units")
         return True
+
+    def _turn_pdf_page(self, direction: int) -> bool:
+        """Left and Right turn the pages while the PDF is the surface showing.
+        The text has no pages to turn, so there they stay the reader's own."""
+        if self._mode == "pdf" and self._pdf_pane is not None:
+            return self._pdf_pane.turn_page(direction)
+        return False
 
     def _zoom(self, delta: int) -> None:
         """In the reader, grow/shrink every font (delta 0 resets to default);
@@ -28381,6 +28476,13 @@ class _PdfWindow:
                 if self._pane is not None else False
             ),
         )
+        _bind_reader_page_keys(
+            self._win,
+            lambda direction: (
+                self._pane.turn_page(direction)
+                if self._pane is not None else False
+            ),
+        )
 
         entry = self._history_entry()
         if entry is not None and self._app is not None and hasattr(
@@ -29940,6 +30042,13 @@ class _SlipOpinionWindow:
                 if self._pane is not None else False
             ),
         )
+        _bind_reader_page_keys(
+            win,
+            lambda direction: (
+                self._pane.turn_page(direction)
+                if self._pane is not None else False
+            ),
+        )
 
         if app is not None and hasattr(app, "record_case_view"):
             def reopen(
@@ -31265,6 +31374,13 @@ class _LinkedPdfWindow:
             self._win,
             lambda direction: (
                 self._pane.scroll_key(direction)
+                if self._pane is not None else False
+            ),
+        )
+        _bind_reader_page_keys(
+            self._win,
+            lambda direction: (
+                self._pane.turn_page(direction)
                 if self._pane is not None else False
             ),
         )
