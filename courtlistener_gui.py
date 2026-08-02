@@ -9182,6 +9182,26 @@ class CourtListenerGUI:
                 pass
             return self.root
 
+        def cite_clicked(act: tuple, snip: str) -> None:
+            """Follow a citation clicked on these pages.
+
+            A *case* goes to its own scan, the reports being what this
+            interface is for, and falls back to its text when no scan can be
+            found.  Everything else on the page — a statute, a rule, a
+            regulation, a Statutes at Large or Federal Register scan, an
+            English report — is not the scan lookup's to open (it answers only
+            for cases, and says so by returning False), so it opens the way it
+            does everywhere else in the app.  Without that last step those
+            links would click into nothing here, though the same citation in
+            the text side of the very same window opens.
+            """
+            def as_text(a=act, s=snip) -> None:
+                _follow_brief_action(self, onward(), a, status, snippet=s)
+
+            if not self.open_cited_case_pdf(onward(), act, snip, status,
+                                            fallback=as_text):
+                as_text()
+
         # The text is fetched now rather than when the reader asks for it, so
         # the case name opens a page already in hand — and so the window can be
         # titled with the case's real citation rather than the clicked one.
@@ -9193,11 +9213,7 @@ class CourtListenerGUI:
                 anchor=anchor,
                 on_save=lambda pane: self._save_cited_pdf(named, pane, status),
                 on_print=lambda pane: self._print_cited_pdf(named, pane, status),
-                on_cite=lambda act, snip: self.open_cited_case_pdf(
-                    onward(), act, snip, status,
-                    fallback=lambda a=act, s=snip: _follow_brief_action(
-                        self, onward(), a, status, snippet=s),
-                ),
+                on_cite=cite_clicked,
                 on_cite_browser=_open_citation_in_browser,
                 on_open_text=lambda: _follow_brief_action(
                     self, onward(), action, status, snippet=snippet),

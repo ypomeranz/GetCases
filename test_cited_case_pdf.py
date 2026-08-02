@@ -222,6 +222,7 @@ class _FakeViewer:
     def __init__(self, parent, data, url, title, **kw):
         self.parent, self.data, self.url, self.title = parent, data, url, title
         self.kw = kw
+        self._win = f"toplevel of {title}"   # what a click here starts from
         self.surfaced = 0
         self.analyses = []
         self.scrolled: list = []
@@ -392,6 +393,35 @@ class CitedCasePdfTests(unittest.TestCase):
             ("cite", "381 U.S. 479"), "Griswold v. Connecticut")
         self.assertEqual(len(_FakeViewer.opened), 2)
         self.assertEqual(_FakeViewer.opened[1].data, b"%PDF-2")
+
+    def test_a_statute_inside_that_scan_opens_as_well(self):
+        # The scan lookup has no answer for anything but a case, so a statute,
+        # a rule or a regulation clicked on these pages has to go on to the
+        # ordinary opener rather than fall on the floor.
+        self._click()
+        _FakeViewer.opened[0].kw["on_cite"](
+            ("usc", "42:1983:"), "42 U.S.C. § 1983")
+        self.assertEqual(len(_FakeViewer.opened), 1)   # no second scan
+        self.assertEqual([args[2] for args, _kw in TEXT_OPENS],
+                         [("usc", "42:1983:")])
+
+    def test_and_so_do_the_other_sources_that_are_not_cases(self):
+        self._click()
+        for action in (("statpdf", "https://govinfo.test/statute/14/27"),
+                       ("cfr", "29:1614.105:a,1"),
+                       ("engrep", "156:145")):
+            _FakeViewer.opened[0].kw["on_cite"](action, "")
+        self.assertEqual([args[2] for args, _kw in TEXT_OPENS],
+                         [("statpdf", "https://govinfo.test/statute/14/27"),
+                          ("cfr", "29:1614.105:a,1"),
+                          ("engrep", "156:145")])
+
+    def test_a_statute_click_starts_from_the_scan_it_was_clicked_in(self):
+        # Not from the window that scan was opened out of, which may be gone.
+        self._click()
+        window = _FakeViewer.opened[0]
+        window.kw["on_cite"](("usc", "42:1983:"), "")
+        self.assertIs(TEXT_OPENS[0][0][1], window._win)
 
     def test_the_viewer_can_save_and_print_the_scan(self):
         self._click()

@@ -973,8 +973,12 @@ class WindowIndependenceTests(unittest.TestCase):
 
     def test_and_a_citation_followed_out_of_it_starts_from_it(self):
         src = _source_of("CourtListenerGUI", "_show_cited_case_pdf")
-        self.assertIn("on_cite=lambda act, snip: self.open_cited_case_pdf(\n"
-                      "                    onward()", src)
+        self.assertIn("on_cite=cite_clicked", src)
+        self.assertIn(
+            "if not self.open_cited_case_pdf(onward(), act, snip, status,",
+            src)
+        self.assertIn(
+            "_follow_brief_action(self, onward(), a, status, snippet=s)", src)
         self.assertIn("on_open_text=lambda: _follow_brief_action(\n"
                       "                    self, onward()", src)
 
