@@ -2671,6 +2671,10 @@ def _us_reports_loc_url(citation: str) -> Optional[str]:
     """
     Return the LOC CDN PDF URL for a US Reports citation, or None if the
     volume falls outside the LOC collection (vols 1-542 only).
+
+    This is the first opinion beginning on the cited page; where a second one
+    begins there too, it is filed beside this one (see
+    :func:`_us_reports_sibling_url`).
     """
     m = _US_CITE_RE.search(citation)
     if not m:
@@ -2678,10 +2682,262 @@ def _us_reports_loc_url(citation: str) -> Optional[str]:
     vol, page = int(m.group(1)), int(m.group(2))
     if vol > _LOC_CUTOFF:
         return None
+    stem = f"usrep{vol:03d}{page:03d}"
     return (
-        f"https://cdn.loc.gov/service/ll/usrep/"
-        f"usrep{vol:03d}/usrep{vol:03d}{page:03d}/usrep{vol:03d}{page:03d}.pdf"
+        f"https://cdn.loc.gov/service/ll/usrep/usrep{vol:03d}/{stem}/{stem}.pdf"
     )
+
+
+# Two opinions almost never begin on the same page of the U.S. Reports — but
+# it happens.  71 U.S. 2 is where both Brobst v. Brobst and Ex parte Milligan
+# begin, and each collection files the second alongside the first under a name
+# of its own: the LOC appends a letter (usrep071002.pdf, usrep071002a.pdf),
+# GovInfo a number (USREPORTS-71-2.pdf, USREPORTS-71-2-2.pdf).  The citation
+# alone therefore cannot say which scan is wanted; what settles it is the case
+# name each PDF carries in its own title.
+_LOC_PAGE_SUFFIXES = "abcdefgh"
+_MAX_PAGE_OPINIONS = 8       # a page beginning a ninth opinion does not exist
+_LOC_SIBLING_URL_RE = re.compile(r"/usrep\d{6}[a-z]/", re.IGNORECASE)
+# The two collections' per-opinion file names, taken apart so a sibling can be
+# built from the scan actually in hand — whichever host it came from
+# (cdn.loc.gov and tile.loc.gov serve the same files under different paths).
+_LOC_USREP_URL_RE = re.compile(
+    r"^(?P<head>.*/)(?P<stem>usrep\d{6})(?P<suffix>[a-z]*)/"
+    r"(?P=stem)(?P=suffix)\.pdf$",
+    re.IGNORECASE,
+)
+_GOVINFO_USREP_URL_RE = re.compile(
+    r"^(.*/USREPORTS-\d+-\d+)\.pdf$", re.IGNORECASE)
+
+_PDF_TITLE_RE = re.compile(rb"/Title\s*(\(|<)")
+# The escapes a PDF literal string may carry (PDF 32000-1 7.3.4.2).
+_PDF_STRING_ESCAPES = {
+    b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f",
+    b"(": b"(", b")": b")", b"\\": b"\\",
+}
+
+
+@dataclass(frozen=True)
+class _UsReportsPageOpinion:
+    """One scan of an opinion sharing a U.S. Reports page with another."""
+    url: str
+    name: str      # the case as the scan's own PDF title names it
+
+
+def _pdf_title(data: bytes) -> str:
+    """The ``/Title`` of a PDF, read straight out of its bytes.
+
+    Only as much of a parse as the document information dictionary needs, and
+    deliberately tolerant of a *partial* file: the LOC's scans carry theirs in
+    the first few kilobytes, so a title can be had from a range request rather
+    than a whole opinion.  Returns "" when the bytes in hand hold no title.
+    """
+    m = _PDF_TITLE_RE.search(data or b"")
+    if not m:
+        return ""
+    i = m.end()
+    if m.group(1) == b"<":                      # hexadecimal string
+        end = data.find(b">", i)
+        if end < 0:
+            return ""
+        digits = re.sub(rb"[^0-9A-Fa-f]", b"", data[i:end])
+        if len(digits) % 2:
+            digits += b"0"                      # an odd final digit is padded
+        try:
+            raw = bytes.fromhex(digits.decode("ascii"))
+        except ValueError:
+            return ""
+    else:                                       # literal (…) string
+        out = bytearray()
+        depth = 1
+        while i < len(data):
+            ch = data[i:i + 1]
+            if ch == b"\\":
+                nxt = data[i + 1:i + 2]
+                if nxt in _PDF_STRING_ESCAPES:
+                    out += _PDF_STRING_ESCAPES[nxt]
+                    i += 2
+                    continue
+                if nxt.isdigit():               # \ddd, octal, up to 3 digits
+                    digits = b""
+                    while len(digits) < 3 and data[i + 1:i + 2].isdigit():
+                        digits += data[i + 1:i + 2]
+                        i += 1
+                    out += bytes([int(digits, 8) & 0xFF])
+                    i += 1
+                    continue
+                if nxt in b"\r\n":
+                    i += 2                      # a line continuation: both go
+                    continue
+                out += nxt                      # any other escape is itself
+                i += 2
+                continue
+            if ch == b"(":
+                depth += 1
+            elif ch == b")":
+                depth -= 1
+                if depth == 0:
+                    break
+            out += ch
+            i += 1
+        else:
+            return ""       # the string never ended — a truncated read
+        raw = bytes(out)
+    if raw[:2] in (b"\xfe\xff", b"\xff\xfe"):
+        return raw.decode("utf-16", errors="replace").strip()
+    return raw.decode("latin-1", errors="replace").strip()
+
+
+def _us_reports_title_name(title: str) -> str:
+    """The case name inside a US Reports scan's title.
+
+    The LOC gives the whole citation — "U.S. Reports: Brobst et al. v. Brobst,
+    71 U.S. (4 Wall.) 2 (1867)." — and GovInfo the caption alone, "Brobst et
+    al. v. Brobst"; both come back as the second.  The citation is cut at the
+    comma *before* the volume number, so a caption carrying commas of its own
+    survives.
+    """
+    text = re.sub(r"^\s*U\.?\s?S\.?\s*Reports:\s*", "", title or "",
+                  flags=re.IGNORECASE)
+    m = re.search(r",\s*\d+\s+U\.\s?S\.", text)
+    if m:
+        text = text[:m.start()]
+    return re.sub(r"\s+", " ", text).strip(" ,.")
+
+
+def _us_reports_pdf_case_name(url: str) -> str:
+    """The case a US Reports scan says it is, read from as little of it as
+    will do — the first quarter-megabyte, which is where both collections put
+    the title — falling back to the whole file if it is not in there."""
+    for headers in ({"Range": "bytes=0-262143"}, {}):
+        try:
+            resp = _anon_session.get(url, timeout=20, headers=headers)
+        except Exception as exc:
+            print(f"[usrep] title fetch failed for {url}: {exc}")
+            return ""
+        if resp.status_code not in (200, 206):
+            print(f"[usrep] title fetch {resp.status_code} for {url}")
+            return ""
+        title = _pdf_title(resp.content)
+        if title:
+            return _us_reports_title_name(title)
+        if resp.status_code == 200:
+            break       # that was the whole scan; it carries no title
+    return ""
+
+
+def _us_reports_sibling_url(url: str, number: int) -> Optional[str]:
+    """Where the *number*-th opinion beginning on a U.S. Reports page is filed
+    (2 = the second one), in the collection the first one's *url* comes from.
+
+    Read off that URL rather than rebuilt from the citation, so the sibling is
+    always fetched from the same host and path the scan in hand came from.
+    """
+    m = _GOVINFO_USREP_URL_RE.match(url or "")
+    if m:
+        return f"{m.group(1)}-{number}.pdf"
+    m = _LOC_USREP_URL_RE.match(url or "")
+    if m and not m.group("suffix"):
+        i = number - 2
+        if not 0 <= i < len(_LOC_PAGE_SUFFIXES):
+            return None
+        stem = m.group("stem") + _LOC_PAGE_SUFFIXES[i]
+        return f"{m.group('head')}{stem}/{stem}.pdf"
+    return None
+
+
+_us_reports_page_lock = threading.Lock()
+_us_reports_page_cache: dict[str, list[_UsReportsPageOpinion]] = {}
+
+
+def _us_reports_page_opinions(
+    citation: str, url: str,
+) -> list[_UsReportsPageOpinion]:
+    """Every scan of an opinion beginning on the page *url* names.
+
+    A sibling is probed for first, so the ordinary page — the one that begins
+    a single opinion — costs one HEAD and nothing else.  Only when one exists
+    is anything fetched, and then each scan is asked its own name (see
+    :func:`_us_reports_pdf_case_name`), which is the only thing that tells
+    them apart.  A second scan that will not name itself is treated as no
+    second scan at all: it could not be chosen between anyway, and a source
+    answering 200 to anything would otherwise conjure up a page of them.  An
+    empty list means the page begins one opinion, as nearly every page does.
+    """
+    if not url or _LOC_SIBLING_URL_RE.search(url):
+        return []       # already one of the siblings: it names itself
+    with _us_reports_page_lock:
+        hit = _us_reports_page_cache.get(url)
+    if hit is not None:
+        return list(hit)
+
+    def exists(candidate: str) -> bool:
+        try:
+            resp = _anon_session.head(
+                candidate, timeout=10, allow_redirects=True)
+            return resp.status_code == 200
+        except Exception as exc:
+            print(f"[usrep] sibling check failed for {candidate}: {exc}")
+            return False
+
+    siblings: list[tuple[str, str]] = []       # (url, the name it gives)
+    for number in range(2, _MAX_PAGE_OPINIONS + 1):
+        candidate = _us_reports_sibling_url(url, number)
+        if not candidate or not exists(candidate):
+            break
+        name = _us_reports_pdf_case_name(candidate)
+        if not name and not siblings:
+            print(f"[usrep] {citation}: a second scan that names no case; "
+                  "reading the page as the one opinion it says it is")
+            break
+        siblings.append((candidate, name))
+    opinions = [
+        _UsReportsPageOpinion(url, _us_reports_pdf_case_name(url)),
+        *(_UsReportsPageOpinion(u, n) for u, n in siblings),
+    ] if siblings else []
+    with _us_reports_page_lock:
+        _us_reports_page_cache[url] = opinions
+    return list(opinions)
+
+
+def _us_reports_page_choice(
+    citation: str, url: str, expected_name: str,
+) -> "tuple[str, list[_CaseLawPdfChoice]]":
+    """Which scan of a U.S. Reports page to open, and what to offer if that
+    cannot be told.
+
+    The page is nearly always one opinion's alone, and then this is simply the
+    URL that came in.  Where it is not — 71 U.S. 2 begins both Brobst v.
+    Brobst and Ex parte Milligan — the case being opened is matched against
+    the name each scan carries in its own PDF title, since the citation cannot
+    tell them apart.  A name matching none of them, or two of them equally
+    well, leaves the first scan (what the citation has always opened) and
+    returns every opinion for the window's PDF menu, so the reader can pick
+    the other; otherwise the list comes back empty.
+    """
+    try:
+        opinions = _us_reports_page_opinions(citation, url)
+    except Exception as exc:      # never stand between a reader and the scan
+        print(f"[usrep] checking {citation} for a second opinion failed: {exc}")
+        return url, []
+    if not opinions:
+        return url, []
+    listed = "; ".join(o.name or "unnamed" for o in opinions)
+    print(f"[usrep] {citation} begins {len(opinions)} opinions: {listed}")
+    matched = (_match_page_opinion(opinions, expected_name)
+               if expected_name else None)
+    if matched is not None:
+        print(f"[usrep] {expected_name!r} is the one at {matched.url}")
+        return matched.url, []
+    print(f"[usrep] could not tell which of them {expected_name!r} is")
+    return opinions[0].url, [
+        _CaseLawPdfChoice(
+            cite=citation, url=o.url,
+            label=f"{citation} — {o.name}" if o.name
+            else f"{citation} — Opinion {i}",
+        )
+        for i, o in enumerate(opinions, 1)
+    ]
 
 
 def _us_reports_govinfo_url(citation: str) -> Optional[tuple[str, str]]:
@@ -2860,10 +3116,15 @@ def _case_law_opinion_name(opinion: _CaseLawPageOpinion) -> str:
         return opinion.name
 
 
-def _match_case_law_page_opinion(
-    opinions: list[_CaseLawPageOpinion], expected_name: str,
-) -> Optional[_CaseLawPageOpinion]:
-    """Best unambiguous CAP page opinion for a CL/Scholar case name."""
+def _match_page_opinion(opinions: list, expected_name: str):
+    """The one opinion of a shared page that a source's case name names.
+
+    Serves any page whose scans have to be told apart by their captions — the
+    CAP opinions sharing a reporter page, the two U.S. Reports opinions
+    beginning on one page — so *opinions* is anything with a ``.name``.
+    Returns None where the name matches none of them, or fits two equally
+    well: that is exactly when the reader should be the one to choose.
+    """
     expected = re.sub(r"<[^>]+>", "", expected_name or "").strip()
     if not expected:
         return None
@@ -2919,7 +3180,7 @@ def _case_law_pdf_choices_for_cites(
             chosen_url = url
             page_opinions = _case_law_page_opinions(url)
             if page_opinions and expected_name:
-                matched = _match_case_law_page_opinion(
+                matched = _match_page_opinion(
                     page_opinions, expected_name)
                 if matched is not None:
                     chosen_url = matched.url
@@ -11217,6 +11478,14 @@ class CourtListenerGUI:
         # Determine whether this is a SCOTUS case.
         court_val = str(item.get("court_id") or "")
         is_scotus = "scotus" in court_val
+        # The case as the record names it.  Both collections can hold more
+        # than one scan for a citation — several reporters printing the same
+        # case (case.law), or two opinions beginning on one U.S. Reports page
+        # — and this is what tells them apart.
+        expected_name = re.sub(
+            r"<[^>]+>", "",
+            str(item.get("caseName") or item.get("case_name") or ""),
+        ).strip()
 
         def _head_ok(url: str, label: str) -> bool:
             try:
@@ -11245,6 +11514,16 @@ class CourtListenerGUI:
         #    Beyond that an opinion is carved out of the Court's bound-volume/
         #    preliminary-print PDF (vols 584+; downloaded from supremecourt.gov
         #    on first use, reused from the "US Reports" folder after).
+        def _which_opinion(cite: str, url: str) -> str:
+            """The scan to open of those beginning on the cited page, keeping
+            the others for the window's PDF menu when the case name could not
+            say which is which (see :func:`_us_reports_page_choice`)."""
+            chosen, choices = _us_reports_page_choice(
+                cite, url, expected_name)
+            if choices:
+                item["_case_law_pdf_choices"] = choices
+            return chosen
+
         def _try_govinfo(cite: str) -> Optional[str]:
             gov = _us_reports_govinfo_url(cite)
             if not gov:
@@ -11252,17 +11531,21 @@ class CourtListenerGUI:
             link_url, direct_url = gov
             if _head_ok(link_url, "GovInfo link"):
                 print(f"[resolve] using GovInfo link URL: {link_url}")
-                return link_url
+                # The stable link redirects to the first opinion on the page;
+                # where a second one begins there too, the scans themselves
+                # are what have to be chosen between.
+                chosen = _which_opinion(cite, direct_url)
+                return link_url if chosen == direct_url else chosen
             if _head_ok(direct_url, "GovInfo direct PDF"):
                 print(f"[resolve] using GovInfo direct PDF URL: {direct_url}")
-                return direct_url
+                return _which_opinion(cite, direct_url)
             return None
 
         def _try_loc(cite: str) -> Optional[str]:
             loc_url = _us_reports_loc_url(cite)
             if loc_url and _head_ok(loc_url, "LOC US Reports"):
                 print(f"[resolve] using LOC US Reports PDF: {loc_url}")
-                return loc_url
+                return _which_opinion(cite, loc_url)
             return None
 
         def _try_official_us_reports(cite: str) -> Optional[str]:
@@ -11366,10 +11649,6 @@ class CourtListenerGUI:
         #      parallel cite before giving up; when more than one reporter scan
         #      exists, keep all of them for the case window's PDF menu.
         if not is_scotus:
-            expected_name = re.sub(
-                r"<[^>]+>", "",
-                str(item.get("caseName") or item.get("case_name") or ""),
-            ).strip()
             choices = _case_law_pdf_choices_for_cites(
                 all_cites, expected_name=expected_name)
             if choices:
@@ -28551,7 +28830,7 @@ def _open_case_law_pdf(
 
     def ready(opinions: list[_CaseLawPageOpinion]) -> None:
         chosen = (
-            _match_case_law_page_opinion(opinions, expected_name)
+            _match_page_opinion(opinions, expected_name)
             if opinions and expected_name else None
         )
         if opinions and chosen is None:
