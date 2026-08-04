@@ -190,6 +190,7 @@ class _FakePane:
         self.destroyed = False
         self.focused = 0
         self.scrolled = []
+        self.turned = []
         self.stepped = []
         self.find_pages = None
         self.viewport = (2, 96.0)
@@ -214,6 +215,10 @@ class _FakePane:
 
     def scroll_key(self, direction):
         self.scrolled.append(direction)
+        return True
+
+    def turn_page(self, direction):
+        self.turned.append(direction)
         return True
 
     def has_find(self):
@@ -253,7 +258,11 @@ class _FakeReader:
         self.zoomed = []
         self.stepped = []
         self.scrolled = []
+        self.turned = []
         self.exported = []
+        # A chromeless reader can be switched to a scan of its own; in the
+        # text it has no pages to turn.
+        self.pdf_showing = False
 
     def _zoom(self, delta):
         self.zoomed.append(delta)
@@ -270,6 +279,12 @@ class _FakeReader:
     def _scroll_reader(self, direction):
         self.scrolled.append(direction)
         return True
+
+    def _turn_pdf_page(self, direction):
+        # The embedded opinion turns pages only when it is itself showing a
+        # scan; in the text it has none, and says so.
+        self.turned.append(direction)
+        return bool(self.pdf_showing)
 
     def _export_rtf(self):
         self.exported.append("rtf")
@@ -315,7 +330,8 @@ VIEWER_NAMES = [
     "_build_reader", "zoom",
     "_show_text", "_show_scan", "_sync_bar", "_refresh_scale", "_flash",
     "_post_copy_menu", "_bigger", "_smaller", "_reset_scale", "_rescale",
-    "_scroll_key", "_find_open", "_find_step", "_drop_reader", "_show_zoom",
+    "_scroll_key", "_page_key", "_find_open", "_find_step", "_drop_reader",
+    "_show_zoom",
     "_save_label", "_print_label", "_save", "_print", "_on_destroy", "alive",
 ]
 
@@ -675,6 +691,29 @@ class ScrollAndFindTests(unittest.TestCase):
         viewer = _Viewer()
         viewer._pane = None
         self.assertFalse(viewer._scroll_key(+1))
+
+    def test_left_and_right_turn_the_scan_s_pages(self):
+        viewer = _Viewer()
+        self.assertTrue(viewer._page_key(+1))
+        self.assertTrue(viewer._page_key(-1))
+        self.assertEqual(viewer._pane.turned, [+1, -1])
+
+    def test_the_opinion_text_has_no_pages_to_turn(self):
+        viewer = _in_text_mode()
+        self.assertFalse(viewer._page_key(+1))
+        self.assertEqual(viewer._pane.turned, [])
+
+    def test_but_a_scan_the_opinion_itself_switched_to_does(self):
+        viewer = _in_text_mode()
+        viewer._reader.pdf_showing = True
+        self.assertTrue(viewer._page_key(+1))
+        self.assertEqual(viewer._reader.turned, [+1])
+        self.assertEqual(viewer._pane.turned, [])
+
+    def test_no_scan_yet_leaves_the_key_alone(self):
+        viewer = _Viewer()
+        viewer._pane = None
+        self.assertFalse(viewer._page_key(+1))
 
     def test_find_searches_the_scan_s_text_layer(self):
         viewer = _Viewer()

@@ -91,6 +91,18 @@ def _source_of(cls: str, name: str) -> str:
     raise AssertionError(f"{cls} has no {name}")
 
 
+def _class_value(cls: str, name: str):
+    """A class-level constant, evaluated from the source, so a test measures
+    against the value the app itself uses."""
+    body = next(n.body for n in TREE.body
+                if isinstance(n, ast.ClassDef) and n.name == cls)
+    for node in body:
+        for target in getattr(node, "targets", ()):
+            if isinstance(target, ast.Name) and target.id == name:
+                return ast.literal_eval(node.value)
+    raise AssertionError(f"{cls} has no {name}")
+
+
 def _module_value(name: str):
     """A module-level constant, evaluated from the source."""
     for node in TREE.body:
@@ -973,8 +985,12 @@ class WindowIndependenceTests(unittest.TestCase):
 
     def test_and_a_citation_followed_out_of_it_starts_from_it(self):
         src = _source_of("CourtListenerGUI", "_show_cited_case_pdf")
-        self.assertIn("on_cite=lambda act, snip: self.open_cited_case_pdf(\n"
-                      "                    onward()", src)
+        self.assertIn("on_cite=cite_clicked", src)
+        self.assertIn(
+            "if not self.open_cited_case_pdf(onward(), act, snip, status,",
+            src)
+        self.assertIn(
+            "_follow_brief_action(self, onward(), a, status, snippet=s)", src)
         self.assertIn("on_open_text=lambda: _follow_brief_action(\n"
                       "                    self, onward()", src)
 
@@ -1032,7 +1048,7 @@ class _BookmarkApp:
 
 
 STRIP_NAMES = ["_sync_bar_menu", "_add_bar_menu_bookmark", "_bookmark_owner",
-               "showing_text"]
+               "showing_text", "has_text_side", "details_showing"]
 STRIP_NS = _load("_FloatingPdfWindow", STRIP_NAMES, {"_ACCEL": "Ctrl"})
 
 
@@ -1047,6 +1063,14 @@ class _StripViewer:
         self._mode = mode
         self._recent_menu = recent
         self._interface_menu = interface
+        # What has_text_side/details_showing read: a viewer with an opinion
+        # behind it offers the case's details on the menu; one showing only
+        # pages has none to offer.
+        self._on_build_text = None
+        self._pane = None
+        self._bytes = b""
+        self._details_win = None
+        self.details_toggled = 0
         self.closed = 0
         self._bar_menu = _StripMenu()
         for label in ("Save As…", "Print…"):
@@ -1057,6 +1081,9 @@ class _StripViewer:
 
     def close(self):
         self.closed += 1
+
+    def toggle_details(self):
+        self.details_toggled += 1
 
 
 class StripMenuTests(unittest.TestCase):
@@ -1198,6 +1225,367 @@ class ScanWindowSourceTests(unittest.TestCase):
         src = _source_of("_PdfWindow", "_embed_discovered_text")
         self.assertIn("chromeless=True", src)
         self.assertIn("initial_pdf_analysis=self._initial_pdf_analysis()", src)
+
+
+# ---------------------------------------------------------------------------
+# The case's details, in a panel beside the window ("s")
+# ---------------------------------------------------------------------------
+
+DETAILS_NAMES = ["_details_shortcut", "details_showing", "toggle_details",
+                 "_open_details", "_hide_details", "_details_window",
+                 "_details_width", "_place_details", "_on_geometry",
+                 "_build_reader", "adopt_reader", "has_scan", "has_text_side",
+                 "showing_text"]
+
+
+class _Packable:
+    def __init__(self, master=None):
+        self.master = master
+        self.packed = False
+        self.destroyed = False
+
+    def pack(self, **_kw):
+        self.packed = True
+
+    def destroy(self):
+        self.destroyed = True
+
+
+class _DetailsPanelWindow:
+    """The Toplevel the panel is built into."""
+
+    made: list = []
+
+    def __init__(self, parent=None):
+        self.parent = parent
+        self.titles: list = []
+        self.geometries: list = []
+        self.bindings: dict = {}
+        self.protocols: dict = {}
+        self.mapped = False
+        self.destroyed = False
+        self.lifted = 0
+        _DetailsPanelWindow.made.append(self)
+
+    def title(self, value=None):
+        if value is None:
+            return self.titles[-1] if self.titles else ""
+        self.titles.append(value)
+        return None
+
+    def transient(self, _master=None):
+        self.transient_to = _master
+
+    def bind(self, sequence, callback, add=None):
+        self.bindings[sequence] = callback
+
+    def protocol(self, name, func):
+        self.protocols[name] = func
+
+    def geometry(self, spec=None):
+        if spec is None:
+            return self.geometries[-1] if self.geometries else ""
+        self.geometries.append(spec)
+        return None
+
+    def deiconify(self):
+        self.mapped = True
+
+    def withdraw(self):
+        self.mapped = False
+
+    def lift(self):
+        self.lifted += 1
+
+    def winfo_ismapped(self):
+        return self.mapped
+
+    def winfo_viewable(self):
+        return True
+
+
+class _DetailsReader:
+    """The chromeless opinion the details panel is built by."""
+
+    def __init__(self):
+        self._details_panel_w = 300
+        self._details_host = None
+        self._details_views = True
+        self._details_on = False
+        self._details_var = _Var(False)
+        self.built = 0
+        self.refreshed = 0
+        self.panel = None
+
+    def _details_panel(self):
+        self.built += 1
+        self.panel = _Packable(self._details_host)
+        return self.panel
+
+    def _refresh_details_view(self):
+        self.refreshed += 1
+
+
+class _GeomWindow(_Widget):
+    """A window that knows where it is and how big it is."""
+
+    def __init__(self, x=100, y=80, w=720, h=880):
+        super().__init__()
+        self.place = (x, y, w, h)
+        self.bindings: dict = {}
+
+    def winfo_rootx(self):
+        return self.place[0]
+
+    def winfo_rooty(self):
+        return self.place[1]
+
+    def winfo_width(self):
+        return self.place[2]
+
+    def winfo_height(self):
+        return self.place[3]
+
+    def winfo_viewable(self):
+        return True
+
+    def update_idletasks(self):
+        pass
+
+    def focus_get(self):
+        return getattr(self, "focused", None)
+
+    def bind(self, sequence, callback, add=None):
+        self.bindings[sequence] = callback
+
+
+class _TypingWidget:
+    def __init__(self, cls="TEntry", state="normal"):
+        self.cls, self.state = cls, state
+
+    def winfo_class(self):
+        return self.cls
+
+    def cget(self, _option):
+        return self.state
+
+
+#: A desktop 1600x1000 wide, so the placement arithmetic is checkable.
+DETAILS_WORK_AREA = (0, 0, 1600, 1000)
+
+DETAILS_NS = _load(
+    "_FloatingPdfWindow", DETAILS_NAMES,
+    {"_ui_toplevel": _DetailsPanelWindow,
+     "_ensure_modern_ttk_styles": lambda _w: None,
+     "_work_area": lambda _w: DETAILS_WORK_AREA,
+     "_widget_accepts_typing": _load_functions(
+         ["_widget_accepts_typing"])["_widget_accepts_typing"],
+     "_EmbeddedCaseHost": lambda body, window: _Packable(body),
+     "ttk": type("ttk", (), {"Frame": _Packable}),
+     "_ScholarTextWindow": type(
+         "_ScholarTextWindow", (), {"_DETAILS_PANEL_W": 300}),
+     },
+)
+
+
+class _DetailsViewer:
+    _MIN_H = 280
+    _MIN_W = 380
+    _DETAILS_GAP = _class_value("_FloatingPdfWindow", "_DETAILS_GAP")
+
+    def __init__(self, scan=True, reader="build", x=100, y=80, w=720, h=880):
+        self._pane = object() if scan else None
+        self._bytes = b"%PDF" if scan else None
+        self._win = _GeomWindow(x, y, w, h)
+        self._body = object()
+        self._mode = "pdf" if scan else "text"
+        self._text_host = None
+        self._details_win = None
+        self._details_geom = ()
+        self.flashed: list = []
+        self.synced = 0
+        self.reader = _DetailsReader() if reader == "build" else None
+        # What the reader's own __init__ does as it finishes: tells the window
+        # around it that it now has an opinion.
+        self._on_build_text = None if reader is None else (
+            lambda host: (self.adopt_reader(self.reader), self.reader)[1])
+        self._reader = self.reader if reader == "ready" else None
+        for name in DETAILS_NAMES:
+            setattr(self, name, DETAILS_NS[name].__get__(self))
+
+    def _flash(self, message, ms=2500):
+        self.flashed.append(message)
+
+    def _sync_bar(self):
+        self.synced += 1
+
+    def press_s(self, focused=None):
+        self._win.focused = focused
+        return self._details_shortcut(None)
+
+
+class _ConfigureEvent:
+    def __init__(self, widget):
+        self.widget = widget
+
+
+class DetailsPanelTests(unittest.TestCase):
+    """"s" stands the case's details beside the window — over the pages as
+    much as over the text — without touching the window itself."""
+
+    def setUp(self):
+        _DetailsPanelWindow.made.clear()
+
+    def test_s_opens_the_panel(self):
+        viewer = _DetailsViewer()
+        self.assertEqual(viewer.press_s(), "break")
+        self.assertTrue(viewer.details_showing())
+        self.assertEqual(len(_DetailsPanelWindow.made), 1)
+
+    def test_it_is_the_opinion_s_own_panel_holding_the_case_s_details(self):
+        viewer = _DetailsViewer()
+        viewer.press_s()
+        reader = viewer.reader
+        self.assertEqual(reader.built, 1)
+        self.assertFalse(reader._details_views)   # no "Show" selector here
+        self.assertIs(reader.panel.master, reader._details_host)
+        self.assertTrue(reader.panel.packed)
+        self.assertTrue(reader._details_on)
+        self.assertEqual(reader.refreshed, 1)
+
+    def test_it_stands_to_the_right_of_the_window_at_its_height(self):
+        viewer = _DetailsViewer(x=100, y=80, w=720, h=880)
+        viewer.press_s()
+        self.assertEqual(_DetailsPanelWindow.made[0].geometry(),
+                         f"300x880+{100 + 720 + viewer._DETAILS_GAP}+80")
+
+    def test_a_maximized_window_puts_it_against_the_right_of_the_desktop(self):
+        # Nothing to the window's right to stand in: it goes over the edge of
+        # the pages rather than moving them.
+        viewer = _DetailsViewer(x=0, y=0, w=1600, h=1000)
+        viewer.press_s()
+        self.assertEqual(_DetailsPanelWindow.made[0].geometry(),
+                         "300x1000+1300+0")
+
+    def test_pressing_it_again_puts_the_panel_away_but_keeps_it(self):
+        viewer = _DetailsViewer()
+        viewer.press_s()
+        viewer.press_s()
+        self.assertFalse(viewer.details_showing())
+        panel_win = _DetailsPanelWindow.made[0]
+        self.assertFalse(panel_win.destroyed)
+        viewer.press_s()
+        self.assertTrue(viewer.details_showing())
+        self.assertEqual(len(_DetailsPanelWindow.made), 1)
+        self.assertEqual(viewer.reader.built, 1)   # neither rebuilt nor refetched
+
+    def test_the_panel_s_own_keys_and_close_box_put_it_away(self):
+        viewer = _DetailsViewer()
+        viewer.press_s()
+        panel_win = _DetailsPanelWindow.made[0]
+        for seq in ("<KeyPress-s>", "<Escape>", "<Control-w>", "<Command-w>"):
+            with self.subTest(seq=seq):
+                panel_win.mapped = True
+                self.assertEqual(panel_win.bindings[seq](None), "break")
+                self.assertFalse(viewer.details_showing())
+        panel_win.mapped = True
+        panel_win.protocols["WM_DELETE_WINDOW"]()
+        self.assertFalse(viewer.details_showing())
+
+    def test_the_key_is_left_alone_while_a_field_is_being_typed_in(self):
+        viewer = _DetailsViewer()
+        self.assertIsNone(viewer.press_s(_TypingWidget("TEntry")))
+        self.assertEqual(_DetailsPanelWindow.made, [])
+        # A disabled box takes no typing, so the key is free to fire.
+        self.assertEqual(
+            viewer.press_s(_TypingWidget("Text", state="disabled")), "break")
+
+    def test_opening_it_over_the_pages_leaves_the_pages_showing(self):
+        # The opinion is built for its details, behind the scan — building it
+        # must not switch the window to the text side.
+        viewer = _DetailsViewer()
+        viewer.press_s()
+        self.assertIsNotNone(viewer._reader)   # built, and behind the pages
+        self.assertEqual(viewer._mode, "pdf")
+        self.assertFalse(viewer.showing_text())
+
+    def test_but_a_window_with_no_pages_is_the_text_as_it_arrives(self):
+        # adopt_reader's other half: with no scan the opinion *is* the surface.
+        viewer = _DetailsViewer(scan=False, reader=None)
+        viewer._mode = "pdf"
+        viewer.adopt_reader(_DetailsReader())
+        self.assertEqual(viewer._mode, "text")
+
+    def test_a_case_whose_text_has_not_arrived_says_so(self):
+        viewer = _DetailsViewer(reader="none")
+        viewer._on_build_text = lambda host: None
+        viewer.press_s()
+        self.assertEqual(viewer.flashed, ["Case details not ready"])
+        self.assertEqual(_DetailsPanelWindow.made, [])
+
+    def test_a_document_with_no_case_behind_it_has_no_details(self):
+        # The Statutes at Large, an English report: pages and nothing else.
+        viewer = _DetailsViewer(reader=None)
+        viewer.press_s()
+        self.assertEqual(_DetailsPanelWindow.made, [])
+        self.assertEqual(viewer.flashed, [])
+
+    def test_the_panel_follows_the_window_about(self):
+        viewer = _DetailsViewer(x=100, y=80)
+        viewer.press_s()
+        viewer._win.place = (300, 120, 720, 880)
+        viewer._on_geometry(_ConfigureEvent(viewer._win))
+        self.assertEqual(_DetailsPanelWindow.made[0].geometry(),
+                         f"300x880+{300 + 720 + viewer._DETAILS_GAP}+120")
+
+    def test_but_not_for_an_event_that_moved_nothing(self):
+        viewer = _DetailsViewer()
+        viewer.press_s()
+        panel_win = _DetailsPanelWindow.made[0]
+        viewer._on_geometry(_ConfigureEvent(viewer._win))
+        placed = len(panel_win.geometries)
+        viewer._on_geometry(_ConfigureEvent(viewer._win))
+        self.assertEqual(len(panel_win.geometries), placed)
+
+    def test_nor_for_a_child_widget_s_own_configure(self):
+        viewer = _DetailsViewer()
+        viewer.press_s()
+        panel_win = _DetailsPanelWindow.made[0]
+        placed = len(panel_win.geometries)
+        viewer._win.place = (300, 120, 720, 880)
+        viewer._on_geometry(_ConfigureEvent(object()))
+        self.assertEqual(len(panel_win.geometries), placed)
+
+    def test_a_window_with_the_panel_closed_ignores_being_moved(self):
+        viewer = _DetailsViewer()
+        viewer._on_geometry(_ConfigureEvent(viewer._win))   # nothing to place
+        self.assertEqual(_DetailsPanelWindow.made, [])
+
+
+class DetailsMenuTests(unittest.TestCase):
+    def test_the_strip_offers_the_panel_and_says_when_it_is_open(self):
+        viewer = _StripViewer()
+        viewer._on_build_text = object()
+        viewer._sync_bar_menu()
+        self.assertIn("Case Details\ts", viewer._bar_menu.labels())
+        viewer._details_win = type(
+            "W", (), {"winfo_ismapped": lambda _s: True})()
+        viewer._sync_bar_menu()
+        self.assertIn("Hide Case Details\ts", viewer._bar_menu.labels())
+
+    def test_the_entry_opens_it(self):
+        viewer = _StripViewer()
+        viewer._on_build_text = object()
+        viewer._sync_bar_menu()
+        entry = next(cmd for kind, label, cmd in viewer._bar_menu.items
+                     if label.startswith("Case Details"))
+        entry()
+        self.assertEqual(viewer.details_toggled, 1)
+
+    def test_a_document_with_no_case_behind_it_is_not_offered_it(self):
+        viewer = _StripViewer()
+        viewer._sync_bar_menu()
+        self.assertNotIn("Case Details\ts", viewer._bar_menu.labels())
 
 
 if __name__ == "__main__":

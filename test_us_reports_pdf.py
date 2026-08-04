@@ -9,11 +9,18 @@ Both are lifted out of ``courtlistener_gui`` with ``ast`` — the module imports
 tkinter, which a headless run does not have.
 """
 
+import __future__
 import ast
+import dataclasses
+import difflib
 import pathlib
 import re
 import threading
+import typing
 import unittest
+from types import SimpleNamespace
+
+from court_catalog import STATE_COURTS
 
 try:
     import pypdfium2  # noqa: F401
@@ -22,23 +29,49 @@ except ImportError:  # pragma: no cover - depends on the environment
     HAVE_PDFIUM = False
 
 
-def _load(*names, consts=()):
+#: ``courtlistener_gui`` postpones its annotations; the pieces lifted out of
+#: it are compiled the same way, or an annotation naming a class loaded later
+#: would be evaluated here and fail.
+_POSTPONED = __future__.annotations.compiler_flag
+
+
+def _exec(source: str, ns: dict) -> None:
+    exec(compile(source, "<courtlistener_gui>", "exec", _POSTPONED), ns)
+
+
+def _segment(src: str, node) -> str:
+    """A node's source, decorators and all — ``get_source_segment`` starts at
+    the ``def``/``class`` line, which would drop a ``@dataclass``."""
+    text = ast.get_source_segment(src, node)
+    for dec in reversed(getattr(node, "decorator_list", None) or []):
+        text = f"@{ast.get_source_segment(src, dec)}\n{text}"
+    return text
+
+
+def _load(*names, consts=(), extra=None):
     src = pathlib.Path(__file__).with_name("courtlistener_gui.py").read_text()
     tree = ast.parse(src)
     ns = {"re": re, "_PDFIUM_LOCK": threading.RLock()}
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            target = node.targets[0]
-            if getattr(target, "id", "") in consts:
-                exec(ast.get_source_segment(src, node), ns)
-    found = {n.name: ast.get_source_segment(src, n)
+    ns.update(extra or {})
+    found = {n.name: _segment(src, n)
              for n in tree.body
-             if isinstance(n, ast.FunctionDef) and n.name in names}
+             if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+             and n.name in names}
     missing = [n for n in names if n not in found]
     if missing:
         raise AssertionError(f"not found at module level: {missing}")
+    # Definitions first: a constant can be built out of them (the frequent
+    # party names are a set comprehension over _name_tokens), while a function
+    # only reaches for a constant when it is called.
     for name in names:
-        exec(found[name], ns)
+        _exec(found[name], ns)
+    for node in tree.body:
+        targets = (
+            node.targets if isinstance(node, ast.Assign)
+            else [node.target] if isinstance(node, ast.AnnAssign) else []
+        )
+        if any(getattr(t, "id", "") in consts for t in targets):
+            _exec(ast.get_source_segment(src, node), ns)
     return ns
 
 
@@ -353,6 +386,354 @@ class GovInfoHiddenTextTests(unittest.TestCase):
             opinion_location.us_reports_cite_from_pdf(self.pages),
             "567 U.S. 519",
         )
+
+
+# ---------------------------------------------------------------------------
+# Two opinions beginning on one page
+# ---------------------------------------------------------------------------
+#
+# 71 U.S. 2 is where both Brobst v. Brobst and Ex parte Milligan begin.  Each
+# collection files the second alongside the first — the LOC appends a letter,
+# GovInfo a number — and only the case name inside each PDF says which is
+# which, so a citation on its own would always have opened Brobst.
+
+PAGE_NS = _load(
+    "_us_reports_loc_url", "_us_reports_govinfo_url", "_us_reports_sibling_url",
+    "_pdf_title", "_us_reports_title_name", "_us_reports_pdf_case_name",
+    "_us_reports_page_opinions", "_us_reports_page_choice",
+    "_normalized_us_cite", "_UsReportsPageOpinion", "_CaseLawPdfChoice",
+    # The real name matcher and everything under it, so two captions are told
+    # apart here exactly as they are everywhere else in the app.
+    "_match_page_opinion", "_match_tier", "_name_match_score", "_name_parties",
+    "_name_tokens", "_party_overlap", "_is_acronym_of", "_is_common_party",
+    "_token_close",
+    consts=("_US_CITE_RE", "_LOC_CUTOFF", "_GOVINFO_MAX", "_PDF_TITLE_RE",
+            "_PDF_STRING_ESCAPES", "_LOC_PAGE_SUFFIXES", "_MAX_PAGE_OPINIONS",
+            "_LOC_SIBLING_URL_RE", "_LOC_USREP_URL_RE", "_GOVINFO_USREP_URL_RE",
+            "_us_reports_page_lock",
+            "_us_reports_page_cache", "_NAME_STOPWORDS", "_NAME_MATCH_MIN",
+            "_NAME_PARTY_SPLIT_RE", "_US_PARTY_RE", "_MAX_CLEAN_PARTY",
+            "_COMMON_PARTY_NAMES"),
+    extra={"threading": threading, "dataclass": dataclasses.dataclass,
+           "Optional": typing.Optional, "difflib": difflib,
+           "_STATE_COURTS": STATE_COURTS,      # the frequent-party names
+           "print": lambda *a, **k: None},
+)
+
+#: The real document information dictionaries, as the two collections write
+#: them — the LOC gives the whole citation, GovInfo the caption alone.
+LOC_INFO = (
+    b"5 0 obj\n<</Title(U.S. Reports: Brobst et al. v. Brobst, 71 U.S. "
+    b"\\(4 Wall.\\) 2 \\(1867\\).)/Author(Supreme Court of the United States)"
+    b"/Subject(U.S. Reports Volume 71; Wallace Volume 4)>>"
+)
+GOVINFO_INFO = (
+    b"<</Producer(ABBYY FineReader 15; modified using iText)"
+    b"/Title(Brobst et al. v. Brobst)>>"
+)
+
+LOC_FIRST = ("https://cdn.loc.gov/service/ll/usrep/usrep071/"
+             "usrep071002/usrep071002.pdf")
+LOC_SECOND = ("https://cdn.loc.gov/service/ll/usrep/usrep071/"
+              "usrep071002a/usrep071002a.pdf")
+GOV_FIRST = ("https://www.govinfo.gov/content/pkg/USREPORTS-71/pdf/"
+             "USREPORTS-71-2.pdf")
+GOV_SECOND = ("https://www.govinfo.gov/content/pkg/USREPORTS-71/pdf/"
+              "USREPORTS-71-2-2.pdf")
+
+
+def _scan(title: str, pad: int = 0) -> bytes:
+    """A stand-in scan carrying *title* in its information dictionary, with
+    *pad* bytes of page data in front of it."""
+    return (b"%PDF-1.4\n" + b"\x00" * pad
+            + b"<</Title(" + title.encode() + b")>>\ntrailer\n")
+
+
+class _FakeCollection:
+    """The collections' HTTP surface: HEAD says what exists, GET hands back
+    the scan (or the first bytes of it, for a range request)."""
+
+    def __init__(self, bodies):
+        self.bodies = dict(bodies)
+        self.heads: list = []
+        self.gets: list = []
+
+    def head(self, url, **_kw):
+        self.heads.append(url)
+        return SimpleNamespace(
+            status_code=200 if url in self.bodies else 404)
+
+    def get(self, url, headers=None, **_kw):
+        self.gets.append((url, dict(headers or {})))
+        body = self.bodies.get(url)
+        if body is None:
+            return SimpleNamespace(status_code=404, content=b"")
+        if "Range" in (headers or {}):
+            return SimpleNamespace(status_code=206, content=body[:262144])
+        return SimpleNamespace(status_code=200, content=body)
+
+
+class SiblingUrlTests(unittest.TestCase):
+    """Where each collection files a second opinion off the same page."""
+
+    def test_the_loc_appends_a_letter(self):
+        self.assertEqual(PAGE_NS["_us_reports_loc_url"]("71 U.S. 2"), LOC_FIRST)
+        self.assertEqual(PAGE_NS["_us_reports_sibling_url"](LOC_FIRST, 2),
+                         LOC_SECOND)
+        self.assertEqual(PAGE_NS["_us_reports_sibling_url"](LOC_FIRST, 3),
+                         LOC_SECOND.replace("002a", "002b"))
+
+    def test_govinfo_appends_a_number(self):
+        self.assertEqual(
+            PAGE_NS["_us_reports_govinfo_url"]("71 U.S. 2")[1], GOV_FIRST)
+        self.assertEqual(PAGE_NS["_us_reports_sibling_url"](GOV_FIRST, 2),
+                         GOV_SECOND)
+        self.assertEqual(PAGE_NS["_us_reports_sibling_url"](GOV_FIRST, 3),
+                         GOV_SECOND[:-5] + "3.pdf")
+
+    def test_the_sibling_comes_from_the_host_the_scan_did(self):
+        # tile.loc.gov and cdn.loc.gov serve the same files by different
+        # paths; a sibling must be fetched from wherever the first one was.
+        tile = ("https://tile.loc.gov/storage-services/service/ll/usrep/"
+                "usrep071/usrep071002/usrep071002.pdf")
+        self.assertEqual(
+            PAGE_NS["_us_reports_sibling_url"](tile, 2),
+            tile.replace("usrep071002/usrep071002.pdf",
+                         "usrep071002a/usrep071002a.pdf"))
+
+    def test_the_letters_run_out_before_the_pages_do(self):
+        self.assertIsNone(PAGE_NS["_us_reports_sibling_url"](LOC_FIRST, 99))
+        self.assertIsNone(PAGE_NS["_us_reports_sibling_url"](LOC_SECOND, 2))
+        self.assertIsNone(
+            PAGE_NS["_us_reports_sibling_url"]("https://example.test/x.pdf", 2))
+
+
+class PdfTitleTests(unittest.TestCase):
+    """Reading a scan's own title out of its bytes."""
+
+    def test_the_loc_gives_the_citation_with_the_name(self):
+        title = PAGE_NS["_pdf_title"](LOC_INFO)
+        self.assertEqual(
+            title,
+            "U.S. Reports: Brobst et al. v. Brobst, 71 U.S. (4 Wall.) 2 (1867).")
+        self.assertEqual(PAGE_NS["_us_reports_title_name"](title),
+                         "Brobst et al. v. Brobst")
+
+    def test_govinfo_gives_the_caption_alone(self):
+        title = PAGE_NS["_pdf_title"](GOVINFO_INFO)
+        self.assertEqual(title, "Brobst et al. v. Brobst")
+        self.assertEqual(PAGE_NS["_us_reports_title_name"](title),
+                         "Brobst et al. v. Brobst")
+
+    def test_a_caption_of_its_own_commas_survives_the_citation_being_cut(self):
+        self.assertEqual(
+            PAGE_NS["_us_reports_title_name"](
+                "U.S. Reports: Smith, Executor v. Jones, 71 U.S. (4 Wall.) 9."),
+            "Smith, Executor v. Jones")
+
+    def test_a_hexadecimal_title(self):
+        self.assertEqual(
+            PAGE_NS["_pdf_title"](b"/Title<45782070617274652E>"),
+            "Ex parte.")
+
+    def test_a_utf_16_title(self):
+        self.assertEqual(
+            PAGE_NS["_pdf_title"](b"/Title<FEFF00450078002000700061007200740065>"),
+            "Ex parte")
+
+    def test_an_octal_escape(self):
+        self.assertEqual(PAGE_NS["_pdf_title"](rb"/Title(Ex\040parte)"),
+                         "Ex parte")
+
+    def test_an_escape_that_means_nothing_stands_for_itself(self):
+        self.assertEqual(PAGE_NS["_pdf_title"](rb"/Title(Ex\ parte\z)"),
+                         "Ex partez")
+
+    def test_a_line_continuation_closes_up(self):
+        self.assertEqual(PAGE_NS["_pdf_title"](b"/Title(Ex par\\\nte)"),
+                         "Ex parte")
+
+    def test_a_title_with_parentheses_of_its_own(self):
+        self.assertEqual(
+            PAGE_NS["_pdf_title"](rb"/Title(Brobst \(4 Wall.\) 2)"),
+            "Brobst (4 Wall.) 2")
+
+    def test_a_title_cut_off_by_a_short_read_is_no_title(self):
+        # A range request that stopped mid-string must not yield half a name.
+        self.assertEqual(PAGE_NS["_pdf_title"](LOC_INFO[:40]), "")
+
+    def test_and_neither_is_a_scan_without_one(self):
+        self.assertEqual(PAGE_NS["_pdf_title"](b"%PDF-1.4\ntrailer\n"), "")
+
+
+class PageOpinionTests(unittest.TestCase):
+    """Discovering that a page begins more than one opinion, and naming them."""
+
+    def setUp(self):
+        PAGE_NS["_us_reports_page_cache"].clear()
+
+    def _run(self, bodies, url=LOC_FIRST, cite="71 U.S. 2"):
+        session = _FakeCollection(bodies)
+        PAGE_NS["_anon_session"] = session
+        return PAGE_NS["_us_reports_page_opinions"](cite, url), session
+
+    def test_the_ordinary_page_costs_one_head_and_nothing_else(self):
+        opinions, session = self._run({LOC_FIRST: _scan("Brobst v. Brobst")})
+        self.assertEqual(opinions, [])
+        self.assertEqual(session.heads, [LOC_SECOND])
+        self.assertEqual(session.gets, [])
+
+    def test_a_second_opinion_is_found_and_both_are_named(self):
+        opinions, _s = self._run({
+            LOC_FIRST: _scan("U.S. Reports: Brobst et al. v. Brobst, "
+                             "71 U.S. (4 Wall.) 2 (1867)."),
+            LOC_SECOND: _scan("U.S. Reports: Ex parte Milligan, "
+                              "71 U.S. (4 Wall.) 2 (1866)."),
+        })
+        self.assertEqual([o.url for o in opinions], [LOC_FIRST, LOC_SECOND])
+        self.assertEqual([o.name for o in opinions],
+                         ["Brobst et al. v. Brobst", "Ex parte Milligan"])
+
+    def test_govinfo_files_the_same_page_its_own_way(self):
+        opinions, session = self._run(
+            {GOV_FIRST: _scan("Brobst et al. v. Brobst"),
+             GOV_SECOND: _scan("Ex parte Milligan")},
+            url=GOV_FIRST)
+        self.assertEqual([o.name for o in opinions],
+                         ["Brobst et al. v. Brobst", "Ex parte Milligan"])
+        self.assertEqual(session.heads[0], GOV_SECOND)
+
+    def test_the_probe_stops_at_the_first_one_that_is_not_there(self):
+        third = LOC_SECOND.replace("002a", "002b")
+        opinions, session = self._run({
+            LOC_FIRST: _scan("One v. One"),
+            LOC_SECOND: _scan("Two v. Two"),
+        })
+        self.assertEqual(len(opinions), 2)
+        self.assertEqual(session.heads, [LOC_SECOND, third])
+
+    def test_the_title_is_read_from_the_head_of_the_scan(self):
+        _opinions, session = self._run({
+            LOC_FIRST: _scan("Brobst v. Brobst"),
+            LOC_SECOND: _scan("Ex parte Milligan"),
+        })
+        self.assertTrue(all("Range" in headers for _u, headers in session.gets))
+
+    def test_a_scan_that_keeps_its_title_further_in_is_fetched_whole(self):
+        opinions, session = self._run({
+            LOC_FIRST: _scan("Brobst v. Brobst"),
+            LOC_SECOND: _scan("Ex parte Milligan", pad=300000),
+        })
+        self.assertEqual(opinions[1].name, "Ex parte Milligan")
+        self.assertEqual([headers.get("Range", "whole")
+                          for url, headers in session.gets if url == LOC_SECOND],
+                         ["bytes=0-262143", "whole"])
+
+    def test_a_sibling_does_not_go_looking_for_siblings_of_its_own(self):
+        opinions, session = self._run({LOC_SECOND: _scan("Ex parte Milligan")},
+                                      url=LOC_SECOND)
+        self.assertEqual(opinions, [])
+        self.assertEqual(session.heads, [])
+
+    def test_the_answer_is_kept_so_the_page_is_only_read_once(self):
+        bodies = {LOC_FIRST: _scan("One v. One"), LOC_SECOND: _scan("Two v. Two")}
+        first, _s = self._run(bodies)
+        second, session = self._run(bodies)
+        self.assertEqual([o.name for o in second], [o.name for o in first])
+        self.assertEqual(session.heads, [])
+        self.assertEqual(session.gets, [])
+
+
+class WhichOpinionTests(unittest.TestCase):
+    """Which of two opinions on one page a citation opens."""
+
+    def setUp(self):
+        PAGE_NS["_us_reports_page_cache"].clear()
+        PAGE_NS["_anon_session"] = _FakeCollection({
+            LOC_FIRST: _scan("U.S. Reports: Brobst et al. v. Brobst, "
+                             "71 U.S. (4 Wall.) 2 (1867)."),
+            LOC_SECOND: _scan("U.S. Reports: Ex parte Milligan, "
+                              "71 U.S. (4 Wall.) 2 (1866)."),
+        })
+
+    def _choose(self, name):
+        return PAGE_NS["_us_reports_page_choice"](
+            "71 U.S. 2", LOC_FIRST, name)
+
+    def test_the_case_being_opened_picks_its_own_scan(self):
+        url, choices = self._choose("Ex parte Milligan")
+        self.assertEqual(url, LOC_SECOND)
+        self.assertEqual(choices, [])
+
+    def test_and_the_other_one_gets_the_first(self):
+        url, choices = self._choose("Brobst v. Brobst")
+        self.assertEqual(url, LOC_FIRST)
+        self.assertEqual(choices, [])
+
+    def test_a_courtlistener_style_caption_still_matches(self):
+        self.assertEqual(self._choose("MILLIGAN, EX PARTE")[0], LOC_SECOND)
+
+    def test_a_name_that_matches_neither_offers_both(self):
+        url, choices = self._choose("Ex parte Merryman")
+        self.assertEqual(url, LOC_FIRST)   # as the citation always opened
+        self.assertEqual([c.url for c in choices], [LOC_FIRST, LOC_SECOND])
+        self.assertEqual([c.label for c in choices],
+                         ["71 U.S. 2 — Brobst et al. v. Brobst",
+                          "71 U.S. 2 — Ex parte Milligan"])
+        self.assertEqual({c.cite for c in choices}, {"71 U.S. 2"})
+
+    def test_and_so_does_a_record_with_no_name_at_all(self):
+        url, choices = self._choose("")
+        self.assertEqual(url, LOC_FIRST)
+        self.assertEqual(len(choices), 2)
+
+    def test_a_third_opinion_with_no_name_is_still_offered(self):
+        third = LOC_SECOND.replace("002a", "002b")
+        PAGE_NS["_us_reports_page_cache"].clear()
+        PAGE_NS["_anon_session"] = _FakeCollection({
+            LOC_FIRST: _scan("Brobst et al. v. Brobst"),
+            LOC_SECOND: _scan("Ex parte Milligan"),
+            third: b"%PDF-1.4\ntrailer\n",     # no title in it
+        })
+        url, choices = self._choose("Ex parte Merryman")
+        self.assertEqual(url, LOC_FIRST)
+        self.assertEqual([c.label for c in choices],
+                         ["71 U.S. 2 — Brobst et al. v. Brobst",
+                          "71 U.S. 2 — Ex parte Milligan",
+                          "71 U.S. 2 — Opinion 3"])
+
+    def test_a_second_scan_that_names_no_case_is_no_second_scan(self):
+        # Nothing could be chosen between, and a source that answers 200 to
+        # anything would otherwise invent a whole page of opinions.
+        PAGE_NS["_us_reports_page_cache"].clear()
+        PAGE_NS["_anon_session"] = _FakeCollection({
+            LOC_FIRST: _scan("Brobst et al. v. Brobst"),
+            LOC_SECOND: b"%PDF-1.4\ntrailer\n",
+        })
+        self.assertEqual(self._choose("Ex parte Milligan"), (LOC_FIRST, []))
+
+    def test_a_source_that_says_yes_to_everything_is_not_believed(self):
+        PAGE_NS["_us_reports_page_cache"].clear()
+
+        class _Yes:
+            heads: list = []
+
+            def head(self, url, **_kw):
+                _Yes.heads.append(url)
+                return SimpleNamespace(status_code=200)
+
+            def get(self, _url, headers=None, **_kw):
+                return SimpleNamespace(status_code=200, content=b"%PDF-1.4\n")
+
+        PAGE_NS["_anon_session"] = _Yes()
+        self.assertEqual(self._choose("Ex parte Milligan"), (LOC_FIRST, []))
+        self.assertEqual(len(_Yes.heads), 1)   # it gave up after the first
+
+    def test_the_page_of_one_opinion_is_left_exactly_as_it_was(self):
+        PAGE_NS["_us_reports_page_cache"].clear()
+        PAGE_NS["_anon_session"] = _FakeCollection(
+            {LOC_FIRST: _scan("Brobst v. Brobst")})
+        self.assertEqual(self._choose("Brobst v. Brobst"), (LOC_FIRST, []))
 
 
 if __name__ == "__main__":

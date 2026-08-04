@@ -229,6 +229,203 @@ class ReaderScrollKeyTests(unittest.TestCase):
         self.assertEqual(pane.steps, [-1, 1])
 
 
+def _pdf_pane_constants(*names) -> dict:
+    """The real ``_PdfPane`` class constants, so the page arithmetic below is
+    tested against the values the pane lays its pages out with."""
+    src = pathlib.Path(__file__).with_name("courtlistener_gui.py").read_text()
+    body = next(n.body for n in ast.parse(src).body
+                if isinstance(n, ast.ClassDef) and n.name == "_PdfPane")
+    out = {}
+    for node in body:
+        for target in getattr(node, "targets", ()):
+            if isinstance(target, ast.Name) and target.id in names:
+                out[target.id] = ast.literal_eval(node.value)
+    missing = [n for n in names if n not in out]
+    if missing:
+        raise AssertionError(f"_PdfPane has no {missing}")
+    return out
+
+
+class _TurnPane:
+    """A pane laid out the way ``_layout`` lays one out: a slot per page,
+    stacked from the top with the pane's own padding between them."""
+
+    consts = _pdf_pane_constants("_PAD", "_PAGE_TOP_SLOP")
+    _PAD = consts["_PAD"]
+    _PAGE_TOP_SLOP = consts["_PAGE_TOP_SLOP"]
+    turn_page = _load("turn_page", cls="_PdfPane")["turn_page"]
+
+    def __init__(self, pages=3, height=1000):
+        self._disposed = False
+        self._slots = []
+        y = self._PAD
+        for _ in range(pages):
+            self._slots.append((y, height, (0.0, 0.0, 1.0, 1.0), 1.0))
+            y += height + self._PAD
+        self._view_top = 0.0
+        self.went: list = []
+        self._canvas = type(
+            "Canvas", (), {"canvasy": lambda _s, _n, pane=self: pane._view_top},
+        )()
+
+    def page_top(self, i: int) -> float:
+        """Where scroll_to_page would put page *i*."""
+        return self._slots[i][0] - self._PAD
+
+    def at(self, i: int, past: float = 0.0) -> "_TurnPane":
+        """Put the view at page *i*, *past* pixels down it."""
+        self._view_top = self.page_top(i) + past
+        return self
+
+    def scroll_to_page(self, i, y_pt=None):
+        self.went.append(i)
+        self._view_top = self.page_top(i)
+
+
+class PdfPageKeyTests(unittest.TestCase):
+    """Left and Right turn the pages of a PDF (``_PdfPane.turn_page``)."""
+
+    def test_forward_goes_to_the_next_page(self):
+        pane = _TurnPane().at(0)
+        self.assertTrue(pane.turn_page(1))
+        self.assertEqual(pane.went, [1])
+
+    def test_back_goes_to_the_page_before(self):
+        pane = _TurnPane().at(2)
+        self.assertTrue(pane.turn_page(-1))
+        self.assertEqual(pane.went, [1])
+
+    def test_a_page_read_part_way_down_goes_back_to_its_own_top_first(self):
+        # Otherwise Back from the middle of page 2 skips the top of it, which
+        # the reader has not seen yet.
+        pane = _TurnPane().at(1, past=400)
+        pane.turn_page(-1)
+        pane.turn_page(-1)
+        self.assertEqual(pane.went, [1, 0])
+
+    def test_and_forward_from_there_still_goes_to_the_next_one(self):
+        pane = _TurnPane().at(1, past=400)
+        pane.turn_page(1)
+        self.assertEqual(pane.went, [2])
+
+    def test_a_view_just_short_of_a_page_does_not_skip_over_it(self):
+        pane = _TurnPane()
+        pane._view_top = pane.page_top(1) - 4   # the last of page 1 in view
+        pane.turn_page(1)
+        self.assertEqual(pane.went, [1])
+
+    def test_the_ends_of_the_document_stay_where_they_are(self):
+        first = _TurnPane().at(0)
+        first.turn_page(-1)
+        self.assertEqual(first.went, [0])
+        last = _TurnPane().at(2)
+        last.turn_page(1)
+        self.assertEqual(last.went, [2])
+
+    def test_a_rounded_scroll_still_counts_as_being_at_the_page_top(self):
+        # yview_moveto takes a fraction, so landing a pixel off is normal.
+        pane = _TurnPane().at(1, past=_TurnPane._PAGE_TOP_SLOP - 1)
+        pane.turn_page(-1)
+        self.assertEqual(pane.went, [0])
+
+    def test_a_pane_with_no_pages_leaves_the_key_alone(self):
+        empty = _TurnPane(pages=0)
+        self.assertFalse(empty.turn_page(1))
+        gone = _TurnPane()
+        gone._disposed = True
+        self.assertFalse(gone.turn_page(1))
+        self.assertEqual(gone.went, [])
+
+
+class ReaderPageKeyTests(unittest.TestCase):
+    """Which window the Left/Right keys reach, and which they leave alone."""
+
+    @classmethod
+    def setUpClass(cls):
+        ns = _load("_reader_scroll_key_owns", "_bind_reader_page_keys")
+        cls.bind_pages = staticmethod(ns["_bind_reader_page_keys"])
+
+    @staticmethod
+    def _event(widget):
+        return type("Event", (), {"widget": widget})()
+
+    def _bound(self, answer=True):
+        win, calls = _ScrollWindow(), []
+        self.bind_pages(win, lambda direction: calls.append(direction) or answer)
+        return win, calls
+
+    def test_left_and_right_turn_the_page_and_are_consumed(self):
+        win, calls = self._bound()
+        for seq in ("<KeyPress-Left>", "<KeyPress-Right>"):
+            with self.subTest(seq=seq):
+                self.assertEqual(
+                    win.bindings[seq](self._event(_ScrollWidget())), "break")
+        self.assertEqual(calls, [-1, 1])
+
+    def test_a_window_with_no_pages_showing_leaves_them_alone(self):
+        # The opinion text, or a viewer whose scan has not arrived.
+        win, calls = self._bound(answer=False)
+        self.assertIsNone(
+            win.bindings["<KeyPress-Right>"](self._event(_ScrollWidget())))
+        self.assertEqual(calls, [1])
+
+    def test_the_caret_keeps_them_in_a_text_widget(self):
+        win, calls = self._bound()
+        self.assertIsNone(
+            win.bindings["<KeyPress-Left>"](self._event(_ScrollWidget("Text"))))
+        self.assertEqual(calls, [])
+
+    def test_and_so_do_inputs_and_selectors(self):
+        win, calls = self._bound()
+        for cls_name in ("Entry", "TEntry", "Spinbox", "TCombobox", "Listbox",
+                         "Treeview", "TScale", "TScrollbar"):
+            with self.subTest(widget_class=cls_name):
+                self.assertIsNone(win.bindings["<KeyPress-Left>"](
+                    self._event(_ScrollWidget(cls_name))))
+        self.assertEqual(calls, [])
+
+    def test_the_case_reader_turns_pages_only_while_its_scan_is_showing(self):
+        ns = _load("_turn_pdf_page", cls="_ScholarTextWindow")
+        Reader = type("Reader", (), {"_turn_pdf_page": ns["_turn_pdf_page"]})
+        turned: list = []
+        reader = Reader()
+        reader._pdf_pane = type("Pane", (), {
+            "turn_page": lambda _self, d: turned.append(d) or True})()
+
+        reader._mode = "pdf"
+        self.assertTrue(reader._turn_pdf_page(+1))
+        reader._mode = "text"
+        self.assertFalse(reader._turn_pdf_page(+1))
+        self.assertEqual(turned, [+1])
+
+    def test_the_page_canvas_binds_them_and_panning_moves_to_shift(self):
+        src = _source_of("_PdfPane", "__init__")
+        self.assertIn('canvas.bind("<KeyPress-Left>",', src)
+        self.assertIn("self.turn_page(-1)", src)
+        self.assertIn("self.turn_page(1)", src)
+        self.assertIn('canvas.bind("<Shift-KeyPress-Left>", '
+                      "lambda _e: self._hwheel(-1))", src)
+        self.assertIn('canvas.bind("<Shift-KeyPress-Right>", '
+                      "lambda _e: self._hwheel(1))", src)
+
+    def test_every_window_that_shows_pages_routes_them(self):
+        # The point of the window-level binding is that it is on every view
+        # that shows a PDF; a new one must not quietly go without.
+        src = pathlib.Path(__file__).with_name("courtlistener_gui.py").read_text()
+        windows = [
+            (node.name, ast.get_source_segment(src, node) or "")
+            for node in ast.parse(src).body
+            if isinstance(node, ast.ClassDef)
+            and any(isinstance(n, ast.Call)
+                    and getattr(n.func, "id", "") == "_PdfPane"
+                    for n in ast.walk(node))
+        ]
+        self.assertTrue(windows)
+        for name, body in windows:
+            with self.subTest(window=name):
+                self.assertIn("_bind_reader_page_keys(", body)
+
+
 class _FakePane:
     def __init__(self, exists=True, has_find=True, showing=False):
         self._exists, self._has_find = exists, has_find

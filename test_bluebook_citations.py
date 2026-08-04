@@ -43,7 +43,7 @@ from courtlistener_gui import (
     _case_pdf_text_source,
     _open_statute_action,
     _case_law_page_opinions,
-    _match_case_law_page_opinion,
+    _match_page_opinion,
     _opinion_db_spotlight_results,
     _citation_search_variants,
     _citation_link_name,
@@ -1876,7 +1876,7 @@ class CaseLawSharedPageTests(unittest.TestCase):
             _CaseLawPageOpinion("first.pdf", "first.json", "Alpha v. One"),
             _CaseLawPageOpinion("second.pdf", "second.json", "Beta v. Two"),
         ]
-        chosen = _match_case_law_page_opinion(opinions, "Beta v. Two")
+        chosen = _match_page_opinion(opinions, "Beta v. Two")
         self.assertIsNotNone(chosen)
         self.assertEqual(chosen.url, "second.pdf")
 
